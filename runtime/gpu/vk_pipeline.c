@@ -77,6 +77,7 @@ static struct {
     PlatCond cond;
     Obj *tab[BUCKETS];
     VkpStats stats;
+    uint64_t map_missing, map_unknown_rows;
 } P = {.lock = PLAT_MUTEX_INIT, .cond = PLAT_COND_INIT};
 
 // ---------- the store
@@ -85,6 +86,17 @@ int vkp_store_open(const char *base, const char *variants, char *why, size_t cap
     ShcError e = shc_set_open(&P.set, base, variants, SHC_DESC_SCHEMA, why, cap);
     P.store_open = e == SHC_OK;
     return P.store_open;
+}
+
+int vkp_store_open_map(const char *base, const char *variants, const char *map, char *why, size_t cap) {
+    ShcError e = shc_set_open_map(&P.set, base, variants, map, SHC_DESC_SCHEMA, why, cap);
+    P.store_open = e == SHC_OK;
+    return P.store_open;
+}
+
+void vkp_stage_set_ledger_digest(VkpStage *stage, const uint8_t digest[SHC_DIGEST_BYTES]) {
+    memcpy(stage->ledger_digest, digest, SHC_DIGEST_BYTES);
+    stage->has_ledger_digest = 1;
 }
 
 void vkp_store_close(void) {
@@ -104,11 +116,12 @@ static void shape_text(const VkpStage *s, char *out, size_t cap) {
 
 static void digest_text(const VkpStage *s, char *out, size_t cap) {
     out[0] = 0;
-    if (!s || !s->answers) return;
+    const uint8_t *answers = s ? (s->has_ledger_digest ? s->ledger_digest : s->answers) : NULL;
+    if (!answers) return;
     static const uint8_t zero[SHC_DIGEST_BYTES];
-    if (!memcmp(s->answers, zero, sizeof zero)) return;
-    snprintf(out, cap, "@%02x%02x%02x%02x%02x%02x%02x%02x", s->answers[0], s->answers[1], s->answers[2], s->answers[3],
-             s->answers[4], s->answers[5], s->answers[6], s->answers[7]);
+    if (!memcmp(answers, zero, sizeof zero)) return;
+    snprintf(out, cap, "@%02x%02x%02x%02x%02x%02x%02x%02x", answers[0], answers[1], answers[2], answers[3],
+             answers[4], answers[5], answers[6], answers[7]);
 }
 
 void vkp_module(const VkpStage *s, int expect, VkpModule *out) {
@@ -117,7 +130,19 @@ void vkp_module(const VkpStage *s, int expect, VkpModule *out) {
     digest_text(s, dg, sizeof dg);
     memset(out, 0, sizeof *out);
     ShcEntry e;
-    int from = P.store_open && s->key ? shc_set_find(&P.set, s->key, s->answers, &e) : SHC_MISS;
+    int from = SHC_MISS;
+    if (P.store_open && s->key) {
+        if (s->has_ledger_digest) {
+            int mapped = 0;
+            from = shc_set_find_ledger(&P.set, s->key, s->ledger_digest, &e, &mapped);
+            if (!P.set.has_variant_map)
+                __atomic_fetch_add(&P.map_missing, 1, __ATOMIC_RELAXED);
+            else if (!mapped)
+                __atomic_fetch_add(&P.map_unknown_rows, 1, __ATOMIC_RELAXED);
+        } else {
+            from = shc_set_find(&P.set, s->key, s->answers, &e);
+        }
+    }
     if (from == SHC_MISS)
         rt_fatal("gfx: vulkan: the shader cache has no module for stage %s%s (%s): prepare translates the programs of the "
                  "game's archives, and this program is not among them", s->key ? s->key : "(none)", dg, shape);
@@ -761,6 +786,8 @@ void vkp_release(const char *key) {
 void vkp_stats(VkpStats *out) {
     plat_mutex_lock(&P.lock);
     *out = P.stats;
+    out->map_missing = __atomic_load_n(&P.map_missing, __ATOMIC_RELAXED);
+    out->map_unknown_rows = __atomic_load_n(&P.map_unknown_rows, __ATOMIC_RELAXED);
     plat_mutex_unlock(&P.lock);
 }
 
@@ -924,6 +951,8 @@ void vkp_close(void) {
     vkDestroyPipelineCache(gpu_vk.device, P.cache, NULL);
     vkp_layouts_destroy(&P.lay);
     memset(&P.stats, 0, sizeof P.stats);
+    __atomic_store_n(&P.map_missing, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&P.map_unknown_rows, 0, __ATOMIC_RELAXED);
     P.vi = VK_NULL_HANDLE, P.cache = VK_NULL_HANDLE;
     P.cache_path[0] = 0;
     P.cache_state = VKP_CACHE_NONE;
@@ -931,21 +960,25 @@ void vkp_close(void) {
 }
 
 // The prepared folder's files, under the names tools/prepare writes: the translate step's base pack, the ledger step's
-// variants pack (absent before a first ledger) and the pipelines step's cache (absent when the step was skipped, which
-// leaves every first use a miss, served by oot2/vk_miss.h).
+// variants pack and full-ledger-digest map (either may be absent for older prepared folders), and the pipelines step's
+// cache (absent when the step was skipped, which leaves every first use a miss, served by oot2/vk_miss.h).
 void gpu_vk_open_game(const char *folder) {
-    char base[600], variants[600], cache[600], why[512];
+    char base[600], variants[600], variant_map[600], cache[600], why[512];
     if (snprintf(base, sizeof base, "%s/shaders/shader-base.bin", folder) >= (int)sizeof base ||
         snprintf(variants, sizeof variants, "%s/shaders/shader-variants.bin", folder) >= (int)sizeof variants ||
+        snprintf(variant_map, sizeof variant_map, "%s/shaders/shader-variant-map.bin", folder) >= (int)sizeof variant_map ||
         snprintf(cache, sizeof cache, "%s/pipelines/pipeline.cache", folder) >= (int)sizeof cache)
         rt_fatal("gfx: vulkan: the game folder's path is too long: %s", folder);
     FILE *f = fopen(variants, "rb");
+    FILE *m = fopen(variant_map, "rb");
     if (f) fclose(f);
-    if (!vkp_store_open(base, f ? variants : NULL, why, sizeof why))
+    if (m) fclose(m);
+    if (!vkp_store_open_map(base, f ? variants : NULL, m ? variant_map : NULL, why, sizeof why))
         rt_fatal("gfx: vulkan: the shader packs of the game folder cannot be opened (run oot2 prepare): %s", why);
     vkp_open(cache);
-    rt_log("gfx: vulkan: shader packs %s%s%s; pipeline cache %s", base, f ? " and " : " (no variants pack)",
-           f ? variants : "", P.cache_state == VKP_CACHE_LOADED ? "seeded" :
+    rt_log("gfx: vulkan: shader packs %s%s%s%s%s; pipeline cache %s", base, f ? " and " : " (no variants pack)",
+           f ? variants : "", m ? " with " : " (no variant map)", m ? variant_map : "",
+           P.cache_state == VKP_CACHE_LOADED ? "seeded" :
            P.cache_state == VKP_CACHE_NONE ? "empty (no file)" : "empty (refused)");
 }
 

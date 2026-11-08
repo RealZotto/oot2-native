@@ -34,6 +34,7 @@ const char *shc_error_name(ShcError e) {
     case SHC_E_SCHEMA: return "SCHEMA";
     case SHC_E_ROLE: return "ROLE";
     case SHC_E_TRANSLATOR: return "TRANSLATOR";
+    case SHC_E_MAP: return "MAP";
     case SHC_E_INDEX_TRUNCATED: return "INDEX_TRUNCATED";
     case SHC_E_INDEX_HASH: return "INDEX_HASH";
     case SHC_E_ROW: return "ROW";
@@ -223,22 +224,117 @@ int shc_entry_intact(const ShcEntry *e) {
     return !memcmp(sha, e->sha256, 32);
 }
 
-ShcError shc_set_open(ShcSet *s, const char *base, const char *variants, uint32_t schema, char *why, size_t cap) {
+static ShcError shc_map_open(ShcSet *s, const char *path, char *why, size_t cap) {
+    uint64_t size = 0;
+    const uint8_t *map = plat_map_file(path, &size);
+    if (!map)
+        return refuse(SHC_E_MAP, why, cap, "cannot open or map shader variant map %s", path);
+    if (size < SHC_MAP_HEADER_BYTES || memcmp(map, SHC_MAP_MAGIC, 8) || get32(map + 8) != SHC_MAP_VERSION ||
+        get32(map + 12) != SHC_MAP_HEADER_BYTES || get32(map + 16) != SHC_MAP_ROW_BYTES || get32(map + 20) != 0) {
+        plat_unmap_file(map, size);
+        return refuse(SHC_E_MAP, why, cap, "shader variant map %s has an unsupported header", path);
+    }
+    uint64_t count = get64(map + 24);
+    if (count > (size - SHC_MAP_HEADER_BYTES) / SHC_MAP_ROW_BYTES ||
+        size != SHC_MAP_HEADER_BYTES + count * SHC_MAP_ROW_BYTES) {
+        plat_unmap_file(map, size);
+        return refuse(SHC_E_MAP, why, cap, "shader variant map %s has a truncated or oversized row table", path);
+    }
+    uint8_t sha[32];
+    rt_sha256(map + SHC_MAP_HEADER_BYTES, count * SHC_MAP_ROW_BYTES, sha);
+    if (memcmp(sha, map + 64, sizeof sha)) {
+        plat_unmap_file(map, size);
+        return refuse(SHC_E_MAP, why, cap, "shader variant map %s has a damaged row table", path);
+    }
+    const uint8_t *previous = NULL;
+    for (uint64_t i = 0; i < count; i++) {
+        const uint8_t *r = map + SHC_MAP_HEADER_BYTES + i * SHC_MAP_ROW_BYTES;
+        if (!key_ok(r) || (previous && memcmp(previous, r, SHC_KEY_BYTES + SHC_DIGEST_BYTES) >= 0)) {
+            plat_unmap_file(map, size);
+            return refuse(SHC_E_MAP, why, cap, "shader variant map %s has a malformed or unordered row %llu", path,
+                          (unsigned long long)i);
+        }
+        previous = r;
+    }
+    s->variant_map = map;
+    s->variant_map_size = size;
+    s->variant_map_count = count;
+    s->owns_variant_map = 1;
+    s->has_variant_map = 1;
+    return SHC_OK;
+}
+
+static void shc_map_close(ShcSet *s) {
+    if (s->variant_map && s->owns_variant_map) plat_unmap_file(s->variant_map, s->variant_map_size);
+    s->variant_map = NULL;
+    s->variant_map_size = s->variant_map_count = 0;
+    s->owns_variant_map = s->has_variant_map = 0;
+}
+
+static int shc_map_find(const ShcSet *s, const char *key, const uint8_t *digest, const uint8_t **out) {
+    if (!s->has_variant_map || !key || !digest) return 0;
+    size_t n = strlen(key);
+    if (!n || n >= SHC_KEY_BYTES) return 0;
+    uint8_t probe[SHC_KEY_BYTES + SHC_DIGEST_BYTES] = {0};
+    memcpy(probe, key, n);
+    memcpy(probe + SHC_KEY_BYTES, digest, SHC_DIGEST_BYTES);
+    uint64_t lo = 0, hi = s->variant_map_count;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        const uint8_t *r = s->variant_map + SHC_MAP_HEADER_BYTES + mid * SHC_MAP_ROW_BYTES;
+        int c = memcmp(r, probe, sizeof probe);
+        if (c < 0) lo = mid + 1;
+        else if (c > 0) hi = mid;
+        else {
+            *out = r + SHC_KEY_BYTES + SHC_DIGEST_BYTES;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+ShcError shc_set_open_map(ShcSet *s, const char *base, const char *variants, const char *map, uint32_t schema,
+                          char *why, size_t cap) {
     memset(s, 0, sizeof *s);
     ShcError e = shc_open(&s->base, base, SHC_ROLE_BASE, schema, why, cap);
-    if (e != SHC_OK || !variants) return e;
-    e = shc_open(&s->variants, variants, SHC_ROLE_VARIANTS, schema, why, cap);
-    if (e == SHC_OK && memcmp(s->variants.translator, s->base.translator, 32)) {
-        e = refuse(SHC_E_TRANSLATOR, why, cap, "shader cache pack %s was written by another translator than the base "
-                   "pack %s (run oot2 prepare again)", variants, base);
-        shc_close(&s->variants);
+    if (e != SHC_OK) return e;
+    if (variants) {
+        e = shc_open(&s->variants, variants, SHC_ROLE_VARIANTS, schema, why, cap);
+        if (e == SHC_OK && memcmp(s->variants.translator, s->base.translator, 32)) {
+            e = refuse(SHC_E_TRANSLATOR, why, cap, "shader cache pack %s was written by another translator than the base "
+                       "pack %s (run oot2 prepare again)", variants, base);
+            shc_close(&s->variants);
+        }
+        if (e != SHC_OK) {
+            shc_close(&s->base);
+            return e;
+        }
+        s->has_variants = 1;
     }
-    if (e != SHC_OK) {
-        shc_close(&s->base);
-        return e;
+    if (map) {
+        e = shc_map_open(s, map, why, cap);
+        if (e != SHC_OK) {
+            shc_set_close(s);
+            return e;
+        }
+        for (uint64_t i = 0; i < s->variant_map_count; i++) {
+            const uint8_t *r = s->variant_map + SHC_MAP_HEADER_BYTES + i * SHC_MAP_ROW_BYTES;
+            ShcEntry entry;
+            if (!shc_find(&s->base, (const char *)r, NULL, &entry) ||
+                (memcmp(r + SHC_KEY_BYTES + SHC_DIGEST_BYTES, zero_digest, SHC_DIGEST_BYTES) &&
+                 (!s->has_variants || !shc_find(&s->variants, (const char *)r,
+                                                r + SHC_KEY_BYTES + SHC_DIGEST_BYTES, &entry)))) {
+                shc_set_close(s);
+                return refuse(SHC_E_MAP, why, cap, "shader variant map %s names a row absent from its shader packs",
+                              map);
+            }
+        }
     }
-    s->has_variants = 1;
     return SHC_OK;
+}
+
+ShcError shc_set_open(ShcSet *s, const char *base, const char *variants, uint32_t schema, char *why, size_t cap) {
+    return shc_set_open_map(s, base, variants, NULL, schema, why, cap);
 }
 
 int shc_set_find(const ShcSet *s, const char *key, const uint8_t *answers, ShcEntry *out) {
@@ -248,7 +344,19 @@ int shc_set_find(const ShcSet *s, const char *key, const uint8_t *answers, ShcEn
     return shc_find(&s->base, key, NULL, out) ? SHC_FROM_BASE : SHC_MISS;
 }
 
+int shc_set_find_ledger(const ShcSet *s, const char *key, const uint8_t *ledger_digest, ShcEntry *out, int *mapped) {
+    const uint8_t *target = NULL;
+    int found = shc_map_find(s, key, ledger_digest, &target);
+    if (mapped) *mapped = found;
+    if (found && memcmp(target, zero_digest, SHC_DIGEST_BYTES)) {
+        if (shc_find(&s->variants, key, target, out)) return SHC_FROM_VARIANTS;
+        return SHC_MISS;
+    }
+    return shc_find(&s->base, key, NULL, out) ? SHC_FROM_BASE : SHC_MISS;
+}
+
 void shc_set_close(ShcSet *s) {
+    shc_map_close(s);
     shc_close(&s->variants);
     shc_close(&s->base);
     s->has_variants = 0;

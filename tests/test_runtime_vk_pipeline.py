@@ -47,7 +47,9 @@ from test_runtime_gpu import (EXIT_FATAL, ROOT, build_program, case_env, clang_o
 
 sys.path.insert(0, str(ROOT / "tools" / "shaders"))
 sys.path.insert(0, str(ROOT / "tools" / "pipecost"))
+sys.path.insert(0, str(ROOT / "tools"))
 import cache_pack as cp  # noqa: E402
+from prepare import ledger as prepare_ledger  # noqa: E402
 
 TEST_SOURCE = ROOT / "tests" / "runtime" / "vk_pipeline_test.c"
 UNI_LAYOUT = ROOT / "xlate" / "host" / "UniLayout.cs"
@@ -198,8 +200,8 @@ def io(location: int, components: int = 4, component: int = 0, type_: str = "flo
     return d
 
 
-def write_pack(path: Path, entries: list[cp.Entry], *, schema: int = cp.DESC_SCHEMA) -> Path:
-    cp.write_pack(path, entries, translator=TRANSLATOR, schema=schema)
+def write_pack(path: Path, entries: list[cp.Entry], *, schema: int = cp.DESC_SCHEMA, role: int = cp.BASE) -> Path:
+    cp.write_pack(path, entries, translator=TRANSLATOR, schema=schema, role=role)
     return path
 
 
@@ -953,6 +955,16 @@ class StoreTest(unittest.TestCase):
         ]
         cls.pack = write_pack(cls.dir / "base.bin", e)
         cls.pack3 = write_pack(cls.dir / "base3.bin", [cp.Entry("a.1", mod, describe("a.1", "ps", mod, schema=3))], schema=3)
+        variant_answers = {"tex": {"0": "3d"}}
+        cls.variant_digest = cp.answers_digest(variant_answers)
+        cls.ledger_digest = hashlib.sha256(b"complete synthetic ledger answers").digest()
+        variant_description = json.loads(describe("ps.ok", "ps", mod))
+        variant_description["answers"].update(variant_answers)
+        variant = cp.Entry("ps.ok", mod, json.dumps(variant_description).encode("utf-8"), answers=cls.variant_digest)
+        cls.variants = write_pack(cls.dir / "variants.bin", [variant], role=cp.VARIANTS)
+        cls.variant_map = cls.dir / "variant-map.bin"
+        cls.variant_map.write_bytes(prepare_ledger.variant_map_bytes(
+            {("ps.ok", cls.ledger_digest): cls.variant_digest}, hashlib.sha256(b"ledger file").hexdigest()))
 
     def store(self, key: str, kind: str, shape: str = "1") -> subprocess.CompletedProcess:
         return run("store", str(self.pack), "-", key, kind, shape)
@@ -963,6 +975,23 @@ class StoreTest(unittest.TestCase):
         self.assertRegex(done.stdout, r"module \d+ bytes from 1, kind ps, fits 1, 2 inputs, 1 outputs")
         done = self.store("vs.ok", "vs")
         self.assertIn("kind vs, fits 1, 0 inputs, 1 outputs", done.stdout)
+
+    def test_a_full_ledger_digest_resolves_through_the_map_and_counts_fallbacks(self) -> None:
+        mapped = run("storemap", str(self.pack), str(self.variants), str(self.variant_map), "ps.ok", "ps", "1",
+                     self.ledger_digest.hex())
+        self.assertEqual(mapped.returncode, 0, mapped.stdout + mapped.stderr)
+        self.assertEqual(mapped.stdout, "module from 2, map missing 0, unknown 0\n")
+
+        unknown = hashlib.sha256(b"unmapped full ledger row").hexdigest()
+        fallback = run("storemap", str(self.pack), str(self.variants), str(self.variant_map), "ps.ok", "ps", "1",
+                       unknown)
+        self.assertEqual(fallback.returncode, 0, fallback.stdout + fallback.stderr)
+        self.assertEqual(fallback.stdout, "module from 1, map missing 0, unknown 1\n")
+
+        no_map = run("storemap", str(self.pack), str(self.variants), "-", "ps.ok", "ps", "1",
+                     self.ledger_digest.hex())
+        self.assertEqual(no_map.returncode, 0, no_map.stdout + no_map.stderr)
+        self.assertEqual(no_map.stdout, "module from 1, map missing 1, unknown 0\n")
 
     def fatal(self, done: subprocess.CompletedProcess) -> str:
         self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)

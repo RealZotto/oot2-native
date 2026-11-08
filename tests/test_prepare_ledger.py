@@ -20,7 +20,8 @@ What is proved, each with a counter-run kept outside the repository (the commit'
   one variant;
 - a variant goes into the variants file and never into the base pack, which keeps its bytes;
 - a new ledger runs this step and nothing else, and a new translator runs the translate step and this one after it;
-- the runtime reader takes a variant before the base pack's default row;
+- the prepare map connects a full ledger digest to its projected variant digest, and the runtime resolves it before the
+  base pack's default row;
 - a variant the translator refuses, or that gets no answer, is a named failure record, rows that cannot be used are
   counted and skipped, and a damaged ledger stops the step by line.
 
@@ -220,6 +221,9 @@ class LedgerBase(trt.Base):
     def variants_path(self, dest: Path | None = None) -> Path:
         return (dest or self.dest) / translate.SHADERS / cp.VARIANTS_FILE
 
+    def map_path(self, dest: Path | None = None) -> Path:
+        return (dest or self.dest) / translate.SHADERS / ledger.VARIANT_MAP_FILE
+
     def variants(self, dest: Path | None = None) -> cp.Pack:
         return cp.open_pack(self.variants_path(dest), role=cp.VARIANTS)
 
@@ -327,6 +331,17 @@ class VariantTest(LedgerBase):
         self.assertEqual({r.answers for r in self.variants().rows},
                          {digest_of(img={"1": in_type}), digest_of(img={"1": in_format})})
         self.assertEqual(self.record()["default_rows"], 1)
+
+    def test_unknown_image_format_is_translated_and_maps_the_full_row_digest(self):
+        complete = {"img": {"1": {"fmt": "Unknown", "type": "2d"}}, "tex": {"9": "cube"}}
+        self.go([row(KEY["cs"], "cs", **complete)])
+        projected = digest_of(img={"1": complete["img"]["1"]})
+        full = digest_of(**complete)
+        variant = self.variants().find(KEY["cs"], projected)
+        self.assertFalse(variant.failed)
+        self.assertNotEqual(full, projected)
+        _, mappings = ledger.read_variant_map(self.map_path())
+        self.assertEqual(mappings[(KEY["cs"], full)], projected)
 
     def test_a_variant_that_is_the_base_entry_again_is_not_packed(self):
         # SAMEALL asks for texture 1 and ignores the answer: its variant is the base module and description again.
@@ -489,6 +504,9 @@ class KeyTest(LedgerBase):
         self.assertIn("the output of step ledger failed its full check; it runs again", text)
         self.assertEqual(cp.verify_pack(self.variants_path(), role=cp.VARIANTS), [])
         self.assertIn("translate: kept", text)
+        self.map_path().unlink()
+        self.assertIn("ledger: started (its output is missing)", self.go())
+        self.assertTrue(self.map_path().exists())
         # a variants pack with no variant recorded must not exist
         self.go([row(KEY["vs"], "vs")])
         shutil.copy(self.pack_path(), self.variants_path())
@@ -636,7 +654,8 @@ class RuntimeReaderTest(LedgerBase):
 
     def test_the_runtime_reader_takes_the_variant_before_the_base(self):
         tex, attr = digest_of(tex={"3": "3d"}), digest_of(attr={"0": "sint"})
-        self.go([row(KEY["vs"], "vs", tex={"3": "3d"}), row(KEY["vs"], "vs", attr={"0": "sint"}),
+        full_tex = digest_of(tex={"3": "3d", "7": "cube"})
+        self.go([row(KEY["vs"], "vs", tex={"3": "3d", "7": "cube"}), row(KEY["vs"], "vs", attr={"0": "sint"}),
                  row(KEY["cs"], "cs", img={"1": IMG_3D})])
         base, variants = self.pack(), self.variants()
         queries = [(KEY["vs"], tex), (KEY["vs"], attr), (KEY["vs"], cp.ZERO_DIGEST),
@@ -652,6 +671,15 @@ class RuntimeReaderTest(LedgerBase):
                 f"miss 0123456789abcdef.000 {cp.digest_text(tex)}"]
         q = shct.write_queries(self.root / "set.q", queries)
         self.assertEqual(self.lines("set", self.pack_path(), self.variants_path(), q), want)
+        map_unknown = digest_of(fout={"0": "uint"})
+        map_queries = shct.write_queries(self.root / "map.q",
+                                         [(KEY["vs"], full_tex), (KEY["vs"], map_unknown)])
+        mapped = self.expect("variants", variants, variants.find(KEY["vs"], tex)).split()
+        unknown = self.expect("base", base, base.find(KEY["vs"])).split()
+        mapped[2] = cp.digest_text(full_tex)
+        unknown[0], unknown[2] = "fallback", cp.digest_text(map_unknown)
+        self.assertEqual(self.lines("map", self.pack_path(), self.variants_path(), self.map_path(), map_queries),
+                         [" ".join(mapped), " ".join(unknown)])
         # the module a variant gives is not the base module of its program
         self.assertNotEqual(want[0].split()[4], want[2].split()[4])
         # without the variants pack every query takes the base pack's row

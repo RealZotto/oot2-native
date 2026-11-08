@@ -14,6 +14,7 @@ runtime/core/sha256.c at -O1 and -O2:
   open nor the lookup reads another entry (a control run shows the protection is live);
 - variants first: through the pair of packs, a digest the variants pack holds comes from it, anything else from the
   base pack's default row;
+- the full-ledger map: a raw ledger digest maps to a projected variant or base, while an unknown digest falls back;
 - refusals: a pack of another description schema, an index cut short, an entry that ends past the end of the file,
   and a damaged index, rows out of order, the wrong role, another translator, a short file and another magic, each
   under the name the Python reader gives the same file.
@@ -43,8 +44,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools" / "shaders"))
+sys.path.insert(0, str(ROOT / "tools"))
 
 import cache_pack as cp  # noqa: E402
+from prepare import ledger as prepare_ledger  # noqa: E402
 
 TEST_SOURCE = ROOT / "tests" / "runtime" / "shader_cache_test.c"
 SOURCES = (TEST_SOURCE, ROOT / "runtime" / "gpu" / "shader_cache.c", ROOT / "runtime" / "core" / "plat.c",
@@ -499,6 +502,37 @@ class CReaderTest(unittest.TestCase):
         # Without a variants pack every query takes the base pack's row.
         self.assertEqual(self.lines("set", packs.base, "-", q),
                          [line("base", base[key])] * 4 + [line("base", base[only_base]), want[-1]])
+
+    def test_c_maps_full_ledger_digests_to_projected_variants_and_falls_back(self) -> None:
+        packs = Packs(self.dir)
+        base = {e.key: e for e in packs.base_entries}
+        variant = packs.variant_entries[0]
+        source = hashlib.sha256(b"full ledger answers, including unread slots").digest()
+        base_source = hashlib.sha256(b"default ledger answers").digest()
+        unknown = hashlib.sha256(b"row absent from map").digest()
+        base_key = next(e.key for e in packs.base_entries if not e.failed and e.key != variant.key)
+        entries = {(variant.key, source): variant.answers, (base_key, base_source): cp.ZERO_DIGEST}
+        map_path = self.dir / "variant-map.bin"
+        map_path.write_bytes(prepare_ledger.variant_map_bytes(entries, hashlib.sha256(b"ledger").hexdigest()))
+        self.assertNotEqual(source, variant.answers)
+
+        def line(source_name: str, entry: cp.Entry, digest: bytes) -> str:
+            status, msha, dsha = expected(entry)
+            return f"{source_name} {entry.key} {digest.hex()} {status} {msha} {dsha}"
+
+        queries = [(variant.key, source), (base_key, base_source), (variant.key, unknown)]
+        q = write_queries(self.dir / "map.q", queries)
+        self.assertEqual(self.lines("map", packs.base, packs.variants, map_path, q),
+                         [line("variants", variant, source), line("base", base[base_key], base_source),
+                          line("fallback", base[variant.key], unknown)])
+        self.assertEqual(self.lines("map", packs.base, packs.variants, "-", q)[0],
+                         line("fallback", base[variant.key], source))
+
+        damaged_map = bytearray(map_path.read_bytes())
+        damaged_map[-1] ^= 0x80
+        bad_path = self.dir / "damaged-map.bin"
+        bad_path.write_bytes(damaged_map)
+        self.assertTrue(self.lines("map", packs.base, packs.variants, bad_path, q)[0].startswith("refused MAP: "))
 
     def assert_refused(self, path: Path, name: str, role: str = "base") -> None:
         got = self.lines("open", path, role, str(cp.DESC_SCHEMA))

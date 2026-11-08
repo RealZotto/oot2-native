@@ -61,6 +61,9 @@ typedef struct LedgerTrack {
 void ledger_track_reset(LedgerTrack *t);
 // Follow one record of a replay; at a draw or dispatch, make the rows of the stages it runs.
 void ledger_track_op(LedgerTrack *t, const op_hdr *r);
+// The SHA-256 of the current stage's complete canonical answers object, or zero when it has none. Matches the digest
+// written into ledger.jsonl, before prepare projects answers onto the slots the module reads.
+void ledger_track_answers_digest(const LedgerTrack *t, int kind, uint8_t out[32]);
 
 // ---- the rows
 // The folder the file lives in (the player's output folder): rows already there are loaded, so a new run adds to them.

@@ -8,9 +8,9 @@ what the translate step left: shaders/shader-base.bin, shaders/split/. A first p
 records that and writes nothing, and the run that follows the game's first run translates what it recorded.
 
 Output: shaders/shader-variants.bin (tools/shaders/cache_pack.py, role variants), one row for each (program, answers
-digest) the ledger asks for that its module reads and the default translation did not already use, and nothing else.
-Without such a row the file is not written, and a stale one is deleted. The base pack is never written here: a variant
-goes into the variants pack only, and the runtime's reader takes it before the base pack's default row.
+digest) the ledger asks for that its module reads and the default translation did not already use; and
+shaders/shader-variant-map.bin, a sorted map from the ledger's full answers digest to the projected digest or base.
+Without variants the variants pack is deleted, but the map is still written. The base pack is never written here.
 
 What a row asks for. A ledger row holds what was bound to its stage when a draw ran (the ledger study), a superset of what
 the stage's module reads, so each row is cut down to the answers the module uses before it counts:
@@ -28,7 +28,8 @@ the stage's module reads, so each row is cut down to the answers the module uses
   attribute's recorded answer, and "float" for a colour target. A row whose answers are all dropped is a default row
   and adds no variant.
 - What is left is the variant's answers. Its digest is the answers digest of the job that carries them
-  (cache_pack.answers_digest), so rows that differ only in slots the module does not read give one variant.
+  (cache_pack.answers_digest), so rows that differ only in slots the module does not read give one variant. The map
+  connects each full ledger-row digest to that projected digest, or to the base when projection adds nothing.
 - A variant whose translation is byte for byte the base module and whose description, apart from its answers and
   timing, is the base description's adds nothing either, and is not packed: the runtime reader finds no variant for
   the digest and takes the base pack's row, which is that same module and description. The step counts these.
@@ -58,6 +59,7 @@ import hashlib
 import json
 import re
 import shutil
+import struct
 import sys
 import threading
 import time
@@ -77,9 +79,14 @@ import cache_pack  # noqa: E402  (tools/shaders/cache_pack.py)
 import corpus  # noqa: E402  (tools/shaders/corpus.py: variant_job)
 import pool  # noqa: E402  (tools/shaders/pool.py)
 
-FORMAT = 1                      # changes when the outputs change shape: the step runs again
+FORMAT = 2                      # changes when the outputs change shape: the step runs again
 HERE = Path(__file__).resolve().parent
 LEDGER_FILE = "ledger.jsonl"    # runtime/include/oot2/ledger.h LEDGER_FILE, in the output folder (the game folder)
+VARIANT_MAP_FILE = "shader-variant-map.bin"
+MAP_MAGIC = b"OOT2VM1\0"
+MAP_VERSION = 1
+MAP_HEADER = struct.Struct("<8sIIIIQ32s32s")
+MAP_ROW = struct.Struct("<32s32s32s")
 HEADER = {"oot2_ledger": 1}
 SCRATCH = "ledger"              # temp/ledger/
 KINDS = ("vs", "ps", "cs", "ts", "ms")
@@ -99,6 +106,7 @@ class Row:
     key: str
     kind: str
     answers: dict               # {"tex": {"3": "2darray"}, "img": {"1": {"fmt": ..., "type": ...}}, ...}
+    digest: bytes               # SHA-256 of all answers, not the projected job answers
 
 
 def canonical(answers: dict) -> str:
@@ -114,6 +122,62 @@ def ledger_digest(path: Path) -> str:
         return "none"
     except OSError as e:
         raise PrepareError(f"the ledger {path} cannot be read: {e.strerror or e}") from None
+
+
+def _ledger_digest_bytes(digest: str) -> bytes:
+    return bytes(32) if digest == "none" else bytes.fromhex(digest)
+
+
+def variant_map_bytes(destinations: dict[tuple[str, bytes], bytes], digest: str) -> bytes:
+    """The sorted (stage key, full ledger digest) to projected digest map. A zero target means base."""
+    records = []
+    for (key, source), target in sorted(destinations.items(), key=lambda item: (item[0][0].encode("ascii"),
+                                                                                item[0][1])):
+        encoded = key.encode("ascii")
+        if not encoded or len(encoded) >= 32 or len(source) != 32 or len(target) != 32:
+            raise PrepareError("a shader variant map row is outside its fixed fields")
+        records.append(MAP_ROW.pack(encoded.ljust(32, b"\0"), source, target))
+    body = b"".join(records)
+    header = MAP_HEADER.pack(MAP_MAGIC, MAP_VERSION, MAP_HEADER.size, MAP_ROW.size, 0, len(records),
+                             _ledger_digest_bytes(digest), hashlib.sha256(body).digest())
+    return header + body
+
+
+def read_variant_map(path: Path) -> tuple[str, dict[tuple[str, bytes], bytes]] | None:
+    """Read and validate the variant map, returning its source ledger digest and entries."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < MAP_HEADER.size:
+        return None
+    magic, version, header_size, row_size, reserved, count, ledger_sha, rows_sha = MAP_HEADER.unpack_from(data)
+    if (magic != MAP_MAGIC or version != MAP_VERSION or header_size != MAP_HEADER.size or row_size != MAP_ROW.size or
+            reserved or count > (len(data) - header_size) // row_size or
+            len(data) != header_size + count * row_size):
+        return None
+    body = data[header_size:]
+    if hashlib.sha256(body).digest() != rows_sha:
+        return None
+    destinations: dict[tuple[str, bytes], bytes] = {}
+    previous = None
+    for offset in range(0, len(body), row_size):
+        key_field, source, target = MAP_ROW.unpack_from(body, offset)
+        end = key_field.find(b"\0")
+        if end <= 0 or any(key_field[end:]):
+            return None
+        try:
+            key = key_field[:end].decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        if not cache_pack.KEY_RE.fullmatch(key):
+            return None
+        order = (key_field, source)
+        if previous is not None and order <= previous:
+            return None
+        previous = order
+        destinations[(key, source)] = target
+    return ("none" if ledger_sha == bytes(32) else ledger_sha.hex()), destinations
 
 
 def read_ledger(path: Path) -> tuple[list[Row], str]:
@@ -183,7 +247,7 @@ def check_row(line: int, obj) -> Row:
     expect = hashlib.sha256(canonical(answers).encode("ascii")).hexdigest() if answers else "0"
     if digest != expect:
         raise ValueError("the digest does not match the answers (the row is damaged)")
-    return Row(line, key, kind, answers)
+    return Row(line, key, kind, answers, cache_pack.ZERO_DIGEST if digest == "0" else bytes.fromhex(digest))
 
 
 def _answer_ok(name: str, value) -> bool:
@@ -305,13 +369,14 @@ class Variant:
     rank: int = 0               # among the variants of one program, in digest order
 
 
-def plan(rows: list[Row], jobs: dict[str, dict], base: cache_pack.Pack) -> tuple[list[Variant], dict]:
-    """The variants a ledger asks for, sorted by key and digest, and the counts of what became of its rows."""
+def plan(rows: list[Row], jobs: dict[str, dict], base: cache_pack.Pack) -> tuple[list[Variant], dict, dict]:
+    """The variants a ledger asks for, sorted by key and digest, plus each usable row's projected digest or base."""
     counts = {"rows": len(rows), "programs": len({r.key for r in rows}), "unknown_programs": 0, "other_stage": 0,
               "base_failed": 0, "default_rows": 0, "variant_rows": 0, "merged_rows": 0}
     problems: dict[str, list[str]] = {"unknown_programs": [], "other_stage": [], "base_failed": []}
     reads: dict[str, Reads | None] = {}
     found: dict[tuple[str, bytes], Variant] = {}
+    destinations: dict[tuple[str, bytes], bytes] = {}
 
     def skip(name: str, row: Row) -> None:
         counts[name] += 1
@@ -335,9 +400,11 @@ def plan(rows: list[Row], jobs: dict[str, dict], base: cache_pack.Pack) -> tuple
         kept = project(row.answers, reads[row.key])
         if not kept:
             counts["default_rows"] += 1
+            destinations[(row.key, row.digest)] = cache_pack.ZERO_DIGEST
             continue
         variant = corpus.variant_job(job, kept)
         digest = cache_pack.answers_digest(variant)
+        destinations[(row.key, row.digest)] = digest
         if (row.key, digest) in found:
             counts["merged_rows"] += 1
         else:
@@ -348,7 +415,7 @@ def plan(rows: list[Row], jobs: dict[str, dict], base: cache_pack.Pack) -> tuple
     for v in variants:
         v.rank = rank[v.key] = rank.get(v.key, -1) + 1
     counts["problems"] = {name: keys[:NAMED] for name, keys in problems.items() if keys}
-    return variants, counts
+    return variants, counts, destinations
 
 
 # --- translation ----------------------------------------------------------------------------------------------------
@@ -430,12 +497,13 @@ def same_as_base(base: cache_pack.Pack, key: str, module: bytes, desc: bytes) ->
 
 
 def entries_of(variants: list[Variant], outcome: dict[tuple[str, bytes], pool.Result], scratch: Path,
-               base: cache_pack.Pack) -> tuple[list, int]:
+               base: cache_pack.Pack) -> tuple[list, int, set[tuple[str, bytes]]]:
     """The variants pack's entries and how many variants were left out: a translated variant's module and description
     (carried in the translator's reply), a failure record for one that did not translate, nothing for one that is the
     base entry again."""
     entries = []
     identical = 0
+    identical_keys = set()
     for v in variants:
         r = outcome[(v.key, v.digest)]
         if r.status == "ok" and not (r.module and r.description):
@@ -443,13 +511,14 @@ def entries_of(variants: list[Variant], outcome: dict[tuple[str, bytes], pool.Re
         if r.status == "ok":
             if same_as_base(base, v.key, r.module, r.description):
                 identical += 1
+                identical_keys.add((v.key, v.digest))
             else:
                 entries.append(cache_pack.Entry(v.key, r.module, r.description, answers=v.digest))
         else:
             entries.append(cache_pack.Entry(v.key, None, translate.failure_text({"status": r.status,
                                                                                  "message": r.message}),
                                             answers=v.digest, failed=True))
-    return entries, identical
+    return entries, identical, identical_keys
 
 
 # --- the step -------------------------------------------------------------------------------------------------------
@@ -465,27 +534,39 @@ class Ledger(Step):
 
     def current(self, ctx: Context, record: dict) -> bool:
         path = ctx.dest / translate.SHADERS / cache_pack.VARIANTS_FILE
+        map_path = ctx.dest / translate.SHADERS / VARIANT_MAP_FILE
         try:
-            if not record["variants"]:
-                return not path.exists()
-            return path.stat().st_size == record["pack_bytes"]
+            pack_current = path.stat().st_size == record["pack_bytes"] if record["variants"] else not path.exists()
+            return pack_current and map_path.stat().st_size == record["map_bytes"]
         except (OSError, KeyError, TypeError):
             return False
 
     def verify(self, ctx: Context, record: dict) -> bool:
-        """The pack's every entry against its row and description, its translator against the base pack's, and its
-        rows against the record."""
+        """The pack's entries and the sorted digest map against their rows and the record."""
         folder = ctx.dest / translate.SHADERS
         path = folder / cache_pack.VARIANTS_FILE
+        map_path = folder / VARIANT_MAP_FILE
         try:
             base = cache_pack.open_pack(folder / cache_pack.BASE_FILE, role=cache_pack.BASE)
-            if not record["variants"]:
-                return not path.exists()
-            if cache_pack.verify_pack(path, role=cache_pack.VARIANTS):
+            if record["variants"]:
+                if cache_pack.verify_pack(path, role=cache_pack.VARIANTS):
+                    return False
+                pack = cache_pack.open_pack(path, role=cache_pack.VARIANTS)
+                if pack.translator != base.translator or len(pack.rows) != record["variants"] or \
+                        not all(base.find(r.key) is not None for r in pack.rows):
+                    return False
+            elif path.exists():
                 return False
-            pack = cache_pack.open_pack(path, role=cache_pack.VARIANTS)
-            return pack.translator == base.translator and len(pack.rows) == record["variants"] and \
-                all(base.find(r.key) is not None for r in pack.rows)
+            parsed = read_variant_map(map_path)
+            if not parsed or parsed[0] != record["ledger_sha256"] or map_path.stat().st_size != record["map_bytes"]:
+                return False
+            pack = cache_pack.open_pack(path, role=cache_pack.VARIANTS) if record["variants"] else None
+            for (key, _), target in parsed[1].items():
+                if base.find(key) is None:
+                    return False
+                if target != cache_pack.ZERO_DIGEST and (pack is None or pack.find(key, target) is None):
+                    return False
+            return True
         except (OSError, KeyError, TypeError, ValueError, cache_pack.PackError):
             return False
 
@@ -496,7 +577,8 @@ class Ledger(Step):
         identity = check.translator_identity(ctx)
         folder = ctx.dest / translate.SHADERS
         pack = folder / cache_pack.VARIANTS_FILE
-        for stale in (pack, pack.with_name(pack.name + ".tmp")):
+        map_path = folder / VARIANT_MAP_FILE
+        for stale in (pack, pack.with_name(pack.name + ".tmp"), map_path, map_path.with_name(map_path.name + ".tmp")):
             stale.unlink(missing_ok=True)       # write-once: a step that runs again deletes its own pack first
         scratch = ctx.dest / check.TEMP / SCRATCH
         shutil.rmtree(scratch, ignore_errors=True)
@@ -514,7 +596,7 @@ class Ledger(Step):
             rep.say(f"ledger: no {LEDGER_FILE} in the output folder yet; the game writes it when a run ends, and the "
                     "next prepare translates what it recorded")
         jobs = translate.load_jobs(folder / translate.SPLIT) if rows else {}
-        variants, counts = plan(rows, jobs, base)
+        variants, counts, destinations = plan(rows, jobs, base)
         for name, text in (("unknown_programs", "name a program the split does not hold"),
                            ("other_stage", "name another stage than their program's"),
                            ("base_failed", "name a program the base pack holds as a failure record")):
@@ -547,7 +629,11 @@ class Ledger(Step):
             seconds = time.monotonic() - t0
             failed = [(v, outcome[(v.key, v.digest)]) for v in variants if outcome[(v.key, v.digest)].status != "ok"]
             translated = len(variants) - len(failed)
-            entries, identical = entries_of(variants, outcome, scratch, base)
+            entries, identical, identical_keys = entries_of(variants, outcome, scratch, base)
+            destinations = {
+                source: cache_pack.ZERO_DIGEST if (source[0], target) in identical_keys else target
+                for source, target in destinations.items()
+            }
             try:
                 if entries:
                     written = cache_pack.write_pack(pack, entries, translator=identity, role=cache_pack.VARIANTS)
@@ -567,9 +653,19 @@ class Ledger(Step):
                     + (f"pack {translate.mib(written['bytes'])} written" if entries else "no variants pack is written"))
         elif rows:
             rep.say("ledger: no row asks for a variant, so no variants pack is written")
+        map_data = variant_map_bytes(destinations, digest)
+        map_tmp = map_path.with_name(map_path.name + ".tmp")
+        try:
+            map_tmp.write_bytes(map_data)
+            map_tmp.replace(map_path)
+        except OSError as e:
+            map_tmp.unlink(missing_ok=True)
+            raise PrepareError(f"the shader variant map could not be written ({e}). Run oot2 prepare again.") from None
         return {
             "bytes": written["bytes"],
             "pack_bytes": written["bytes"],
+            "map_bytes": len(map_data),
+            "map_rows": len(destinations),
             "index_bytes": written["index_bytes"],
             "module_bytes": written["module_bytes"],
             "description_bytes": written["description_bytes"],

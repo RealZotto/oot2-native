@@ -425,6 +425,43 @@ static void case_store(const char *base, const char *variants, const char *key, 
     vkp_store_close();
 }
 
+static int parse_sha256(const char *text, uint8_t digest[32]) {
+    if (strlen(text) != 64) return 0;
+    for (int i = 0; i < 32; i++) {
+        unsigned value;
+        if (sscanf(text + i * 2, "%2x", &value) != 1) return 0;
+        digest[i] = (uint8_t)value;
+    }
+    return 1;
+}
+
+static void case_storemap(const char *base, const char *variants, const char *map, const char *key, const char *kind,
+                          const char *shape, const char *digest_text) {
+    char why[512];
+    uint8_t digest[32];
+    if (!vkp_store_open_map(base, strcmp(variants, "-") ? variants : NULL, strcmp(map, "-") ? map : NULL,
+                            why, sizeof why)) {
+        printf("refused: %s\n", why);
+        return;
+    }
+    if (!parse_sha256(digest_text, digest)) {
+        printf("bad digest\n");
+        vkp_store_close();
+        return;
+    }
+    nvn_stage st = {.kind = NVN_STAGE_PS, .ctl_size = 0x57, .code_size = 0x1230, .inst_size = 0x1000};
+    snprintf(st.key, sizeof st.key, "%s", key);
+    VkpStage s = {.key = key, .shape = strcmp(shape, "0") ? &st : NULL};
+    vkp_stage_set_ledger_digest(&s, digest);
+    static VkpModule m;
+    vkp_module(&s, kind_of(kind), &m);
+    VkpStats stats;
+    vkp_stats(&stats);
+    printf("module from %d, map missing %llu, unknown %llu\n", m.from,
+           (unsigned long long)stats.map_missing, (unsigned long long)stats.map_unknown_rows);
+    vkp_store_close();
+}
+
 static void case_storeopen(const char *base, const char *variants) {
     char why[512];
     if (!vkp_store_open(base, strcmp(variants, "-") ? variants : NULL, why, sizeof why)) printf("refused: %s\n", why);
@@ -1046,6 +1083,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "optional")) case_optional();
     else if (!strcmp(cs, "cachejudge")) case_cachejudge();
     else if (!strcmp(cs, "store") && argc >= 7) case_store(argv[2], argv[3], argv[4], argv[5], argv[6]);
+    else if (!strcmp(cs, "storemap") && argc >= 9)
+        case_storemap(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8]);
     else if (!strcmp(cs, "storeopen") && argc >= 4) case_storeopen(argv[2], argv[3]);
     else if (!strcmp(cs, "usable")) case_usable();
     else if (!strcmp(cs, "caps") && argc >= 4) case_caps(argv[2], argv[3], argc - 4, argv + 4);

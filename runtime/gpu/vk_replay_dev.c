@@ -49,7 +49,7 @@ static const ShaderBinds *dev_binds(const nvn_stage *s) {
             return &e->binds;
         }
     plat_mutex_unlock(&g_bind_lock);
-    VkpStage st = {s->key, NULL, s};
+    VkpStage st = {.key = s->key, .shape = s};
     VkpModule m;
     vkp_module(&st, s->kind, &m);   // the stage kinds are SHD_*'s order
     BindEntry *e = calloc(1, sizeof *e);

@@ -993,7 +993,12 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
     if (!vkn_topology(prim, &topo)) stop("primitive %d has no Vulkan topology", prim);
     VkBool32 restart = (VkBool32)S.restart_en;
     *restart_out = restart;
-    VkpStage vst = {vs->key, NULL, vs}, fst = {fs->key, NULL, fs};
+    uint8_t vs_digest[SHC_DIGEST_BYTES], fs_digest[SHC_DIGEST_BYTES];
+    ledger_track_answers_digest(&S.track, vs->kind, vs_digest);
+    ledger_track_answers_digest(&S.track, fs->kind, fs_digest);
+    VkpStage vst = {.key = vs->key, .shape = vs}, fst = {.key = fs->key, .shape = fs};
+    vkp_stage_set_ledger_digest(&vst, vs_digest);
+    vkp_stage_set_ledger_digest(&fst, fs_digest);
     // A pipeline that is not ready and may be skipped (oot2/vk_miss.h) answers NULL: nothing of the draw is written, so
     // the state the frame keeps (the bound pipeline, the dynamic state, the buffers) is as the draw before left it.
     VkPipeline pipe = F.ops->graphics(&vst, NULL, &fst, &F.formats, targets_hold_earlier_picture());
@@ -1120,8 +1125,15 @@ static void op_draw_mesh(const p_draw_mesh *d, uint64_t indirect) {
         stop("sample mask %#x is not replayed yet", S.sample_mask);
 
     pass_begin();
-    VkpStage task = {ts ? ts->key : NULL, NULL, ts};
-    VkpStage mesh = {ms->key, NULL, ms}, pixel = {fs->key, NULL, fs};
+    uint8_t task_digest[SHC_DIGEST_BYTES] = {0}, mesh_digest[SHC_DIGEST_BYTES], pixel_digest[SHC_DIGEST_BYTES];
+    if (ts) ledger_track_answers_digest(&S.track, ts->kind, task_digest);
+    ledger_track_answers_digest(&S.track, ms->kind, mesh_digest);
+    ledger_track_answers_digest(&S.track, fs->kind, pixel_digest);
+    VkpStage task = {.key = ts ? ts->key : NULL, .shape = ts};
+    VkpStage mesh = {.key = ms->key, .shape = ms}, pixel = {.key = fs->key, .shape = fs};
+    if (ts) vkp_stage_set_ledger_digest(&task, task_digest);
+    vkp_stage_set_ledger_digest(&mesh, mesh_digest);
+    vkp_stage_set_ledger_digest(&pixel, pixel_digest);
     VkPipeline pipe = F.ops->graphics(&mesh, ts ? &task : NULL, &pixel, &F.formats, targets_hold_earlier_picture());
     if (!pipe) {
         g_stats.skipped++;
@@ -1201,7 +1213,10 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     pass_end();
     F.noting = vkgt_enabled;   // the pass's mark is made; the buffers from here on are this dispatch's
     if (F.after_xfer) full_barrier();
-    VkpStage cst = {cs->key, NULL, cs};
+    uint8_t digest[SHC_DIGEST_BYTES];
+    ledger_track_answers_digest(&S.track, cs->kind, digest);
+    VkpStage cst = {.key = cs->key, .shape = cs};
+    vkp_stage_set_ledger_digest(&cst, digest);
     bind_pipeline(1, F.ops->compute(&cst));
     bind_set0(1);
     Set1 s;

@@ -180,6 +180,35 @@ static int case_set(const char *base, const char *variants, const char *queries)
     return 0;
 }
 
+static int case_map(const char *base, const char *variants, const char *map, const char *queries) {
+    ShcSet s;
+    char why[512] = "";
+    ShcError e = shc_set_open_map(&s, base, strcmp(variants, "-") ? variants : NULL,
+                                  strcmp(map, "-") ? map : NULL, SHC_DESC_SCHEMA, why, sizeof why);
+    if (e != SHC_OK) {
+        printf("refused %s: %s\n", shc_error_name(e), why);
+        return 0;
+    }
+    size_t n;
+    Query *q = read_queries(queries, &n);
+    for (size_t i = 0; i < n; i++) {
+        ShcEntry en;
+        int mapped = 0;
+        int from = shc_set_find_ledger(&s, q[i].key, q[i].digest, &en, &mapped);
+        if (from == SHC_MISS) {
+            printf("miss %s %s\n", q[i].key, q[i].digest_text);
+            continue;
+        }
+        char mod[65], text[65];
+        print_entry(&en, mod, text);
+        printf("%s %s %s %u %s %s\n", !mapped ? "fallback" :
+               from == SHC_FROM_VARIANTS ? "variants" : "base", en.key, q[i].digest_text, en.status, mod, text);
+    }
+    free(q);
+    shc_set_close(&s);
+    return 0;
+}
+
 static const uint8_t *g_map;
 static uint64_t g_size;
 
@@ -293,6 +322,7 @@ int main(int argc, char **argv) {
     if (argc >= 5 && !strcmp(argv[1], "open")) return case_open(argv[2], argv[3], argv[4]);
     if (argc >= 5 && !strcmp(argv[1], "find")) return case_find(argv[2], argv[3], argv[4]);
     if (argc >= 5 && !strcmp(argv[1], "set")) return case_set(argv[2], argv[3], argv[4]);
+    if (argc >= 6 && !strcmp(argv[1], "map")) return case_map(argv[2], argv[3], argv[4], argv[5]);
     if (argc >= 6 && !strcmp(argv[1], "isolated")) return case_isolated(argc, argv);
     if (argc >= 6 && !strcmp(argv[1], "bench")) return case_bench(argv[2], argv[3], argv[4], argv[5]);
     fprintf(stderr, "usage: shader_cache_test open|find|set|isolated|bench ...\n");

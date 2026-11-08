@@ -149,9 +149,9 @@ static VkmOps fake_ops(int own_drain, int own_values) {
     return o;
 }
 
-static VkpStage vstage(void) { return (VkpStage){g_vs.key, NULL, &g_vs}; }
-static VkpStage tstage(void) { return (VkpStage){g_ts.key, NULL, &g_ts}; }
-static VkpStage pstage(void) { return (VkpStage){g_ps.key, NULL, &g_ps}; }
+static VkpStage vstage(void) { return (VkpStage){.key = g_vs.key, .shape = &g_vs}; }
+static VkpStage tstage(void) { return (VkpStage){.key = g_ts.key, .shape = &g_ts}; }
+static VkpStage pstage(void) { return (VkpStage){.key = g_ps.key, .shape = &g_ps}; }
 
 static void wait_built(void) {
     for (int i = 0; i < 400 && !__atomic_load_n(&g_g_built, __ATOMIC_ACQUIRE); i++) sleep_ms(10);
@@ -311,7 +311,7 @@ static void case_compute_wait(void) {
     VkmConfig c = {50ull * 1000000ull, 0};
     vkm_set_config(&c);
     g_build_ms = 300;
-    VkpStage cs = {g_cs.key, NULL, &g_cs};
+    VkpStage cs = {.key = g_cs.key, .shape = &g_cs};
     VkPipeline p = vkm_compute(&cs);
     CHECK(p == PIPE_C);
     VkmStats s;

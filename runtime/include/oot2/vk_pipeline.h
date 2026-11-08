@@ -72,6 +72,8 @@ typedef struct VkpStage {
     const char *key;            // the job key, "<key16>.<variant>"
     const uint8_t *answers;     // the answers digest (32 bytes), NULL for the default answers
     const nvn_stage *shape;     // what to print when the stage cannot be served; may be NULL
+    uint8_t ledger_digest[SHC_DIGEST_BYTES];
+    int has_ledger_digest;
 } VkpStage;
 
 typedef struct VkpModule {
@@ -85,7 +87,9 @@ typedef struct VkpModule {
 
 // Open the packs (variants may be NULL). 1, or 0 with the reason in why.
 int vkp_store_open(const char *base, const char *variants, char *why, size_t cap);
+int vkp_store_open_map(const char *base, const char *variants, const char *map, char *why, size_t cap);
 void vkp_store_close(void);
+void vkp_stage_set_ledger_digest(VkpStage *stage, const uint8_t digest[SHC_DIGEST_BYTES]);
 // The module of stage s, whose description must name stage kind `expect` (SHD_*) and say it fits its layout. A named
 // fatal otherwise (no row, a failure record, a description that cannot be read or is of another stage).
 void vkp_module(const VkpStage *s, int expect, VkpModule *out);
@@ -198,5 +202,6 @@ typedef struct VkpStats {
     uint64_t padded;                      // vertex libraries made from a padded module
     uint64_t resident;                    // objects held now
     uint64_t build_ns[3];                 // wall time in the driver: libraries, links, computes
+    uint64_t map_missing, map_unknown_rows;  // full ledger digests without an available map or map entry
 } VkpStats;
 void vkp_stats(VkpStats *out);
