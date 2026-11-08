@@ -45,10 +45,10 @@ TIMEOUT = 120
 EXIT_UNIMPLEMENTED = 71
 
 PASSING = ("release_clock", "release_clock_32k", "cadence_running_stopped", "cadence_period", "cadence_no_burst",
-           "parse_ok", "flush_stop", "device_basic", "auddmg_basic", "mix_voice", "mix_formats", "mix_resample",
-           "mix_adpcm", "mix_pool_refused", "mix_route", "mix_device_volume", "mix_biquad", "mix_loop", "mix_stereo", "mix_sink6",
-           "starve_empty_loop", "stall_lock", "sink_null", "sink_capture", "stall_report", "stall_healthy", "stall_names",
-           "stall_no_update", "sysmix_stream", "opus_fake")
+           "parse_ok", "flush_stop", "device_basic", "auddmg_basic", "mix_voice", "mix_voice_slots", "mix_voice_slots_old",
+           "mix_formats", "mix_resample", "mix_adpcm", "mix_pool_refused", "mix_route", "mix_device_volume", "mix_biquad",
+           "mix_loop", "mix_stereo", "mix_sink6", "starve_empty_loop", "stall_lock", "sink_null", "sink_capture",
+           "stall_report", "stall_healthy", "stall_names", "stall_no_update", "sysmix_stream", "opus_fake")
 
 SERVICE = "service\taud:u\timplemented\t1\t"
 UPDATE = "FATAL: unimplemented audio: RequestUpdate: "
@@ -185,6 +185,15 @@ class AudioTest(unittest.TestCase):
                     self.assertIn(f"ok {case}", done.stdout)
                     self.assertNotIn("FATAL", done.stderr)
                     self.assertNotIn("is not read", done.stderr)
+
+    def test_voice_slots_do_not_silence_other_channels(self) -> None:
+        for level in LEVELS:
+            for case in ("mix_voice_slots", "mix_voice_slots_old"):
+                with self.subTest(level=level, case=case):
+                    done, _ = self.run_case(level, case)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertIn(f"ok {case}", done.stdout)
+                    self.assertNotIn("FATAL", done.stderr)
 
     def test_a_wave_buffer_outside_the_attached_pools_is_not_read(self) -> None:
         done, _ = self.run_case("-O2", "mix_pool_refused")

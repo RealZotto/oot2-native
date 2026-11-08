@@ -796,6 +796,74 @@ static void g_mix_voice(Cpu *c) {
     sv(c, 0x0A, 0, 0, 0, 0);
 }
 
+// Unused voice records can be zeroed. Dropping one must not silence another, and voice state belongs to the record slot.
+static void g_mix_voice_slots(Cpu *c) {
+    int16_t left[720], right[720];
+    for (int i = 0; i < 720; i++) left[i] = 8192, right[i] = 16384;
+    memcpy((void *)(uintptr_t)DATA_AT, left, sizeof left);
+    memcpy((void *)(uintptr_t)(DATA_AT + 0x1000), right, sizeof right);
+
+    TestCfg t = cfg_default();
+    if (!strcmp(g_case, "mix_voice_slots_old")) t.tag = BK_TAG(14);
+    Rend r = rend_open(c, &t);
+    BkBlock b;
+    block_new(&b, &t);
+    for (int i = 0; i < 2; i++) {
+        voice_play(&b.voice[i], (uint32_t)i, 48000, (uint32_t[]){720}, 1);
+        b.voice[i].channels = 1;
+        b.voice[i].mix_id = 0;
+        b.voice[i].gain[i] = 1.0f;
+        b.voice[i].wave[0].address = DATA_AT + (uint64_t)i * 0x1000;
+        b.voice[i].wave[0].size = sizeof left;
+    }
+    b.voice[2].id = b.voice[3].id = 0;
+    b.pool_addr[0] = DATA_AT, b.pool_size[0] = 0x10000, b.pool_state[0] = 4;
+    b.mix[0] = (BkMix){.volume = 1.0f, .buffer_count = 2, .in_use = 1};
+    b.sink[0] = (BkSink){.type = 1, .in_use = 1, .input_count = 2, .inputs = {0, 1}};
+    BkAnswer a;
+    CHECK(rend_update(c, &r, &b, &a, 0x2000) == 0);
+    uint64_t origin = tm_now(NULL);
+    rend_start(c, &r);
+    tm_set(origin + tick_ns(48000, 240, 1));
+    CHECK(await_signals(1));
+    AudioRenderer *rr = audio_renderer_nth(0);
+    CHECK(rr != NULL);
+    size_t n = 0;
+    const float *out = audio_sink_capture_data(audio_renderer_sink(rr), &n);
+    CHECK(out != NULL && n == 240);
+    for (int i = 0; i < 240; i++) CHECK(near_f(out[2 * i], 0.25f) && near_f(out[2 * i + 1], 0.5f));
+
+    block_resend(&b);
+    memset(&b.voice[1], 0, sizeof b.voice[1]);
+    CHECK(rend_update(c, &r, &b, &a, 0x2000) == 0);
+    CHECK(a.played[0] == 240 && a.played[1] == 0);
+    tm_set(origin + tick_ns(48000, 240, 2));
+    CHECK(await_signals(2));
+    out = audio_sink_capture_data(audio_renderer_sink(rr), &n);
+    CHECK(out != NULL && n == 480);
+    for (int i = 240; i < 480; i++) CHECK(near_f(out[2 * i], 0.25f) && near_f(out[2 * i + 1], 0.0f));
+
+    block_resend(&b);
+    voice_play(&b.voice[1], 3, 48000, (uint32_t[]){240}, 1);
+    b.voice[1].channels = 1, b.voice[1].mix_id = 0;
+    b.voice[1].wave[0].address = DATA_AT + 0x1000, b.voice[1].wave[0].size = 480;
+    b.voice[3].id = 0xffffffffu;
+    b.voice[3].gain[1] = 1.0f;
+    b.voice[3].biquad[0].enable = 1, b.voice[3].biquad[0].num[0] = NAN;
+    CHECK(rend_update(c, &r, &b, &a, 0x2000) == 0);
+    tm_set(origin + tick_ns(48000, 240, 3));
+    CHECK(await_signals(3));
+    out = audio_sink_capture_data(audio_renderer_sink(rr), &n);
+    CHECK(out != NULL && n == 720);
+    for (int i = 480; i < 720; i++) CHECK(near_f(out[2 * i], 0.25f) && near_f(out[2 * i + 1], 0.5f));
+    block_resend(&b);
+    CHECK(rend_update(c, &r, &b, &a, 0x2000) == 0);
+    CHECK(a.played[1] == 240 && a.played[3] == 0);
+    rend_stop(c, &r);
+    rend_close(c, &r);
+    sv(c, 0x0A, 0, 0, 0, 0);
+}
+
 // The sample formats the client may use, each a ramp of 240 samples, one frame, volume 1.
 static void g_mix_formats(Cpu *c) {
     static float out[240 * 2];
@@ -1652,6 +1720,8 @@ static GuestFn entry_for(const char *name) {
     if (!strcmp(name, "stall_names")) return g_stall_names;
     if (!strcmp(name, "stall_no_update")) return g_stall_no_update;
     if (!strcmp(name, "mix_voice")) return g_mix_voice;
+    if (!strcmp(name, "mix_voice_slots")) return g_mix_voice_slots;
+    if (!strcmp(name, "mix_voice_slots_old")) return g_mix_voice_slots;
     if (!strcmp(name, "mix_formats")) return g_mix_formats;
     if (!strcmp(name, "mix_resample")) return g_mix_resample;
     if (!strcmp(name, "mix_adpcm")) return g_mix_adpcm;

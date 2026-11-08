@@ -177,9 +177,9 @@ static void voice_reset(AudioRenderer *r, unsigned id) {
     v->loops_done = 0;
 }
 
-static void update_voice(AudioRenderer *r, const AudrenVoiceIn *in) {
-    ServerVoice *v = &r->voices[in->id];
-    if (in->is_new || !in->in_use) voice_reset(r, in->id);
+static void update_voice(AudioRenderer *r, unsigned slot, const AudrenVoiceIn *in) {
+    ServerVoice *v = &r->voices[slot];
+    if (in->is_new || !in->in_use) voice_reset(r, slot);
     v->in = *in;
     v->use_float_biquads = 0;
     if (!in->in_use) return;
@@ -200,7 +200,7 @@ static void update_voice(AudioRenderer *r, const AudrenVoiceIn *in) {
             (*seen)++;
             rt_log("audio: wave buffer, sent flag %u (%s): voice %u slot %u, %llu bytes at %#llx, samples %d to %d, loop %u "
                    "(count %d), end of stream %u; voice format %u, rate %u, state %u, pitch %.3f, volume %.3f",
-                   w->sent, w->sent ? "kept as it is" : "queued", in->id, i, (unsigned long long)w->size,
+                   w->sent, w->sent ? "kept as it is" : "queued", slot, i, (unsigned long long)w->size,
                    (unsigned long long)w->address, w->start, w->end, w->loop, w->loop_count, w->end_of_stream,
                    in->sample_format, in->sample_rate, in->play_state, in->pitch, in->volume);
         }
@@ -480,7 +480,7 @@ static int read_voice(const uint8_t *src, int rev, int index, int voice_count, A
         memcpy((uint8_t *)v + AUDREN_VOICE_TAIL_V1, src + AUDREN_VOICE_TAIL_V2, audren_voice_in_stride(rev) - AUDREN_VOICE_TAIL_V2);
         for (unsigned f = 0; f < 2; f++) {
             v->biquads[f].enable = fb[f].enable;
-            if (!fb[f].enable) continue;
+            if (!v->in_use || !fb[f].enable) continue;
             for (unsigned c = 0; c < 3; c++)
                 if (!isfinite(fb[f].numerator[c])) return fail(w, "voice record %d: filter %u has a numerator that is not finite", index, f);
             for (unsigned c = 0; c < 2; c++)
@@ -489,8 +489,10 @@ static int read_voice(const uint8_t *src, int rev, int index, int voice_count, A
     } else {
         memcpy(v, src, sizeof *v);
     }
-    if (v->id >= (uint32_t)voice_count) return fail(w, "voice record %d carries the id %u, the renderer has %d voices", index, v->id, voice_count);
-    if (v->in_use && v->wave_buffer_index >= 4) return fail(w, "voice %u has the wave buffer index %u (of 4)", v->id, v->wave_buffer_index);
+    if (v->in_use && v->id >= (uint32_t)voice_count)
+        return fail(w, "voice record %d carries the id %u, the renderer has %d voices", index, v->id, voice_count);
+    if (v->in_use && v->wave_buffer_index >= 4)
+        return fail(w, "voice %d has the wave buffer index %u (of 4)", index, v->wave_buffer_index);
     return 1;
 }
 
@@ -586,12 +588,13 @@ int audio_renderer_update(AudioRenderer *r, const uint8_t *input, uint64_t in_si
         for (uint32_t i = 0; i < h.voice_resources / sizeof(AudrenChannelIn) && !bad; i++)
             if (chans[i].id >= (uint32_t)vc * 6) bad = !fail(&w, "voice channel resource %u carries the id %u (of %d)", i, chans[i].id, vc * 6);
         if (bad) break;
+        // Voice state follows the record's slot; an unused record may have a zero or unspecified id.
         for (int i = 0; i < vc; i++) {
             AudrenVoiceIn v;
             AudrenBiquadFloat fb[2];
             read_voice(voices + (size_t)i * vstride, rev, i, vc, &v, fb, &w);
-            update_voice(r, &v);
-            ServerVoice *sv = &r->voices[v.id];
+            update_voice(r, (unsigned)i, &v);
+            ServerVoice *sv = &r->voices[i];
             sv->use_float_biquads = rev >= 15;
             if (rev >= 15) memcpy(sv->float_biquads, fb, sizeof fb);
         }
