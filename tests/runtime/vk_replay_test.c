@@ -549,6 +549,7 @@ static uint64_t counter_wait(void *ctx, uint64_t value, uint64_t timeout_ns) {
     return r;
 }
 static uint64_t g_cur_value;
+static int g_hold_timeline;
 static uint64_t fake_begin(int kind) {
     CHECK(kind == GPU_VK_REPLAY);
     g_cur_value = gpu_sync_begin();
@@ -560,7 +561,7 @@ static uint64_t fake_end(const VkSemaphoreSubmitInfo *waits, uint32_t n) {
     uint64_t v = g_cur_value;
     lput(&g_pkt, "pkt submit %llu\n", (ull)v);
     gpu_sync_end();
-    counter_raise(v);   // the stand-in device is done at once
+    if (!g_hold_timeline) counter_raise(v);   // the stand-in device is normally done at once
     return v;
 }
 
@@ -1216,6 +1217,75 @@ static void case_many_queries(void) {
     printf("ok many_queries\n");
 }
 
+static void case_many_pending_reports(void) {
+    open_fakes();
+    wr64(0x800, 7);
+    wr64(0x810, 0);
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    PUT(r, OP_REPORT_COUNTER, (p_report_counter){NVN_COUNTER_TYPE_SAMPLES_PASSED, HOST + 0x800});
+    for (int i = 0; i < 1024; i++)
+        PUT(r, OP_REPORT_COUNTER, (p_report_counter){NVN_COUNTER_TYPE_TIMESTAMP, HOST + 0x1000 + (uint64_t)i * 16});
+    PUT(r, OP_RENDER_COND, (p_render_cond){0, 0, HOST + 0x800});
+    draw_k(r, 1);
+    uint64_t h = rec_end(r);
+    CHECK(gpu_sync_wait(vkr_submit(&h, 1), 10000000000ull));
+    VkrStats st;
+    vkr_stats(&st);
+    printf("first draws %llu\n", (ull)st.draws);
+
+    wr64(0x800, 7);
+    r = rec_begin(1);
+    for (int i = 0; i < 1024; i++)
+        PUT(r, OP_REPORT_COUNTER, (p_report_counter){NVN_COUNTER_TYPE_TIMESTAMP, HOST + 0x1000 + (uint64_t)i * 16});
+    PUT(r, OP_REPORT_COUNTER, (p_report_counter){NVN_COUNTER_TYPE_SAMPLES_PASSED, HOST + 0x800});
+    PUT(r, OP_REPORT_COUNTER, (p_report_counter){NVN_COUNTER_TYPE_TIMESTAMP, HOST + 0x800});
+    PUT(r, OP_RENDER_COND, (p_render_cond){1, 0, HOST + 0x800});
+    draw_k(r, 2);
+    h = rec_end(r);
+    CHECK(gpu_sync_wait(vkr_submit(&h, 1), 10000000000ull));
+    vkr_stats(&st);
+    printf("second draws %llu\n", (ull)st.draws);
+
+    wr64(0x800, 7);
+    r = rec_begin(0);
+    PUT(r, OP_RENDER_COND, (p_render_cond){1, 0, HOST + 0x800});
+    draw_k(r, 3);
+    h = rec_end(r);
+    CHECK(gpu_sync_wait(vkr_submit(&h, 1), 10000000000ull));
+    vkr_stats(&st);
+    printf("third draws %llu\n", (ull)st.draws);
+    close_fakes();
+    printf("ok many_pending_reports\n");
+}
+
+static void case_pending_across_frames(void) {
+    open_fakes();
+    g_hold_timeline = 1;
+    wr64(0x800, 7);
+    wr64(0x810, 0);
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    PUT(r, OP_REPORT_COUNTER, (p_report_counter){NVN_COUNTER_TYPE_SAMPLES_PASSED, HOST + 0x800});
+    uint64_t h = rec_end(r);
+    uint64_t first = vkr_submit(&h, 1);
+    r = rec_begin(1);
+    for (int i = 0; i < 1024; i++)
+        PUT(r, OP_REPORT_COUNTER, (p_report_counter){NVN_COUNTER_TYPE_TIMESTAMP, HOST + 0x1000 + (uint64_t)i * 16});
+    PUT(r, OP_RENDER_COND, (p_render_cond){0, 0, HOST + 0x800});
+    draw_k(r, 1);
+    h = rec_end(r);
+    uint64_t last = vkr_submit(&h, 1);
+    CHECK(last > first && gpu_sync_done() < first);
+    VkrStats st;
+    vkr_stats(&st);
+    printf("draws %llu\n", (ull)st.draws);
+    counter_raise(last);
+    CHECK(gpu_sync_wait(last, 10000000000ull));
+    close_fakes();
+    printf("ok pending_across_frames\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
@@ -1259,6 +1329,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "broken")) case_broken();
     else if (!strcmp(cs, "reports")) case_reports();
     else if (!strcmp(cs, "many_queries")) case_many_queries();
+    else if (!strcmp(cs, "many_pending_reports")) case_many_pending_reports();
+    else if (!strcmp(cs, "pending_across_frames")) case_pending_across_frames();
     else {
         fprintf(stderr, "unknown case %s\n", cs);
         return 2;

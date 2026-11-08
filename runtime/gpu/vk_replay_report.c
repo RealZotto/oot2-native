@@ -87,9 +87,10 @@ int vkr_no_pending, vkr_no_queries, vkr_stamp_at_replay, vkr_reverse_results;
 
 static int g_counting;   // samples passed are counted (the channel's, across frames)
 
-#define PENDING 1024     // reports remembered, newest last: the newest to an address decides while it is not done
-static struct { uint64_t addr, value; int samples; } g_pending[PENDING];
-static unsigned g_pending_head;
+// Reports remain in submission order until their timeline value is done.
+typedef struct { uint64_t addr, value; int samples; } Pending;
+static Pending *g_pending;
+static size_t g_pending_n, g_pending_cap;
 
 // ---------- the completion thread's side, and what tests read
 static PlatMutex g_lock = PLAT_MUTEX_INIT;   // the statistics and the WaitEvent sites
@@ -101,7 +102,7 @@ static struct { uint64_t caller; int unsatisfied_logged; } g_sites[WAIT_SITES];
 static int g_nsites;
 
 void vkr_report_reset(void) {
-    g_counting = 0, g_pending_head = 0, R.n = 0, R.np = 0, R.nq = 0, R.open = -1;
+    g_counting = 0, g_pending_n = 0, R.n = 0, R.np = 0, R.nq = 0, R.open = -1;
     plat_mutex_lock(&g_lock);
     g_running = 0, g_nsites = 0;
     memset(&g_st, 0, sizeof g_st);
@@ -125,6 +126,27 @@ static void push(Entry e) {
 }
 
 void vkr_report_frame_begin(void) { R.n = 0, R.np = 0, R.nq = 0, R.open = -1; }
+
+static void pending_add(uint64_t addr, uint64_t value, int samples) {
+    if (g_pending_n == g_pending_cap) {
+        uint64_t done = gpu_sync_done();
+        size_t first = 0;
+        while (first < g_pending_n && g_pending[first].value <= done) first++;
+        if (first) {
+            g_pending_n -= first;
+            memmove(g_pending, g_pending + first, g_pending_n * sizeof *g_pending);
+        }
+        if (g_pending_n == g_pending_cap) {
+            if (g_pending_cap > SIZE_MAX / 2 / sizeof *g_pending)
+                rt_fatal("gfx: vulkan: too many pending counter reports");
+            size_t cap = g_pending_cap ? 2 * g_pending_cap : 1024;
+            Pending *p = realloc(g_pending, cap * sizeof *p);
+            if (!p) rt_fatal("gfx: vulkan: out of memory for pending counter reports");
+            g_pending = p, g_pending_cap = cap;
+        }
+    }
+    g_pending[g_pending_n++] = (Pending){addr, value, samples};
+}
 
 // The first draw of a pass while counting begins a query.
 void vkr_report_draw(void) {
@@ -176,8 +198,7 @@ int vkr_report_op(const op_hdr *r) {
         e.u.rep.type = p->type, e.u.rep.addr = report_addr(p->addr);
         if (vkr_stamp_at_replay) e.stamp = rt_ticks();
         push(e);
-        unsigned i = g_pending_head++ % PENDING;
-        g_pending[i].addr = p->addr, g_pending[i].value = vkr_frame_value(), g_pending[i].samples = samples;
+        pending_add(p->addr, vkr_frame_value(), samples);
         return 1;
     }
     case OP_RESET_COUNTER:
@@ -205,9 +226,9 @@ int vkr_report_op(const op_hdr *r) {
 // 1: *v read; 2: a samples-passed report not done (unknown); 0: the CPU cannot read the word.
 static int counter_word(uint64_t addr, uint64_t *v) {
     uint64_t done = gpu_sync_done();
-    for (unsigned k = 1; !vkr_no_pending && k <= PENDING && k <= g_pending_head; k++) {
-        unsigned i = (g_pending_head - k) % PENDING;
-        if (g_pending[i].addr == addr && g_pending[i].value > done) return *v = 0, g_pending[i].samples ? 2 : 1;
+    for (size_t i = g_pending_n; !vkr_no_pending && i-- > 0;) {
+        if (g_pending[i].value <= done) break;
+        if (g_pending[i].addr == addr) return *v = 0, g_pending[i].samples ? 2 : 1;
     }
     const VkReplayOps *ops = vkr_frame_ops();
     if (gfx_gpu_only(addr) || !ops->cpu_reads || !ops->cpu_reads(addr, sizeof *v)) return 0;
