@@ -394,6 +394,25 @@ void ledger_track_reset(LedgerTrack *t) {
     t->depth_fmt = -1;
 }
 
+static int tracker_slot(int kind) {
+    switch (kind) {
+    case NVN_STAGE_VS: return 0;
+    case NVN_STAGE_PS: return 1;
+    case NVN_STAGE_CS: return 2;
+    case NVN_STAGE_TS: return 3;
+    case NVN_STAGE_MS: return 4;
+    default: return -1;
+    }
+}
+
+static void invalidate_answers_digest(LedgerTrack *t, int stage) {
+    for (int i = 0; i < 5; i++)
+        if (KIND_STAGE[i] == stage) {
+            t->answers_digest_valid &= (uint8_t)~(1u << i);
+            return;
+        }
+}
+
 static int view_format(const nvn_tex_rec *r) { return r->has_view && r->view.set_format ? r->view.format : r->tex.d.format; }
 
 static void bind_program(LedgerTrack *t, const p_bind_program *p) {
@@ -411,6 +430,7 @@ static void bind_program(LedgerTrack *t, const p_bind_program *p) {
 
 static void bind_tex(LedgerTrack *t, const p_bind_handles *b, int image) {
     if (b->stage < 0 || b->stage >= LEDGER_STAGES) return;
+    invalidate_answers_digest(t, b->stage);
     for (int i = 0; i < b->n && i < 32; i++) {
         int slot = b->first + i;
         uint8_t type = 0;
@@ -429,6 +449,7 @@ static void bind_tex(LedgerTrack *t, const p_bind_handles *b, int image) {
 }
 
 static void set_rt(LedgerTrack *t, const p_set_rt *p) {
+    invalidate_answers_digest(t, 1);
     memset(t->fout, 0, sizeof t->fout);
     memset(t->color_fmt, 0, sizeof t->color_fmt);
     t->ncolor = 0, t->samples = 1;
@@ -446,6 +467,7 @@ static void set_rt(LedgerTrack *t, const p_set_rt *p) {
 }
 
 static void bind_vattr(LedgerTrack *t, const p_bind_vattr *p) {
+    invalidate_answers_digest(t, 0);
     for (int i = 0; i < p->n && i < NVN_VERTEX_BINDINGS; i++) {
         int loc = p->first + i;
         if (loc < 0 || loc >= LEDGER_ATTRS) continue;
@@ -479,25 +501,19 @@ static void emit(const LedgerTrack *t, int s, int raster) {
     add_row(&r);
 }
 
-static int tracker_stage(int kind) {
-    switch (kind) {
-    case NVN_STAGE_VS: return 0;
-    case NVN_STAGE_PS: return 1;
-    case NVN_STAGE_CS: return 5;
-    case NVN_STAGE_TS: return 6;
-    case NVN_STAGE_MS: return 7;
-    default: return -1;
-    }
-}
-
-void ledger_track_answers_digest(const LedgerTrack *t, int kind, uint8_t out[32]) {
-    RowBin r;
-    memset(&r, 0, sizeof r);
-    int s = tracker_stage(kind);
-    if (s < 0) {
+void ledger_track_answers_digest(LedgerTrack *t, int kind, uint8_t out[32]) {
+    int slot = tracker_slot(kind);
+    if (slot < 0) {
         memset(out, 0, 32);
         return;
     }
+    if (t->answers_digest_valid & (1u << slot)) {
+        memcpy(out, t->answers_digest[slot], 32);
+        return;
+    }
+    RowBin r;
+    memset(&r, 0, sizeof r);
+    int s = KIND_STAGE[slot];
     memcpy(r.tex, t->tex[s], sizeof r.tex);
     memcpy(r.img_type, t->img_type[s], sizeof r.img_type);
     memcpy(r.img_fmt, t->img_fmt[s], sizeof r.img_fmt);
@@ -505,6 +521,8 @@ void ledger_track_answers_digest(const LedgerTrack *t, int kind, uint8_t out[32]
     if (s == 1) memcpy(r.fout, t->fout, sizeof r.fout);
     char *text = answers_text(&r, out);
     free(text);
+    memcpy(t->answers_digest[slot], out, 32);
+    t->answers_digest_valid |= (uint8_t)(1u << slot);
 }
 
 void ledger_track_op(LedgerTrack *t, const op_hdr *h) {

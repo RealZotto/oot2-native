@@ -648,10 +648,18 @@ static void bind_pipeline(int compute, VkPipeline p) {
     F.pipe[compute] = p;
 }
 
-static const ShaderBinds *binds_of(const nvn_stage *s, int kind) {
-    const ShaderBinds *b = F.ops->binds(s);
-    if (!b) stop("stage %s has no description the replay can read", s->key);
-    if (b->kind != kind) stop("stage %s is a %s program where a %s was bound", s->key, shd_kind_name(b->kind),
+static VkpStage replay_stage(const nvn_stage *s) {
+    uint8_t digest[SHC_DIGEST_BYTES];
+    ledger_track_answers_digest(&S.track, s->kind, digest);
+    VkpStage stage = {.key = s->key, .shape = s};
+    vkp_stage_set_ledger_digest(&stage, digest);
+    return stage;
+}
+
+static const ShaderBinds *binds_of(const VkpStage *stage, int kind) {
+    const ShaderBinds *b = F.ops->binds(stage);
+    if (!b) stop("stage %s has no description the replay can read", stage->key);
+    if (b->kind != kind) stop("stage %s is a %s program where a %s was bound", stage->key, shd_kind_name(b->kind),
                               shd_kind_name(kind));
     return b;
 }
@@ -985,7 +993,8 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
     const nvn_stage *vs = P.id[ST_VS], *fs = P.id[ST_FS];
     if (!vs) stop("a draw with no vertex stage bound");
     if (!fs) stop("a draw with no pixel stage bound (stage %s)", vs->key);
-    const ShaderBinds *vb = binds_of(vs, SHD_VS), *fb = binds_of(fs, SHD_PS);
+    VkpStage vst = replay_stage(vs), fst = replay_stage(fs);
+    const ShaderBinds *vb = binds_of(&vst, SHD_VS), *fb = binds_of(&fst, SHD_PS);
     if (S.conservative) stop("conservative rasterization is not replayed yet");
     if (S.sample_mask != ~0u && (S.sample_mask & 1) != 1) stop("sample mask %#x is not replayed yet", S.sample_mask);
     pass_begin();
@@ -993,12 +1002,6 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
     if (!vkn_topology(prim, &topo)) stop("primitive %d has no Vulkan topology", prim);
     VkBool32 restart = (VkBool32)S.restart_en;
     *restart_out = restart;
-    uint8_t vs_digest[SHC_DIGEST_BYTES], fs_digest[SHC_DIGEST_BYTES];
-    ledger_track_answers_digest(&S.track, vs->kind, vs_digest);
-    ledger_track_answers_digest(&S.track, fs->kind, fs_digest);
-    VkpStage vst = {.key = vs->key, .shape = vs}, fst = {.key = fs->key, .shape = fs};
-    vkp_stage_set_ledger_digest(&vst, vs_digest);
-    vkp_stage_set_ledger_digest(&fst, fs_digest);
     // A pipeline that is not ready and may be skipped (oot2/vk_miss.h) answers NULL: nothing of the draw is written, so
     // the state the frame keeps (the bound pipeline, the dynamic state, the buffers) is as the draw before left it.
     VkPipeline pipe = F.ops->graphics(&vst, NULL, &fst, &F.formats, targets_hold_earlier_picture());
@@ -1118,22 +1121,16 @@ static void op_draw_mesh(const p_draw_mesh *d, uint64_t indirect) {
     if (ms->kind != NVN_STAGE_MS) stop("mesh stage %s has kind %u", ms->key, ms->kind);
     if (!indirect && (d->first < 0 || d->count < 0))
         stop("a direct mesh draw with first %d and count %d", d->first, d->count);
-    const ShaderBinds *tb = ts ? binds_of(ts, SHD_TS) : NULL;
-    const ShaderBinds *mb = binds_of(ms, SHD_MS), *fb = binds_of(fs, SHD_PS);
+    VkpStage task = {0};
+    if (ts) task = replay_stage(ts);
+    VkpStage mesh = replay_stage(ms), pixel = replay_stage(fs);
+    const ShaderBinds *tb = ts ? binds_of(&task, SHD_TS) : NULL;
+    const ShaderBinds *mb = binds_of(&mesh, SHD_MS), *fb = binds_of(&pixel, SHD_PS);
     if (S.conservative) stop("conservative rasterization is not replayed yet");
     if (S.sample_mask != ~0u && (S.sample_mask & 1) != 1)
         stop("sample mask %#x is not replayed yet", S.sample_mask);
 
     pass_begin();
-    uint8_t task_digest[SHC_DIGEST_BYTES] = {0}, mesh_digest[SHC_DIGEST_BYTES], pixel_digest[SHC_DIGEST_BYTES];
-    if (ts) ledger_track_answers_digest(&S.track, ts->kind, task_digest);
-    ledger_track_answers_digest(&S.track, ms->kind, mesh_digest);
-    ledger_track_answers_digest(&S.track, fs->kind, pixel_digest);
-    VkpStage task = {.key = ts ? ts->key : NULL, .shape = ts};
-    VkpStage mesh = {.key = ms->key, .shape = ms}, pixel = {.key = fs->key, .shape = fs};
-    if (ts) vkp_stage_set_ledger_digest(&task, task_digest);
-    vkp_stage_set_ledger_digest(&mesh, mesh_digest);
-    vkp_stage_set_ledger_digest(&pixel, pixel_digest);
     VkPipeline pipe = F.ops->graphics(&mesh, ts ? &task : NULL, &pixel, &F.formats, targets_hold_earlier_picture());
     if (!pipe) {
         g_stats.skipped++;
@@ -1209,14 +1206,11 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     }
     const nvn_stage *cs = P.id[ST_CS];
     if (!cs) stop("a dispatch with no compute stage bound");
-    const ShaderBinds *b = binds_of(cs, SHD_CS);
+    VkpStage cst = replay_stage(cs);
+    const ShaderBinds *b = binds_of(&cst, SHD_CS);
     pass_end();
     F.noting = vkgt_enabled;   // the pass's mark is made; the buffers from here on are this dispatch's
     if (F.after_xfer) full_barrier();
-    uint8_t digest[SHC_DIGEST_BYTES];
-    ledger_track_answers_digest(&S.track, cs->kind, digest);
-    VkpStage cst = {.key = cs->key, .shape = cs};
-    vkp_stage_set_ledger_digest(&cst, digest);
     bind_pipeline(1, F.ops->compute(&cst));
     bind_set0(1);
     Set1 s;

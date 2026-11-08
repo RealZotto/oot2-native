@@ -177,6 +177,10 @@ class LedgerTest(unittest.TestCase):
         for done in self.passes("digest"):
             self.assertIn(f"digest {expected}", done.stdout)
 
+    def test_digest_cache_is_reused_and_invalidated_by_vertex_answer_changes(self) -> None:
+        for done in self.passes("digest-cache"):
+            self.assertIn("ok digest-cache", done.stdout)
+
     def test_a_recording_called_from_another_gives_the_callers_state(self) -> None:
         for done in self.passes("call"):
             rows = Rows(done.stdout)

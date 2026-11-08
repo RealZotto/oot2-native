@@ -103,7 +103,10 @@ ShcError shc_set_open_map(ShcSet *s, const char *base, const char *variants, con
 // The variants pack's row of (key, answers) when answers is not zero and the row exists, else the base pack's row of
 // key. Returns where the entry came from, or SHC_MISS.
 int shc_set_find(const ShcSet *s, const char *key, const uint8_t *answers, ShcEntry *out);
-// Resolve a full ledger-row digest through the map, then the projected digest in the variants pack. `mapped` is 1
-// only for a row present in the map; otherwise the base row is used.
+// Resolve a full ledger-row digest through the map, returning its projected digest or zero for base. On a missing
+// mapping, returns 0 and also writes zero to target.
+int shc_set_resolve_ledger(const ShcSet *s, const char *key, const uint8_t *ledger_digest, uint8_t target[32]);
+// Resolve a full ledger-row digest and return the matching variant or base pack entry. `mapped` reports whether a
+// map row was found, including rows that explicitly select base.
 int shc_set_find_ledger(const ShcSet *s, const char *key, const uint8_t *ledger_digest, ShcEntry *out, int *mapped);
 void shc_set_close(ShcSet *s);

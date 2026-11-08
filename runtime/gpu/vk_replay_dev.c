@@ -34,22 +34,31 @@
 #define BIND_BUCKETS 4096
 typedef struct BindEntry {
     const nvn_stage *stage;
+    uint8_t digest[SHC_DIGEST_BYTES];
+    int has_ledger_digest;
     ShaderBinds binds;
     struct BindEntry *next;
 } BindEntry;
 static BindEntry *g_bind[BIND_BUCKETS];
 static PlatMutex g_bind_lock = PLAT_MUTEX_INIT;
 
-static const ShaderBinds *dev_binds(const nvn_stage *s) {
+static const ShaderBinds *dev_binds(const VkpStage *stage) {
+    const nvn_stage *s = stage->shape;
+    uint8_t digest[SHC_DIGEST_BYTES] = {0};
+    const uint8_t *source = stage->has_ledger_digest ? stage->ledger_digest : stage->answers;
+    if (source) memcpy(digest, source, sizeof digest);
     uint32_t h = (uint32_t)(((uintptr_t)s >> 4) * 0x9E3779B1u) % BIND_BUCKETS;
+    for (size_t i = 0; i < sizeof digest; i++) h = (h ^ digest[i]) * 0x01000193u;
+    h = (h ^ (uint32_t)stage->has_ledger_digest) % BIND_BUCKETS;
     plat_mutex_lock(&g_bind_lock);
     for (BindEntry *e = g_bind[h]; e; e = e->next)
-        if (e->stage == s) {
+        if (e->stage == s && e->has_ledger_digest == stage->has_ledger_digest &&
+            !memcmp(e->digest, digest, sizeof digest)) {
             plat_mutex_unlock(&g_bind_lock);
             return &e->binds;
         }
     plat_mutex_unlock(&g_bind_lock);
-    VkpStage st = {.key = s->key, .shape = s};
+    VkpStage st = *stage;
     VkpModule m;
     vkp_module(&st, s->kind, &m);   // the stage kinds are SHD_*'s order
     BindEntry *e = calloc(1, sizeof *e);
@@ -58,6 +67,8 @@ static const ShaderBinds *dev_binds(const nvn_stage *s) {
     if (!shd_parse_binds(m.description, m.description_bytes, SHC_DESC_SCHEMA, &e->binds, why, sizeof why))
         rt_fatal("gfx: vulkan: the description of stage %s: %s", s->key, why);
     e->stage = s;
+    e->has_ledger_digest = stage->has_ledger_digest;
+    memcpy(e->digest, digest, sizeof digest);
     plat_mutex_lock(&g_bind_lock);
     e->next = g_bind[h], g_bind[h] = e;
     plat_mutex_unlock(&g_bind_lock);

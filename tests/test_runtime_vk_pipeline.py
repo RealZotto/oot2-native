@@ -958,13 +958,15 @@ class StoreTest(unittest.TestCase):
         variant_answers = {"tex": {"0": "3d"}}
         cls.variant_digest = cp.answers_digest(variant_answers)
         cls.ledger_digest = hashlib.sha256(b"complete synthetic ledger answers").digest()
+        cls.same_variant_ledger_digest = hashlib.sha256(b"same projection, different full row").digest()
         variant_description = json.loads(describe("ps.ok", "ps", mod))
         variant_description["answers"].update(variant_answers)
         variant = cp.Entry("ps.ok", mod, json.dumps(variant_description).encode("utf-8"), answers=cls.variant_digest)
         cls.variants = write_pack(cls.dir / "variants.bin", [variant], role=cp.VARIANTS)
         cls.variant_map = cls.dir / "variant-map.bin"
         cls.variant_map.write_bytes(prepare_ledger.variant_map_bytes(
-            {("ps.ok", cls.ledger_digest): cls.variant_digest}, hashlib.sha256(b"ledger file").hexdigest()))
+            {("ps.ok", cls.ledger_digest): cls.variant_digest,
+             ("ps.ok", cls.same_variant_ledger_digest): cls.variant_digest}, hashlib.sha256(b"ledger file").hexdigest()))
 
     def store(self, key: str, kind: str, shape: str = "1") -> subprocess.CompletedProcess:
         return run("store", str(self.pack), "-", key, kind, shape)
@@ -980,18 +982,28 @@ class StoreTest(unittest.TestCase):
         mapped = run("storemap", str(self.pack), str(self.variants), str(self.variant_map), "ps.ok", "ps", "1",
                      self.ledger_digest.hex())
         self.assertEqual(mapped.returncode, 0, mapped.stdout + mapped.stderr)
-        self.assertEqual(mapped.stdout, "module from 2, map missing 0, unknown 0\n")
+        mapped_lines = mapped.stdout.splitlines()
+        self.assertEqual(mapped_lines[1], "module from 2, map missing 0, unknown 0")
+
+        same_projection = run("storemap", str(self.pack), str(self.variants), str(self.variant_map), "ps.ok", "ps", "1",
+                              self.same_variant_ledger_digest.hex())
+        self.assertEqual(same_projection.returncode, 0, same_projection.stdout + same_projection.stderr)
+        same_projection_lines = same_projection.stdout.splitlines()
+        self.assertEqual(same_projection_lines[0], mapped_lines[0])
+        self.assertEqual(same_projection_lines[1], "module from 2, map missing 0, unknown 0")
 
         unknown = hashlib.sha256(b"unmapped full ledger row").hexdigest()
         fallback = run("storemap", str(self.pack), str(self.variants), str(self.variant_map), "ps.ok", "ps", "1",
                        unknown)
         self.assertEqual(fallback.returncode, 0, fallback.stdout + fallback.stderr)
-        self.assertEqual(fallback.stdout, "module from 1, map missing 0, unknown 1\n")
+        fallback_lines = fallback.stdout.splitlines()
+        self.assertNotEqual(fallback_lines[0], mapped_lines[0])
+        self.assertEqual(fallback_lines[1], "module from 1, map missing 0, unknown 1")
 
         no_map = run("storemap", str(self.pack), str(self.variants), "-", "ps.ok", "ps", "1",
                      self.ledger_digest.hex())
         self.assertEqual(no_map.returncode, 0, no_map.stdout + no_map.stderr)
-        self.assertEqual(no_map.stdout, "module from 1, map missing 1, unknown 0\n")
+        self.assertEqual(no_map.stdout.splitlines()[1], "module from 1, map missing 1, unknown 0")
 
     def fatal(self, done: subprocess.CompletedProcess) -> str:
         self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)

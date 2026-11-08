@@ -344,9 +344,17 @@ int shc_set_find(const ShcSet *s, const char *key, const uint8_t *answers, ShcEn
     return shc_find(&s->base, key, NULL, out) ? SHC_FROM_BASE : SHC_MISS;
 }
 
+int shc_set_resolve_ledger(const ShcSet *s, const char *key, const uint8_t *ledger_digest, uint8_t target[32]) {
+    const uint8_t *mapped_target = NULL;
+    memset(target, 0, SHC_DIGEST_BYTES);
+    if (!shc_map_find(s, key, ledger_digest, &mapped_target)) return 0;
+    memcpy(target, mapped_target, SHC_DIGEST_BYTES);
+    return 1;
+}
+
 int shc_set_find_ledger(const ShcSet *s, const char *key, const uint8_t *ledger_digest, ShcEntry *out, int *mapped) {
-    const uint8_t *target = NULL;
-    int found = shc_map_find(s, key, ledger_digest, &target);
+    uint8_t target[SHC_DIGEST_BYTES];
+    int found = shc_set_resolve_ledger(s, key, ledger_digest, target);
     if (mapped) *mapped = found;
     if (found && memcmp(target, zero_digest, SHC_DIGEST_BYTES)) {
         if (shc_find(&s->variants, key, target, out)) return SHC_FROM_VARIANTS;

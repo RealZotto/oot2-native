@@ -89,6 +89,7 @@ typedef struct VkpModule {
 int vkp_store_open(const char *base, const char *variants, char *why, size_t cap);
 int vkp_store_open_map(const char *base, const char *variants, const char *map, char *why, size_t cap);
 void vkp_store_close(void);
+// Copy a full ledger-row digest into a stage for map-aware module, binding, and pipeline-key resolution.
 void vkp_stage_set_ledger_digest(VkpStage *stage, const uint8_t digest[SHC_DIGEST_BYTES]);
 // The module of stage s, whose description must name stage kind `expect` (SHD_*) and say it fits its layout. A named
 // fatal otherwise (no row, a failure record, a description that cannot be read or is of another stage).

@@ -453,6 +453,10 @@ static void case_storemap(const char *base, const char *variants, const char *ma
     snprintf(st.key, sizeof st.key, "%s", key);
     VkpStage s = {.key = key, .shape = strcmp(shape, "0") ? &st : NULL};
     vkp_stage_set_ledger_digest(&s, digest);
+    VkpFormats formats = {0};
+    char pipeline_key[512];
+    vkp_graphics_key(&s, NULL, &s, &formats, pipeline_key, sizeof pipeline_key);
+    printf("key %s\n", pipeline_key);
     static VkpModule m;
     vkp_module(&s, kind_of(kind), &m);
     VkpStats stats;

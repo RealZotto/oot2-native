@@ -345,9 +345,10 @@ static void stage(nvn_stage *s, const char *key, int kind) {
 }
 static void cbuf(ShaderBinds *b, uint8_t slot, uint16_t binding) { b->cb[b->ncb++] = (ShdCbuf){slot, 1, binding}; }
 
-static const ShaderBinds *my_binds(const nvn_stage *s) {
+static const ShaderBinds *my_binds(const VkpStage *stage) {
+    const nvn_stage *s = stage->shape;
     return s == &g_vs ? &g_vs_binds : s == &g_ps ? &g_ps_binds : s == &g_cs ? &g_cs_binds : s == &g_head ? &g_head_binds
-           : s == &g_img ? &g_img_binds : vkr_device_ops()->binds(s);
+           : s == &g_img ? &g_img_binds : vkr_device_ops()->binds(stage);
 }
 
 // After setup: the pack opened, the stages and their bindings made (the pack's modules, tests/test_runtime_vk_pipeline.py:
