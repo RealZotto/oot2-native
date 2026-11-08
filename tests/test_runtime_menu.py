@@ -73,6 +73,7 @@ ROWS = {
     "Exclusive fullscreen at 60 Hz": ("Display", "greyed", "-"),
     "Overlay (frame time)": ("Display", "live", "overlay"),
     "Audio output": ("Audio", "greyed", "-"),
+    "Stick dead zone": ("Input", "live", "input_dead_zone"),
     "Controls": ("Input", "greyed", "-"),
     "Enhancements": ("Enhancements", "greyed", "-"),
     "Counters": ("Debug", "live", "counters"),
@@ -216,6 +217,14 @@ class MenuTest(unittest.TestCase):
         self.assertEqual(rows["hold_placement"]["value"], "sync")
         self.assertEqual(rows["overlay"]["value"], "0")
         self.assertEqual(rows["frame_rate_target"]["value"], "0")
+
+    def test_default_keyboard_buttons_leave_both_sticks_available(self) -> None:
+        rows = {r["key"]: r for r in rows_of(self.passes("rows", str(self.ini())).stdout)}
+        expected = {"input_key_a": "return", "input_key_b": "x", "input_key_x": "c", "input_key_y": "v",
+                    "input_key_zl": "q", "input_key_zr": "e", "input_key_plus": "space", "input_key_minus": "tab"}
+        for key, value in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(rows[key]["value"], value)
 
     def test_a_rate_that_does_not_divide_the_game_s_step_is_marked_experimental(self) -> None:
         for rate, experimental in (("30", False), ("60", False), ("20", False), ("40", True), ("100", True)):

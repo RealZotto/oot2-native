@@ -162,7 +162,8 @@ static void setup(int w, int h, int with_ui) {
         printf("no window: %s\n", win_why());
         exit(EXIT_NO_DEVICE);
     }
-    win_set_input(&(WinInput){test_button, test_pointer, test_resized, test_closed});
+    win_set_input(&(WinInput){.button = test_button, .menu_open = ui_menu_is_open, .pointer = test_pointer,
+                              .resized = test_resized, .closed = test_closed});
     vkw_window(&win_vulkan, with_ui ? &g_ui : NULL);
     guest_heap(64 * MiB);
     gpu_vk_open();
@@ -640,7 +641,8 @@ static void test_closed_exit(void) {
 static void case_exit(void) {
     setup(800, 450, 0);
     CHECK(settle_at(800, 450));
-    win_set_input(&(WinInput){test_button, test_pointer, test_resized, test_closed_exit});
+    win_set_input(&(WinInput){.button = test_button, .menu_open = ui_menu_is_open, .pointer = test_pointer,
+                              .resized = test_resized, .closed = test_closed_exit});
     win_post_close();
     for (;;) run_ticks(1);
 }

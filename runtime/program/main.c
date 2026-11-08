@@ -222,6 +222,7 @@ static int print_vulkan_items(void) {
 // ---- the window (oot2/window.h, oot2/vk_present.h). Only the Vulkan back end presents to one, and only in a
 // build with SDL3; every other start has none and presents to nothing (null) or to the offscreen capture.
 static int menu_button(int button, int down) { return ui_menu_input((UiButton)button, down); }
+static int menu_open(void) { return ui_menu_is_open(); }
 static void menu_pointer(float x, float y, int down) { ui_menu_pointer(x, y, down); }
 
 // The window's close button ends the run through the stop hooks (census.tsv, the ledger), as the capture's end does.
@@ -254,7 +255,7 @@ static void open_window(const char *gfx) {
         rt_log("oot2: no window (%s): the picture goes to the offscreen capture only", win_why());
         return;
     }
-    win_set_input(&(WinInput){menu_button, menu_pointer, window_resized, window_closed});
+    win_set_input(&(WinInput){menu_button, menu_open, menu_pointer, window_resized, window_closed});
     rt_settings_hook(RT_SET_window_mode, window_key, NULL);
     rt_settings_hook(RT_SET_window_width, window_key, NULL);
     rt_settings_hook(RT_SET_window_height, window_key, NULL);

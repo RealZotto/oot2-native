@@ -12,7 +12,9 @@
 // except where it says so: the settings store's live hooks call win_request with the store's lock held, and the
 // thread's own save of a resized window's size takes that lock.
 //
-// Game input (hid) is not here: this layer reports the keys and buttons of the menu only, and the pointer.
+// Game input (hid) starts here: the thread also produces the host input snapshot (oot2/hid_input.h) from the gamepad or
+// the keyboard, and applies the vibration requests nn::hid made. The header declares only the menu- and pointer-facing
+// calls below; the hid producer is window.c's own, and no SDK type crosses this header.
 //
 // A build without SDL3 (tools/fetch_sdl3.py, SDL3_DIR) compiles the same file to refusals: win_open returns 0 and
 // win_why says so, and the program goes on presenting to the offscreen capture (oot2/vk_capture.h).
@@ -53,12 +55,15 @@ int win_is_open(void);
 void win_state(WinState *out);
 
 // Called on the window's thread. button: the menu's UiButton (oot2/ui.h) as an int and 1 for a press or 0 for a release;
-// returns 1 when the menu consumed it. pointer: the pointer in client pixels, with the left button down (1) or up (0).
-// resized: the window's size, in pixels, once it has stopped changing (the program saves it as the remembered size); it
-// is also called for a size the program set itself (a request that changed it), and not in borderless mode. closed: the window's close request, once; the
-// program ends the run (the window is destroyed by win_close or by the end of the process).
+// returns 1 when the menu consumed it. menu_open: returns 1 while the configuration menu is open, so this thread's hid
+// producer swallows the game input (hid_host_input_suppress). pointer: the pointer in client pixels, with the left button
+// down (1) or up (0). resized: the window's size, in pixels, once it has stopped changing (the program saves it as the
+// remembered size); it is also called for a size the program set itself (a request that changed it), and not in borderless
+// mode. closed: the window's close request, once; the program ends the run (the window is destroyed by win_close or by
+// the end of the process).
 typedef struct WinInput {
     int (*button)(int button, int down);
+    int (*menu_open)(void);
     void (*pointer)(float x, float y, int down);
     void (*resized)(int width, int height);
     void (*closed)(void);

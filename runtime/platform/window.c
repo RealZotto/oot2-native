@@ -2,8 +2,10 @@
 // Copyright (C) 2026 The oot2-native contributors
 //
 // The window (oot2/window.h): SDL3, one thread that makes the window and pumps its events, the Vulkan surface calls, the
-// menu's keys and pad buttons and the pointer. Compiled without SDL3 (OOT2_WITH_SDL3 unset: no kit, tools/fetch_sdl3.py)
-// to refusals, so a program built that way starts and presents to the offscreen capture.
+// menu's keys and pad buttons, the pointer, and the host input layer's producer: it reads the gamepad (or, with none, the
+// keyboard), applies the mapping and dead zone, publishes the snapshot (oot2/hid_input.h), and plays the vibration
+// requests it is given. Compiled without SDL3 (OOT2_WITH_SDL3 unset: no kit, tools/fetch_sdl3.py) to refusals, so a
+// program built that way starts and presents to the offscreen capture.
 //
 // Why a thread of our own: SDL wants every video call on the thread that initialised it, the game's main thread waits
 // for the guest in rt_kernel_run, and no guest thread may touch a window. The thread is that SDL "main thread".
@@ -15,6 +17,8 @@
 #include <string.h>
 
 #include "oot2/window.h"
+#include "oot2/hid_input.h"
+#include "oot2/settings.h"
 
 #ifndef OOT2_WITH_SDL3
 
@@ -239,6 +243,159 @@ static void handle(const SDL_Event *e, SDL_Gamepad **pads, float *px, float *py,
     }
 }
 
+// ---------- the host input layer's producer
+// The first gamepad opened is player 1's controller. Without one, the keyboard stands in for its buttons and sticks.
+// Which gamepad button or keyboard key presses each of the controller's buttons is the remap the settings
+// store holds (oot2.ini's [input] keys, input_pad_* and input_key_*; oot2/hid_input.h), read fresh every sample, so a
+// change is live at once. The menu's own keys (F1, Escape, the pad's Guide, Back with Start) stay fixed above all of it.
+static SDL_Gamepad *first_pad(SDL_Gamepad **pads) {
+    for (int i = 0; i < MAX_PADS; i++)
+        if (pads[i]) return pads[i];
+    return NULL;
+}
+
+static int32_t stick(Sint16 v, int32_t dead) { return hid_host_input_deadzone((int32_t)v, dead); }
+
+// A gamepad source's SDL fact, one of its two fields set and the other -1 (in HidPadSource order, designated so the
+// order is written where the store names it). The two triggers are axes: they press past half travel, as before.
+typedef struct PadRef { int btn; int axis; } PadRef;
+static const PadRef pad_ref[HID_PAD_SOURCES] = {
+    [HID_PAD_SOUTH] = {SDL_GAMEPAD_BUTTON_SOUTH, -1},
+    [HID_PAD_EAST] = {SDL_GAMEPAD_BUTTON_EAST, -1},
+    [HID_PAD_WEST] = {SDL_GAMEPAD_BUTTON_WEST, -1},
+    [HID_PAD_NORTH] = {SDL_GAMEPAD_BUTTON_NORTH, -1},
+    [HID_PAD_LEFT_SHOULDER] = {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, -1},
+    [HID_PAD_RIGHT_SHOULDER] = {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, -1},
+    [HID_PAD_BACK] = {SDL_GAMEPAD_BUTTON_BACK, -1},
+    [HID_PAD_START] = {SDL_GAMEPAD_BUTTON_START, -1},
+    [HID_PAD_DPAD_UP] = {SDL_GAMEPAD_BUTTON_DPAD_UP, -1},
+    [HID_PAD_DPAD_DOWN] = {SDL_GAMEPAD_BUTTON_DPAD_DOWN, -1},
+    [HID_PAD_DPAD_LEFT] = {SDL_GAMEPAD_BUTTON_DPAD_LEFT, -1},
+    [HID_PAD_DPAD_RIGHT] = {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, -1},
+    [HID_PAD_LEFT_STICK] = {SDL_GAMEPAD_BUTTON_LEFT_STICK, -1},
+    [HID_PAD_RIGHT_STICK] = {SDL_GAMEPAD_BUTTON_RIGHT_STICK, -1},
+    [HID_PAD_LEFT_TRIGGER] = {-1, SDL_GAMEPAD_AXIS_LEFT_TRIGGER},
+    [HID_PAD_RIGHT_TRIGGER] = {-1, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER},
+};
+
+// The keyboard's scancode for each source (HidKeySource order). The menu's own keys (F1, Escape) are not among them.
+static const SDL_Scancode key_sc[HID_KEY_SOURCES] = {
+    [HID_KEY_UP] = SDL_SCANCODE_UP, [HID_KEY_DOWN] = SDL_SCANCODE_DOWN,
+    [HID_KEY_LEFT] = SDL_SCANCODE_LEFT, [HID_KEY_RIGHT] = SDL_SCANCODE_RIGHT,
+    [HID_KEY_A] = SDL_SCANCODE_A, [HID_KEY_B] = SDL_SCANCODE_B,
+    [HID_KEY_C] = SDL_SCANCODE_C, [HID_KEY_D] = SDL_SCANCODE_D,
+    [HID_KEY_E] = SDL_SCANCODE_E, [HID_KEY_F] = SDL_SCANCODE_F,
+    [HID_KEY_G] = SDL_SCANCODE_G, [HID_KEY_H] = SDL_SCANCODE_H,
+    [HID_KEY_I] = SDL_SCANCODE_I, [HID_KEY_J] = SDL_SCANCODE_J,
+    [HID_KEY_K] = SDL_SCANCODE_K, [HID_KEY_L] = SDL_SCANCODE_L,
+    [HID_KEY_M] = SDL_SCANCODE_M, [HID_KEY_N] = SDL_SCANCODE_N,
+    [HID_KEY_O] = SDL_SCANCODE_O, [HID_KEY_P] = SDL_SCANCODE_P,
+    [HID_KEY_Q] = SDL_SCANCODE_Q, [HID_KEY_R] = SDL_SCANCODE_R,
+    [HID_KEY_S] = SDL_SCANCODE_S, [HID_KEY_T] = SDL_SCANCODE_T,
+    [HID_KEY_U] = SDL_SCANCODE_U, [HID_KEY_V] = SDL_SCANCODE_V,
+    [HID_KEY_W] = SDL_SCANCODE_W, [HID_KEY_X] = SDL_SCANCODE_X,
+    [HID_KEY_Y] = SDL_SCANCODE_Y, [HID_KEY_Z] = SDL_SCANCODE_Z,
+    [HID_KEY_RETURN] = SDL_SCANCODE_RETURN, [HID_KEY_SPACE] = SDL_SCANCODE_SPACE,
+    [HID_KEY_TAB] = SDL_SCANCODE_TAB, [HID_KEY_BACKSPACE] = SDL_SCANCODE_BACKSPACE,
+    [HID_KEY_LSHIFT] = SDL_SCANCODE_LSHIFT, [HID_KEY_RSHIFT] = SDL_SCANCODE_RSHIFT,
+    [HID_KEY_LCTRL] = SDL_SCANCODE_LCTRL, [HID_KEY_RCTRL] = SDL_SCANCODE_RCTRL,
+};
+
+// The sources held this instant, one bit each in the enums' order; hid_remap_buttons (oot2/hid_input.h) applies the remap
+// to the two bitmasks, so nothing of the mapping itself lives here.
+static uint32_t pad_sources(SDL_Gamepad *g) {
+    uint32_t m = 0;
+    for (int i = 0; i < HID_PAD_SOURCES; i++) {
+        int held = pad_ref[i].btn >= 0
+                       ? SDL_GetGamepadButton(g, (SDL_GamepadButton)pad_ref[i].btn)
+                       : SDL_GetGamepadAxis(g, (SDL_GamepadAxis)pad_ref[i].axis) > 16384;
+        if (held) m |= 1u << (uint32_t)i;
+    }
+    return m;
+}
+
+static uint64_t key_sources(const bool *k) {
+    uint64_t m = 0;
+    for (int i = 0; i < HID_KEY_SOURCES; i++)
+        if (k[key_sc[i]]) m |= UINT64_C(1) << (uint32_t)i;
+    return m;
+}
+
+// The store's remap, read fresh: for console button i, its gamepad source and its keyboard source, in the console-button
+// order the store's keys and oot2/hid_input.h's HID_REMAP_BUTTONS share (a, b, x, y, l, r, zl, zr, plus, minus, left,
+// up, right, down, stickl, stickr). The store keeps each value inside its enum; the NONE checks are a backstop that turn
+// anything else into "no source".
+static void read_remap(HidRemap *out) {
+    static const RtSettingId pad_ids[HID_REMAP_BUTTONS] = {
+        [0] = RT_SET_input_pad_a, [1] = RT_SET_input_pad_b, [2] = RT_SET_input_pad_x, [3] = RT_SET_input_pad_y,
+        [4] = RT_SET_input_pad_l, [5] = RT_SET_input_pad_r, [6] = RT_SET_input_pad_zl, [7] = RT_SET_input_pad_zr,
+        [8] = RT_SET_input_pad_plus, [9] = RT_SET_input_pad_minus, [10] = RT_SET_input_pad_left,
+        [11] = RT_SET_input_pad_up, [12] = RT_SET_input_pad_right, [13] = RT_SET_input_pad_down,
+        [14] = RT_SET_input_pad_stickl, [15] = RT_SET_input_pad_stickr,
+    };
+    static const RtSettingId key_ids[HID_REMAP_BUTTONS] = {
+        [0] = RT_SET_input_key_a, [1] = RT_SET_input_key_b, [2] = RT_SET_input_key_x, [3] = RT_SET_input_key_y,
+        [4] = RT_SET_input_key_l, [5] = RT_SET_input_key_r, [6] = RT_SET_input_key_zl, [7] = RT_SET_input_key_zr,
+        [8] = RT_SET_input_key_plus, [9] = RT_SET_input_key_minus, [10] = RT_SET_input_key_left,
+        [11] = RT_SET_input_key_up, [12] = RT_SET_input_key_right, [13] = RT_SET_input_key_down,
+        [14] = RT_SET_input_key_stickl, [15] = RT_SET_input_key_stickr,
+    };
+    for (int i = 0; i < HID_REMAP_BUTTONS; i++) {
+        int64_t p = rt_setting(pad_ids[i]), k = rt_setting(key_ids[i]);
+        out->pad[i] = p >= 0 && p < HID_PAD_NONE ? (uint8_t)p : (uint8_t)HID_PAD_NONE;
+        out->key[i] = k >= 0 && k < HID_KEY_NONE ? (uint8_t)k : (uint8_t)HID_KEY_NONE;
+    }
+}
+
+static void publish_input(SDL_Gamepad **pads) {
+    WinInput wi = input_copy();
+    int suppressed = wi.menu_open && wi.menu_open();
+    hid_host_input_suppress(suppressed);
+    if (suppressed) return;   // the menu is open: read returns a zeroed snapshot, publish nothing new
+    HidHostInput in = {0};
+    int64_t dead = rt_setting(RT_SET_input_dead_zone);
+    int32_t dz = dead >= 0 && dead <= 32767 ? (int32_t)dead : 3200;
+    HidRemap map;
+    read_remap(&map);
+    SDL_Gamepad *g = first_pad(pads);
+    if (g) {
+        in.buttons = hid_remap_buttons(&map, pad_sources(g), 0);   // with a pad open, the keyboard does not stand in
+        in.lx = stick(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX), dz);
+        in.ly = hid_host_input_axis_y(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY), dz);
+        in.rx = stick(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX), dz);
+        in.ry = hid_host_input_axis_y(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY), dz);
+    } else {
+        int n = 0;
+        const bool *keys = SDL_GetKeyboardState(&n);
+        (void)n;
+        if (keys) {
+            uint64_t down = key_sources(keys);
+            in.buttons = hid_remap_buttons(&map, 0, down);
+            hid_keyboard_sticks(down, &in);
+        }
+    }
+    hid_host_input_publish(&in);
+}
+
+// The vibration requests nn::hid made (oot2/hid_input.h), played on the open gamepad; with no gamepad the requests are
+// dropped so a stale rumble never fires at a pad connected later.
+static void apply_rumble(SDL_Gamepad **pads) {
+    HidRumble r;
+    SDL_Gamepad *g = first_pad(pads);
+    if (!g) {
+        while (hid_rumble_take(&r)) {}
+        return;
+    }
+    if (hid_rumble_take(&r)) SDL_RumbleGamepad(g, r.low, r.high, r.duration_ms);
+}
+
+static void wake_rumble(void) {
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = g_ev_wake;
+    SDL_PushEvent(&e);   // the mailbox retains the request even if the event queue is full
+}
+
 static void thread_main(void *arg) {
     (void)arg;
     SDL_SetMainReady();
@@ -249,6 +406,10 @@ static void thread_main(void *arg) {
     }
     g_thread_id = SDL_GetCurrentThreadID();
     g_ev_wake = SDL_RegisterEvents(2);
+    if (!g_ev_wake) {
+        fail("SDL_RegisterEvents");
+        goto quit;
+    }
     g_ev_job = g_ev_wake + 1;
     if (!SDL_Vulkan_LoadLibrary(NULL)) {
         fail("SDL_Vulkan_LoadLibrary");
@@ -278,6 +439,7 @@ static void thread_main(void *arg) {
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
     for (int i = 0; ids && i < n; i++) open_pad(ids[i], pads);
     SDL_free(ids);
+    hid_rumble_set_wake(wake_rumble);
     plat_mutex_lock(&g_mu);
     g_ready = 1;
     plat_cond_broadcast(&g_cv);
@@ -304,6 +466,8 @@ static void thread_main(void *arg) {
             if (in.resized && st.mode == WIN_WINDOWED && !st.minimised && st.width > 0)
                 in.resized(st.width, st.height);
         }
+        apply_rumble(pads);
+        publish_input(pads);
     }
     {   // a job queued as the loop ended still runs: its caller waits for it
         SDL_Event e;
@@ -315,6 +479,7 @@ static void thread_main(void *arg) {
     SDL_DestroyWindow(g_win);
     g_win = NULL;
 quit:
+    hid_rumble_set_wake(NULL);
     SDL_Vulkan_UnloadLibrary();
     SDL_Quit();
 done:

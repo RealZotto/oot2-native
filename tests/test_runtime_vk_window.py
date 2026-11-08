@@ -94,7 +94,7 @@ class WindowTest(unittest.TestCase):
         out.mkdir()
         nvn.layout.write(nvn.layout.place({"main": nvn.MODULE_SIZE}), top)
         glue = build_game.write_shader_glue(RUNTIME, top, tool.glslang)
-        sources = [TEST_SOURCE, nvn.END_SOURCE]
+        sources = [TEST_SOURCE, nvn.END_SOURCE, RUNTIME / "hos" / "hid_input.c"]
         for part in ("core", "nvn", "gpu", "platform"):
             sources += sorted((RUNTIME / part).glob("*.c"))
         sources.append(glue)

@@ -184,6 +184,7 @@ static void scramble(void) {
     for (int id = 0; id < RT_SETTING_COUNT; id++) {
         const RtSettingRow *s = rt_setting_row((RtSettingId)id);
         int64_t v = s->type == RT_SETTING_BOOL ? !s->def : s->type == RT_SETTING_ENUM ? names_count(s->names) - 1 : s->max;
+        if (s->type == RT_SETTING_ENUM && v == s->def) v = s->def == 0 ? 1 : 0;
         CHECK(v != s->def);
         CHECK(rt_settings_set((RtSettingId)id, rt_setting_format((RtSettingId)id, v, text), why, sizeof why));
         CHECK(have_of(id) == v);
