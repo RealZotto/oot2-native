@@ -142,6 +142,7 @@ static VkImageView dev_storage_image(uint32_t id, int type, uint64_t value, uint
 typedef struct Chunk {
     VkBuffer buf;
     VkDeviceMemory mem;
+    VkDeviceAddress address;
     uint8_t *map;
     uint32_t size, used;
     struct Chunk *next;
@@ -151,7 +152,56 @@ static PlatMutex g_chunk_lock = PLAT_MUTEX_INIT;
 static struct {
     uint64_t value;                    // the frame the chunks below belong to
     Chunk *held;                       // its chunks, the current one first
+    VkDescriptorPool task_pool;
+    uint32_t task_sets;
 } g_frame;
+
+static void task_pool_gone(void *arg, uint64_t value) {
+    (void)value;
+    vkDestroyDescriptorPool(gpu_vk.device, (VkDescriptorPool)(uintptr_t)arg, NULL);
+}
+
+static void task_pool_new(void) {
+    static const uint32_t sets_per_pool = 512;
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, sets_per_pool * 8},
+                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sets_per_pool * 8}};
+    VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                     .maxSets = sets_per_pool, .poolSizeCount = 2, .pPoolSizes = sizes};
+    GPU_VK_OK(vkCreateDescriptorPool(gpu_vk.device, &ci, NULL, &g_frame.task_pool),
+              "vkCreateDescriptorPool (task-stage resources)");
+    g_frame.task_sets = 0;
+    vkrec_effect(task_pool_gone, (void *)(uintptr_t)g_frame.task_pool);
+}
+
+static VkDescriptorSet dev_task_set(uint64_t value, uint32_t n, const VkWriteDescriptorSet *writes) {
+    if (g_frame.value != value) rt_fatal("gfx: vulkan: task descriptors requested outside their frame's scratch");
+    if (n > VKP_SET2_MAX) rt_fatal("gfx: vulkan: task stage has %u set-2 descriptors, at most %u fit", n, VKP_SET2_MAX);
+    if (!g_frame.task_pool || g_frame.task_sets == 512) task_pool_new();
+    const VkpLayouts *layouts = vkp_layouts();
+    VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                      .descriptorPool = g_frame.task_pool, .descriptorSetCount = 1,
+                                      .pSetLayouts = &layouts->task};
+    VkDescriptorSet set;
+    VkResult r = vkAllocateDescriptorSets(gpu_vk.device, &ai, &set);
+    if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) {
+        task_pool_new();
+        ai.descriptorPool = g_frame.task_pool;
+        GPU_VK_OK(vkAllocateDescriptorSets(gpu_vk.device, &ai, &set),
+                  "vkAllocateDescriptorSets (task-stage resources)");
+    } else GPU_VK_OK(r, "vkAllocateDescriptorSets (task-stage resources)");
+    g_frame.task_sets++;
+    VkWriteDescriptorSet updated[VKP_SET2_MAX];
+    memcpy(updated, writes, n * sizeof *updated);
+    for (uint32_t i = 0; i < n; i++) updated[i].dstSet = set;
+    vkUpdateDescriptorSets(gpu_vk.device, n, updated, 0, NULL);
+    return set;
+}
+
+static VkDeviceAddress dev_buffer_address(VkBuffer buffer) {
+    for (Chunk *c = g_frame.held; c; c = c->next)
+        if (c->buf == buffer) return c->address;
+    return 0;
+}
 
 static Chunk *chunk_new(uint32_t size) {
     Chunk *c = calloc(1, sizeof *c);
@@ -160,7 +210,7 @@ static Chunk *chunk_new(uint32_t size) {
                              .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                       VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
     GPU_VK_OK(vkCreateBuffer(gpu_vk.device, &bi, NULL, &c->buf), "vkCreateBuffer (replay scratch)");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(gpu_vk.device, c->buf, &req);
@@ -171,10 +221,14 @@ static Chunk *chunk_new(uint32_t size) {
     for (uint32_t i = 0; i < mp.memoryTypeCount && type == UINT32_MAX; i++)
         if ((req.memoryTypeBits >> i & 1) && (mp.memoryTypes[i].propertyFlags & want) == want) type = i;
     if (type == UINT32_MAX) rt_fatal("gfx: vulkan: no host-visible coherent memory for the replay's scratch");
-    VkMemoryAllocateInfo alloc = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
-                               .memoryTypeIndex = type};
+    VkMemoryAllocateFlagsInfo flags = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+                                       .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo alloc = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &flags,
+                                  .allocationSize = req.size, .memoryTypeIndex = type};
     GPU_VK_OK(vkAllocateMemory(gpu_vk.device, &alloc, NULL, &c->mem), "vkAllocateMemory (replay scratch)");
     GPU_VK_OK(vkBindBufferMemory(gpu_vk.device, c->buf, c->mem, 0), "vkBindBufferMemory (replay scratch)");
+    VkBufferDeviceAddressInfo address = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = c->buf};
+    c->address = vkGetBufferDeviceAddress(gpu_vk.device, &address);
     void *p;
     GPU_VK_OK(vkMapMemory(gpu_vk.device, c->mem, 0, VK_WHOLE_SIZE, 0, &p), "vkMapMemory (replay scratch)");
     c->map = p, c->size = size;
@@ -194,7 +248,8 @@ static void chunks_back(void *arg, uint64_t value) {
 }
 
 static void *dev_scratch(uint64_t value, uint32_t bytes, uint32_t align, VkBuffer *buffer, VkDeviceSize *offset) {
-    if (g_frame.value != value) g_frame.value = value, g_frame.held = NULL;
+    if (g_frame.value != value) g_frame.value = value, g_frame.held = NULL, g_frame.task_pool = VK_NULL_HANDLE,
+                                 g_frame.task_sets = 0;
     Chunk *c = g_frame.held;
     uint32_t at = c ? (c->used + align - 1) & ~(align - 1) : 0;
     if (!c || at + bytes > c->size) {
@@ -281,6 +336,7 @@ const VkReplayOps *vkr_device_ops(void) {
                               .image = dev_image,
                               .acquire = dev_acquire, .image_slot = dev_image_slot,
                               .storage_image = dev_storage_image, .scratch = dev_scratch,
+                              .buffer_address = dev_buffer_address, .task_set = dev_task_set,
                               .raw = gpu_vk_raw_begin, .frame_begin = dev_frame_begin, .frame_end = dev_frame_end,
                               .queries = dev_queries, .query_results = dev_query_results, .cpu_reads = dev_cpu_reads};
     const VkpLayouts *l = vkp_layouts();   // read at every call: the pipeline builder may open after the first frame

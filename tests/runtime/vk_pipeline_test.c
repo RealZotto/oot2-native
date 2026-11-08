@@ -6,6 +6,7 @@
 //
 // Cases that need no device (continuous integration runs them):
 //   tables                       the layout's tables and the dynamic state lists, printed
+//   keys                         vertex, mesh and task-mesh pipelines have distinct cache keys
 //   desc FILE                    a description parsed: stage, fit, interface by location, or the refusal
 //   pad VS_DESC PS_DESC          the padding a vertex stage needs for a pixel stage
 //   binds FILE                   a description's bindings parsed (shd_parse_binds), or the refusal
@@ -130,6 +131,21 @@ static void case_tables(void) {
     f.eds3.extendedDynamicState3PolygonMode = 0;
     print_dynamic("nopoly", &f);
     printf("ok tables\n");
+}
+
+static void case_keys(void) {
+    nvn_stage vs_shape = {.kind = NVN_STAGE_VS}, task_shape = {.kind = NVN_STAGE_TS}, mesh_shape = {.kind = NVN_STAGE_MS};
+    VkpStage vs = {.key = "6100000000000001.00000000", .shape = &vs_shape};
+    VkpStage task = {.key = "6100000000000002.00000000", .shape = &task_shape};
+    VkpStage mesh = {.key = "6100000000000003.00000000", .shape = &mesh_shape};
+    VkpStage ps = {.key = "6100000000000004.00000000"};
+    VkpFormats formats = {1, {VK_FORMAT_R8G8B8A8_UNORM}, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
+    char vertex_key[256], mesh_key[256], task_mesh_key[256];
+    vkp_graphics_key(&vs, NULL, &ps, &formats, vertex_key, sizeof vertex_key);
+    vkp_graphics_key(&mesh, NULL, &ps, &formats, mesh_key, sizeof mesh_key);
+    vkp_graphics_key(&mesh, &task, &ps, &formats, task_mesh_key, sizeof task_mesh_key);
+    CHECK(strcmp(vertex_key, mesh_key) && strcmp(mesh_key, task_mesh_key) && strcmp(vertex_key, task_mesh_key));
+    printf("vertex %s\nmesh %s\ntask-mesh %s\nok keys\n", vertex_key, mesh_key, task_mesh_key);
 }
 
 // ---------- descriptions, padding, SPIR-V
@@ -568,9 +584,9 @@ static void case_synth_draw(const char *pack, int unpad) {
     open_all(pack, NULL);
     vkp_unpad = unpad;
     VkpStage vs = {.key = VS_KEY}, ps = {.key = PS_KEY};
-    VkPipeline p32 = vkp_graphics(&vs, &ps, &F32), p16 = vkp_graphics(&vs, &ps, &F16);
+    VkPipeline p32 = vkp_graphics(&vs, NULL, &ps, &F32), p16 = vkp_graphics(&vs, NULL, &ps, &F16);
     CHECK(p32 && p16 && p32 != p16);
-    CHECK(vkp_graphics(&vs, &ps, &F32) == p32);   // the same pipeline again, made once
+    CHECK(vkp_graphics(&vs, NULL, &ps, &F32) == p32);   // the same pipeline again, made once
     print_stats("graphics");
     static float img32[32 * 32 * 4];
     static uint16_t img16[32 * 32 * 4];
@@ -668,7 +684,7 @@ static void case_synth_cache(const char *pack, const char *file, const char *pha
     open_all(pack, file);
     printf("cache_state %d\n", (int)vkp_cache_state());
     VkpStage vs = {.key = VS_KEY}, ps = {.key = PS_KEY}, cs = {.key = CS_KEY};
-    CHECK(vkp_graphics(&vs, &ps, &F32) && vkp_graphics(&vs, &ps, &F16) && vkp_compute(&cs));
+    CHECK(vkp_graphics(&vs, NULL, &ps, &F32) && vkp_graphics(&vs, NULL, &ps, &F16) && vkp_compute(&cs));
     print_stats(phase);
     if (!strcmp(phase, "cold")) {
         char why[256];
@@ -682,7 +698,7 @@ static void case_synth_cache(const char *pack, const char *file, const char *pha
 static void case_synth_release(const char *pack) {
     open_all(pack, NULL);
     VkpStage vs = {.key = VS_KEY}, ps = {.key = PS_KEY};
-    CHECK(vkp_graphics(&vs, &ps, &F32));
+    CHECK(vkp_graphics(&vs, NULL, &ps, &F32));
     VkpStats a, b, c;
     vkp_stats(&a);
     vkp_release(PS_KEY);
@@ -690,7 +706,7 @@ static void case_synth_release(const char *pack) {
     printf("resident %llu before, %llu after releasing the pixel stage\n", (unsigned long long)a.resident,
            (unsigned long long)b.resident);
     CHECK(b.resident < a.resident);
-    CHECK(vkp_graphics(&vs, &ps, &F32));
+    CHECK(vkp_graphics(&vs, NULL, &ps, &F32));
     vkp_stats(&c);
     printf("the pipeline and the pixel stage's library were made again: links %llu to %llu, libraries %llu to %llu\n",
            (unsigned long long)b.links, (unsigned long long)c.links, (unsigned long long)b.libraries,
@@ -709,7 +725,7 @@ static void thread_main(void *arg) {
     __atomic_add_fetch(&g_started, 1, __ATOMIC_SEQ_CST);
     while (!__atomic_load_n(&g_go, __ATOMIC_ACQUIRE)) plat_yield();
     VkpStage vs = {.key = VS_KEY}, ps = {.key = PS_KEY};
-    g_thread_pipe[i] = vkp_graphics(&vs, &ps, &F32);
+    g_thread_pipe[i] = vkp_graphics(&vs, NULL, &ps, &F32);
     __atomic_add_fetch(&g_done, 1, __ATOMIC_SEQ_CST);
 }
 
@@ -734,7 +750,7 @@ static void case_synth_absent(const char *pack) {
     nvn_stage st = {.kind = NVN_STAGE_VS, .ctl_size = 0x57, .code_size = 0x4560, .inst_size = 0x4000};
     snprintf(st.key, sizeof st.key, "%s", NO_KEY);
     VkpStage vs = {.key = NO_KEY, .shape = &st}, ps = {.key = PS_KEY};
-    vkp_graphics(&vs, &ps, &F32);
+    vkp_graphics(&vs, NULL, &ps, &F32);
     printf("returned\n");
 }
 
@@ -790,7 +806,7 @@ static void job_main(void *arg) {
         if (g_compute_jobs) {
             CHECK(vkp_compute(&a));
         } else {
-            for (int f = 0; f < 2; f++) CHECK(vkp_graphics(&a, &b, g_formats[f]));
+            for (int f = 0; f < 2; f++) CHECK(vkp_graphics(&a, NULL, &b, g_formats[f]));
         }
         j->ms = (double)(plat_now_ns() - t0) / 1e6;
     }
@@ -828,7 +844,7 @@ static void case_corpus(const char *pack, const char *list, int pairs, int threa
     vkp_stats(&a);
     for (uint32_t i = 0; i < g_njobs; i++) {
         VkpStage x = {.key = g_jobs[i].vs}, y = {.key = g_jobs[i].ps};
-        if (pairs) CHECK(vkp_graphics(&x, &y, g_formats[0]));
+        if (pairs) CHECK(vkp_graphics(&x, NULL, &y, g_formats[0]));
         else CHECK(vkp_compute(&x));
     }
     vkp_stats(&b);
@@ -918,8 +934,8 @@ static void case_firstdraw(const char *draw, const char *pack, const char *vkey,
     s.out = malloc((size_t)s.width * s.height * 16);
     open_all(pack, NULL);
     VkpStage vs = {.key = vkey}, ps = {.key = pkey};
-    s.pipeline = vkp_graphics(&vs, &ps, &F32);
-    VkPipeline p16 = vkp_graphics(&vs, &ps, &F16);
+    s.pipeline = vkp_graphics(&vs, NULL, &ps, &F32);
+    VkPipeline p16 = vkp_graphics(&vs, NULL, &ps, &F16);
     CHECK(s.pipeline && p16);
     draw_run(&s);
     FILE *f = fopen(out_path, "wb");
@@ -1019,6 +1035,7 @@ int main(int argc, char **argv) {
     if (argc < 2) return 2;
     const char *cs = argv[1];
     if (!strcmp(cs, "tables")) case_tables();
+    else if (!strcmp(cs, "keys")) case_keys();
     else if (!strcmp(cs, "desc") && argc >= 3) case_desc(argv[2]);
     else if (!strcmp(cs, "pad") && argc >= 4) case_pad(argv[2], argv[3]);
     else if (!strcmp(cs, "binds") && argc >= 3) case_binds(argv[2]);

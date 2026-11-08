@@ -254,7 +254,7 @@ static void open_pack(const char *pack) {
     g_ops.cpu_reads = my_cpu_reads;
     vkr_set_ops(&g_ops);
     VkpStage vs = {.key = VS_KEY}, ps = {.key = PS_KEY};
-    CHECK(vkp_graphics(&vs, &ps, &F32));   // made now: no pipeline is made with a submission held
+    CHECK(vkp_graphics(&vs, NULL, &ps, &F32));   // made now: no pipeline is made with a submission held
     const float colour[4] = {0.25f, 0.5f, 0.75f, 0.0f}, mul[4] = {1, 1, 1, 1}, u[4] = {0, 0, 0, 0};
     memcpy((void *)(uintptr_t)(P + 0x2000), colour, 16);
     memcpy((void *)(uintptr_t)(P + 0x2100), mul, 16);

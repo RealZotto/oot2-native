@@ -148,19 +148,21 @@ typedef struct VkpFormats {     // the attachments a graphics pipeline draws int
 // pre-rasterization library (padded with the outputs the pixel stage reads and it does not write, keyed by the
 // module and the pad set), the pixel stage's fragment library, the output library of the formats and the shared vertex
 // input library. Created once, then kept until a vkp_release of either stage or vkp_close.
-VkPipeline vkp_graphics(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats);
+VkPipeline vkp_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats);
 // The compute pipeline of a compute stage.
 VkPipeline vkp_compute(const VkpStage *cs);
 // What the miss path (oot2/vk_miss.h) needs of the builder. The same key text vkp_graphics keeps its object under.
-void vkp_graphics_key(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats, char *out, size_t cap);
+void vkp_graphics_key(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
+                      char *out, size_t cap);
 // The pipeline when it exists already, else VK_NULL_HANDLE (nothing is created, also not while another thread makes it).
-VkPipeline vkp_find_graphics(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats);
+VkPipeline vkp_find_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats);
 VkPipeline vkp_find_compute(const VkpStage *cs);
 // vkp_graphics for the miss path: when neither the vertex nor the fragment library exists they are built side by side
 // (the second on a helper thread), and `late`, when not NULL, points at a flag the caller sets once it stopped waiting
 // for this build: from then on the build creates its objects with work in flight (the one place the rule of "no pipeline
 // while a submission is in flight" yields, counted by the miss path). vkp_graphics is the call with late NULL.
-VkPipeline vkp_graphics_ex(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats, const int *late);
+VkPipeline vkp_graphics_ex(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
+                           const int *late);
 // vkp_compute for the miss path. A `late` that is not NULL (here and in vkp_graphics_ex) marks a build made by the miss
 // path with the submission gate held: the submission being replayed is then not counted as work in flight. Any other
 // caller keeps the strict rule.

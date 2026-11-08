@@ -422,7 +422,7 @@ static void case_uniform_draw(int imports, int gated, const char *pack) {
     open_pack(pack);
     static const VkpFormats F32 = {1, {VK_FORMAT_R32G32B32A32_SFLOAT}, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
     VkpStage vs = {.key = VS_KEY}, ps = {.key = PS_KEY};
-    CHECK(vkp_graphics(&vs, &ps, &F32));   // no pipeline is made with a submission in flight
+    CHECK(vkp_graphics(&vs, NULL, &ps, &F32));   // no pipeline is made with a submission in flight
     const float colour[4] = {0.25f, 0.5f, 0.75f, 0.0f}, mul[4] = {2.0f, 2.0f, 2.0f, 0.5f};
     const float u1[4] = {0.5f, 0.25f, 0.0f, 0.0f}, u2[4] = {0.0f, 0.5f, 1.0f, 0.5f};
     memcpy((void *)(uintptr_t)(P + 0x2000), colour, 16);

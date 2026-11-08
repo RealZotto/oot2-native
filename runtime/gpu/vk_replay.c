@@ -19,6 +19,7 @@
 
 #include "oot2/gpu_vk.h"
 #include "oot2/ledger.h"
+#include "oot2/mesh_abi.h"
 #include "oot2/nvn_program.h"
 #include "oot2/nvn_tex.h"
 #include "oot2/runtime.h"
@@ -53,6 +54,7 @@ int vkr_no_flip;
 int vkr_no_drop;
 int vkr_no_declare;
 int vkr_no_features;
+int vkr_no_first_task;
 
 // ---------- the op list
 const char *vkr_op_ticket(uint32_t op) {
@@ -64,13 +66,13 @@ const char *vkr_op_ticket(uint32_t op) {
     case OP_DISPATCH: case OP_DISPATCH_IND: case OP_BARRIER: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL:
     case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: case OP_PRIM_RESTART:
     case OP_PUSH_CONST: case OP_WAIT_SYNC: case OP_SAMPLE_MASK: case OP_DEPTH_BOUNDS: case OP_CONSERVATIVE:
+    case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
     case OP_SHADING_RATE_IMAGE: case OP_SHADING_RATE_PALETTE: case OP_SHADING_RATE_MODE: case OP_SCRATCH: case OP_HINT:
     case OP_COPY_B2B: case OP_UPDATE_UB: case OP_COPY_B2T: case OP_COPY_STRIDE: case OP_COPY_T2B: case OP_COPY_T2T:
     case OP_CLEAR_TEX: case OP_CLEAR_BUF: case OP_COPY_IMAGE_STRIDE:
     case OP_SIGNAL_EVENT: case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_COND: case OP_WAIT_EVENT:
         return VKR_REPLAYED;
-    case OP_DRAW_MESH: case OP_DRAW_MESH_IND: case OP_GEOMETRY_MODE:
-        return "task and mesh draws (the mesh draws)";
+    case OP_GEOMETRY_MODE: return "geometry processing mode (mesh outputs declare their primitive mode)";
     case OP_BIND_ACCEL: return "acceleration structures (no ticket: the replay has no ray tracing)";
     case OP_JUMP: case OP_CALL: return "a called recording (the front end inlines every one)";
     default: return "unknown";
@@ -125,7 +127,7 @@ typedef struct {
     VkCullModeFlags cull;
     VkFrontFace front;
     VkPolygonMode mode;
-    VkBool32 bias_en, discard, clamp, clip11, dt, dw, bt, st, restart, logic;
+    VkBool32 bias_en, discard, clamp, clip11, dt, dw, bt, st, restart, restart_valid, logic;
     float bias[3], line_width, bounds[2], blend_color[4];
     VkCompareOp df;
     VkStencilOp sop[2][3];
@@ -238,6 +240,13 @@ static Bound scratch(uint32_t bytes, uint32_t align, void **out) {
     g_stats.scratch_bytes += bytes;
     if (out) *out = p;
     return b;
+}
+
+static VkDeviceAddress scratch_address(Bound b) {
+    if (!F.ops->buffer_address) stop("a mesh draw needs the device address of replay scratch");
+    VkDeviceAddress address = F.ops->buffer_address(b.buf);
+    if (!address || address > UINT64_MAX - b.off) stop("a mesh draw's scratch buffer has no usable device address");
+    return address + b.off;
 }
 
 void *vkr_scratch(uint32_t bytes, uint32_t align, VkBuffer *buffer, VkDeviceSize *offset) {
@@ -572,7 +581,7 @@ static void dyn_compute(Dyn *d) {
 }
 
 #define DIFF(field) (!F.dyn_valid || memcmp(&n.field, &o->field, sizeof n.field))
-static void dyn_emit(VkPrimitiveTopology topo, VkBool32 restart) {
+static void dyn_emit(VkPrimitiveTopology topo, VkBool32 restart, int mesh) {
     Dyn n;
     dyn_compute(&n);
     n.topo = topo, n.restart = restart;
@@ -606,8 +615,8 @@ static void dyn_emit(VkPrimitiveTopology topo, VkBool32 restart) {
             vkrec_SetStencilReference(face, n.smask[f][2]);
         }
     }
-    if (DIFF(topo)) vkrec_SetPrimitiveTopology(n.topo);
-    if (DIFF(restart)) vkrec_SetPrimitiveRestartEnable(n.restart);
+    if (!mesh && DIFF(topo)) vkrec_SetPrimitiveTopology(n.topo);
+    if (!mesh && (!o->restart_valid || DIFF(restart))) vkrec_SetPrimitiveRestartEnable(n.restart);
     if (DIFF(blend_color)) vkrec_SetBlendConstants(n.blend_color);
     if (DIFF(logic)) vkrec_SetLogicOpEnableEXT(VK_FALSE);
     if (n.ntargets && (DIFF(ntargets) || DIFF(blend_en) || DIFF(eq) || DIFF(wm))) {
@@ -615,6 +624,8 @@ static void dyn_emit(VkPrimitiveTopology topo, VkBool32 restart) {
         vkrec_SetColorBlendEquationEXT(0, n.ntargets, n.eq);
         vkrec_SetColorWriteMaskEXT(0, n.ntargets, n.wm);
     }
+    if (mesh) n.topo = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM, n.restart_valid = VK_FALSE;
+    else n.restart_valid = VK_TRUE;
     *o = n;
     F.dyn_valid = 1;
 }
@@ -700,9 +711,12 @@ static uint64_t bank_word(int st, const uint8_t *c0, uint32_t slot, uint32_t off
 }
 
 static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_stage_t *ps, const ShaderBinds *b,
-                            const uint8_t *c0) {
+                            const uint8_t *c0, uint32_t descriptor_set) {
     for (uint32_t i = 0; i < b->ncb; i++) {
         const ShdCbuf *cb = &b->cb[i];
+        if (cb->set != descriptor_set)
+            stop("stage %s reads constant bank c[%u] from set %u, expected set %u", stage->key, cb->slot, cb->set,
+                 descriptor_set);
         Bound at;
         VkDeviceSize range = UNIFORM_MAX;
         if (cb->slot == 0) {
@@ -737,6 +751,9 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
     }
     for (uint32_t i = 0; i < b->nsb; i++) {
         const ShdSbuf *sb = &b->sb[i];
+        if (sb->set != descriptor_set)
+            stop("stage %s reads storage buffer %u from set %u, expected set %u", stage->key, sb->ordinal, sb->set,
+                 descriptor_set);
         uint64_t addr = bank_word(st, c0, sb->cb_slot, sb->address_byte_offset, 8);
         uint64_t size = bank_word(st, c0, sb->cb_slot, sb->address_byte_offset + 8u, 4);
         if (!addr || !size) {   // unbound: zeros; one the module writes gets its own, so the shared zeros stay zero
@@ -979,7 +996,7 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
     VkpStage vst = {vs->key, NULL, vs}, fst = {fs->key, NULL, fs};
     // A pipeline that is not ready and may be skipped (oot2/vk_miss.h) answers NULL: nothing of the draw is written, so
     // the state the frame keeps (the bound pipeline, the dynamic state, the buffers) is as the draw before left it.
-    VkPipeline pipe = F.ops->graphics(&vst, &fst, &F.formats, targets_hold_earlier_picture());
+    VkPipeline pipe = F.ops->graphics(&vst, NULL, &fst, &F.formats, targets_hold_earlier_picture());
     if (!pipe) {
         g_stats.skipped++;
         return 0;
@@ -987,7 +1004,7 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
     bind_pipeline(0, pipe);
     stamp_targets();
     bind_set0(0);
-    dyn_emit(topo, restart);
+    dyn_emit(topo, restart, 0);
     Set1 s;
     memset(&s, 0, sizeof s);
     if (vb->raw || fb->raw) raw_words(&s, vb->raw ? vs : fs);
@@ -995,9 +1012,9 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
     support(&s);
     uint8_t c0[VKN_BANK_BYTES];
     vkn_c0_graphics(c0, NVN_STAGE_VS, S.ssbo[ST_VS], base_instance);
-    stage_resources(&s, ST_VS, vs, &P.ps[ST_VS], vb, c0);
+    stage_resources(&s, ST_VS, vs, &P.ps[ST_VS], vb, c0, 1);
     vkn_c0_graphics(c0, NVN_STAGE_PS, S.ssbo[ST_FS], base_instance);
-    stage_resources(&s, ST_FS, fs, &P.ps[ST_FS], fb, c0);
+    stage_resources(&s, ST_FS, fs, &P.ps[ST_FS], fb, c0, 1);
     vkrec_PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, F.ops->graphics_layout, 1, s.n, s.w);
     vkrec_PushConstants(F.ops->graphics_layout, vkp_push_range(VKP_GRAPHICS).stageFlags, 0, VKP_PUSH_BYTES, s.push);
     vkr_report_draw();
@@ -1054,6 +1071,119 @@ static void op_draw_idx_ind(const p_draw_idx_ind *d) {
     vkrec_DrawIndexedIndirect((VkBuffer)(uintptr_t)ref.buffer, ref.offset, 1, 20);
 }
 
+static void mesh_first_task_push(Set1 *s, VkDeviceAddress address) {
+    if (!address) stop("a mesh draw's first-task word has no device address");
+    if (vkr_no_first_task) address = 0;
+    s->push[MESH_FIRST_TASK_PUSH_WORD] = (uint32_t)address;
+    s->push[MESH_FIRST_TASK_PUSH_WORD + 1] = (uint32_t)(address >> 32);
+    s->push[MESH_FIRST_TASK_PUSH_WORD + 2] = 0;
+}
+
+static Bound mesh_indirect_record(uint64_t indirect) {
+    if (!indirect || indirect > UINT64_MAX - MESH_INDIRECT_COMMAND_BYTES + 4)
+        stop("a mesh indirect draw's record address is invalid");
+    BackingRef src;
+    F.ops->resolve(indirect, MESH_INDIRECT_COMMAND_BYTES - 4, F.value, &src);
+    void *mapped;
+    Bound dst = scratch(MESH_INDIRECT_RECORD_BYTES, 16, &mapped);
+    const uint32_t initial[MESH_INDIRECT_RECORD_BYTES / sizeof(uint32_t)] = {0, 1, 1, 0};
+    memcpy(mapped, initial, sizeof initial);
+
+    vkr_xfer_begin();
+    VkBufferCopy count = {src.offset, dst.off, sizeof(uint32_t)};
+    VkBufferCopy first = {src.offset + sizeof(uint32_t), dst.off + MESH_INDIRECT_FIRST_OFFSET, sizeof(uint32_t)};
+    vkrec_CopyBuffer((VkBuffer)(uintptr_t)src.buffer, dst.buf, &count);
+    vkrec_CopyBuffer((VkBuffer)(uintptr_t)src.buffer, dst.buf, &first);
+    vkr_count_transfer(2 * sizeof(uint32_t));
+    full_barrier();
+    return dst;
+}
+
+static void op_draw_mesh(const p_draw_mesh *d, uint64_t indirect) {
+    g_stats.draw_ops++;
+    if (!S.render) {
+        g_stats.render_off++;
+        return;
+    }
+    if (P.id[ST_VS]) stop("a mesh draw with a vertex stage bound");
+    const nvn_stage *ts = P.id[ST_TS], *ms = P.id[ST_MS], *fs = P.id[ST_FS];
+    if (!ms) stop("a mesh draw with no mesh stage bound");
+    if (!fs) stop("a mesh draw with no pixel stage bound (stage %s)", ms->key);
+    if (ts && ts->kind != NVN_STAGE_TS) stop("mesh task stage %s has kind %u", ts->key, ts->kind);
+    if (ms->kind != NVN_STAGE_MS) stop("mesh stage %s has kind %u", ms->key, ms->kind);
+    if (!indirect && (d->first < 0 || d->count < 0))
+        stop("a direct mesh draw with first %d and count %d", d->first, d->count);
+    const ShaderBinds *tb = ts ? binds_of(ts, SHD_TS) : NULL;
+    const ShaderBinds *mb = binds_of(ms, SHD_MS), *fb = binds_of(fs, SHD_PS);
+    if (S.conservative) stop("conservative rasterization is not replayed yet");
+    if (S.sample_mask != ~0u && (S.sample_mask & 1) != 1)
+        stop("sample mask %#x is not replayed yet", S.sample_mask);
+
+    pass_begin();
+    VkpStage task = {ts ? ts->key : NULL, NULL, ts};
+    VkpStage mesh = {ms->key, NULL, ms}, pixel = {fs->key, NULL, fs};
+    VkPipeline pipe = F.ops->graphics(&mesh, ts ? &task : NULL, &pixel, &F.formats, targets_hold_earlier_picture());
+    if (!pipe) {
+        g_stats.skipped++;
+        return;
+    }
+    if (!F.ops->buffer_address) stop("mesh draws need replay scratch with buffer device addresses");
+
+    Set1 s, task_set_data;
+    memset(&s, 0, sizeof s);
+    memset(&task_set_data, 0, sizeof task_set_data);
+    if ((ts && tb->raw) || mb->raw || fb->raw) {
+        if (ts && tb->raw) raw_words(&s, ts);
+        if (mb->raw) raw_words(&s, ms);
+        if (fb->raw) raw_words(&s, fs);
+    }
+
+    Bound record = {0};
+    VkDeviceAddress first_address;
+    if (indirect) {
+        record = mesh_indirect_record(indirect);
+        first_address = scratch_address(record) + MESH_INDIRECT_FIRST_OFFSET;
+        pass_begin();
+    } else {
+        void *first_word;
+        Bound first = scratch(MESH_FIRST_TASK_WORD_BYTES, MESH_FIRST_TASK_WORD_BYTES, &first_word);
+        memcpy(first_word, &d->first, sizeof(uint32_t));
+        first_address = scratch_address(first);
+    }
+    bind_pipeline(0, pipe);
+    stamp_targets();
+    bind_set0(0);
+    dyn_emit(VK_PRIMITIVE_TOPOLOGY_MAX_ENUM, VK_FALSE, 1);
+    support(&s);
+
+    if (ts) {
+        uint8_t c0[VKN_BANK_BYTES];
+        vkn_c0_graphics(c0, NVN_STAGE_TS, S.ssbo[ST_TS], 0);
+        stage_resources(&task_set_data, ST_TS, ts, &P.ps[ST_TS], tb, c0, 2);
+        if (task_set_data.n) {
+            if (!F.ops->task_set) stop("task stage %s needs set-2 descriptors, and these ops allocate none", ts->key);
+            VkDescriptorSet set = F.ops->task_set(F.value, task_set_data.n, task_set_data.w);
+            if (!set) stop("task stage %s has no set-2 descriptor set", ts->key);
+            vkrec_BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, F.ops->graphics_layout, 2, 1, &set, 0, NULL);
+        }
+    }
+    uint8_t c0[VKN_BANK_BYTES];
+    vkn_c0_graphics(c0, NVN_STAGE_MS, S.ssbo[ST_MS], 0);
+    stage_resources(&s, ST_MS, ms, &P.ps[ST_MS], mb, c0, 1);
+    vkn_c0_graphics(c0, NVN_STAGE_PS, S.ssbo[ST_FS], 0);
+    stage_resources(&s, ST_FS, fs, &P.ps[ST_FS], fb, c0, 1);
+    mesh_first_task_push(&s, first_address);
+    vkrec_PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, F.ops->graphics_layout, 1, s.n, s.w);
+    vkrec_PushConstants(F.ops->graphics_layout, vkp_push_range(VKP_GRAPHICS).stageFlags, 0, VKP_PUSH_BYTES, s.push);
+    vkr_report_draw();
+    F.draws++, g_stats.draws++;
+    if (!F.pass_draws++) F.pass_vs = ms->key, F.pass_fs = fs->key;
+    if (indirect)
+        vkrec_DrawMeshTasksIndirectEXT(record.buf, record.off, 1, MESH_INDIRECT_RECORD_BYTES);
+    else
+        vkrec_DrawMeshTasksEXT((uint32_t)d->count, 1, 1);
+}
+
 // ---------- dispatches
 // ind: the GPU address of the group counts of an indirect dispatch (0: direct, groups). The counts go into the driver bank
 // c[0] too, and the CPU cannot say what they will be: they may be the output of earlier work of this submission, or of a
@@ -1088,7 +1218,7 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
         patch = bank(&F.c0[ST_CS], c0, VKN_BANK_BYTES);
     }
     support(&s);
-    stage_resources(&s, ST_CS, cs, &P.ps[ST_CS], b, c0);
+    stage_resources(&s, ST_CS, cs, &P.ps[ST_CS], b, c0, 1);
     vkrec_PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, F.ops->compute_layout, 1, s.n, s.w);
     vkrec_PushConstants(F.ops->compute_layout, vkp_push_range(VKP_COMPUTE).stageFlags, 0, VKP_PUSH_BYTES, s.push);
     F.draws++, g_stats.dispatches++;
@@ -1280,6 +1410,8 @@ static void record(const op_hdr *r) {
     case OP_DRAW: op_draw(a); break;
     case OP_DRAW_IDX: op_draw_idx(a); break;
     case OP_DRAW_IDX_IND: op_draw_idx_ind(a); break;
+    case OP_DRAW_MESH: op_draw_mesh(a, 0); break;
+    case OP_DRAW_MESH_IND: op_draw_mesh(NULL, ((const p_draw_mesh_ind *)a)->ind); break;
     case OP_DISPATCH: {
         const p_dispatch *d = a;
         const uint32_t g[3] = {(uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z};

@@ -50,11 +50,13 @@ struct nvn_stage;
 
 // What the miss path asks of the builder and the timeline: the device's, or a test's stand-ins.
 typedef struct VkmOps {
-    VkPipeline (*find_graphics)(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats);
+    VkPipeline (*find_graphics)(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats);
     VkPipeline (*find_compute)(const VkpStage *cs);
-    VkPipeline (*build_graphics)(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats, const int *late);
+    VkPipeline (*build_graphics)(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
+                                 const int *late);
     VkPipeline (*build_compute)(const VkpStage *cs);
-    void (*graphics_key)(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats, char *out, size_t cap);
+    void (*graphics_key)(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
+                         char *out, size_t cap);
     // Wait until the recorder has made every call it was given (the ring is empty), then until every submission handed
     // to the queue is done; returns how many submissions that was.
     uint64_t (*drain)(void);
@@ -77,7 +79,8 @@ void vkm_set_config(const VkmConfig *c);
 
 // The pipeline of a graphics draw: the one that exists, else the miss path's. VK_NULL_HANDLE is a draw to skip (only
 // when may_skip is set). Called by the replay with the submission gate held.
-VkPipeline vkm_graphics(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats, int may_skip);
+VkPipeline vkm_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
+                        int may_skip);
 // The pipeline of a dispatch: the one that exists, else built after a drain; never skipped.
 VkPipeline vkm_compute(const VkpStage *cs);
 

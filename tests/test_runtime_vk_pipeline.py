@@ -242,6 +242,13 @@ class TablesTest(unittest.TestCase):
         self.assertEqual((self.consts["GlobalSet"], self.consts["PushSet"], self.consts["TaskSet"]), (0, 1, 2))
         self.assertEqual((self.consts["PushConstantBytes"], self.consts["PushDescriptorLimit"]), (128, 32))
 
+    def test_graphics_pipeline_keys_distinguish_vertex_mesh_and_task_mesh(self) -> None:
+        done = run("keys")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        rows = [line.split(maxsplit=1) for line in done.stdout.splitlines() if line.startswith(("vertex ", "mesh ", "task-mesh "))]
+        self.assertEqual([row[0] for row in rows], ["vertex", "mesh", "task-mesh"])
+        self.assertEqual(len({row[1] for row in rows}), 3, rows)
+
     def test_set_zero_is_the_global_update_after_bind_arrays(self) -> None:
         rows = [l for l in self.lines if l[0] == "set0"]
         self.assertEqual(len(rows), 2)

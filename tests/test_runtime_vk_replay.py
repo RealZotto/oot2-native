@@ -19,8 +19,9 @@ live; a storage buffer binds from its bank's words, rounded down to 16 bytes, an
 listed; a storage image binds the view the ops make of the texture its c[2] image handle names, in the general layout, and the
 stores into one placed in its storage are declared written (an arena image holds its own stores, and a module that only
 reads declares nothing); a texture's push constant slot holds its bindless slot and its sampler; draws, indexed and indirect draws, direct
-and indirect dispatches and clears become their packets (an indirect dispatch's counts are copied by the GPU into a bank
-of its own); a GPU write over a copied uniform range drops the copy, so that every later read of the range is live; copies,
+and indirect dispatches and mesh draws become their packets (a mesh draw's first-task word is passed by a scratch device
+address, and an indirect `{count, first}` record is converted by GPU copies); an indirect dispatch's counts are copied by
+the GPU into a bank of its own; a GPU write over a copied uniform range drops the copy, so that every later read of the range is live; copies,
 fills, updates and texture clears are one transfer command each behind a full barrier, with the channel's strides, their
 writes into memory the CPU can see declared once; every op of the list is replayed or stops by name with its ticket; a recording that is not whole stops by name.
 Reports, events and waits are done by the completion thread in op-stream order (an event WRITE then ADD leaves their
@@ -56,6 +57,8 @@ LEVEL = "-O2"
 VS_KEY = "00000000000000a1.00000001"
 PS_KEY = "00000000000000b2.00000001"
 CS_KEY = "00000000000000c3.00000001"
+TS_KEY = "00000000000000d1.00000001"
+MS_KEY = "00000000000000d2.00000001"
 REPLAYED = {
     "BEGIN", "END", "SET_RT", "CLEAR_COLOR", "CLEAR_DS", "VIEWPORTS", "SCISSOR", "DEPTH_RANGE", "BIND_PROGRAM",
     "BIND_STATE", "BIND_VATTR", "BIND_VSTREAM", "BIND_VBUF", "BIND_UBO", "BIND_SSBO", "BIND_TEX", "BIND_SAMP", "BIND_IMG",
@@ -65,6 +68,7 @@ REPLAYED = {
     "HINT", "COPY_B2B", "UPDATE_UB", "COPY_B2T", "COPY_STRIDE", "COPY_T2B", "COPY_T2T", "CLEAR_TEX", "CLEAR_BUF",
     "COPY_IMAGE_STRIDE", "SIGNAL_EVENT", "REPORT_COUNTER", "RESET_COUNTER", "RENDER_COND", "WAIT_EVENT",
     "SHADING_RATE_PALETTE",
+    "DRAW_MESH", "DRAW_MESH_IND",
 }
 
 
@@ -417,6 +421,39 @@ class GraphicsTest(ReplayBase):
         readable, gpu = (writes(f[a:b], 1) for a, b in ((0, draws[0]), (draws[0], draws[1])))
         self.assertEqual([word(x, 0x644) for x in readable], [7])   # the record's base instance, read at submit
         self.assertEqual([word(x, 0x644) for x in gpu], [None])     # a record in GPU memory keeps 0
+
+    def test_mesh_draws_preserve_first_task_for_direct_and_gpu_written_indirect_records(self) -> None:
+        out = self.passing("mesh")
+        f = frame(out, 1)
+        pushes = [p for p in f if p.startswith("PushConstants")]
+        self.assertEqual(len(pushes), 5, pushes)
+        first_tasks = [re.search(r"first_task=(\d+)", p) for p in pushes]
+        self.assertEqual([m.group(1) if m else None for m in first_tasks],
+                         ["21", "37", "9", "41", "7"], pushes)
+        self.assertEqual(sum(p.startswith("DrawMeshTasksEXT") for p in f), 3)
+        self.assertEqual(sum(p.startswith("DrawMeshTasksIndirectEXT") for p in f), 2)
+        copies = [p for p in f if p.startswith("CopyBuffer")]
+        self.assertEqual(len(copies), 4, copies)
+        converted = [re.fullmatch(r"CopyBuffer 0xb3->0x5c (\d+)->(\d+) size=4", p) for p in copies]
+        self.assertTrue(all(converted), copies)
+        values = [(int(m.group(1)), int(m.group(2))) for m in converted if m]
+        self.assertEqual([src for src, _ in values], [0x100, 0x104, 0x108, 0x10C])
+        self.assertEqual(values[1][1] - values[0][1], 12)
+        self.assertEqual(values[3][1] - values[2][1], 12)
+        self.assertIn("op task_set frame 1 n=1", out)
+        self.assertIn("BindDescriptorSets 0 0x6100 2 0x5e8", f)
+
+    def test_counter_run_without_first_task_propagation(self) -> None:
+        out = self.passing("mesh", "--mutant", "nofirsttask")
+        pushes = [p for p in frame(out, 1) if p.startswith("PushConstants")]
+        self.assertEqual(len(pushes), 5, pushes)
+        self.assertTrue(all("first_task=unavailable" in p for p in pushes), pushes)
+
+    def test_vertex_restart_state_is_emitted_after_mesh_draws(self) -> None:
+        f = frame(self.passing("mesh_restart"), 1)
+        restart = [p for p in f if p.startswith("SetPrimitiveRestartEnable")]
+        self.assertEqual(restart, ["SetPrimitiveRestartEnable 0", "SetPrimitiveRestartEnable 1",
+                                   "SetPrimitiveRestartEnable 0"])
 
     def test_a_gpu_write_drops_the_uniform_copy_and_later_reads_are_live(self) -> None:
         # read first: draw 1 reads the copy (taken at submit), its pixel stage writes the range, draw 2 reads it live

@@ -7,6 +7,7 @@
 //
 // Cases that need no device (continuous integration runs them): the miss path over stand-in builds, the real recorder
 // over stand-in calls and the real timeline over a counter standing in for the device's semaphore.
+//   task_stage        a task stage survives the asynchronous graphics miss build
 //   drain_order       a miss in the middle of a frame: the ring is empty and the timeline idle when the build starts
 //   bound_skip        a graphics build past the bound: the draw is skipped, counted, the next draw of it skipped at once,
 //                     the build finishes in its job and serves the draw after it
@@ -84,25 +85,29 @@ static void start_counter(void) {
 #define PIPE_G ((VkPipeline)(uintptr_t)0x101)
 #define PIPE_C ((VkPipeline)(uintptr_t)0x102)
 static const nvn_stage g_vs = {.key = "5100000000000001.00000000", .kind = NVN_STAGE_VS};
+static const nvn_stage g_ts = {.key = "5100000000000004.00000000", .kind = NVN_STAGE_TS};
 static const nvn_stage g_ps = {.key = "5100000000000002.00000000", .kind = NVN_STAGE_PS};
 static const nvn_stage g_cs = {.key = "5100000000000003.00000000", .kind = NVN_STAGE_CS};
 static const VkpFormats g_fmt = {1, {VK_FORMAT_R8G8B8A8_UNORM}, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
 
 static uint64_t g_build_ms;
-static int g_g_built, g_c_built, g_late_at_end, g_builds;
+static int g_g_built, g_c_built, g_late_at_end, g_builds, g_expect_task;
 static uint64_t g_at_executed, g_at_done, g_at_issued;   // what the build saw when it started (the drain case)
 static uint64_t g_sent, g_executed;                       // packets put, calls made
 
-static VkPipeline f_find_g(const VkpStage *vs, const VkpStage *ps, const VkpFormats *f) {
-    (void)vs, (void)ps, (void)f;
+static VkPipeline f_find_g(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *f) {
+    (void)vs, (void)task, (void)ps, (void)f;
     return __atomic_load_n(&g_g_built, __ATOMIC_ACQUIRE) ? PIPE_G : VK_NULL_HANDLE;
 }
 static VkPipeline f_find_c(const VkpStage *cs) {
     (void)cs;
     return __atomic_load_n(&g_c_built, __ATOMIC_ACQUIRE) ? PIPE_C : VK_NULL_HANDLE;
 }
-static VkPipeline f_build_g(const VkpStage *vs, const VkpStage *ps, const VkpFormats *f, const int *late) {
+static VkPipeline f_build_g(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *f,
+                            const int *late) {
     (void)vs, (void)ps, (void)f;
+    CHECK((task != NULL) == g_expect_task);
+    if (task) CHECK(!strcmp(task->key, g_ts.key));
     __atomic_add_fetch(&g_builds, 1, __ATOMIC_RELAXED);
     g_at_executed = __atomic_load_n(&g_executed, __ATOMIC_ACQUIRE);
     g_at_done = gpu_sync_done(), g_at_issued = gpu_sync_issued();
@@ -118,7 +123,9 @@ static VkPipeline f_build_c(const VkpStage *cs) {
     __atomic_store_n(&g_c_built, 1, __ATOMIC_RELEASE);
     return PIPE_C;
 }
-static void f_key(const VkpStage *vs, const VkpStage *ps, const VkpFormats *f, char *out, size_t cap) {
+static void f_key(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *f, char *out,
+                  size_t cap) {
+    (void)task;
     (void)f;
     snprintf(out, cap, "g|%s|%s", vs->key, ps->key);
 }
@@ -143,11 +150,27 @@ static VkmOps fake_ops(int own_drain, int own_values) {
 }
 
 static VkpStage vstage(void) { return (VkpStage){g_vs.key, NULL, &g_vs}; }
+static VkpStage tstage(void) { return (VkpStage){g_ts.key, NULL, &g_ts}; }
 static VkpStage pstage(void) { return (VkpStage){g_ps.key, NULL, &g_ps}; }
 
 static void wait_built(void) {
     for (int i = 0; i < 400 && !__atomic_load_n(&g_g_built, __ATOMIC_ACQUIRE); i++) sleep_ms(10);
     CHECK(__atomic_load_n(&g_g_built, __ATOMIC_ACQUIRE));
+}
+
+// ---------- task_stage
+static void case_task_stage(void) {
+    VkmOps o = fake_ops(1, 0);
+    vkm_set_ops(&o);
+    VkmConfig c = {0, 0};
+    vkm_set_config(&c);
+    g_build_ms = 1;
+    g_expect_task = 1;
+    VkpStage vs = vstage(), task = tstage(), ps = pstage();
+    CHECK(vkm_graphics(&vs, &task, &ps, &g_fmt, 0) == PIPE_G);
+    CHECK(__atomic_load_n(&g_builds, __ATOMIC_RELAXED) == 1);
+    vkm_close();
+    printf("ok task_stage\n");
 }
 
 // ---------- drain_order
@@ -200,7 +223,7 @@ static void case_drain_order(void) {
     vkm_set_ops(&o);
     g_build_ms = 5;
     VkpStage vs = vstage(), ps = pstage();
-    VkPipeline p = vkm_graphics(&vs, &ps, &g_fmt, 1);
+    VkPipeline p = vkm_graphics(&vs, NULL, &ps, &g_fmt, 1);
     CHECK(p == PIPE_G);
     printf("at the build: %llu of %llu packets made into calls, submissions issued %llu done %llu\n", (ull)g_at_executed,
            (ull)g_sent, (ull)g_at_issued, (ull)g_at_done);
@@ -227,19 +250,19 @@ static void case_bound_skip(void) {
     vkm_set_config(&c);
     g_build_ms = 500;
     VkpStage vs = vstage(), ps = pstage();
-    VkPipeline p = vkm_graphics(&vs, &ps, &g_fmt, 1);
+    VkPipeline p = vkm_graphics(&vs, NULL, &ps, &g_fmt, 1);
     CHECK(p == VK_NULL_HANDLE);   // past the bound: a draw to skip
     VkmStats s;
     vkm_stats(&s);
     CHECK(s.graphics_misses == 1 && s.skipped_draws == 1 && s.skipped_pending == 0 && s.would_skip == 0);
     CHECK(!g_g_built);
-    CHECK(vkm_graphics(&vs, &ps, &g_fmt, 1) == VK_NULL_HANDLE);   // the build is still running: skipped at once
+    CHECK(vkm_graphics(&vs, NULL, &ps, &g_fmt, 1) == VK_NULL_HANDLE);   // the build is still running: skipped at once
     vkm_stats(&s);
     CHECK(s.graphics_misses == 1 && s.skipped_draws == 2 && s.skipped_pending == 1);
     CHECK(__atomic_load_n(&g_builds, __ATOMIC_RELAXED) == 1);     // no second build of the same pipeline
     wait_built();
     CHECK(g_late_at_end == 1);   // the build was told that the replay stopped waiting
-    CHECK(vkm_graphics(&vs, &ps, &g_fmt, 1) == PIPE_G);   // and now it serves the draw
+    CHECK(vkm_graphics(&vs, NULL, &ps, &g_fmt, 1) == PIPE_G);   // and now it serves the draw
     vkm_close();
     vkm_stats(&s);
     CHECK(s.late_builds == 1 && s.skipped_draws == 2);
@@ -255,7 +278,7 @@ static void case_override(void) {
     vkm_set_config(&c);
     g_build_ms = 300;
     VkpStage vs = vstage(), ps = pstage();
-    VkPipeline p = vkm_graphics(&vs, &ps, &g_fmt, 1);
+    VkPipeline p = vkm_graphics(&vs, NULL, &ps, &g_fmt, 1);
     CHECK(p == PIPE_G);   // waited
     VkmStats s;
     vkm_stats(&s);
@@ -273,7 +296,7 @@ static void case_kept_wait(void) {
     vkm_set_config(&c);
     g_build_ms = 300;
     VkpStage vs = vstage(), ps = pstage();
-    VkPipeline p = vkm_graphics(&vs, &ps, &g_fmt, 0);   // the draw's target holds no earlier picture: it may not be skipped
+    VkPipeline p = vkm_graphics(&vs, NULL, &ps, &g_fmt, 0);   // the draw's target holds no earlier picture: it may not be skipped
     CHECK(p == PIPE_G);
     VkmStats s;
     vkm_stats(&s);
@@ -394,7 +417,7 @@ static void case_release_during_build(void) {
     vkm_program_bound(1, p1, 1);
     g_build_ms = 400;
     VkpStage vs = vstage(), ps = pstage();
-    CHECK(vkm_graphics(&vs, &ps, &g_fmt, 1) == VK_NULL_HANDLE);   // skipped: the build goes on
+    CHECK(vkm_graphics(&vs, NULL, &ps, &g_fmt, 1) == VK_NULL_HANDLE);   // skipped: the build goes on
     vkm_program_release(1);
     g_done = 100;
     vkm_retire();
@@ -413,7 +436,7 @@ static void case_env(const char *expect) {
     vkm_set_config(NULL);   // read OOT2_VK_MISS_BOUND at the first miss
     g_build_ms = 300;
     VkpStage vs = vstage(), ps = pstage();
-    VkPipeline p = vkm_graphics(&vs, &ps, &g_fmt, 1);
+    VkPipeline p = vkm_graphics(&vs, NULL, &ps, &g_fmt, 1);
     printf("%s\n", p ? "waited" : "skipped");
     CHECK(!strcmp(expect, p ? "waited" : "skipped"));
     wait_built();
@@ -489,7 +512,7 @@ static void case_dev_drain(const char *pack) {
     CHECK(gpu_sync_open() == frame && gpu_sync_handed() == frame);
     CHECK(plat_thread_start(open_gate_later, (void *)(uintptr_t)200, 1 << 20));
     VkpStage vs = {.key = "5100000000000001.00000000"}, ps = {.key = "5100000000000002.00000000"};
-    VkPipeline p = vkm_graphics(&vs, &ps, &(VkpFormats){1, {VK_FORMAT_R8G8B8A8_UNORM}, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED}, 1);
+    VkPipeline p = vkm_graphics(&vs, NULL, &ps, &(VkpFormats){1, {VK_FORMAT_R8G8B8A8_UNORM}, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED}, 1);
     CHECK(p != VK_NULL_HANDLE);
     CHECK(gpu_sync_done() >= held);   // the build came after the device finished the held submission
     VkmStats s;
@@ -498,7 +521,7 @@ static void case_dev_drain(const char *pack) {
            (double)s.drain_ns / 1e6, (double)s.stall_ns[0] / 1e6, (ull)s.graphics_misses);
     CHECK(s.drained_submissions == 1 && s.graphics_misses == 1 && s.skipped_draws == 0);
     CHECK(s.drain_ns >= 100ull * 1000000ull);
-    CHECK(vkm_graphics(&vs, &ps, &(VkpFormats){1, {VK_FORMAT_R8G8B8A8_UNORM}, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED}, 1) == p);
+    CHECK(vkm_graphics(&vs, NULL, &ps, &(VkpFormats){1, {VK_FORMAT_R8G8B8A8_UNORM}, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED}, 1) == p);
     vkrec_end(NULL, 0);
     vkrec_close();
     gpu_sync_finish();
@@ -545,9 +568,11 @@ static void case_dev_release(const char *pack) {
 
 // The real builder after a pause, so that the frame's work has reached the queue by the time the builder checks the queue
 // (the check that the flag of a build the replay stopped waiting for lets through).
-static VkPipeline slow_build(const VkpStage *vs, const VkpStage *ps, const VkpFormats *f, const int *late) {
+static VkPipeline slow_build(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *f,
+                             const int *late) {
+    (void)task;
     sleep_ms(150);
-    return vkp_graphics_ex(vs, ps, f, late);
+    return vkp_graphics_ex(vs, NULL, ps, f, late);
 }
 
 static void case_dev_late(const char *pack) {
@@ -563,15 +588,15 @@ static void case_dev_late(const char *pack) {
     (void)frame;
     VkpStage vs = {.key = "5100000000000001.00000000"}, ps = {.key = "5100000000000002.00000000"};
     VkpFormats f = {1, {VK_FORMAT_R8G8B8A8_UNORM}, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
-    VkPipeline p = vkm_graphics(&vs, &ps, &f, 1);
+    VkPipeline p = vkm_graphics(&vs, NULL, &ps, &f, 1);
     CHECK(p == VK_NULL_HANDLE);   // skipped
     // the frame goes on and its work reaches the queue, held by the device, while the build is still creating objects
     vkrec_end(NULL, 0);
     uint64_t held = held_submission(VK_NULL_HANDLE, VK_PIPELINE_BIND_POINT_GRAPHICS);   // the queue is busy from here
     CHECK(gpu_sync_issued() == held && gpu_sync_done() < held);
     CHECK(plat_thread_start(open_gate_later, (void *)(uintptr_t)500, 1 << 20));
-    for (int i = 0; i < 1000 && !vkp_find_graphics(&vs, &ps, &f); i++) sleep_ms(10);
-    CHECK(vkp_find_graphics(&vs, &ps, &f) != VK_NULL_HANDLE);
+    for (int i = 0; i < 1000 && !vkp_find_graphics(&vs, NULL, &ps, &f); i++) sleep_ms(10);
+    CHECK(vkp_find_graphics(&vs, NULL, &ps, &f) != VK_NULL_HANDLE);
     VkmStats s;
     vkm_stats(&s);
     CHECK(s.skipped_draws == 1 && s.graphics_misses == 1);
@@ -598,7 +623,8 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (!strcmp(cs, "drain_order")) case_drain_order();
+    if (!strcmp(cs, "task_stage")) case_task_stage();
+    else if (!strcmp(cs, "drain_order")) case_drain_order();
     else if (!strcmp(cs, "bound_skip")) case_bound_skip();
     else if (!strcmp(cs, "override")) case_override();
     else if (!strcmp(cs, "kept_wait")) case_kept_wait();

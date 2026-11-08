@@ -8,7 +8,7 @@
 //   vk_replay_draw draw DRAW OUT --pack PACK [--depth-out FILE] [--depth-mode near_is_minus_w|near_is_zero]
 //                  [--origin lower_left|upper_left] [--imports] [--no-snapshot] [--no-flip] [--rewrite-uniform] [--cold]
 //
-// --cold leaves the pair's pipeline unbuilt, so that the first draw is a miss: the replay's miss path (oot2/vk_miss.h)
+// --cold leaves the program's pipeline unbuilt, so that the first draw is a miss: the replay's miss path (oot2/vk_miss.h)
 // drains, builds and resumes, and the image must be the one a prebuilt pipeline gives.
 //
 // `probe` opens the Vulkan device and closes it again: "ok probe", or the named fatal of a machine that has none.
@@ -16,17 +16,17 @@
 // `draw` plays one draw, described by the text file DRAW, through the NVN2 entry points as a game calls them (their
 // synthetic addresses, arguments in the AAPCS64 registers, every object in guest memory), on the Vulkan back end, and
 // writes the colour target as raw 32-bit floats to OUT (row 0 first, as the back end's read_texels gives it) and, with
-// --depth-out, the depth target the same way. The draw is a vertex and pixel pair of the player's shader pack: the
-// pack's job keys name the pair, and the program's control section and code area come from files the driver wrote
-// from the game's own archives (a control section is not in the split, and the key hashes it), so ProgramSetShaders
-// computes the key itself and the harness stops unless it equals the one the draw file names.
+// --depth-out, the depth target the same way. Each stage's control section and code area come from the files named in
+// DRAW, and its job key names the module in PACK. The key hashes both files, so ProgramSetShaders computes it itself
+// and the harness stops unless it equals the one DRAW names. Stages may come from game archives or be synthesized for
+// a test; no game data is needed.
 //
 // The draw file holds one directive a line, every file name relative to the file's own folder:
 //   size W H                        the colour target (RGBA32F), W by H
 //   clear R G B A                   its clear colour
 //   viewport X Y W H, scissor X Y W H   default: the whole target
 //   depth NEAR FAR CLEAR            a DEPTH32F target, cleared to CLEAR, depth test LESS and write on, depth range NEAR FAR
-//   program vs|ps KEY CTL CODE      a stage: its job key, control section file, code area file
+//   program vs|ps|ts|ms KEY CTL CODE a stage: its job key, control section file, code area file
 //   attribute LOC FORMAT OFFSET STREAM    FORMAT r32f rg32f rgb32f rgba32f or the 32-bit integer forms (r32i, r32ui, ...)
 //   stream INDEX STRIDE DIVISOR     vertex stream state
 //   vertex_buffer INDEX FILE        bound at stream INDEX
@@ -42,6 +42,8 @@
 //   draw arrays PRIM FIRST COUNT, draw elements PRIM COUNT, draw indirect PRIM COUNT BASE_INSTANCE
 //                                   the last: DrawElementsIndirect over the index buffer, its record {COUNT, 1, 0, 0,
 //                                   BASE_INSTANCE} in a buffer of the CPU pool
+//   draw mesh direct FIRST COUNT, draw mesh indirect COUNT FIRST
+//                                   the indirect record {COUNT, FIRST} is in a buffer of the CPU pool
 //   polygon line|point|fill OFFSETS, offset FACTOR UNITS CLAMP
 //                                   the polygon state (mode, offset enables: point 1, line 2, fill 4) and the offset
 //   depth_clamp, depth_bounds MIN MAX, line_width W
@@ -51,6 +53,9 @@
 //                                   with --out1
 //   chmask T HEX                    target T's channel mask (r 1, g 2, b 4, a 8), the others 0xf
 //   blend_dual                      blend on target 0 with dual-source factors (SRC1_COLOR, ONE_MINUS_SRC1_COLOR)
+//
+// The program stages may be synthesized for a test; no game data is needed. ProgramSetShaders computes each stage's key
+// from its control section and code area, so both files must match the key in the draw file.
 //
 // What this expects of the replay (oot2/vk_replay.h and runtime/gpu/vk_replay.c, as written): every record of the
 // recording is replayed; the driver banks c[0], c[1] (from the code area at the control section's +0x40 and +0x44), c[2]
@@ -101,7 +106,8 @@ typedef unsigned long long ull;
 #define LOW32(v) ((v) & 0xffffffffu)
 
 // ---- the draw file
-enum { ST_VS, ST_PS };
+enum { ST_VS = NVN_STAGE_VS, ST_PS = NVN_STAGE_PS, ST_TS = NVN_STAGE_TS, ST_MS = NVN_STAGE_MS };
+enum { NVN_STAGE_TASK = 6, NVN_STAGE_MESH = 7 };
 #define NAME 128
 #define MAX_ATTR 16
 #define MAX_STREAM 8
@@ -139,7 +145,7 @@ typedef struct {
     int vp[4], sc[4];
     int depth;
     float dnear, dfar, dclear;
-    Prog prog[2];
+    Prog prog[3];
     int nprog;
     Attr attr[MAX_ATTR];
     int nattr;
@@ -153,7 +159,7 @@ typedef struct {
     int nubo, nsbo;
     Tex tex[MAX_TEX];
     int ntex;
-    int indexed, prim, first, count;
+    int indexed, prim, first, count, mesh, mesh_indirect;
     int polygon, offsets;      // NVNpolygonMode, or -1 for no polygon state
     float offset[3];
     int has_offset, clamp, bounds;
@@ -205,8 +211,20 @@ static void write_file(const char *path, const void *data, size_t n) {
 static int stage_of(const char *s) {
     if (!strcmp(s, "vs")) return ST_VS;
     if (!strcmp(s, "ps")) return ST_PS;
+    if (!strcmp(s, "ts")) return NVN_STAGE_TASK;
+    if (!strcmp(s, "ms")) return NVN_STAGE_MESH;
     fprintf(stderr, "unknown stage %s\n", s);
     exit(2);
+}
+
+static int stage_kind(int stage) {
+    switch (stage) {
+    case ST_VS: return NVN_STAGE_VS;
+    case ST_PS: return NVN_STAGE_PS;
+    case NVN_STAGE_TASK: return NVN_STAGE_TS;
+    case NVN_STAGE_MESH: return NVN_STAGE_MS;
+    default: CHECK(0); return 0;
+    }
 }
 
 // The NVNformat of a vertex attribute's name.
@@ -269,7 +287,7 @@ static void parse_draw(const char *path, Draw *d) {
             CHECK(sscanf(rest, "%f %f %f", &x[0], &x[1], &x[2]) == 3);
             d->depth = 1, d->dnear = x[0], d->dfar = x[1], d->dclear = x[2];
         } else if (!strcmp(w, "program")) {
-            CHECK(sscanf(rest, "%127s %39s %127s %127s", a, b, c2, e) == 4 && d->nprog < 2);
+            CHECK(sscanf(rest, "%127s %39s %127s %127s", a, b, c2, e) == 4 && d->nprog < 3);
             Prog *p = &d->prog[d->nprog++];
             p->stage = stage_of(a);
             snprintf(p->key, sizeof p->key, "%s", b);
@@ -335,7 +353,18 @@ static void parse_draw(const char *path, Draw *d) {
             d->dual = 1;
         } else if (!strcmp(w, "draw")) {
             CHECK(sscanf(rest, "%127s", a) == 1);
-            if (!strcmp(a, "indirect")) {
+            if (!strcmp(a, "mesh")) {
+                char form[32];
+                CHECK(sscanf(rest, "%*s %31s", form) == 1);
+                d->mesh = 1;
+                if (!strcmp(form, "direct")) {
+                    CHECK(sscanf(rest, "%*s %*s %d %d", &d->first, &d->count) == 2);
+                } else {
+                    CHECK(!strcmp(form, "indirect") &&
+                          sscanf(rest, "%*s %*s %d %d", &d->count, &d->first) == 2);
+                    d->mesh_indirect = 1;
+                }
+            } else if (!strcmp(a, "indirect")) {
                 CHECK(sscanf(rest, "%*s %d %d %d", &d->prim, &d->count, &d->base_instance) == 3);
                 d->indexed = 1, d->indirect = 1;
             } else if (!strcmp(a, "arrays")) {
@@ -350,8 +379,14 @@ static void parse_draw(const char *path, Draw *d) {
         }
     }
     fclose(f);
-    CHECK(d->w && d->h && d->nprog == 2 && d->count > 0 && d->nvbuf > 0);
-    CHECK(d->prog[0].stage == ST_VS && d->prog[1].stage == ST_PS);
+    CHECK(d->w && d->h && d->count > 0);
+    if (d->mesh) {
+        CHECK(d->nprog == 3 && d->prog[0].stage == NVN_STAGE_TASK && d->prog[1].stage == NVN_STAGE_MESH &&
+              d->prog[2].stage == ST_PS && d->nvbuf == 0 && !d->indexed && !d->nattr && !d->nstream);
+        CHECK(d->first >= 0);
+    } else {
+        CHECK(d->nprog == 2 && d->prog[0].stage == ST_VS && d->prog[1].stage == ST_PS && d->nvbuf > 0);
+    }
     if (d->vp[2] < 0) d->vp[0] = d->vp[1] = 0, d->vp[2] = (int)d->w, d->vp[3] = (int)d->h;
     if (d->sc[2] < 0) d->sc[0] = d->sc[1] = 0, d->sc[2] = (int)d->w, d->sc[3] = (int)d->h;
 }
@@ -563,11 +598,10 @@ static void read_target(const GTex *t, uint64_t texel_bytes, const char *path) {
     write_file(path, (const void *)(uintptr_t)dst, (size_t)bytes);
 }
 
-// A program of the draw's two stages: the code areas into the CPU pool, SetShaders over them, and the key each stage
-// got compared with the key the draw names.
-static uint64_t make_program(const Draw *d, const nvn_stage *ids[2]) {
-    uint64_t sd = galloc(16 * 2, 16), p = galloc(0xC0, 16);
-    for (int i = 0; i < 2; i++) {
+// The draw's stages: their code areas go into the CPU pool, SetShaders records them, and their runtime keys must match the draw.
+static uint64_t make_program(const Draw *d, const nvn_stage *ids[NVN_STAGE_KINDS]) {
+    uint64_t sd = galloc(16 * (uint64_t)d->nprog, 16), p = galloc(0xC0, 16);
+    for (int i = 0; i < d->nprog; i++) {
         size_t cn, kn;
         void *ctl = read_file(d->prog[i].ctl, &cn), *code = read_file(d->prog[i].code, &kn);
         uint64_t off = cpu_take(kn, 256, 0), ctl_at = galloc(cn, 16);
@@ -578,15 +612,16 @@ static uint64_t make_program(const Draw *d, const nvn_stage *ids[2]) {
         free(ctl), free(code);
     }
     OK(NVN(nvnProgramInitialize, p, g_dev));
-    OK(NVN(nvnProgramSetShaders, p, 2, sd));
+    OK(NVN(nvnProgramSetShaders, p, (uint64_t)d->nprog, sd));
     const prog_t *x = (const prog_t *)(uintptr_t)p;
-    for (int i = 0; i < 2; i++) {
-        ids[i] = nvn_program_stage(x, i);
-        CHECK(ids[i] != NULL);
-        int same = !strcmp(ids[i]->key, d->prog[i].key);
-        printf("key %s %s %s\n", i ? "ps" : "vs", ids[i]->key, same ? "equals the pack's" : "DIFFERS from the pack's");
+    for (int i = 0; i < d->nprog; i++) {
+        const nvn_stage *id = nvn_program_stage(x, i);
+        CHECK(id != NULL && id->kind == stage_kind(d->prog[i].stage));
+        ids[id->kind] = id;
+        int same = !strcmp(id->key, d->prog[i].key);
+        printf("key %s %s %s\n", nvn_stage_kind_name(id->kind), id->key, same ? "equals the pack's" : "DIFFERS from the pack's");
         if (!same) {
-            fprintf(stderr, "ProgramSetShaders keyed stage %d %s, the draw names %s\n", i, ids[i]->key, d->prog[i].key);
+            fprintf(stderr, "ProgramSetShaders keyed stage %d %s, the draw names %s\n", i, id->key, d->prog[i].key);
             exit(1);
         }
     }
@@ -667,13 +702,16 @@ static void run_draw(const Opts *o) {
     }
 
     // the programs, and their pipeline before the first submission (the pair's attachment formats are the targets')
-    const nvn_stage *ids[2];
+    const nvn_stage *ids[NVN_STAGE_KINDS] = {0};
     uint64_t prog = make_program(&d, ids);
     VkpFormats formats = {(uint32_t)d.ntargets, {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT}, d.depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED,
                           VK_FORMAT_UNDEFINED};
-    VkpStage vs = {.key = ids[0]->key, .shape = ids[0]}, ps = {.key = ids[1]->key, .shape = ids[1]};
-    if (!o->cold) CHECK(vkp_graphics(&vs, &ps, &formats) != VK_NULL_HANDLE);
-    else CHECK(vkp_find_graphics(&vs, &ps, &formats) == VK_NULL_HANDLE);   // a miss, by construction
+    VkpStage vs = {.key = ids[ST_VS] ? ids[ST_VS]->key : NULL, .shape = ids[ST_VS]};
+    VkpStage task = {.key = ids[ST_TS] ? ids[ST_TS]->key : NULL, .shape = ids[ST_TS]};
+    VkpStage mesh = {.key = ids[ST_MS] ? ids[ST_MS]->key : NULL, .shape = ids[ST_MS]};
+    VkpStage ps = {.key = ids[ST_PS]->key, .shape = ids[ST_PS]};
+    if (!o->cold) CHECK(vkp_graphics(d.mesh ? &mesh : &vs, d.mesh ? &task : NULL, &ps, &formats) != VK_NULL_HANDLE);
+    else CHECK(vkp_find_graphics(d.mesh ? &mesh : &vs, d.mesh ? &task : NULL, &ps, &formats) == VK_NULL_HANDLE);
 
     // the buffers
     Buf vbuf[4], ibuf = {0}, ubo[MAX_UBO], sbo[MAX_SBO];
@@ -690,7 +728,10 @@ static void run_draw(const Opts *o) {
         ibuf = make_buffer(data, n, 256, 0);
         free(data);
     }
-    if (d.indirect) {
+    if (d.mesh_indirect) {
+        const uint32_t record[2] = {(uint32_t)d.count, (uint32_t)d.first};
+        indirect = make_buffer(record, sizeof record, 256, 0);
+    } else if (d.indirect) {
         const uint32_t record[5] = {(uint32_t)d.count, 1, 0, 0, (uint32_t)d.base_instance};
         indirect = make_buffer(record, sizeof record, 256, 0);
     }
@@ -818,14 +859,24 @@ static void run_draw(const Opts *o) {
         fv(0, d.dclear);
         NVN(nvnCommandBufferClearDepthStencil, cb, 1, 0, 0);
     }
-    NVN(nvnCommandBufferBindProgram, cb, prog, NVN_SHADER_STAGE_VERTEX_BIT | NVN_SHADER_STAGE_FRAGMENT_BIT);
-    NVN(nvnCommandBufferBindVertexAttribState, cb, (uint64_t)nloc, attrs);
-    NVN(nvnCommandBufferBindVertexStreamState, cb, (uint64_t)d.nstream, streams);
-    for (int i = 0; i < d.nvbuf; i++) NVN(nvnCommandBufferBindVertexBuffer, cb, d.vbuf[i].index, vbuf[i].addr, vbuf[i].size);
-    for (int i = 0; i < d.nubo; i++) NVN(nvnCommandBufferBindUniformBuffer, cb, (uint64_t)d.ubo[i].stage, d.ubo[i].r, ubo[i].addr, ubo[i].size);
-    for (int i = 0; i < d.nsbo; i++) NVN(nvnCommandBufferBindStorageBuffer, cb, (uint64_t)d.sbo[i].stage, d.sbo[i].r, sbo[i].addr, sbo[i].size);
-    for (int i = 0; i < d.ntex; i++) NVN(nvnCommandBufferBindTexture, cb, (uint64_t)d.tex[i].stage, d.tex[i].slot, handle[i]);
-    if (d.indirect) NVN(nvnCommandBufferDrawElementsIndirect, cb, (uint64_t)d.prim, (uint64_t)d.itype, ibuf.addr, indirect.addr);
+    uint64_t stage_mask = d.mesh ? (NVN_SHADER_STAGE_FRAGMENT_BIT | (1u << NVN_STAGE_TASK) | (1u << NVN_STAGE_MESH))
+                                 : (NVN_SHADER_STAGE_VERTEX_BIT | NVN_SHADER_STAGE_FRAGMENT_BIT);
+    NVN(nvnCommandBufferBindProgram, cb, prog, stage_mask);
+    if (!d.mesh) {
+        NVN(nvnCommandBufferBindVertexAttribState, cb, (uint64_t)nloc, attrs);
+        NVN(nvnCommandBufferBindVertexStreamState, cb, (uint64_t)d.nstream, streams);
+        for (int i = 0; i < d.nvbuf; i++)
+            NVN(nvnCommandBufferBindVertexBuffer, cb, d.vbuf[i].index, vbuf[i].addr, vbuf[i].size);
+    }
+    for (int i = 0; i < d.nubo; i++)
+        NVN(nvnCommandBufferBindUniformBuffer, cb, (uint64_t)d.ubo[i].stage, d.ubo[i].r, ubo[i].addr, ubo[i].size);
+    for (int i = 0; i < d.nsbo; i++)
+        NVN(nvnCommandBufferBindStorageBuffer, cb, (uint64_t)d.sbo[i].stage, d.sbo[i].r, sbo[i].addr, sbo[i].size);
+    for (int i = 0; i < d.ntex; i++)
+        NVN(nvnCommandBufferBindTexture, cb, (uint64_t)d.tex[i].stage, d.tex[i].slot, handle[i]);
+    if (d.mesh_indirect) NVN(nvnCommandBufferDrawMeshTasksIndirect, cb, indirect.addr);
+    else if (d.mesh) NVN(nvnCommandBufferDrawMeshTasks, cb, (uint64_t)d.first, (uint64_t)d.count);
+    else if (d.indirect) NVN(nvnCommandBufferDrawElementsIndirect, cb, (uint64_t)d.prim, (uint64_t)d.itype, ibuf.addr, indirect.addr);
     else if (d.indexed) NVN(nvnCommandBufferDrawElements, cb, (uint64_t)d.prim, (uint64_t)d.itype, (uint64_t)d.count, ibuf.addr);
     else NVN(nvnCommandBufferDrawArrays, cb, (uint64_t)d.prim, (uint64_t)d.first, (uint64_t)d.count);
     uint64_t handles = galloc(8, 8);

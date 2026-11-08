@@ -10,7 +10,8 @@
 // lines for the calls the recorder made (its thread). A stop must end in one named fatal, which the driver checks.
 //
 // The fake address space: HOST is real memory of this program that the backing map would import (the replay reads it:
-// the uniform snapshot, indirect group counts), MIRROR and VRAM are numbers only (a mirror and an extent: never read).
+// uniform snapshots and readable indirect records), MIRROR and VRAM are GPU-only addresses. g_vram supplies bytes only
+// to the stand-in transfer command, so the mesh-indirect test can model a GPU-written {count, first} record.
 // Addresses in the logs are printed from their region's start, so the logs do not depend on where this program loads.
 #include <stdarg.h>
 #include <stdio.h>
@@ -23,6 +24,7 @@
 #include "oot2/bindless.h"
 #include "oot2/gpu.h"
 #include "oot2/gpu_vk.h"
+#include "oot2/mesh_abi.h"
 #include "oot2/nvn.h"
 #include "oot2/nvn_obj.h"
 #include "oot2/nvn_program.h"
@@ -46,6 +48,7 @@ typedef unsigned long long ull;
 // ---------- the fake address space
 #define HOST_BYTES (1u << 20)
 static _Alignas(4096) uint8_t g_host[HOST_BYTES];
+static uint8_t g_vram[HOST_BYTES];
 #define HOST ((uint64_t)(uintptr_t)g_host)
 #define MIRROR 0x30000000ull
 #define VRAM 0x40000000ull
@@ -57,6 +60,7 @@ static _Alignas(4096) uint8_t g_host[HOST_BYTES];
 
 static uint8_t g_arena[8u << 20];
 static uint32_t g_arena_used;
+static int g_mesh_pushes;
 
 // An address as the logs print it: H+, M+ or V+ and the offset from the region's start.
 static void where(char *out, size_t cap, uint64_t a) {
@@ -65,7 +69,6 @@ static void where(char *out, size_t cap, uint64_t a) {
     else if (a - VRAM < REGION_BYTES) snprintf(out, cap, "V+0x%llx", (ull)(a - VRAM));
     else snprintf(out, cap, "0x%llx", (ull)a);
 }
-
 // ---------- the two logs
 typedef struct {
     char *p;
@@ -92,8 +95,9 @@ static void lput(Log *l, const char *fmt, ...) {
 
 // ---------- the stages and their bindings
 // g_vs_raw and g_cs_raw: stages that reach memory through the page table; g_cs_img: a compute stage that stores to an image
-static nvn_stage g_vs, g_ps, g_cs, g_vs_raw, g_cs_raw, g_cs_img;
-static ShaderBinds g_vs_binds, g_ps_binds, g_cs_binds, g_vs_raw_binds, g_cs_raw_binds, g_cs_img_binds;
+static nvn_stage g_vs, g_ps, g_cs, g_ts, g_ms, g_mps, g_vs_raw, g_cs_raw, g_cs_img;
+static ShaderBinds g_vs_binds, g_ps_binds, g_cs_binds, g_ts_binds, g_ms_binds, g_mps_binds, g_vs_raw_binds,
+    g_cs_raw_binds, g_cs_img_binds;
 
 static void stage(nvn_stage *s, const char *key, int kind, uint32_t c1_at, uint32_t c1_end) {
     memset(s, 0, sizeof *s);
@@ -109,6 +113,9 @@ static void make_stages(void) {
     stage(&g_vs, "00000000000000a1.00000001", NVN_STAGE_VS, 0x100, 0x140);
     stage(&g_ps, "00000000000000b2.00000001", NVN_STAGE_PS, 0, 0);
     stage(&g_cs, "00000000000000c3.00000001", NVN_STAGE_CS, 0, 0);
+    stage(&g_ts, "00000000000000d1.00000001", NVN_STAGE_TS, 0, 0);
+    stage(&g_ms, "00000000000000d2.00000001", NVN_STAGE_MS, 0, 0);
+    stage(&g_mps, "00000000000000d3.00000001", NVN_STAGE_PS, 0, 0);
     // the compute stage's c[0] layout (vk_nvn.h, VknC0Layout): two root words, three uniform rows, two storage rows
     g_cs.ctl[0xA9] = 2, g_cs.ctl[0xB1] = 3, g_cs.ctl[0xB2] = 2;
 
@@ -135,6 +142,15 @@ static void make_stages(void) {
     cbuf(c, 0, 1), cbuf(c, 2, 2), cbuf(c, 24, 3);
     c->sb[c->nsb++] = (ShdSbuf){.set = 1, .ordinal = 0, .cb_slot = 0, .write = 0, .binding = 4, .address_byte_offset = 0x320};
 
+    g_ts_binds.kind = SHD_TS, g_ts_binds.fits = 1;
+    g_ts_binds.cb[g_ts_binds.ncb++] = (ShdCbuf){0, 2, 0};
+    g_ms_binds.kind = SHD_MS, g_ms_binds.fits = 1;
+    cbuf(&g_ms_binds, 0, 1);
+    g_ms_binds.ntex = 1;
+    g_ms_binds.tex[0] = (ShdTex){.via = SHD_VIA_PUSH_SLOT, .kind = SHD_TEX_COMBINED, .view = BV_2D, .set = 1,
+                                 .binding = 0, .array_length = 1, .push_slot = 0, .push_offset = 16, .c2_slot = 0};
+    g_mps_binds.kind = SHD_PS, g_mps_binds.fits = 1;
+
     stage(&g_cs_raw, "00000000000000c4.00000001", NVN_STAGE_CS, 0, 0);   // the same layout as g_cs, and the page table
     g_cs_raw.ctl[0xA9] = 2, g_cs_raw.ctl[0xB1] = 3, g_cs_raw.ctl[0xB2] = 2;
     g_cs_raw_binds = g_cs_binds;
@@ -151,9 +167,14 @@ static void make_stages(void) {
 
 // ---------- the stand-in ops
 static int g_skip_next;   // the next graphics get answers NULL, a draw to skip (the miss path's answer)
-static VkPipeline op_graphics(const VkpStage *vs, const VkpStage *ps, const VkpFormats *f, int may_skip) {
+static VkPipeline op_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *f,
+                              int may_skip) {
     (void)may_skip;
-    lput(&g_ops, "op graphics %s %s colors=%u c0=%d depth=%d stencil=%d\n", vs->key, ps->key, f->ncolor,
+    if (task)
+        lput(&g_ops, "op graphics task=%s mesh=%s pixel=%s colors=%u c0=%d depth=%d stencil=%d\n", task->key, vs->key,
+             ps->key, f->ncolor, f->ncolor ? (int)f->color[0] : 0, (int)f->depth, (int)f->stencil);
+    else
+        lput(&g_ops, "op graphics %s %s colors=%u c0=%d depth=%d stencil=%d\n", vs->key, ps->key, f->ncolor,
          f->ncolor ? (int)f->color[0] : 0, (int)f->depth, (int)f->stencil);
     if (g_skip_next) {
         g_skip_next = 0;
@@ -167,6 +188,7 @@ static VkPipeline op_compute(const VkpStage *cs) {
 }
 static const ShaderBinds *op_binds(const nvn_stage *s) {
     return s == &g_vs ? &g_vs_binds : s == &g_ps ? &g_ps_binds : s == &g_cs ? &g_cs_binds
+           : s == &g_ts ? &g_ts_binds : s == &g_ms ? &g_ms_binds : s == &g_mps ? &g_mps_binds
            : s == &g_vs_raw ? &g_vs_raw_binds : s == &g_cs_raw ? &g_cs_raw_binds : s == &g_cs_img ? &g_cs_img_binds : NULL;
 }
 static int g_log_resolves;   // a case that checks the order of the resolves against the raw path's begin sets it
@@ -251,6 +273,16 @@ static void *op_scratch(uint64_t value, uint32_t bytes, uint32_t align, VkBuffer
     *buffer = (VkBuffer)(uintptr_t)BUF_SCRATCH, *offset = at;
     return g_arena + at;
 }
+static VkDeviceAddress op_buffer_address(VkBuffer buffer) {
+    CHECK((uint64_t)(uintptr_t)buffer == BUF_SCRATCH);
+    return 0x50000000;
+}
+static VkDescriptorSet op_task_set(uint64_t value, uint32_t n, const VkWriteDescriptorSet *writes) {
+    lput(&g_ops, "op task_set frame %llu n=%u\n", (ull)value, n);
+    for (uint32_t i = 0; i < n; i++)
+        lput(&g_ops, "op task_write b=%u type=%u\n", writes[i].dstBinding, writes[i].descriptorType);
+    return (VkDescriptorSet)(uintptr_t)0x5E8;
+}
 // The page table's words of a frame: the same four for every stage (the device's own begin does the work once).
 static void op_raw(uint64_t value, uint32_t push[4]) {
     lput(&g_ops, "op raw frame %llu\n", (ull)value);
@@ -274,7 +306,8 @@ static const VkReplayOps g_fake_ops = {
     .graphics_layout = (VkPipelineLayout)(uintptr_t)0x6100, .compute_layout = (VkPipelineLayout)(uintptr_t)0x6200,
     .binds = op_binds, .resolve = op_resolve, .gpu_wrote = op_gpu_wrote, .target = op_target, .image = op_image,
     .acquire = op_acquire,
-    .image_slot = op_image_slot, .storage_image = op_storage_image, .scratch = op_scratch, .raw = op_raw,
+    .image_slot = op_image_slot, .storage_image = op_storage_image, .scratch = op_scratch,
+    .buffer_address = op_buffer_address, .task_set = op_task_set, .raw = op_raw,
     .frame_begin = op_frame_begin,
     .frame_end = op_frame_end, .queries = op_queries, .query_results = op_query_results, .cpu_reads = op_cpu_reads};
 
@@ -359,6 +392,17 @@ static void VKAPI_CALL fake_PushConstants(VkCommandBuffer cb, VkPipelineLayout l
         uint32_t x;
         memcpy(&x, (const uint8_t *)v + i, 4);
         if (x) lput(&g_pkt, " %u=%#x", i, x);
+    }
+    if (g_mesh_pushes && off == 0 && size >= MESH_FIRST_TASK_PUSH_OFFSET + sizeof(uint64_t)) {
+        VkDeviceAddress address;
+        memcpy(&address, (const uint8_t *)v + MESH_FIRST_TASK_PUSH_OFFSET, sizeof address);
+        if (address >= 0x50000000 && address - 0x50000000 + sizeof(uint32_t) <= sizeof g_arena) {
+            uint32_t first;
+            memcpy(&first, g_arena + (address - 0x50000000), sizeof first);
+            lput(&g_pkt, " first_task=%u", first);
+        } else {
+            lput(&g_pkt, " first_task=unavailable");
+        }
     }
     lput(&g_pkt, "\n");
 }
@@ -467,6 +511,9 @@ static void region_text(const VkBufferImageCopy *r) {
 }
 static void VKAPI_CALL fake_CopyBuffer(VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n, const VkBufferCopy *r) {
     CHECK(cb == FAKE_CB && n == 1);
+    if ((uintptr_t)s == BUF_VRAM && (uintptr_t)d == BUF_SCRATCH && r->srcOffset + r->size <= sizeof g_vram &&
+        r->dstOffset + r->size <= sizeof g_arena)
+        memcpy(g_arena + r->dstOffset, g_vram + r->srcOffset, (size_t)r->size);
     lput(&g_pkt, "pkt CopyBuffer 0x%llx->0x%llx %llu->%llu size=%llu\n", (ull)(uintptr_t)s, (ull)(uintptr_t)d,
          (ull)r->srcOffset, (ull)r->dstOffset, (ull)r->size);
 }
@@ -653,6 +700,24 @@ static p_bind_program program(int compute) {
         p.code[0] = MIRROR + 0x1000, p.id[0] = &g_vs;
         p.code[1] = MIRROR + 0x2000, p.id[1] = &g_ps;
     }
+    return p;
+}
+static p_bind_program program_mesh(void) {
+    p_bind_program p;
+    memset(&p, 0, sizeof p);
+    p.stages = (1u << NVN_STAGE_TS) | (1u << NVN_STAGE_MS) | (1u << NVN_STAGE_PS);
+    p.nstage = 3;
+    p.code[0] = MIRROR + 0x3000, p.id[0] = &g_ts;
+    p.code[1] = MIRROR + 0x4000, p.id[1] = &g_ms;
+    p.code[2] = MIRROR + 0x5000, p.id[2] = &g_mps;
+    return p;
+}
+static p_bind_program program_mesh_only(void) {
+    p_bind_program p = program_mesh();
+    p.stages &= ~(1u << NVN_STAGE_TS);
+    p.nstage = 2;
+    p.code[0] = p.code[1], p.id[0] = p.id[1];
+    p.code[1] = p.code[2], p.id[1] = p.id[2];
     return p;
 }
 
@@ -1110,6 +1175,51 @@ static void case_draw_indirect(void) {
     printf("ok draw_indirect\n");
 }
 
+static void case_mesh(void) {
+    open_fakes();
+    g_mesh_pushes = 1;
+    const uint32_t records[2][2] = {{3, 41}, {0, 7}};
+    memcpy(g_vram + 0x100, records, sizeof records);
+    Rec *r = rec_begin(0);
+    p_set_rt rt = one_target(0);
+    put(r, OP_SET_RT, &rt, sizeof rt);
+    PUT(r, OP_VIEWPORTS, (p_viewports){.first = 0, .n = 1, .v = {{0, 0, 64, 32}}});
+    PUT(r, OP_BIND_PROGRAM, program_mesh_only());
+    PUT(r, OP_DRAW_MESH, (p_draw_mesh){.first = 21, .count = 1});
+    PUT(r, OP_BIND_PROGRAM, program_mesh());
+    PUT(r, OP_DRAW_MESH, (p_draw_mesh){.first = 37, .count = 2});
+    PUT(r, OP_DRAW_MESH, (p_draw_mesh){.first = 9, .count = 0});
+    PUT(r, OP_DRAW_MESH_IND, (p_draw_mesh_ind){.ind = VRAM + 0x100});
+    PUT(r, OP_DRAW_MESH_IND, (p_draw_mesh_ind){.ind = VRAM + 0x108});
+    uint64_t h = rec_end(r);
+    vkr_submit(&h, 1);
+    close_fakes();
+    printf("ok mesh\n");
+}
+
+static void case_mesh_restart(void) {
+    open_fakes();
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    p_bind_program mesh = program_mesh_only();
+    mesh.stages |= 1u << NVN_STAGE_VS;
+    PUT(r, OP_BIND_PROGRAM, mesh);
+    PUT(r, OP_DRAW_MESH, (p_draw_mesh){.first = 0, .count = 1});
+    PUT(r, OP_BIND_PROGRAM, program(0));
+    draw3(r, NVN_DRAW_PRIMITIVE_TRIANGLES);
+    PUT(r, OP_PRIM_RESTART, (p_prim_restart){.enable = 1, .index = 0xFFFF});
+    draw3(r, NVN_DRAW_PRIMITIVE_TRIANGLES);
+    PUT(r, OP_BIND_PROGRAM, mesh);
+    PUT(r, OP_DRAW_MESH, (p_draw_mesh){.first = 1, .count = 1});
+    PUT(r, OP_BIND_PROGRAM, program(0));
+    PUT(r, OP_PRIM_RESTART, (p_prim_restart){.enable = 0, .index = 0xFFFF});
+    draw3(r, NVN_DRAW_PRIMITIVE_TRIANGLES);
+    uint64_t h = rec_end(r);
+    vkr_submit(&h, 1);
+    close_fakes();
+    printf("ok mesh_restart\n");
+}
+
 static void case_oplist(void) {
     for (uint32_t op = 0; op < OP_COUNT_; op++) {
         const char *t = vkr_op_ticket(op);
@@ -1300,6 +1410,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(m, "nodrop")) vkr_no_drop = 1;
         else if (!strcmp(m, "nodeclare")) vkr_no_declare = 1;
         else if (!strcmp(m, "nofeatures")) vkr_no_features = 1;
+        else if (!strcmp(m, "nofirsttask")) vkr_no_first_task = 1;
         else if (!strcmp(m, "nopending")) vkr_no_pending = 1;
         else if (!strcmp(m, "reverse")) vkr_reverse_results = 1;
         else {
@@ -1325,6 +1436,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "features")) case_features();
     else if (!strcmp(cs, "dual_two_targets")) case_dual_two_targets();
     else if (!strcmp(cs, "draw_indirect")) case_draw_indirect();
+    else if (!strcmp(cs, "mesh")) case_mesh();
+    else if (!strcmp(cs, "mesh_restart")) case_mesh_restart();
     else if (!strcmp(cs, "stop") && argc >= 3) case_stop((uint32_t)strtoul(argv[2], NULL, 10));
     else if (!strcmp(cs, "broken")) case_broken();
     else if (!strcmp(cs, "reports")) case_reports();

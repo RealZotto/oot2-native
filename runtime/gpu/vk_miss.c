@@ -51,7 +51,7 @@ static const VkmOps g_device = {
 typedef struct Job {
     struct Job *next;
     char key[KEY_MAX];
-    VkpStage vs, ps;        // the stage records are immortal (the programs and state study), so the keys and shapes stay valid
+    VkpStage vs, task, ps;  // the stage records are immortal (the programs and state study), so keys and shapes stay valid
     VkpFormats formats;
     const VkmOps *ops;
     int late;               // set (release) by the replay once it stopped waiting for this build
@@ -186,7 +186,7 @@ static void reap_jobs(void) {
 
 static void job_main(void *arg) {
     Job *j = arg;
-    VkPipeline p = j->ops->build_graphics(&j->vs, &j->ps, &j->formats, &j->late);
+    VkPipeline p = j->ops->build_graphics(&j->vs, j->task.key ? &j->task : NULL, &j->ps, &j->formats, &j->late);
     plat_mutex_lock(&M.lock);
     j->result = p;
     j->done = 1;   // j is not touched after the unlock
@@ -228,24 +228,27 @@ static void skip_note(const VkpStage *vs, const VkpStage *ps, uint64_t waited_ns
     plat_mutex_unlock(&M.lock);
     if (!vkm_no_count_skip) capture_count(CAPTURE_SKIPPED_DRAWS, 1);
     if (!say) return;
+    const char *kind = vs->shape && vs->shape->kind == NVN_STAGE_MS ? "mesh" : "vertex";
     if (pending)
-        rt_log("gfx: vulkan: draw skipped: the graphics pipeline of vertex stage %s and pixel stage %s is still being built "
-               "(skipped draws so far: %llu)", vs->key, ps->key, (unsigned long long)total);
+        rt_log("gfx: vulkan: draw skipped: the graphics pipeline of %s stage %s and pixel stage %s is still being built "
+               "(skipped draws so far: %llu)", kind, vs->key, ps->key,
+               (unsigned long long)total);
     else
-        rt_log("gfx: vulkan: draw skipped: the graphics pipeline of vertex stage %s and pixel stage %s was not ready after "
-               "%.0f ms (bound %.0f ms); its build goes on (skipped draws so far: %llu)", vs->key, ps->key, ms(waited_ns),
-               ms(c->bound_ns), (unsigned long long)total);
+        rt_log("gfx: vulkan: draw skipped: the graphics pipeline of %s stage %s and pixel stage %s was not ready after "
+               "%.0f ms (bound %.0f ms); its build goes on (skipped draws so far: %llu)", kind, vs->key, ps->key,
+               ms(waited_ns), ms(c->bound_ns), (unsigned long long)total);
 }
 
 // ---------- graphics
-VkPipeline vkm_graphics(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats, int may_skip) {
+VkPipeline vkm_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
+                        int may_skip) {
     const VkmOps *o = ops();
-    VkPipeline p = o->find_graphics(vs, ps, formats);
+    VkPipeline p = o->find_graphics(vs, task, ps, formats);
     if (p) return p;
     reap_jobs();
     VkmConfig cfg = config();
     char key[KEY_MAX];
-    o->graphics_key(vs, ps, formats, key, sizeof key);
+    o->graphics_key(vs, task, ps, formats, key, sizeof key);
     uint64_t t0 = o->now_ns();
 
     // A build of this very pipeline that an earlier draw gave up waiting for: skip at once, or wait for it.
@@ -274,6 +277,7 @@ VkPipeline vkm_graphics(const VkpStage *vs, const VkpStage *ps, const VkpFormats
     if (!j) rt_fatal("gfx: vulkan: out of memory for a pipeline build");
     snprintf(j->key, sizeof j->key, "%s", key);
     j->vs = *vs, j->ps = *ps, j->formats = *formats, j->ops = o;
+    if (task) j->task = *task;
     uint64_t build0 = o->now_ns();
     plat_mutex_lock(&M.lock);
     j->next = M.jobs, M.jobs = j;
@@ -312,9 +316,10 @@ VkPipeline vkm_graphics(const VkpStage *vs, const VkpStage *ps, const VkpFormats
     plat_mutex_unlock(&M.lock);
     stall_note(0, stall);
     if (say)
-        rt_log("gfx: vulkan: pipeline miss (graphics): vertex stage %s, pixel stage %s: %llu submission(s) drained in "
-               "%.1f ms, built in %.1f ms, the replay waited %.1f ms%s", vs->key, ps->key, (unsigned long long)waited,
-               ms(drain_ns), ms(built), ms(stall),
+        rt_log("gfx: vulkan: pipeline miss (graphics): %s stage %s, pixel stage %s: %llu submission(s) drained in "
+               "%.1f ms, built in %.1f ms, the replay waited %.1f ms%s",
+               vs->shape && vs->shape->kind == NVN_STAGE_MS ? "mesh" : "vertex", vs->key, ps->key,
+               (unsigned long long)waited, ms(drain_ns), ms(built), ms(stall),
                !over ? "" : cfg.unbounded ? " (past the bound: without the override this draw would have been skipped)"
                                            : " (past the bound, but the draw's target holds no earlier picture: waited)");
     return p;

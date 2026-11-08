@@ -58,7 +58,7 @@ enum { K_LIBRARY, K_LINK, K_COMPUTE };
 typedef struct Obj {
     struct Obj *next;
     char key[KEY_MAX];
-    char ref[2][32];       // the stage keys this object was made from, for vkp_release
+    char ref[3][32];       // the stage keys this object was made from, for vkp_release
     VkPipeline pipe;
     int ready;
 } Obj;
@@ -104,7 +104,7 @@ static void shape_text(const VkpStage *s, char *out, size_t cap) {
 
 static void digest_text(const VkpStage *s, char *out, size_t cap) {
     out[0] = 0;
-    if (!s->answers) return;
+    if (!s || !s->answers) return;
     static const uint8_t zero[SHC_DIGEST_BYTES];
     if (!memcmp(s->answers, zero, sizeof zero)) return;
     snprintf(out, cap, "@%02x%02x%02x%02x%02x%02x%02x%02x", s->answers[0], s->answers[1], s->answers[2], s->answers[3],
@@ -156,7 +156,7 @@ static Obj *find_locked(uint32_t h, const char *key) {
 typedef VkPipeline (*BuildFn)(void *ctx);
 
 // The object under key, made by build(ctx) the first time it is asked for, once however many threads ask.
-static VkPipeline obj_get(const char *key, const char *ref0, const char *ref1, BuildFn build, void *ctx) {
+static VkPipeline obj_get(const char *key, const char *ref0, const char *ref1, const char *ref2, BuildFn build, void *ctx) {
     uint32_t h = hash_key(key);
     plat_mutex_lock(&P.lock);
     for (;;) {
@@ -174,6 +174,7 @@ static VkPipeline obj_get(const char *key, const char *ref0, const char *ref1, B
     snprintf(o->key, sizeof o->key, "%s", key);
     if (ref0) snprintf(o->ref[0], sizeof o->ref[0], "%s", ref0);
     if (ref1) snprintf(o->ref[1], sizeof o->ref[1], "%s", ref1);
+    if (ref2) snprintf(o->ref[2], sizeof o->ref[2], "%s", ref2);
     o->next = P.tab[h];
     P.tab[h] = o;
     plat_mutex_unlock(&P.lock);
@@ -265,7 +266,7 @@ typedef struct PipeInfo {
     VkPipelineRenderingCreateInfo rendering;
     VkDynamicState dyn[VKP_MAX_DYNAMIC];
     VkPipelineDynamicStateCreateInfo dynamic;
-    VkPipelineShaderStageCreateInfo stage;
+    VkPipelineShaderStageCreateInfo stage[2];
     VkGraphicsPipelineLibraryCreateInfoEXT lib;
     VkGraphicsPipelineCreateInfo gp;
 } PipeInfo;
@@ -300,7 +301,7 @@ static void pipe_info(PipeInfo *p, VkGraphicsPipelineLibraryFlagsEXT part, VkSha
                                                     .dynamicStateCount = nd, .pDynamicStates = p->dyn};
     uint32_t ns = 0;
     if (module) {
-        p->stage = (VkPipelineShaderStageCreateInfo){
+        p->stage[0] = (VkPipelineShaderStageCreateInfo){
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = (part & PART_PRE_RASTER) ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT, .module = module,
             .pName = "main"};
@@ -312,11 +313,46 @@ static void pipe_info(PipeInfo *p, VkGraphicsPipelineLibraryFlagsEXT part, VkSha
         vin = (part & PART_VERTEX_INPUT) != 0;
     p->gp = (VkGraphicsPipelineCreateInfo){
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &p->lib, .flags = LIB_FLAGS, .stageCount = ns,
-        .pStages = ns ? &p->stage : NULL, .pVertexInputState = vin ? &p->vis : NULL,
+        .pStages = ns ? p->stage : NULL, .pVertexInputState = vin ? &p->vis : NULL,
         .pInputAssemblyState = vin ? &p->ias : NULL, .pViewportState = pre ? &p->vps : NULL,
         .pRasterizationState = pre ? &p->rs : NULL, .pMultisampleState = (frag || out) ? &p->ms : NULL,
         .pDepthStencilState = frag ? &p->ds : NULL, .pColorBlendState = out ? &p->cbs : NULL, .pDynamicState = &p->dynamic,
         .layout = (pre || frag) ? P.lay.graphics : VK_NULL_HANDLE};
+}
+
+typedef struct MeshCtx {
+    const VkpStage *task, *mesh;
+    const VkpModule *task_module, *mesh_module;
+    const int *late;
+} MeshCtx;
+
+static VkPipeline create_graphics(VkGraphicsPipelineCreateInfo ci, int kind, int flags, const char *what);
+
+static VkPipeline build_mesh_library(void *c) {
+    MeshCtx *x = c;
+    require_idle("a mesh pre-rasterization library would be created", x->mesh->key, x->late);
+    check_capabilities(x->mesh, x->mesh_module);
+    VkShaderModule task = VK_NULL_HANDLE;
+    if (x->task) {
+        check_capabilities(x->task, x->task_module);
+        task = make_module(x->task_module->code, x->task_module->bytes / 4);
+    }
+    VkShaderModule mesh = make_module(x->mesh_module->code, x->mesh_module->bytes / 4);
+    PipeInfo pi;
+    pipe_info(&pi, PART_PRE_RASTER, NULL, NULL);
+    uint32_t n = 0;
+    if (task)
+        pi.stage[n++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                          .stage = VK_SHADER_STAGE_TASK_BIT_EXT, .module = task,
+                                                          .pName = "main"};
+    pi.stage[n++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                      .stage = VK_SHADER_STAGE_MESH_BIT_EXT, .module = mesh,
+                                                      .pName = "main"};
+    pi.gp.stageCount = n, pi.gp.pStages = pi.stage;
+    VkPipeline p = create_graphics(pi.gp, K_LIBRARY, LIB_SHADER, "vkCreateGraphicsPipelines (mesh pre-rasterization library)");
+    if (task) vkDestroyShaderModule(gpu_vk.device, task, NULL);
+    vkDestroyShaderModule(gpu_vk.device, mesh, NULL);
+    return p;
 }
 
 // vkCreateGraphicsPipelines through the cache, with creation feedback; a failed call is gpu_vk_failed's.
@@ -416,7 +452,7 @@ static void formats_text(const VkpFormats *f, char *out, size_t cap) {
 // ---------- graphics pipelines
 
 typedef struct LinkCtx {
-    const VkpStage *vs, *ps;
+    const VkpStage *vs, *task, *ps;
     const VkpFormats *formats;
     const int *late;
     char vkey[KEY_MAX], pkey[KEY_MAX], okey[KEY_MAX];
@@ -444,7 +480,7 @@ typedef struct LibJob {
 
 static void lib_job_main(void *arg) {
     LibJob *j = arg;
-    obj_get(j->key, j->ref, NULL, j->fn, j->ctx);
+    obj_get(j->key, j->ref, NULL, NULL, j->fn, j->ctx);
     plat_mutex_lock(&P.lock);
     j->done = 1;   // j is not touched after the unlock
     plat_cond_broadcast(&P.cond);
@@ -453,6 +489,45 @@ static void lib_job_main(void *arg) {
 
 static VkPipeline build_link(void *c) {
     LinkCtx *x = c;
+    if (x->vs->shape && x->vs->shape->kind == NVN_STAGE_MS) {
+        VkpModule tm = {0}, mm, pm;
+        if (x->task) vkp_module(x->task, SHD_TS, &tm);
+        vkp_module(x->vs, SHD_MS, &mm);
+        vkp_module(x->ps, SHD_PS, &pm);
+        char why[256], md[24], td[24], pd[24], ft[96];
+        ShdPad unused[MAX_PADS];
+        int missing = shd_pad_set(&mm.desc, &pm.desc, unused, MAX_PADS, why, sizeof why);
+        if (missing < 0)
+            rt_fatal("gfx: vulkan: mesh stage %s cannot be linked to pixel stage %s: %s", x->vs->key, x->ps->key, why);
+        if (missing)
+            rt_fatal("gfx: vulkan: mesh stage %s does not write %d interface ranges read by pixel stage %s",
+                     x->vs->key, missing, x->ps->key);
+
+        MeshCtx mx = {.task = x->task, .mesh = x->vs, .task_module = x->task ? &tm : NULL, .mesh_module = &mm,
+                      .late = x->late};
+        digest_text(x->vs, md, sizeof md);
+        if (x->task) {
+            digest_text(x->task, td, sizeof td);
+            snprintf(x->vkey, sizeof x->vkey, "m|t:%s%s|m:%s%s", x->task->key, td, x->vs->key, md);
+        } else snprintf(x->vkey, sizeof x->vkey, "m|m:%s%s", x->vs->key, md);
+        digest_text(x->ps, pd, sizeof pd);
+        snprintf(x->pkey, sizeof x->pkey, "f|%s%s", x->ps->key, pd);
+        formats_text(x->formats, ft, sizeof ft);
+        snprintf(x->okey, sizeof x->okey, "o|%s", ft);
+        OutputCtx ox = {.formats = x->formats, .late = x->late};
+        VkPipeline pre = obj_get(x->vkey, x->task ? x->task->key : NULL, x->vs->key, NULL, build_mesh_library, &mx);
+        VkPipeline out = obj_get(x->okey, NULL, NULL, NULL, build_output_library, &ox);
+        FragmentCtx fx = {.stage = x->ps, .module = &pm, .late = x->late};
+        VkPipeline frag = obj_get(x->pkey, x->ps->key, NULL, NULL, build_fragment_library, &fx);
+        VkPipeline libs[3] = {pre, frag, out};
+        VkPipelineLibraryCreateInfoKHR li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+                                             .libraryCount = 3, .pLibraries = libs};
+        VkGraphicsPipelineCreateInfo gp = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &li,
+                                           .layout = P.lay.graphics};
+        require_idle("a mesh pipeline would be linked", x->vs->key, x->late);
+        return create_graphics(gp, K_LINK, 0, "vkCreateGraphicsPipelines (mesh fast link)");
+    }
+    if (x->task) rt_fatal("gfx: vulkan: a task stage is bound without a mesh stage");
     VkpModule vm, pm;
     vkp_module(x->vs, SHD_VS, &vm);
     vkp_module(x->ps, SHD_PS, &pm);
@@ -479,15 +554,15 @@ static VkPipeline build_link(void *c) {
     LibJob fj = {x->pkey, x->ps->key, build_fragment_library, &fx, 0};
     PlatThread *helper = NULL;
     if (!obj_ready(x->vkey) && !obj_ready(x->pkey)) helper = plat_thread_start(lib_job_main, &fj, HELPER_STACK);
-    VkPipeline pre = obj_get(x->vkey, x->vs->key, NULL, build_vertex_library, &vx);
-    VkPipeline out = obj_get(x->okey, NULL, NULL, build_output_library, &ox);
+    VkPipeline pre = obj_get(x->vkey, x->vs->key, NULL, NULL, build_vertex_library, &vx);
+    VkPipeline out = obj_get(x->okey, NULL, NULL, NULL, build_output_library, &ox);
     if (helper) {
         plat_mutex_lock(&P.lock);
         while (!fj.done) plat_cond_wait(&P.cond, &P.lock);
         plat_mutex_unlock(&P.lock);
         plat_thread_free(helper);
     }
-    VkPipeline frag = obj_get(x->pkey, x->ps->key, NULL, build_fragment_library, &fx);
+    VkPipeline frag = obj_get(x->pkey, x->ps->key, NULL, NULL, build_fragment_library, &fx);
 
     require_idle("a pipeline would be linked", x->vs->key, x->late);
     VkPipeline libs[4] = {P.vi, pre, frag, out};
@@ -498,31 +573,40 @@ static VkPipeline build_link(void *c) {
     return create_graphics(gp, K_LINK, 0, "vkCreateGraphicsPipelines (fast link)");
 }
 
-void vkp_graphics_key(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats, char *out, size_t cap) {
-    char vd[24], pd[24], ft[96];
+void vkp_graphics_key(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
+                      char *out, size_t cap) {
+    char vd[24], td[24], pd[24], ft[96];
     digest_text(vs, vd, sizeof vd);
+    digest_text(task, td, sizeof td);
     digest_text(ps, pd, sizeof pd);
     formats_text(formats, ft, sizeof ft);
-    snprintf(out, cap, "g|%s%s|%s%s|%s", vs->key, vd, ps->key, pd, ft);
+    if (vs->shape && vs->shape->kind == NVN_STAGE_MS) {
+        if (task) snprintf(out, cap, "g|t:%s%s|m:%s%s|p:%s%s|%s", task->key, td, vs->key, vd, ps->key, pd, ft);
+        else snprintf(out, cap, "g|m:%s%s|p:%s%s|%s", vs->key, vd, ps->key, pd, ft);
+    } else {
+        if (task) rt_fatal("gfx: vulkan: a task stage is bound without a mesh stage");
+        snprintf(out, cap, "g|%s%s|%s%s|%s", vs->key, vd, ps->key, pd, ft);
+    }
 }
 
-VkPipeline vkp_graphics_ex(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats, const int *late) {
+VkPipeline vkp_graphics_ex(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
+                           const int *late) {
     if (!P.open) rt_fatal("gfx: vulkan: vkp_graphics before vkp_open");
     if (formats->ncolor > VKP_MAX_COLOR) rt_fatal("gfx: vulkan: a pipeline with %u colour attachments", formats->ncolor);
-    LinkCtx x = {.vs = vs, .ps = ps, .formats = formats, .late = late};
+    LinkCtx x = {.vs = vs, .task = task, .ps = ps, .formats = formats, .late = late};
     char key[KEY_MAX];
-    vkp_graphics_key(vs, ps, formats, key, sizeof key);
-    return obj_get(key, vs->key, ps->key, build_link, &x);
+    vkp_graphics_key(vs, task, ps, formats, key, sizeof key);
+    return obj_get(key, task ? task->key : vs->key, vs->key, ps->key, build_link, &x);
 }
 
-VkPipeline vkp_graphics(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats) {
-    return vkp_graphics_ex(vs, ps, formats, NULL);
+VkPipeline vkp_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats) {
+    return vkp_graphics_ex(vs, task, ps, formats, NULL);
 }
 
-VkPipeline vkp_find_graphics(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats) {
+VkPipeline vkp_find_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats) {
     if (!P.open) return VK_NULL_HANDLE;
     char key[KEY_MAX];
-    vkp_graphics_key(vs, ps, formats, key, sizeof key);
+    vkp_graphics_key(vs, task, ps, formats, key, sizeof key);
     uint32_t h = hash_key(key);
     plat_mutex_lock(&P.lock);
     Obj *o = find_locked(h, key);
@@ -590,7 +674,7 @@ VkPipeline vkp_compute_ex(const VkpStage *cs, const int *late) {
     ComputeCtx x = {.stage = cs, .late = late};
     char key[KEY_MAX];
     compute_key(cs, key, sizeof key);
-    return obj_get(key, cs->key, NULL, build_compute, &x);
+    return obj_get(key, cs->key, NULL, NULL, build_compute, &x);
 }
 
 VkPipeline vkp_compute(const VkpStage *cs) { return vkp_compute_ex(cs, NULL); }
@@ -661,7 +745,7 @@ void vkp_release(const char *key) {
         Obj **at = &P.tab[b];
         while (*at) {
             Obj *o = *at;
-            if (o->ready && (!strcmp(o->ref[0], key) || !strcmp(o->ref[1], key))) {
+            if (o->ready && (!strcmp(o->ref[0], key) || !strcmp(o->ref[1], key) || !strcmp(o->ref[2], key))) {
                 *at = o->next;
                 vkDestroyPipeline(gpu_vk.device, o->pipe, NULL);
                 P.stats.resident--;

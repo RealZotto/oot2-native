@@ -16,6 +16,9 @@ real graphics miss in the middle of a frame with a submission the device holds (
 own check that nothing is created with work in flight agrees); a pipeline bound in a command buffer the device holds is
 released, and destroyed only after the device finished it; a build past a 1 ms bound goes on beside work in flight.
 
+The no-device miss tests also check that the optional task stage survives the asynchronous graphics build and that a
+vertex-only miss does not invent one.
+
 Each check has a counter-run, a test-only switch of vk_miss_test that breaks the mechanism the check is for: a miss that
 does not drain, a skip that is not counted, a released key destroyed at once, a build that is not told the replay stopped
 waiting. The check must then fail.
@@ -85,6 +88,9 @@ class MissBase(unittest.TestCase):
 
 
 class MissPathTest(MissBase):
+    def test_a_task_stage_survives_the_asynchronous_graphics_build(self) -> None:
+        self.passes("task_stage")
+
     def test_a_miss_in_the_middle_of_a_frame_drains_the_ring_and_the_timeline_before_it_builds(self) -> None:
         out = self.passes("drain_order")
         line = next(l for l in out if l.startswith("at the build:"))

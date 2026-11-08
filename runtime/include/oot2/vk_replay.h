@@ -111,7 +111,8 @@ typedef struct VkReplayOps {
     // The pipeline of a graphics draw and of a dispatch (the device's: the miss path, oot2/vk_miss.h) and the layouts
     // the replay binds against. graphics answers NULL for a draw to skip, which it does only when may_skip is set (every
     // colour and depth target of the pass holds an earlier frame's picture); compute never does.
-    VkPipeline (*graphics)(const VkpStage *vs, const VkpStage *ps, const VkpFormats *formats, int may_skip);
+    VkPipeline (*graphics)(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
+                           int may_skip);
     VkPipeline (*compute)(const VkpStage *cs);
     // A bind of a program (by serial, with its stage records), at every bind: the device counts the stage keys live
     // programs hold, and a repeated bind of a serial changes nothing unless the program was finalized since
@@ -141,6 +142,10 @@ typedef struct VkReplayOps {
     // `bytes` of host-visible memory the device reads, for the frame `value` (freed once it is done): the pointer, and
     // the buffer and offset that bind it. Offsets are aligned to `align`.
     void *(*scratch)(uint64_t value, uint32_t bytes, uint32_t align, VkBuffer *buffer, VkDeviceSize *offset);
+    // The device address of a replay scratch buffer (mesh draws use one word for first_task).
+    VkDeviceAddress (*buffer_address)(VkBuffer buffer);
+    // Allocate and write a set 2 for a task stage; NULL is a named stop when the stage has descriptors.
+    VkDescriptorSet (*task_set)(uint64_t value, uint32_t n, const VkWriteDescriptorSet *writes);
     // The page table for a raw-access stage of the frame `value` (gpu_vk_raw_begin): the push words 0 to 3. NULL: a
     // raw-access stage stops by name.
     void (*raw)(uint64_t value, uint32_t push[4]);
@@ -186,6 +191,8 @@ extern int vkr_no_declare;
 // Tests only: while non-zero, the dynamic state of the core features (line and point fill, depth bias clamp, depth
 // clamp, depth bounds, wide lines, more than one viewport) is left at the default a device without them would say.
 extern int vkr_no_features;
+// Tests only: while non-zero, mesh draws push no first-task address (the counter-run of the mesh ABI).
+extern int vkr_no_first_task;
 // Tests only, the counter-runs of the reports (vk_replay_report.c): the condition reads memory even under a report not
 // done yet; samples passed are never counted; a timestamp is the tick at replay, not at completion; the completion
 // thread walks a frame's events and reports backwards.
