@@ -91,6 +91,8 @@ int vkp_store_open_map(const char *base, const char *variants, const char *map, 
 void vkp_store_close(void);
 // Copy a full ledger-row digest into a stage for map-aware module, binding, and pipeline-key resolution.
 void vkp_stage_set_ledger_digest(VkpStage *stage, const uint8_t digest[SHC_DIGEST_BYTES]);
+// The selected pack entry's answers digest, or zero for the base entry or a missing module.
+void vkp_stage_content_digest(const VkpStage *stage, uint8_t digest[SHC_DIGEST_BYTES]);
 // The module of stage s, whose description must name stage kind `expect` (SHD_*) and say it fits its layout. A named
 // fatal otherwise (no row, a failure record, a description that cannot be read or is of another stage).
 void vkp_module(const VkpStage *s, int expect, VkpModule *out);

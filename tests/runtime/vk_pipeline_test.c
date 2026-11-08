@@ -436,7 +436,7 @@ static int parse_sha256(const char *text, uint8_t digest[32]) {
 }
 
 static void case_storemap(const char *base, const char *variants, const char *map, const char *key, const char *kind,
-                          const char *shape, const char *digest_text) {
+                          const char *shape, const char *digest_text, const char *identity_mode) {
     char why[512];
     uint8_t digest[32];
     if (!vkp_store_open_map(base, strcmp(variants, "-") ? variants : NULL, strcmp(map, "-") ? map : NULL,
@@ -457,6 +457,12 @@ static void case_storemap(const char *base, const char *variants, const char *ma
     char pipeline_key[512];
     vkp_graphics_key(&s, NULL, &s, &formats, pipeline_key, sizeof pipeline_key);
     printf("key %s\n", pipeline_key);
+    uint8_t content_digest[SHC_DIGEST_BYTES];
+    vkp_stage_content_digest(&s, content_digest);
+    if (!strcmp(identity_mode, "raw")) memcpy(content_digest, digest, sizeof content_digest);
+    printf("content ");
+    for (size_t i = 0; i < sizeof content_digest; i++) printf("%02x", content_digest[i]);
+    printf("\n");
     static VkpModule m;
     vkp_module(&s, kind_of(kind), &m);
     VkpStats stats;
@@ -1088,7 +1094,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "cachejudge")) case_cachejudge();
     else if (!strcmp(cs, "store") && argc >= 7) case_store(argv[2], argv[3], argv[4], argv[5], argv[6]);
     else if (!strcmp(cs, "storemap") && argc >= 9)
-        case_storemap(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8]);
+        case_storemap(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8], argc > 9 ? argv[9] : "");
     else if (!strcmp(cs, "storeopen") && argc >= 4) case_storeopen(argv[2], argv[3]);
     else if (!strcmp(cs, "usable")) case_usable();
     else if (!strcmp(cs, "caps") && argc >= 4) case_caps(argv[2], argv[3], argc - 4, argv + 4);

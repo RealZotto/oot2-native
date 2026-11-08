@@ -99,6 +99,16 @@ void vkp_stage_set_ledger_digest(VkpStage *stage, const uint8_t digest[SHC_DIGES
     stage->has_ledger_digest = 1;
 }
 
+void vkp_stage_content_digest(const VkpStage *stage, uint8_t digest[SHC_DIGEST_BYTES]) {
+    memset(digest, 0, SHC_DIGEST_BYTES);
+    if (!P.store_open || !stage || !stage->key) return;
+    ShcEntry entry;
+    int from = stage->has_ledger_digest
+                   ? shc_set_find_ledger(&P.set, stage->key, stage->ledger_digest, &entry, NULL)
+                   : shc_set_find(&P.set, stage->key, stage->answers, &entry);
+    if (from != SHC_MISS) memcpy(digest, entry.answers, SHC_DIGEST_BYTES);
+}
+
 void vkp_store_close(void) {
     if (P.store_open) shc_set_close(&P.set);
     P.store_open = 0;
