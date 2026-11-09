@@ -29,8 +29,11 @@ and driver) and keeps it as the seed every builder starts from, so that the prog
 by the driver in a millisecond or so and only the changed ones build cold. A cache that fails a check is dropped, deleted,
 and the drop is named in the log and in the record (`seed`); the step then builds from an empty cache as it always did.
 `--pipelines-cold` takes no seed, because it exists to time a cold build. A seeded builder saves only when it is recycled
-and at the end (a flush would hand it an empty cache and the seed would stop serving), so a stopped seeded run keeps the
-seed and nothing built since it started.
+and at the end (a flush would hand it an empty cache and the seed would stop serving). A stopped seeded run keeps the seed
+and the segments its builders saved before the stop (on the same key those items are not built again; only a change of
+the key wipes them), and loses what each builder built since its last save. The merged cache keeps the entries of modules
+that no longer exist, so it grows with every key change that rebuilt much; `--pipelines-cold` is the only prune, and the
+step warns when the cache is more than half as large again as the seed it started from.
 
 What it does not build. Task and mesh pipelines wait for the mesh draws ticket and are counted as not built, so the
 totals are a lower bound. Vertex libraries are built as translated, without padding: a pixel stage that reads an
@@ -320,8 +323,6 @@ class Pipelines(Step):
                            # that flushed on its timer would serve the seed only until the first flush and build every
                            # later unchanged program cold. It saves when it is recycled and at the end instead.
                            flush_seconds=float("inf") if seed.used else None)
-        if seed.used:
-            p.recycle_bytes += seed.bytes        # a builder holding the seed is not a builder holding a big build
         t0 = time.monotonic()
         try:
             if todo:
@@ -339,7 +340,8 @@ class Pipelines(Step):
         finally:
             progress_file.close()
         build_seconds = time.monotonic() - t0
-        seed = builders_judge_seed(rep, seed, p.cache_seen)
+        thin = thin_starts(seed, p.seeded_seen)
+        seed = builders_judge_seed(rep, seed, p.cache_seen, p.seeded_seen)
 
         done = {k: r for k, r in results.items() if r.status == "ok"}
         failed = sorted(k for k, r in results.items() if r.status != "ok")
@@ -349,6 +351,7 @@ class Pipelines(Step):
                                f"what is broken; the first reason: {first}: {results[first].message if failed else ''}. "
                                f"The builders' logs are in {logs}.")
         merged = merge(ctx, builder, env, scratch, segments, out / CACHE)
+        warn_cache_growth(rep, seed, merged["bytes"])
         write_times(out / TIMES, results)
         shutil.rmtree(scratch, ignore_errors=True)
         pipeseed.discard(seed_dir)               # the merged cache holds it
@@ -394,7 +397,7 @@ class Pipelines(Step):
             "recycled": p.stats.recycled,
             "lost": p.stats.lost,
             "cold": cold,
-            "seed": {**seed.record(), "starts_loaded": p.cache_seen.get("loaded", 0)},   # builder starts, restarts included
+            "seed": {**seed.record(), "starts_loaded": p.cache_seen.get("loaded", 0) - thin},   # builder starts, restarts included
             "validation": env.get("OOT2_VK_VALIDATION") or "off",
             "validation_errors": p.stats.validation_errors,
             "validation_warnings": p.stats.validation_warnings,
@@ -417,16 +420,40 @@ def say_seed(rep, seed: pipeseed.Seed) -> None:
         rep.say(f"pipelines: no seed: {seed.reason}")
 
 
-def builders_judge_seed(rep, seed: pipeseed.Seed, seen: dict[str, int]) -> pipeseed.Seed:
+def thin_starts(seed: pipeseed.Seed, held: list[int]) -> int:
+    """How many builders that said they loaded the seed hold under half of it (the ready line's seeded=, the bytes the driver
+    holds once it has loaded the cache). The header alone passes the builder's own judgement (cache=loaded); a body that is
+    cut or damaged is ignored by the driver, which then serves nothing, and only this number tells."""
+    return sum(1 for n in held if n * 2 < seed.bytes) if seed.used else 0
+
+
+def builders_judge_seed(rep, seed: pipeseed.Seed, seen: dict[str, int], held: list[int] | None = None) -> pipeseed.Seed:
     """The builders judge the seed again when they start (pipebuild serve --cache) and say what they made of it in the
-    ready line. One that did not load it started from an empty cache, so the seed did not do its work: say so."""
+    ready line. One that did not load it, or loaded it and holds under half of its bytes, started from an empty cache or
+    nearly, so the seed did not do its work: say so."""
     refused = {state: n for state, n in seen.items() if state != "loaded"}
-    if not seed.used or not refused:
+    thin = thin_starts(seed, held or [])
+    if not seed.used or not (refused or thin):
         return seed
-    said = ", ".join(f"{n} said {state}" for state, n in sorted(refused.items()))
-    reason = f"the builder judged it unusable when it started ({said}) and began from an empty cache"
+    said = [f"{n} said {state}" for state, n in sorted(refused.items())]
+    if thin:
+        said.append(f"{thin} said loaded and hold {min(n for n in held if n * 2 < seed.bytes):,} bytes or less of the "
+                    f"{seed.bytes:,}-byte seed, so the driver ignored its body")
+    reason = f"the builder judged it unusable when it started ({', '.join(said)}) and began from an empty cache"
     rep.warning(f"pipelines: the seed was not used by every builder: {reason}. The programs it holds built cold again.")
     return pipeseed.Seed(pipeseed.DROPPED, seed.bytes, seed.source, reason)
+
+
+GROWTH_WARNING = 1.5
+
+
+def warn_cache_growth(rep, seed: pipeseed.Seed, merged_bytes: int) -> None:
+    """The merge keeps the entries of modules that no longer exist, so each key change that rebuilt much adds a copy of
+    what it rebuilt. Name it when the cache is over GROWTH_WARNING times the seed it came from."""
+    if seed.used and merged_bytes > GROWTH_WARNING * seed.bytes:
+        rep.warning(f"pipelines: the cache grew from {seed.bytes / GiB:.2f} to {merged_bytes / GiB:.2f} GiB: the seed's "
+                    "entries of modules that no longer exist are kept, so every key change that rebuilds much adds a "
+                    "copy. `--pipelines-cold` builds a cache with none of them.")
 
 
 # --- the work ---------------------------------------------------------------------------------------------------

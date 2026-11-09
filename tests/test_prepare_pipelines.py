@@ -70,7 +70,7 @@ def serve(args):
         sys.stderr.write("FATAL: gfx: vulkan: stand-in has no device\n")
         sys.exit(70)
     say(f"ready vendor={cfg.get('vendor', '10de')} device={cfg.get('device', '2486')} driver={cfg.get('driver', '0009a000')} "
-        f"api=1.4.351 cache_uuid={cfg.get('uuid', 'ab' * 16)} cache={state} seeded={seeded_bytes}"
+        f"api=1.4.351 cache_uuid={cfg.get('uuid', 'ab' * 16)} cache={state} seeded={cfg.get('seeded', seeded_bytes)}"
         + ("" if cfg.get("older_runtime") else f" zero_workgroup={cfg.get('zero_workgroup', 1)}")
         + " name=Stand-in")
     built = list(seeded)               # the real builder's first segment holds the seed it was given
@@ -117,8 +117,9 @@ def serve(args):
             if key in cfg.get("hang", []):
                 time.sleep(60)
             time.sleep(cfg.get("delay", 0))
-            if key not in built:
-                built.append(key)
+            stored = key + "x" if key in cfg.get("renamed", []) else key      # a module whose entry is a new one
+            if stored not in built:
+                built.append(stored)
             say("ok", kind, key, 1000 + len(key), 1 if key in seeded and key not in cfg.get("cold_keys", []) else 0, 100 * (1 + len(key)))
         elif w[0] == "flush":
             if cfg.get("flush_fail"):
@@ -126,9 +127,14 @@ def serve(args):
                 continue
             path = os.path.join(segments, w[1] + ".bin")
             data = "".join(k + "\n" for k in built)
+            began = time.time()
+            time.sleep(cfg.get("flush_delay", 0))      # the real flush copies the whole cache, which takes a while
             with open(path + ".tmp", "w") as f:
                 f.write(data)
             os.replace(path + ".tmp", path)
+            if log:                                    # the span of this flush, in a file of this process (the shared log
+                with open(log + ".flush%d" % os.getpid(), "a") as f:   # can lose a line when two processes append at once)
+                    f.write("%r %r\n" % (began, time.time()))
             note("flush " + w[1] + " " + " ".join(built))
             built = []
             seeded = []                # like vkp_cache_flush: the builder goes on with an empty cache, the seed is gone

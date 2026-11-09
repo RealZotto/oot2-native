@@ -27,6 +27,11 @@ cache, so a segment holds only what was built since the last one and each byte i
 items of a segment in the progress file only after the worker says the segment is saved, so the record never leads the
 cache: a run that stops loses at most one interval per worker. The next run with the same key skips every recorded item
 whose segment is still there. When everything is built, the builder merges the segments into one cache file.
+
+A seeded builder (tools/prepare/pipeseed.py) is not flushed on a timer, because a flush hands it an empty cache and the
+seed would stop serving. It saves when it is recycled and at the end, and every one of its segments holds the whole seed
+beside what it built, so a stopped seeded run loses what its workers built since their last save, which can be all of
+what they built since they started. Segments saved before the stop stay, on the same key, and their items are skipped.
 """
 
 from __future__ import annotations
@@ -278,6 +283,7 @@ class Child:
         self.replies: queue.Queue[str | None] = queue.Queue()
         self.ws = 0
         self.ws_peak = 0
+        self.base_ws = 0                # the working set right after ready, for a builder that loaded a seed
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self) -> None:
@@ -378,6 +384,8 @@ class Pool:
         self.runtime = runtime or {}     # fields of it that name the runtime the builder was linked with (zero_workgroup)
         self.runtime_seen: dict[str, str] = {}
         self.cache_seen: dict[str, int] = {}   # what each builder's ready line said of the cache it was given (cache=)
+        self.seeded_seen: list[int] = []       # what the builders that said "loaded" said they hold (seeded=)
+        self.flush_lock = threading.Lock()     # one flush at a time: each copies the whole cache beside the driver's
         self.command, self.workers, self.gov = command, workers, governor
         self.logs, self.segments = Path(logs), Path(segments)
         self.on_saved, self.on_failed, self.on_result = on_saved, on_failed, on_result
@@ -450,10 +458,16 @@ class Pool:
                              f"({', '.join(f'{k}={v or chr(45)}, expected {self.runtime[k]}' for k, v in stale.items())}): it would "
                              "build the compute modules in a form a launch never asks for, and every program with "
                              "workgroup memory would build again, cold, at the first launch.")
+        state = got.get("cache", "?")
+        if state == "loaded":
+            # What a builder that holds a seed weighs before it builds anything: the driver may keep far more than the
+            # seed's bytes, and a builder is replaced for what it grew by, not for what it started with.
+            child.base_ws = pool.working_set(child.proc)
         with self.lock:
             self.runtime_seen = {k: got[k] for k in self.runtime}
-            state = got.get("cache", "?")
             self.cache_seen[state] = self.cache_seen.get(state, 0) + 1
+            if state == "loaded" and got.get("seeded", "").isdigit():
+                self.seeded_seen.append(int(got["seeded"]))
             self.children[wid] = child
             if attempt:
                 self.stats.restarts += 1
@@ -463,7 +477,10 @@ class Pool:
         with self.lock:
             name = f"seg-{self.next_segment:06d}"
             self.next_segment += 1
-        reply = child.ask(f"flush {name}", self.timeout)
+        # A seeded builder's flush copies the seed and what it built, in memory beside the driver's own copy, and the
+        # governor's budget does not hold it: the workers flush one at a time instead of all together at the end.
+        with self.flush_lock:
+            reply = child.ask(f"flush {name}", self.timeout)
         word, rest = parse_reply(reply or "")
         if word != "saved" or len(rest) < 2:
             raise SchedError(f"the pipeline builder could not save a segment: {reply!r}. Its log is {child.log_path}.")
@@ -571,9 +588,10 @@ class Pool:
                 if child is not None and pending and time.monotonic() - last >= self.flush_seconds:
                     self._flush(child, pending)
                     pending, pending_items, last = [], {}, time.monotonic()
-                if child is not None and self.final_flush and child.ws_peak >= self.recycle_bytes:
+                if child is not None and self.final_flush and child.ws_peak >= self.recycle_bytes + child.base_ws:
                     # The driver keeps the memory of a big build for the life of the process, and the governor counts
-                    # only the items running: a worker that holds a gigabyte is saved and replaced by a fresh one.
+                    # only the items running: a worker that holds a gigabyte more than it started with is saved and
+                    # replaced by a fresh one.
                     if pending:
                         self._flush(child, pending)
                         pending, pending_items, last = [], {}, time.monotonic()

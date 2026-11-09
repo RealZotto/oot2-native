@@ -11,7 +11,11 @@ the record rule (size, runtime, device and driver of the run that wrote the cach
 the seed folder, deleted when dropped, removed once merged), that the builders are given it, that a builder which refuses
 it is reported, that an interrupted run keeps it for the next, that a cold build takes none, that a cache the full
 check failed on is not one, that a seeded builder is not flushed on a timer (a flush empties its cache, seed included),
-and that the step counts the seed in the memory it gives each worker.
+that the step counts the seed in the memory it gives each worker, that a builder which says it loaded the seed but holds
+under half of it is reported as refusing it, that a seeded builder is replaced for what it grew by and not for the memory
+it started with (and loads the seed again), that the workers flush one at a time, that the merged cache is under the sum of
+the segments, that a cache which grew past one and a half times the seed is named, and that a stopped seeded run resumes
+from the segments it saved.
 """
 
 from __future__ import annotations
@@ -201,6 +205,7 @@ class StepSeedTest(unittest.TestCase):
         self.assertEqual({k for k, v in hits.items() if v == "0"}, {changed})        # the changed one built cold
         self.assertEqual({v for k, v in hits.items() if k != changed}, {"1"})        # every other one was served
         self.assertEqual(rec["cache_hits"], 9)
+        self.assertNotIn("the cache grew", said)                                     # one module changed: no growth to name
         self.assertEqual(sorted(cache_keys(self.cache)), self.first_keys)            # the new cache holds the seed's entries
         self.assertFalse((self.env.dest / "temp" / "pipelines-seed").exists())       # merged, so removed
         self.assertFalse((self.env.dest / "temp" / "pipelines").exists())
@@ -258,6 +263,153 @@ class StepSeedTest(unittest.TestCase):
         self.assertEqual((rec["seed"]["outcome"], rec["seed"]["starts_loaded"]), (pipeseed.DROPPED, 0))
         self.assertIn("other_driver", rec["seed"]["reason"])
         self.assertIn("the seed was not used by every builder", said)
+
+    def test_a_builder_that_says_loaded_but_holds_under_half_of_the_seed_is_reported_as_refusing_it(self) -> None:
+        # cache=loaded only says the header passed; a body that is cut or damaged is ignored by the driver, which then
+        # holds (and serves) next to nothing: the ready line's seeded= tells.
+        seed_bytes = self.cache.stat().st_size
+        self.change_key()
+        self.env.standin(seeded=3)
+        status, ctx = self.env.run(self.ctx)
+        said = self.env.say(ctx)
+        self.assertEqual(status, "ok", said)
+        rec = ctx.state["steps"]["pipelines"]
+        self.assertEqual((rec["seed"]["outcome"], rec["seed"]["starts_loaded"]), (pipeseed.DROPPED, 0), said)
+        self.assertIn("1 said loaded and hold 3 bytes or less", rec["seed"]["reason"])
+        self.assertIn(f"{seed_bytes:,}-byte seed", said)
+        self.assertIn("the seed was not used by every builder", said)
+
+    def test_a_builder_that_holds_half_of_the_seed_or_more_is_counted_as_having_loaded_it(self) -> None:
+        seed_bytes = self.cache.stat().st_size
+        self.change_key()
+        self.env.standin(seeded=(seed_bytes + 1) // 2)
+        status, ctx = self.env.run(self.ctx)
+        self.assertEqual(status, "ok", self.env.say(ctx))
+        rec = ctx.state["steps"]["pipelines"]
+        self.assertEqual((rec["seed"]["outcome"], rec["seed"]["starts_loaded"]), (pipeseed.KEPT, 1))
+
+    def working_sets(self, start: int, grown: int):
+        """The patches that make every builder weigh `start` bytes when it is made ready and `start + grown` after: the
+        driver's own memory, which the seed's size does not say."""
+        seen, alive = {}, []
+
+        def working_set(proc) -> int:
+            alive.append(proc)
+            seen[id(proc)] = seen.get(id(proc), 0) + 1
+            return start if seen[id(proc)] == 1 else start + grown
+
+        return mock.patch.object(pipesched.pool, "working_set", working_set), mock.patch.object(pipesched, "MONITOR_SECONDS", 0.05)
+
+    def test_a_seeded_builder_is_replaced_for_what_it_grew_by_not_for_the_memory_it_started_with(self) -> None:
+        # The driver holds three gigabytes of the seed's pipelines; the seed file is a few bytes of the stand-in's (or
+        # hundreds of megabytes of the real cache). Neither is a reason to replace every builder after every program.
+        self.change_key()
+        self.env.standin(delay=0.25)
+        first, second = self.working_sets(3 << 30, 200 << 20)
+        with first, second:
+            status, ctx = self.env.run(self.ctx)
+        self.assertEqual(status, "ok", self.env.say(ctx))
+        rec = ctx.state["steps"]["pipelines"]
+        self.assertEqual((rec["recycled"], rec["segments"], rec["seed"]["starts_loaded"]), (0, 1, 1))
+
+    def test_a_seeded_builder_that_grew_by_a_gigabyte_is_saved_and_replaced_and_the_seed_serves_the_next_one(self) -> None:
+        changed = "c000000000000002.00000000"
+        self.change_key()
+        self.env.standin(delay=0.25, cold_keys=[changed])
+        first, second = self.working_sets(3 << 30, 2 << 30)
+        with first, second:
+            status, ctx = self.env.run(self.ctx)
+        said = self.env.say(ctx)
+        self.assertEqual(status, "ok", said)
+        rec = ctx.state["steps"]["pipelines"]
+        self.assertGreaterEqual(rec["recycled"], 5)
+        self.assertEqual((rec["lost"], rec["failed"], len(self.env.builds()) - 10), (0, 0, 10))
+        self.assertEqual(set(self.serves()[1:]), {"serve --cache loaded"})                 # every new builder loads the seed
+        self.assertEqual(rec["seed"]["starts_loaded"], len(self.serves()) - 1)
+        hits = self.hits()
+        self.assertEqual({k for k, v in hits.items() if v == "0"}, {changed}, hits)        # served warm after each recycle
+        self.assertEqual(sorted(cache_keys(self.cache)), self.first_keys)
+        self.assert_merge_dedupes(rec)
+
+    def assert_merge_dedupes(self, rec: dict) -> None:
+        """Every segment of a seeded builder holds the whole seed: the merged cache is the union, so under their sum."""
+        self.assertGreaterEqual(rec["segments"], 2)
+        inputs = rec["scratch_peak_bytes"] - rec["cache_bytes"]
+        self.assertLess(rec["cache_bytes"], inputs)
+        self.assertLess(rec["cache_bytes"], inputs / 2)       # five or more copies of the seed went in, one came out
+
+    def test_the_workers_flush_one_at_a_time_so_that_no_two_copy_the_whole_cache_together(self) -> None:
+        self.change_key()
+        self.env.standin(delay=0.1, flush_delay=0.3)
+
+        def spans_files() -> set[Path]:
+            return set(self.env.tmp.glob("standin.log.flush*"))
+
+        before = spans_files()
+        self.ctx.options.pipelines_jobs = 3
+        status, ctx = self.env.run(self.ctx)
+        self.assertEqual(status, "ok", self.env.say(ctx))
+        self.assertEqual(ctx.state["steps"]["pipelines"]["workers"], 3)
+        spans = sorted(tuple(float(x) for x in line.split()) for f in spans_files() - before
+                       for line in f.read_text().splitlines())
+        self.assertEqual(len(spans), 3, spans)                  # the final flush of each worker
+        for (_, ended), (began, _) in zip(spans, spans[1:]):
+            self.assertLessEqual(ended, began, spans)           # one ended before the next began
+
+    def test_a_key_change_that_rebuilds_many_modules_names_the_growth_of_the_cache(self) -> None:
+        seed_bytes = self.cache.stat().st_size
+        self.change_key()
+        self.env.standin(cold_keys=self.first_keys, renamed=self.first_keys)   # every module is a new entry
+        status, ctx = self.env.run(self.ctx)
+        said = self.env.say(ctx)
+        self.assertEqual(status, "ok", said)
+        rec = ctx.state["steps"]["pipelines"]
+        self.assertGreater(rec["cache_bytes"], 1.5 * seed_bytes)
+        self.assertIn("warning: pipelines: the cache grew from", said)
+        self.assertIn("no longer exist", said)
+        self.assertIn("--pipelines-cold", said)
+        self.assertEqual(len(cache_keys(self.cache)), 2 * len(self.first_keys))      # nothing was pruned
+
+    def test_a_stopped_seeded_run_keeps_the_seed_and_the_segments_it_saved_and_the_next_run_builds_the_rest(self) -> None:
+        # Segments saved on the same key are kept (only a change of the key wipes them): the items they hold are not
+        # built again, and what remains is built from the same seed, still served warm.
+        changed = "c000000000000002.00000000"
+        self.change_key()
+        self.env.standin(delay=0.25, cold_keys=[changed])
+        real_pool = pipesched.Pool
+
+        class StopsAfterFive(real_pool):
+            def __init__(self, command, items, *a, **k):
+                super().__init__(command, items[:5], *a, **k)
+
+            def run(self, *a, **k):
+                super().run(*a, **k)
+                raise KeyboardInterrupt
+
+        first, second = self.working_sets(3 << 30, 2 << 30)            # every builder is replaced after each program
+        with first, second, mock.patch.object(pipesched, "Pool", StopsAfterFive):
+            self.assertEqual(run_steps([FakeTranslate(), Pipelines()], self.env.context()), "cancelled")
+        seed_dir = self.env.dest / "temp" / "pipelines-seed"
+        self.assertTrue((seed_dir / "pipeline.cache").is_file())
+        self.assertFalse(self.cache.exists())
+        stopped_at = len(self.env.builds())
+        self.assertEqual(stopped_at - 10, 5)
+        saved = list((self.env.dest / "temp" / "pipelines" / "segments").glob("seg-*.bin"))
+        self.assertEqual(len(saved), 5)                                # each replaced builder saved its segment first
+
+        status, ctx = self.env.run(self.env.context())                  # the same key: resumed
+        said = self.env.say(ctx)
+        self.assertEqual(status, "ok", said)
+        rec = ctx.state["steps"]["pipelines"]
+        self.assertEqual((rec["seed"]["outcome"], rec["seed"]["source"]),
+                         (pipeseed.KEPT, "the seed of an interrupted run"))
+        self.assertEqual((rec["kept_items"], len(self.env.builds()) - stopped_at), (5, 5))     # the rest only
+        hits = self.hits()
+        self.assertEqual(len(hits), 10)
+        self.assertEqual({k for k, v in hits.items() if v == "0"}, {changed}, hits)
+        self.assertEqual(sorted(cache_keys(self.cache)), self.first_keys)
+        self.assert_merge_dedupes(rec)
+        self.assertFalse(seed_dir.exists())
 
     def test_a_cold_build_takes_no_seed(self) -> None:
         self.change_key()
@@ -328,11 +480,6 @@ class StepSeedTest(unittest.TestCase):
         self.assertEqual(status, "ok", self.env.say(ctx))
         self.assertEqual(ctx.state["steps"]["pipelines"]["seed"]["outcome"], pipeseed.DROPPED)
         self.assertEqual(ctx.state["steps"]["pipelines"]["segments"], 10)  # one a program
-
-    def test_the_seed_is_counted_in_the_memory_a_builder_may_hold_before_it_is_replaced(self) -> None:
-        seed_bytes = self.cache.stat().st_size
-        pools, _ = self.run_spied()
-        self.assertEqual(pools[0].recycle_bytes, pipesched.RECYCLE_BYTES + seed_bytes)
 
     def test_the_seed_is_counted_in_the_memory_each_worker_is_given(self) -> None:
         seed_bytes = self.cache.stat().st_size

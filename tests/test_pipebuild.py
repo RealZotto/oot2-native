@@ -322,6 +322,8 @@ class PipeBuildTest(DeviceTestCase):
                              {SYNTH_KEYS["vs.vert"], SYNTH_KEYS["ps.frag"], SYNTH_KEYS["cs.comp"]}, served)   # served warm
             self.assertEqual((second["failed"], second["validation_errors"], second["validation_warnings"]), (0, 0, 0))
             self.assertGreaterEqual(cache.stat().st_size, first_bytes)    # the seed's entries are in the new cache
+            if second["segments"] >= 2:                                   # each seeded builder's segment holds the whole seed
+                self.assertLess(second["cache_bytes"], second["scratch_peak_bytes"] - second["cache_bytes"])   # the merge unions
             self.assertFalse((dest / "temp" / "pipelines-seed").exists())
             items = pipelines.pipesched.order(pipelines.load_work(ctx, dest / "shaders" / cp.BASE_FILE, None).items)
             warm = pipelines.warm_pass(ctx, items, cache)

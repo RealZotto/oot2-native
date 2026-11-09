@@ -35,10 +35,17 @@ The builder judges the file once more when it starts (pipebuild serve --cache), 
 A seeded builder's first segment holds the whole seed (a Vulkan cache cannot be told to write only what it learned), so
 the merge unions as many copies of the seed as the segments written. A flush hands the builder an empty cache, so a seeded
 builder does not flush on a timer (it would serve the seed only until its first flush): it saves when it is recycled and
-at the end, each time with the seed and what it built since it started. A run that is stopped therefore keeps nothing
-built since it started, only the seed, which serves in a lookup what it holds and so costs the changed programs alone. The
-step counts the seed in the memory it gives each worker, and the cache it writes keeps the entries of modules that no
-longer exist: it grows by what a key change built, never shrinks, and the record says both sizes.
+at the end, each time with the seed and what it built since it started. The builders save one at a time, so that no two
+copy the whole cache beside the driver's at once. A run that is stopped keeps the seed and the segments its builders saved
+before the stop (on the same key those items are not built again; only a change of the key wipes the segments), and loses
+what each builder built since its last save. The seed serves what it holds in a lookup, so only the changed programs are
+built again. The step counts the seed in the memory it gives each worker, replaces a builder for what it grew by since it
+loaded the seed, and holds a builder that says it loaded the seed but holds under half of it (the driver ignored a damaged
+body) to be one that refused it.
+
+The cache the step writes keeps the entries of modules that no longer exist: the merge unions what the segments hold and
+nothing says which entries are dead. It grows by what each key change built, never shrinks, and the only prune is
+`--pipelines-cold`. The record says both sizes and the step warns when the cache is over one and a half times the seed.
 """
 
 from __future__ import annotations
