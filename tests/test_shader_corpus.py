@@ -182,6 +182,18 @@ class CorpusHelpersTest(unittest.TestCase):
         self.assertEqual(job["options"], {"capability_fixup": True})
         self.assertIn("nodebug", corpus.PASSES)
 
+    def test_debug_pass_asks_for_the_old_optimizer_form_and_the_default_pass_names_no_option(self):
+        """The sound form is the translator's default, so `default` carries no option and `debug` is the explicit way to
+        the old form for A/B work (opcheck compares the two)."""
+        change, stages = corpus.VARIANTS["debug"]
+        self.assertEqual(set(stages), set(corpus.STAGES))
+        job = {"key": "k", "stage": "ps", "options": {"capability_fixup": True}}
+        out = corpus.variant_job(job, change)
+        self.assertEqual(out["options"], {"capability_fixup": True, "debug": True})
+        self.assertEqual(job["options"], {"capability_fixup": True})
+        self.assertIn("debug", corpus.PASSES)
+        self.assertEqual(corpus.variant_job(job, corpus.VARIANTS["default"][0]), job)
+
     def test_repeat_sample_is_spread_and_stable(self):
         jobs = {f"k{i:05d}": {"stage": "vs"} for i in range(corpus.REPEAT_SAMPLE * 3)}
         keys = corpus.select(jobs, "repeat", corpus.STAGES, None)

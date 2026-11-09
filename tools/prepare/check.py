@@ -65,6 +65,11 @@ PROBE_SOURCE = Path(__file__).resolve().parent / "hostcheck.c"
 TEMP = "temp"                      # dest/temp: the steps' scratch files
 PROBE_TIMEOUT = 120                # seconds; a broken driver can hang instance creation
 XLATE_PROTOCOL = 2                 # the translator's line protocol (xlate/host/Host.cs, tools/shaders/pool.py)
+# The form of the AST optimizer a job gets when it names none, as `--version` says it (optimizer=, xlate/host/Program.cs).
+# Prepare's packs hold the sound form only (debug false with AstOptimizer.cs's rule): a translator whose default is the
+# old form is refused, so a pack never mixes the two. Together with the identity, which is the SHA-256 of the
+# executable, this is what makes the switch of the default a new identity for every key built on it.
+XLATE_OPTIMIZER = "sound"
 XLATE_TIMEOUT = 60                 # seconds for the translator's --version
 
 CPU_V2 = (("sse3", "SSE3"), ("ssse3", "SSSE3"), ("sse4_1", "SSE4.1"), ("sse4_2", "SSE4.2"), ("popcnt", "POPCNT"),
@@ -378,6 +383,11 @@ def shader_tools(ctx: Context) -> str:
     if fields.get("proto") != str(XLATE_PROTOCOL):
         raise PrepareError(f"the shader translator {path} speaks protocol {fields.get('proto')}, and this prepare "
                            f"speaks protocol {XLATE_PROTOCOL}. Use the translator of the same release.")
+    if fields.get("optimizer") != XLATE_OPTIMIZER:
+        raise PrepareError(f"the shader translator {path} translates with the optimizer form "
+                           f"{fields.get('optimizer') or 'of a build older than the sound form (it names none)'} by "
+                           f"default, and this prepare packs the {XLATE_OPTIMIZER} form only, so an old pack and a new "
+                           "one are never mixed. Rebuild it (tools/build_xlate.py) or give another with --xlate.")
     return (f"Python {platform.python_version()} with compression.zstd, translator {path} (protocol {XLATE_PROTOCOL}, "
             f"identity {identity[:16]})")
 

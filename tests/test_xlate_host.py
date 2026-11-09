@@ -317,9 +317,10 @@ class ServeProtocolTest(Harness):
         self.assertEqual(info["proto"], 2)
         self.assertEqual(len(info["translator_id"]), 64)
         self.assertEqual(info["target"], "vulkan1.3")
-        self.assertEqual(info["defaults"]["debug"], True)
+        self.assertEqual(info["defaults"]["debug"], False)      # the sound form of the AST optimizer is the default
         version = subprocess.run([str(EXE), "--version"], capture_output=True, text=True, timeout=60).stdout
         self.assertIn(info["translator_id"], version)
+        self.assertTrue(version.rstrip("\r\n").endswith(" optimizer=sound"), version)   # what prepare reads first
 
     def test_a_translation_rides_in_the_reply_and_the_host_writes_no_file(self):
         request = json.dumps({"job": compute_job("wire", self.exit_bin), "out": str(self.out)})
@@ -455,7 +456,7 @@ class TranslateTest(Harness):
         self.assertIn("Shader", res["capabilities"])
         self.assertEqual(len(res["translator_id"]), 64)
         self.assertEqual(len(res["spv_sha256"]), 64)
-        self.assertEqual(res["options"]["debug"], True)
+        self.assertEqual(res["options"]["debug"], False)       # a job that names no option gets the sound form
         if SPIRV_VAL:
             self.assertTrue(validate.validate_one(SPIRV_VAL, "exit1", spv).ok)
 

@@ -104,7 +104,9 @@ STUB = textwrap.dedent('''\
     import base64, hashlib, json, os, struct, sys, time
     IDENTITY = os.environ.get("STUB_IDENTITY") or hashlib.sha256(open(__file__, "rb").read()).hexdigest()
     if sys.argv[1:] == ["--version"]:
-        print(f"oot2-xlate {IDENTITY} proto={os.environ.get('STUB_PROTO', '2')} spirv=1.3 target=vulkan1.3")
+        form = os.environ.get("STUB_OPTIMIZER", "sound")     # "none": a build older than the sound form names none
+        print(f"oot2-xlate {IDENTITY} proto={os.environ.get('STUB_PROTO', '2')} spirv=1.3 target=vulkan1.3"
+              + ("" if form == "none" else f" optimizer={form}"))
         sys.exit(0)
     for line in sys.stdin:
         request = json.loads(line)
@@ -219,6 +221,8 @@ class RealTranslatorTest(Base):
         self.assertEqual(cache_pack.verify_pack(self.pack_path(), role=cache_pack.BASE), [])
         stages = collections.Counter(json.loads(pack.read(r)[1])["stage"] for r in pack.rows)
         self.assertEqual(stages, {"vs": 2, "ps": 2, "cs": 2})
+        # the jobs name no optimizer option, so every module is the translator's default form: the sound one
+        self.assertEqual({json.loads(pack.read(r)[1])["options"]["debug"] for r in pack.rows}, {False})
         self.assertEqual(rec["bytes"], pack.size + sum(rec["split_files"].values()))
         self.assertEqual(rec["pack_bytes"], pack.size)
         self.assertEqual(rec["spill_bytes"], rec["module_bytes"] + rec["description_bytes"])
@@ -300,6 +304,26 @@ class StandInTest(Base):
         self.assertIn("extract: kept", text)
         self.assertIn("translate: started (its output is missing)", text)
         self.assertEqual(result, "ok", text)
+
+    def test_a_pack_made_with_another_identity_is_not_current_and_the_step_rebuilds_it(self):
+        """A prepared folder from before the sound form was the default: its record and its pack hold the old
+        executable's identity. The step is not kept, and its own verify refuses a pack that is not the recorded one."""
+        dump = self.write_dump(container({"Effect/fx.bfsha": bnsh(*({5: compute(s)} for s in range(1, 4)))}))
+        result, text = self.run_steps(dump, self.stub)
+        self.assertEqual(result, "ok", text)
+        record = self.steps()["translate"]
+        ctx = Context(self.dest, types.SimpleNamespace(xlate=str(self.stub)), Reporter(io.StringIO(), io.StringIO()))
+        self.assertTrue(translate.Translate().verify(ctx, record))
+        old = {**record, "translator": {**record["translator"], "sha256": hashlib.sha256(b"the old executable").hexdigest()}}
+        self.assertFalse(translate.Translate().verify(ctx, old))
+        # the folder as an older prepare left it: the translate step's recorded key is the old one
+        state = statefile.load(self.dest)
+        state["steps"]["translate"]["key"] = hashlib.sha256(b"the old translate key").hexdigest()
+        statefile.save(self.dest, state)
+        result, text = self.run_steps(dump, self.stub)
+        self.assertEqual(result, "ok", text)
+        self.assertIn("translate: started (its inputs changed)", text)
+        self.assertEqual(self.pack().translator, hashlib.sha256(self.stub.read_bytes()).hexdigest())
 
     def test_an_interrupted_run_keeps_what_it_translated(self):
         programs = [compute(s) for s in range(1, 31)]
@@ -437,6 +461,56 @@ class CheckShaderToolsTest(Base):
         broken.write_text("import sys\nsys.exit(4)\n", encoding="utf-8")
         with self.assertRaisesRegex(PrepareError, r"did not answer --version \(exit code 4\)"):
             check.shader_tools(self.ctx(xlate=broken))
+
+    @NEEDS_ZSTD
+    def test_a_translator_whose_default_is_the_old_optimizer_form_is_refused(self):
+        """Prepare packs the sound form only: a translator that says the old one, or says nothing because it was built
+        before the sound form was the default, would put modules of the other form beside the new ones."""
+        for form, said in (("debug", "the optimizer form debug by default"),
+                           ("none", "the optimizer form of a build older than the sound form")):
+            with self.subTest(form), mock.patch.dict(os.environ, {"STUB_OPTIMIZER": form}):
+                with self.assertRaisesRegex(PrepareError, f"translates with {said}.*packs the sound form only"):
+                    check.shader_tools(self.ctx(xlate=self.stub))
+        self.assertIn("protocol 2", check.shader_tools(self.ctx(xlate=self.stub)))      # the green counterpart
+
+    def test_the_keys_of_the_shader_steps_name_the_form_and_the_identity(self):
+        """A folder prepared before the sound form was the default holds the old translator's identity and no form:
+        its translate key, the ledger's and so every key chained to them are not the new ones."""
+        ctx = self.ctx(xlate=self.stub)
+        same = translate.Translate().key(ctx)
+        self.assertEqual(translate.Translate().key(ctx), same)
+        with mock.patch.object(check, "XLATE_OPTIMIZER", "debug"):
+            self.assertNotEqual(translate.Translate().key(ctx), same)
+        before = translate.Translate().key(self.ctx(xlate=self.stub))
+        with open(self.stub, "a", encoding="utf-8") as fh:
+            fh.write("# the old executable's successor\n")
+        self.assertNotEqual(translate.Translate().key(self.ctx(xlate=self.stub)), before)
+
+    def test_every_step_that_reads_the_pack_chains_to_the_identity_and_the_form(self):
+        """The ledger (the variants pack) and the pipeline cache are built from the base pack, so their keys, as the
+        runner chains them (Step.needs), change with the translator identity and with the form: a folder made with the
+        old one rebuilds them, it never mixes them with the new base pack."""
+        from prepare import ledger, pipelines
+        steps = (translate.Translate(), ledger.Ledger(), pipelines.Pipelines())
+
+        def chain() -> dict[str, str]:
+            ctx = self.ctx(xlate=self.stub)
+            ctx.keys["extract"] = "the extract step's key, which is not what changes here"
+            for step in steps:
+                ctx.decide(step)
+            return {step.id: ctx.keys[step.id] for step in steps}
+
+        same = chain()
+        self.assertEqual(chain(), same)
+        self.assertEqual(set(same), {"translate", "ledger", "pipelines"})
+        with mock.patch.object(check, "XLATE_OPTIMIZER", "debug"):
+            other_form = chain()
+        with open(self.stub, "a", encoding="utf-8") as fh:
+            fh.write("# another executable, so another identity\n")
+        other_identity = chain()
+        for other in (other_form, other_identity):
+            for step_id in same:
+                self.assertNotEqual(other[step_id], same[step_id], step_id)
 
     def test_the_translator_identity_is_hashed_again_only_when_the_file_changes(self):
         ctx = self.ctx(xlate=self.stub)

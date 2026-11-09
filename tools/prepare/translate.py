@@ -48,10 +48,14 @@ is kept when the translator refused it, or when it was translated and its entry 
 no answer is tried again. Scratch of a run with another key (another translator, another RomFS, other tools) is
 deleted first. Packing checks every module against its description, so a damaged entry is refused there.
 
-The key: the translator's identity (the SHA-256 of its executable, tools/build_xlate.py), the code of this step,
-split.py, pool.py and cache_pack.py, the description schema, and through Step.needs the extract step's key. A new
-translator translates again and nothing upstream runs again. The translator is found as the check step finds it
-(check.translator): --xlate, else the OOT2_XLATE variable, else oot2-xlate on PATH. The worker count is not in the key.
+The key: the translator's identity (the SHA-256 of its executable, tools/build_xlate.py), the optimizer form the
+pack holds (check.XLATE_OPTIMIZER: the sound form, the translator's default since the AST optimizer rule became it;
+check.shader_tools refuses a translator whose default is another), the code of this step, split.py, pool.py and
+cache_pack.py, the description schema, and through Step.needs the extract step's key. A new translator translates
+again and nothing upstream runs again: a folder prepared before the sound form was the default holds the old
+executable's identity, so its translate step, and every step that needs it, runs again once. The translator is found
+as the check step finds it (check.translator): --xlate, else the OOT2_XLATE variable, else oot2-xlate on PATH. The
+worker count is not in the key.
 """
 
 from __future__ import annotations
@@ -107,7 +111,8 @@ class Translate(Step):
 
     def key(self, ctx: Context) -> str:
         return fingerprint(f"translate-{FORMAT}", f"translator={check.translator_identity(ctx)}",
-                           f"schema={cache_pack.DESC_SCHEMA}", HERE / "translate.py", SHADER_TOOLS / "split.py",
+                           f"optimizer={check.XLATE_OPTIMIZER}", f"schema={cache_pack.DESC_SCHEMA}",
+                           HERE / "translate.py", SHADER_TOOLS / "split.py",
                            SHADER_TOOLS / "pool.py", SHADER_TOOLS / "cache_pack.py")
 
     def current(self, ctx: Context, record: dict) -> bool:

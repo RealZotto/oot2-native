@@ -147,7 +147,9 @@ Changes of this project:
   removed; a reading or convergent one with a single mention moves only to the
   next statement of its own block that uses it, over plain statements only
   (none pinned when it reads), and never into a loop's condition or a call. The
-  default stays the debug mode on, which this file does not touch. The rule is
+  host's job option `debug` now defaults to false, so this rule is the form
+  every job gets; `debug: true` asks for the old form (nothing propagated or
+  dropped), which this file does not touch. The rule is
   this project's code. Two public translators carry the same defects and their
   fixes are evidence only, neither copied: TotK Recomp's own patch keeping
   side-effect assignments, and one of Jaigner's keeping memory reads in place

@@ -21,6 +21,7 @@ Run: python -m unittest discover -s tests -p test_xlate_optimizer.py -v
 
 from __future__ import annotations
 
+import json
 import struct
 import sys
 import unittest
@@ -144,6 +145,25 @@ class OptimizerTest(Harness):
         on, off = self.both("shuffle_now", [s2r(X, TID_X), shfl_idx(V, X, 3), sts(255, V, 0)])
         self.assert_sound(on, off)
         self.assert_propagates(on, off)
+
+    # -- the default ----------------------------------------------------------------------------------
+
+    def test_a_job_that_names_no_debug_option_gets_the_sound_form(self):
+        """The sound form is the default: the same program with no option is byte for byte the module of `debug: false`,
+        and not the module of `debug: true`, which is longer because nothing is propagated."""
+        code = self.dir / "default.bin"
+        code.write_bytes(b"".join([s2r(X, TID_X), sts(255, X, 0), lds(V, 255, 0), s2r(Y, TID_Y), sts(255, V, 4)]) + EXIT)
+        got = self.run_jobs([compute_job("def", code, shared=64),
+                             compute_job("sound", code, shared=64, options={"debug": False}),
+                             compute_job("old", code, shared=64, options={"debug": True})])
+        for key in ("def", "sound", "old"):
+            self.assertEqual((got[key].status, got[key].message), ("ok", ""), key)
+        modules = {key: (self.out / f"{key}.spv").read_bytes() for key in got}
+        descriptions = {key: json.loads((self.out / f"{key}.res.json").read_text(encoding="utf-8")) for key in got}
+        self.assertEqual(modules["def"], modules["sound"])
+        self.assertNotEqual(modules["def"], modules["old"])
+        self.assertLess(len(modules["def"]), len(modules["old"]))
+        self.assertEqual([descriptions[k]["options"]["debug"] for k in ("def", "sound", "old")], [False, False, True])
 
 
 if __name__ == "__main__":

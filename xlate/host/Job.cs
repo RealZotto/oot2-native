@@ -79,7 +79,11 @@ internal readonly record struct ImageAnswer(SamplerType Type, string TypeName, T
 /// <summary>The "options" object of a job; every field is part of the cache key.</summary>
 internal sealed class JobOptions
 {
-    public bool Debug { get; init; } = true;
+    // Whether the AST optimizer runs in its debug mode (nothing propagated, nothing dropped). The default is the
+    // sound form, debug false with this project's AstOptimizer rule; `debug: true` asks for the old form, which
+    // only A/B work wants. A different default is a different module for every job, so it is a different translator
+    // executable and therefore a different identity for every pack and cache that keys on it.
+    public bool Debug { get; init; }
     public bool Reduced { get; init; }
     public bool Float64 { get; init; } = true;
     public bool NonUniformIndexing { get; init; } = true;
@@ -541,7 +545,7 @@ internal sealed class Job
             throw Bad("field 'options' is not an object");
         }
 
-        bool debug = true, reduced = false, float64 = true, nonUniform = true, fixup = true;
+        bool debug = false, reduced = false, float64 = true, nonUniform = true, fixup = true;
         string variant = "";
         MeshLimits limits = MeshLimits.Default;
 

@@ -51,12 +51,14 @@ internal static class Translation
         }
 
         // DebugMode turns the AST optimizer off: nothing is propagated or
-        // dropped, which is the form every module has had so far. With it off
-        // the optimizer follows this project's rule (AstOptimizer.cs): an
-        // operation with an effect stays where it is, and a read or a shuffle
-        // is carried only to the next statement that uses it. The job option
-        // `debug` defaults to true until that form is the default on purpose
-        // (a different default is a different module for every key).
+        // dropped, which is the form every module had until the sound form
+        // became the default. Without it the optimizer follows this project's
+        // rule (AstOptimizer.cs): an operation with an effect stays where it
+        // is, and a read or a shuffle is carried only to the next statement
+        // that uses it. The job option `debug` defaults to false; true asks
+        // for the old form (A/B work). The default is part of the executable,
+        // so changing it changes the translator identity and with it every
+        // key built on that identity.
         if (job.Options.Debug)
         {
             flags |= TranslationFlags.DebugMode;

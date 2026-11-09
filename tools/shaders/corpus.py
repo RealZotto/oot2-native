@@ -13,7 +13,8 @@ Each pass translates a set of jobs on a pool of translator children
 spirv-val (tools/shaders/validate.py) and writes a summary of counts.
 
 Passes:
-  default  every job, default answers, capability post-pass on
+  default  every job, default answers, capability post-pass on; the translator's
+           default optimizer form, which is the sound form (debug false)
   raw      every job, capability post-pass off: the validator's verdict on the
            translator's own output
   repeat   a fixed sample translated again with default answers; every module
@@ -24,8 +25,12 @@ Passes:
   fout     fragment output answers changed for every target (uint), pixel
            programs only
   nodebug  every job, default answers, the AST optimizer's debug mode off
-           (expression propagation on); tools/shaders/opcheck.py compares it
-           with `default`
+           (expression propagation on), asked for explicitly: the same form as
+           `default` since the sound form became the translator's default, kept
+           so that a record made before that can be repeated by name
+  debug    every job, default answers, the old optimizer form asked for with
+           the job option debug true (nothing propagated or dropped), for A/B
+           work: tools/shaders/opcheck.py compares `default` with it
 
 The answer passes measure answer sensitivity (architecture D21): a program
 whose module changes when an answer changes needs that answer in its cache key
@@ -58,7 +63,7 @@ import validate  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 STAGES = ("vs", "ps", "cs", "ts", "ms")
-PASSES = ("default", "raw", "repeat", "tex", "attr", "fout", "nodebug")
+PASSES = ("default", "raw", "repeat", "tex", "attr", "fout", "nodebug", "debug")
 REPEAT_SAMPLE = 2000
 
 # The answers each sensitivity pass sets, and the stages it is run on.
@@ -70,6 +75,7 @@ VARIANTS: dict[str, tuple[dict, tuple[str, ...]]] = {
     "attr": ({"attr": {"*": "sint"}}, ("vs",)),
     "fout": ({"fout": {"*": "uint"}}, ("ps",)),
     "nodebug": ({"options": {"debug": False}}, STAGES),
+    "debug": ({"options": {"debug": True}}, STAGES),
 }
 
 RESULT_FIELDS = ("key", "status", "micros", "wall_ms", "spv_bytes", "message")
@@ -366,7 +372,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             validate_pass(name, work, tool, args.workers)
             facts["validate_wall_s"] = round(time.perf_counter() - t0, 1)
         summary = summarise_pass(name, work, jobs, meta, facts)
-        if name not in ("default", "raw", "nodebug") and (work / "default" / "results.tsv").exists():
+        if name not in ("default", "raw", "nodebug", "debug") and (work / "default" / "results.tsv").exists():
             summary["compare"] = compare_with_default(name, work, jobs)
         (work / f"summary-{name}.json").write_text(json.dumps(summary, indent=1) + "\n", encoding="utf-8")
         print(f"corpus: pass {name}: {summary['status']} in {facts['wall_s']} s", flush=True)

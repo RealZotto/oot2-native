@@ -529,8 +529,9 @@ class Ledger(Step):
 
     def key(self, ctx: Context) -> str:
         return fingerprint(f"ledger-{FORMAT}", f"translator={check.translator_identity(ctx)}",
-                           f"schema={cache_pack.DESC_SCHEMA}", f"ledger={ledger_digest(ctx.dest / LEDGER_FILE)}",
-                           HERE / "ledger.py", SHADER_TOOLS / "corpus.py")
+                           f"optimizer={check.XLATE_OPTIMIZER}", f"schema={cache_pack.DESC_SCHEMA}",
+                           f"ledger={ledger_digest(ctx.dest / LEDGER_FILE)}", HERE / "ledger.py",
+                           SHADER_TOOLS / "corpus.py")
 
     def current(self, ctx: Context, record: dict) -> bool:
         path = ctx.dest / translate.SHADERS / cache_pack.VARIANTS_FILE

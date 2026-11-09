@@ -35,7 +35,12 @@ internal static class Program
     {
         if (args.Length == 1 && args[0] == "--version")
         {
-            Console.Out.WriteLine($"oot2-xlate {ExecutableSha256()} proto={Host.Protocol} spirv=1.3 target=vulkan1.3");
+            // optimizer= names the form a job gets when it sets no `debug` option: "sound" is the AST
+            // optimizer rule of AstOptimizer.cs, "debug" the old form. prepare refuses a translator whose
+            // default is not the sound one, so a pack never holds modules of the other form.
+            string optimizer = new JobOptions().Debug ? "debug" : "sound";
+
+            Console.Out.WriteLine($"oot2-xlate {ExecutableSha256()} proto={Host.Protocol} spirv=1.3 target=vulkan1.3 optimizer={optimizer}");
 
             return 0;
         }

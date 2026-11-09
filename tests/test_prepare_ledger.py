@@ -42,6 +42,7 @@ import textwrap
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
@@ -74,7 +75,7 @@ STUB = textwrap.dedent('''\
     import base64, hashlib, json, os, re, struct, sys
     IDENTITY = os.environ.get("STUB_IDENTITY") or hashlib.sha256(open(__file__, "rb").read()).hexdigest()
     if sys.argv[1:] == ["--version"]:
-        print(f"oot2-xlate {IDENTITY} proto=2 spirv=1.3 target=vulkan1.3")
+        print(f"oot2-xlate {IDENTITY} proto=2 spirv=1.3 target=vulkan1.3 optimizer=sound")
         sys.exit(0)
 
     def pick(table, slot, default):
@@ -479,6 +480,8 @@ class KeyTest(LedgerBase):
 
         same = own_key()
         self.assertEqual(own_key(), same)
+        with mock.patch.object(check, "XLATE_OPTIMIZER", "debug"):      # the form the variants pack holds is in the key
+            self.assertNotEqual(own_key(), same)
         self.ledger_path().write_text(ledger_text([row(KEY["vs"], "vs", tex={"3": "cube"})]), encoding="utf-8")
         other_ledger = own_key()
         self.assertNotEqual(other_ledger, same)
