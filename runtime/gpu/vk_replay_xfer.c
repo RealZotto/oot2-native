@@ -179,6 +179,13 @@ static void op_copy_b2t(const p_copy_b2t *p, int to_texture) {
         stop("%s with copy flags %#x: a mirrored copy is not replayed yet", what, p->flags);
     Sub s;
     sub_resolve(what, &p->tex, &p->r, &s);
+    // An ASTC texture on a device that does not sample ASTC is an image of decoded texels (vkf_decoded, oot2/vk_format.h)
+    // while the buffer holds the game's blocks: the copy would move blocks as texels. A copy between two such images is
+    // texel against texel and stays.
+    const char *refused = vkf_decoded_stop(s.row, s.img.format, VKF_USE_TEXEL_COPY);
+    if (refused)
+        stop("%s over a texture of ASTC blocks decoded to RGBA8 (NVN format %#x): %s between the game's blocks and the "
+             "image's texels is not replayed yet", what, (unsigned)p->tex.tex.d.format, refused);
     BufSide b = buffer_side(what, &s, p->addr);
     vkr_xfer_begin();
     if (to_texture) {

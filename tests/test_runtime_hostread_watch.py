@@ -111,8 +111,10 @@ class HostReadWatchTest(unittest.TestCase):
                         self.assertEqual(got, want, done.stdout)
 
     def test_the_overlapped_reads_really_waited(self) -> None:
-        # The overlapped cases must have met a pending read at least once, or they only tested the fast path.
-        for case in ("overlapped", "overlapped_unbuffered"):
+        # The unbuffered overlapped case must have met a pending read at least once, or it only tested the fast path. The
+        # buffered one reads a file it has just written, which the cache may serve synchronously on any given machine, so
+        # it is not held to a pending read: its pages are still checked by the test above.
+        for case in ("overlapped_unbuffered",):
             with self.subTest(case=case):
                 done = self.run_case(LEVELS[0], case)
                 if f"skip {case}" in done.stdout:

@@ -520,11 +520,22 @@ class GraphicsTest(ReplayBase):
             "masked_clear": "ClearTexture with channel mask 0x3: a masked clear needs a draw",
             "outside": "CopyTextureToBuffer over the region 60,0,0 8x8x1 outside level 0 of a 64x32 texture",
             "mirrored": "CopyTextureToTexture with copy flags 0x4: a mirrored copy is not replayed yet",
+            "decoded_b2t": "CopyBufferToTexture over a texture of ASTC blocks decoded to RGBA8 (NVN format 0x79): a texel "
+                           "copy between the game's blocks and the image's texels is not replayed yet",
+            "decoded_t2b": "CopyTextureToBuffer over a texture of ASTC blocks decoded to RGBA8 (NVN format 0x79): a texel "
+                           "copy between the game's blocks and the image's texels is not replayed yet",
         }
         for what, text in want.items():
             with self.subTest(stop=what):
                 line = self.stopping("xstop", what)
                 self.assertTrue(line.startswith(prefix + text), line)
+
+    def test_a_copy_between_two_images_of_decoded_astc_goes_through(self) -> None:
+        # The green counterpart of the two decoded stops above: texels against texels is a plain image copy.
+        done = self.run_case("xstop", "decoded_pair")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("submit returned", done.stdout)
+        self.assertEqual(fatal_lines(done.stderr), [])
 
 
 class ComputeTest(ReplayBase):

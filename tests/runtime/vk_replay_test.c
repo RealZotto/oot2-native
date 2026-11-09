@@ -1046,6 +1046,16 @@ static void case_xstop(const char *what) {
     } else if (!strcmp(what, "mirrored")) {
         PUT(r, OP_COPY_T2T, (p_copy_t2t){.src = tex_a(), .dst = tex_a(), .sr = region(0, 0, 0, 8, 8, 1),
                                          .dr = region(8, 8, 0, 8, 8, 1), .flags = NVN_COPY_FLAGS_MIRROR_X_BIT});
+    } else if (!strcmp(what, "decoded_b2t") || !strcmp(what, "decoded_t2b")) {
+        // The stand-in device makes every colour image RGBA8, so an ASTC texture's image holds decoded texels.
+        nvn_tex_rec t = texture(TEX_B, 2, NVN_FORMAT_RGBA_ASTC_4x4, NVN_TEXTURE_TARGET_2D, 64, 32, 1);
+        PUT(r, !strcmp(what, "decoded_b2t") ? OP_COPY_B2T : OP_COPY_T2B,
+            (p_copy_b2t){.addr = MIRROR + 0x1000, .tex = t, .r = region(0, 0, 0, 8, 8, 1)});
+    } else if (!strcmp(what, "decoded_pair")) {
+        // The counterpart that goes through: texels to texels, between two images of decoded ASTC.
+        nvn_tex_rec a = texture(TEX_B, 2, NVN_FORMAT_RGBA_ASTC_4x4, NVN_TEXTURE_TARGET_2D, 64, 32, 1);
+        nvn_tex_rec b = texture(TEX_ARRAY, 3, NVN_FORMAT_RGBA_ASTC_4x4, NVN_TEXTURE_TARGET_2D, 64, 32, 1);
+        PUT(r, OP_COPY_T2T, (p_copy_t2t){.src = a, .dst = b, .sr = region(0, 0, 0, 8, 8, 1), .dr = region(8, 8, 0, 8, 8, 1)});
     } else {
         fprintf(stderr, "unknown stop %s\n", what);
         exit(2);
