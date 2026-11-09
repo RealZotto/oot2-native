@@ -86,6 +86,8 @@ static void view_gone(void *arg, uint64_t value) {
 static int dev_target(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarget *out) {
     memset(out, 0, sizeof *out);
     VkbImage *img = vkb_image_get(&t->tex);
+    // a target in storage the CPU can see: its arena image, made current so the pass draws over the CPU's bytes
+    if (!img) img = vkb_image_demand_current(&t->tex, value);
     if (!img) return 0;
     vkb_image_use(img, value);
     int fmt = t->has_view && t->view.set_format ? t->view.format : t->tex.d.format;

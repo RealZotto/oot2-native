@@ -160,6 +160,8 @@ static VkImageUsageFlags arena_usage(VkFormat f) {
     if (ft & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) u |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     // a program may store to a texture the CPU wrote (the title's compute passes do, into an RGBA8 one)
     if (ft & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) u |= VK_IMAGE_USAGE_STORAGE_BIT;
+    // and a pass may render into one (after the intro, an RG8 target of 260x260)
+    if (ft & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     return u;
 }
 

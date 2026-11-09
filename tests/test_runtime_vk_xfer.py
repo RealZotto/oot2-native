@@ -27,6 +27,9 @@ serves the draw and the dispatches (no game data).
   by a buffer copy and come out; the CPU then writes the pages behind the texture and a copy takes them as a buffer, which
   brings their mirror current, and the texels still read back as they were (with the image placed in a mirror's span, as it
   was, the refresh wrote the CPU's bytes over the texels: the counter-run).
+- cpu_target: a pass renders (a scissored clear) into an RG8 texture in CPU-visible storage the CPU wrote: the pass takes the
+  texture's arena image, the CPU's bytes are uploaded before it, and a later submission reads the cleared half and the CPU's
+  other half (without the arena image the replay stopped with "no image stands on the render target's storage").
 
 Every case runs under synchronization validation, which must report nothing. Without a usable device they skip, unless
 OOT2_REQUIRE_GPU is set.
@@ -188,6 +191,12 @@ class TransferTest(vp.DeviceTestCase):
                 self.assertIn("its image is not placed; pages behind it backed 0, mirrors 0, imports 0", out)
                 self.assertIn("texels in by a buffer copy and out by another: as they went in", out)
                 self.assertIn(f"{mode}: the CPU's writes behind the texture left its texels", out)
+
+    def test_a_pass_renders_into_a_target_in_cpu_visible_storage(self) -> None:
+        for mode in ("mirror", "imports"):
+            with self.subTest(destinations=mode):
+                out = self.clean("cpu_target", *(("imports",) if mode == "imports" else ()))
+                self.assertIn("render target in CPU-visible storage: 0 of 1024 texels wrong", out)
 
     def test_counter_run_the_stores_of_a_mirror_are_lost_when_not_declared(self) -> None:
         err = self.failing("storage", "gated", "--pack", str(self.pack), "--mutant", "nodeclare")
