@@ -419,6 +419,224 @@ class OpusInTheBundle(unittest.TestCase):
         self.assertIn("--opus-dir", str(cm.exception))
 
 
+def fake_dll(path: Path, machine: int = 0x8664, extra: bytes = b"") -> Path:
+    """A file with a PE header of the given machine and nothing else: no byte of Microsoft's runtime."""
+    head = bytearray(0x80)
+    head[:2] = b"MZ"
+    head[0x3C:0x40] = (0x40).to_bytes(4, "little")
+    head[0x40:0x44] = b"PE\0\0"
+    head[0x44:0x46] = machine.to_bytes(2, "little")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(head) + extra)
+    return path
+
+
+def fake_redist(folder: Path, names=bundle.VC_RUNTIME_DLLS, machine: int = 0x8664) -> Path:
+    for n in names:
+        fake_dll(folder / n, machine, extra=n.encode())
+    return folder
+
+
+def fake_install(root: Path, versions=("14.50.1", "14.51.36231")) -> Path:
+    """A Visual Studio folder with VC/Redist/MSVC/<version>/x64/Microsoft.VC145.CRT, as vswhere reports it."""
+    for v in versions:
+        fake_redist(root / "VC" / "Redist" / "MSVC" / v / "x64" / "Microsoft.VC145.CRT")
+    (root / "VC" / "Redist" / "MSVC" / "v145").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+class PipebuildAndVcRuntimeInTheBundle(unittest.TestCase):
+    """The bundle ships pipebuild.exe and Microsoft's Visual C++ runtime DLLs: the plan names them, they go where the
+    tools look, versions and SHA-256 reach the manifest, and a machine without the redistributable folder gets a named
+    error. Every DLL here is a synthetic PE header."""
+
+    def setUp(self):
+        self.dir = tmp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.crt = fake_redist(self.dir / "crt")
+        self.stage = bundle.Stage(self.dir / "bundle")
+        self.windows = str(self.dir / "windows")
+
+    def versions(self, path: Path) -> str:
+        return {"vcruntime140.dll": "14.51.1.0", "vcruntime140_1.dll": "14.51.2.0", "msvcp140.dll": "14.51.3.0"}[path.name]
+
+    def stage_runtime(self) -> None:
+        bundle.stage_vc_runtime(self.stage, self.crt, self.versions, system_root=self.windows)
+
+    def test_the_plan_lists_the_three_dlls_and_the_builder(self):
+        self.assertEqual(bundle.REQUIRED_FILES, ("bin/pipebuild.exe" if os.name == "nt" else "bin/pipebuild",
+                                                 "bin/vcruntime140.dll", "bin/vcruntime140_1.dll", "bin/msvcp140.dll"))
+        self.assertEqual(bundle.VC_RUNTIME_DLLS, ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll"))
+        for name in ("oot2-pipebuild", "vc-runtime"):
+            self.assertIn(name, bundle.COMPONENTS)
+
+    def test_both_components_have_their_row_in_the_real_table(self):
+        have = bundle.notice_components(NOTICES_TEXT)
+        self.assertIn("oot2-pipebuild", have)
+        self.assertIn("vc-runtime", have)
+        row = next(l for l in NOTICES_TEXT.splitlines() if l.startswith("| `bundle/vc-runtime/`"))
+        for word in ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "https://aka.ms/vs/18/redistribution",
+                     "Visual C++ redistributable terms", "System32"):
+            self.assertIn(word, row)
+
+    def test_the_dlls_are_staged_unmodified_beside_the_tools_with_a_notice(self):
+        self.stage_runtime()
+        rows = {r["path"]: r for r in self.stage.listing()}
+        self.assertEqual(sorted(rows), ["bin/msvcp140.dll", "bin/vcruntime140.dll", "bin/vcruntime140_1.dll",
+                                        "licenses/vc-runtime/NOTICE.txt"])
+        for name in bundle.VC_RUNTIME_DLLS:
+            self.assertEqual((self.stage.root / "bin" / name).read_bytes(), (self.crt / name).read_bytes())
+            self.assertEqual(rows[f"bin/{name}"]["component"], "vc-runtime")
+        self.assertIn(bundle.VC_TERMS_URL, (self.stage.root / "licenses/vc-runtime/NOTICE.txt").read_text())
+        for name in bundle.REQUIRED_FILES[1:]:
+            self.assertIn(name, rows)
+        bundle.check_notices(list(rows.values()), NOTICES_TEXT)    # the real table has the row and the notice is there
+
+    def test_versions_and_sha256_reach_the_manifest_and_the_notice(self):
+        self.stage_runtime()
+        bundle.finish(self.stage, "v", "abc", ALL_ROWS, say=lambda s: None)
+        manifest = json.loads((self.stage.root / "bundle.json").read_text(encoding="utf-8"))
+        files = manifest["vc_runtime"]["files"]
+        self.assertEqual(sorted(files), sorted(bundle.VC_RUNTIME_DLLS))
+        self.assertEqual(files["msvcp140.dll"]["version"], "14.51.3.0")
+        self.assertEqual(files["vcruntime140.dll"]["sha256"],
+                         hashlib.sha256((self.crt / "vcruntime140.dll").read_bytes()).hexdigest())
+        self.assertEqual(manifest["vc_runtime"]["terms"], bundle.VC_TERMS_URL)
+        notice = (self.stage.root / "licenses/vc-runtime/NOTICE.txt").read_text(encoding="utf-8")
+        self.assertIn(files["vcruntime140_1.dll"]["sha256"], notice)
+        self.assertIn("14.51.2.0", notice)
+
+    def test_a_missing_dll_is_named(self):
+        (self.crt / "msvcp140.dll").unlink()
+        with self.assertRaises(bundle.BundleError) as cm:
+            self.stage_runtime()
+        self.assertIn("msvcp140.dll", str(cm.exception))
+
+    def test_a_folder_that_is_not_there_is_named(self):
+        with self.assertRaises(bundle.BundleError) as cm:
+            bundle.stage_vc_runtime(self.stage, self.dir / "nowhere", self.versions, system_root=self.windows)
+        self.assertIn("nowhere", str(cm.exception))
+
+    def test_an_x86_dll_is_refused(self):
+        fake_redist(self.crt, machine=0x14C)
+        with self.assertRaises(bundle.BundleError) as cm:
+            self.stage_runtime()
+        self.assertIn("not an x64 DLL", str(cm.exception))
+
+    def test_a_file_that_is_not_a_pe_file_is_refused(self):
+        (self.crt / "vcruntime140.dll").write_bytes(b"not a dll")
+        with self.assertRaises(bundle.BundleError):
+            self.stage_runtime()
+
+    def test_the_system_folder_is_never_a_source(self):
+        system32 = fake_redist(self.dir / "windows" / "System32")
+        with self.assertRaises(bundle.BundleError) as cm:
+            bundle.stage_vc_runtime(self.stage, system32, self.versions, system_root=self.windows)
+        self.assertIn("System32", str(cm.exception))
+        self.assertEqual(self.stage.owner, {})
+
+    def test_the_newest_installed_redistributable_is_found_by_vswhere(self):
+        install = fake_install(self.dir / "vs")
+        vswhere = self.dir / "vswhere.exe"
+        vswhere.write_bytes(b"x")
+        seen = []
+
+        def run(cmd, **kw):
+            seen.append(cmd)
+            return mock.Mock(returncode=0, stdout=f"{install}\n", stderr="")
+
+        found = bundle.installed_vc_redist(vswhere, run)
+        self.assertEqual(found, install / "VC" / "Redist" / "MSVC" / "14.51.36231" / "x64" / "Microsoft.VC145.CRT")
+        self.assertIn(bundle.VS_COMPONENT, seen[0])
+        self.assertIn("-latest", seen[0])
+
+    def test_a_machine_without_vswhere_or_the_folder_gets_a_named_error(self):
+        with self.assertRaises(bundle.BundleError) as cm:
+            bundle.installed_vc_redist(self.dir / "missing-vswhere.exe", mock.Mock())
+        self.assertIn("vswhere.exe was not found", str(cm.exception))
+        self.assertIn("--vc-redist", str(cm.exception))
+        vswhere = self.dir / "vswhere.exe"
+        vswhere.write_bytes(b"x")
+        with self.assertRaises(bundle.BundleError) as cm:
+            bundle.installed_vc_redist(vswhere, lambda cmd, **kw: mock.Mock(returncode=0, stdout="", stderr=""))
+        self.assertIn(bundle.VS_COMPONENT, str(cm.exception))
+        bare = self.dir / "bare"
+        (bare / "VC" / "Redist" / "MSVC" / "14.51.1" / "x64").mkdir(parents=True)
+        with self.assertRaises(bundle.BundleError) as cm:
+            bundle.installed_vc_redist(vswhere, lambda cmd, **kw: mock.Mock(returncode=0, stdout=f"{bare}\n", stderr=""))
+        self.assertIn("Microsoft.VC14x.CRT", str(cm.exception))
+
+    def test_a_build_on_a_machine_without_the_folder_fails_before_any_download_or_build(self):
+        with mock.patch.object(bundle, "fetch", side_effect=AssertionError("a download before the folder was found")), \
+                mock.patch.object(bundle, "installed_vc_redist", side_effect=bundle.BundleError("no redistributable")):
+            with self.assertRaises(bundle.BundleError) as cm:
+                bundle.build(ROOT, self.dir / "out", self.dir / "cache", None, None, None, None, None, None, False)
+        self.assertIn("no redistributable", str(cm.exception))
+
+    def test_the_builder_is_staged_with_the_licence_texts_of_what_is_in_it(self):
+        exe = fake_dll(self.dir / "pipebuild.exe")
+        kit = self.dir / "kit"
+        (kit / "Licenses").mkdir(parents=True)
+        (kit / "Licenses" / "volk-LICENSE.md").write_text("synthetic MIT\n", encoding="utf-8")
+        bundle.stage_pipebuild(self.stage, exe, kit)
+        rows = self.stage.listing()
+        self.assertEqual([r["path"] for r in rows], sorted([bundle_env.PIPEBUILD, "licenses/oot2-pipebuild/LICENSE",
+                                                            "licenses/oot2-pipebuild/volk-LICENSE.md"]))
+        self.assertTrue(all(r["component"] == "oot2-pipebuild" for r in rows))
+        bundle.check_notices(rows, NOTICES_TEXT)
+        self.assertEqual(bundle_env.PIPEBUILD, bundle.REQUIRED_FILES[0])
+
+    def test_a_builder_without_volks_licence_text_is_refused(self):
+        exe = fake_dll(self.dir / "pipebuild.exe")
+        with self.assertRaises(bundle.BundleError) as cm:
+            bundle.stage_pipebuild(self.stage, exe, self.dir)
+        self.assertIn("volk-LICENSE.md", str(cm.exception))
+
+    def test_a_bundle_without_the_builder_or_a_dll_is_refused_and_each_is_named(self):
+        with self.assertRaises(bundle.BundleError) as cm:
+            bundle.check_required(self.stage)
+        for rel in bundle.REQUIRED_FILES:
+            self.assertIn(rel, str(cm.exception))
+        self.stage_runtime()
+        with self.assertRaises(bundle.BundleError) as cm:
+            bundle.check_required(self.stage)
+        self.assertIn(bundle_env.PIPEBUILD, str(cm.exception))
+        self.assertNotIn("vcruntime140.dll", str(cm.exception))
+
+    def test_the_real_table_with_the_vc_runtime_row_removed_refuses_the_dlls_by_name(self):
+        self.stage_runtime()
+        cut = "\n".join(l for l in NOTICES_TEXT.splitlines()
+                        if not (l.startswith("|") and "`bundle/vc-runtime/`" in l.split("|")[1])) + "\n"
+        with self.assertRaises(bundle.BundleError) as cm:
+            bundle.check_notices(self.stage.listing(), cut)
+        self.assertIn("bin/vcruntime140.dll", str(cm.exception))
+        self.assertIn("bundle/vc-runtime/", str(cm.exception))
+
+    def test_the_content_rules_pass_the_staged_runtime_and_its_digests(self):
+        self.stage_runtime()
+        bundle.guard(self.stage.root, self.stage.listing())
+
+    @unittest.skipUnless(os.name == "nt", "version.dll")
+    def test_a_real_windows_binary_has_a_dotted_file_version(self):
+        kernel = Path(os.environ["SystemRoot"]) / "System32" / "kernel32.dll"
+        parts = bundle.file_version(kernel).split(".")
+        self.assertEqual(len(parts), 4)
+        self.assertTrue(all(p.isdigit() for p in parts))
+
+    def test_a_builder_for_a_bundle_is_made_by_the_function_a_checkout_uses(self):
+        from prepare import pipelines
+        with mock.patch.object(pipelines, "compile_builder", return_value=self.dir / "pipebuild.exe") as cb, \
+                mock.patch("build_game.vulkan_include", return_value=self.dir), \
+                mock.patch("build_game.find_glslang", return_value="glslang"):
+            out = bundle.build_pipebuild(self.dir / "stage", self.dir, self.dir / "cache", lambda s: None)
+        self.assertEqual(out, self.dir / "pipebuild.exe")
+        args, kw = cb.call_args
+        self.assertEqual(Path(args[0]), self.dir / "stage" / "llvm" / "bin" / "clang.exe")
+        self.assertEqual(args[2], "glslang")
+        self.assertEqual(args[3], self.dir / "cache" / "pipebuild")
+        self.assertTrue(kw["env"]["PATH"].startswith(str(self.dir / "stage" / "llvm" / "bin")))
+
+
 def fake_opus_kit(dest: Path) -> Path:
     """A kit laid out as tools/fetch_opus.py lays one out, from synthetic files (no byte of libopus)."""
     (dest / "include" / "opus").mkdir(parents=True)

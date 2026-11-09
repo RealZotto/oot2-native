@@ -5,7 +5,7 @@
 the game from without installing a toolchain.
 
     py -3.14 -I tools/bundle.py --out DIR [--cache DIR] [--xlate FILE] [--runtime-lib FILE --dav1d-dir DIR --opus-dir DIR --sdl3-dir DIR --vulkan-sdk DIR]
-                                [--no-zip] [--allow-dirty]
+                                [--pipebuild FILE] [--vc-redist DIR] [--no-zip] [--allow-dirty]
 
 What goes in, by kind (every piece has a row in THIRD_PARTY_NOTICES.md whose first cell names `bundle/<component>/`):
 
@@ -21,6 +21,11 @@ What goes in, by kind (every piece has a row in THIRD_PARTY_NOTICES.md whose fir
                linked into the program as in a normal build
   sdl3         the window library (libSDL3.a with its headers and notices, the kit tools/fetch_sdl3.py lays out),
                linked into the program as in a normal build
+  oot2-pipebuild  pipebuild.exe, the program the pipelines step runs, compiled here with the bundle's own compiler by
+               the same function a checkout's step uses (prepare/pipelines.py compile_builder)
+  vc-runtime   Microsoft's Visual C++ runtime DLLs (vcruntime140, vcruntime140_1, msvcp140), copied unmodified from the
+               x64 Microsoft.VC14x.CRT folder of the installed Visual Studio Build Tools (found with vswhere, or --vc-redist),
+               never from System32; their versions and SHA-256 go into bundle.json
   vulkan-headers  the Vulkan headers the host probe compiles against
   zbic-source  the ZBIC decoder's source archive (hexkyz/zstd at its pinned commit), so that prepare needs no download
   oot2         this repository's tools and runtime headers, the launchers, the licence texts, bundle.json
@@ -170,6 +175,8 @@ COMPONENTS = {c.name: c for c in (
     Component("ninja", "Ninja"),
     Component("oot2-xlate", "the shader translator"),
     Component("oot2-runtime", "the runtime library"),
+    Component("oot2-pipebuild", "the pipeline builder program"),
+    Component("vc-runtime", "Microsoft's Visual C++ runtime DLLs"),
     Component("dav1d", "the AV1 decoder"),
     Component("opus", "the Opus decoder"),
     Component("sdl3", "the window library"),
@@ -195,6 +202,7 @@ class Stage:
     def __init__(self, root: Path):
         self.root = Path(root)
         self.owner: dict[str, str] = {}
+        self.facts: dict[str, object] = {}     # what a component records about its inputs, written into bundle.json
         self.root.mkdir(parents=True, exist_ok=True)
 
     def put(self, component: str, rel: str, data: bytes | Path, mode: int | None = None) -> None:
@@ -618,6 +626,170 @@ def stage_translator(stage: Stage, exe: Path) -> None:
               ROOT / "xlate" / "third_party" / "ryujinx" / "LICENSE.txt")
 
 
+# ------------------------------------------------------------------------------------------------ the pipeline builder
+
+def build_pipebuild(stage_root: Path, vulkan: Path, cache: Path, say: Callable[[str], None]) -> Path:
+    """pipebuild.exe, compiled with the bundle's own compiler by the function the pipelines step uses in a checkout
+    (prepare/pipelines.py compile_builder), from the Vulkan kit the runtime library was built with (headers, Volk,
+    glslang). It holds this repository's runtime code and the runtime's own shaders, nothing of the game."""
+    import build_game
+    from prepare import pipelines
+    from prepare.runner import PrepareError
+
+    include = build_game.vulkan_include(vulkan)
+    glslang = build_game.find_glslang(include) if include else None
+    if include is None or not glslang:
+        raise BundleError(f"the Vulkan kit {vulkan} has no headers with Volk, or no glslang: the pipeline builder "
+                          "cannot be compiled")
+    cc = stage_root / "llvm" / "bin" / "clang.exe"
+    env = {k: v for k, v in os.environ.items() if k not in ("VULKAN_SDK", "VK_SDK_PATH", "PYTHONPATH", "PYTHONHOME")
+           and not k.startswith("OOT2_")}
+    env["PATH"] = os.pathsep.join([str(stage_root / "llvm" / "bin"), str(stage_root / "bin"), env.get("PATH", "")])
+    say("bundle: the pipeline builder, compiled with the bundle's own compiler")
+    try:
+        return pipelines.compile_builder(str(cc), include, glslang, cache / "pipebuild", env=env)
+    except PrepareError as e:
+        raise BundleError(f"pipebuild could not be built: {e}") from None
+
+
+def stage_pipebuild(stage: Stage, exe: Path, vulkan: Path) -> None:
+    """pipebuild.exe where bundle_env.pipebuild() looks, with the licence texts of what is compiled into it: this
+    repository's (GPL-3.0-or-later) and Volk's (MIT, from the Vulkan kit's Licenses folder)."""
+    if not Path(exe).is_file():
+        raise BundleError(f"the pipeline builder {exe} is not a file")
+    stage.put("oot2-pipebuild", bundle_env.PIPEBUILD, exe)
+    stage.put("oot2-pipebuild", "licenses/oot2-pipebuild/LICENSE", ROOT / "LICENSE")
+    volk = Path(vulkan) / "Licenses" / "volk-LICENSE.md"
+    if not volk.is_file():
+        raise BundleError(f"the Vulkan kit {vulkan} has no Licenses/volk-LICENSE.md: Volk is compiled into pipebuild")
+    stage.put("oot2-pipebuild", "licenses/oot2-pipebuild/volk-LICENSE.md", volk)
+
+
+# ------------------------------------------------------------------------------------------------ Microsoft's C++ runtime
+
+VC_RUNTIME_DLLS = ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
+# What a bundle must hold whatever else is in it: the pipeline builder and the Visual C++ runtime beside the tools.
+REQUIRED_FILES = (bundle_env.PIPEBUILD, *(f"{bundle_env.VC_RUNTIME}/{n}" for n in VC_RUNTIME_DLLS))
+VC_TERMS_URL = "https://aka.ms/vs/18/redistribution"
+VS_COMPONENT = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+PE_MACHINE_X64 = 0x8664
+
+
+def default_vswhere() -> Path | None:
+    base = os.environ.get("ProgramFiles(x86)") or os.environ.get("ProgramFiles")
+    return Path(base) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe" if base else None
+
+
+def installed_vc_redist(vswhere: Path | None = None, run: Callable = subprocess.run) -> Path:
+    """The x64 Microsoft.VC14x.CRT folder of the newest installed Visual Studio (Build Tools) that has the MSVC x64
+    tools, found with vswhere: <install>/VC/Redist/MSVC/<newest version>/x64/Microsoft.VC14x.CRT. Never System32. A
+    machine without it gets a named error that says what to install or which option to give."""
+    exe = vswhere or default_vswhere()
+    hint = ("Install Visual Studio Build Tools with the 'MSVC v14x x64/x86 build tools' component, or give the folder "
+            "with --vc-redist DIR")
+    if exe is None or not Path(exe).is_file():
+        raise BundleError(f"vswhere.exe was not found ({exe}), so the Visual C++ redistributable folder cannot be located. "
+                          + hint)
+    r = run([str(exe), "-latest", "-products", "*", "-requires", VS_COMPONENT, "-property", "installationPath"],
+            capture_output=True, text=True, errors="replace")
+    found = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    if r.returncode or not found:
+        raise BundleError(f"vswhere found no Visual Studio with the component {VS_COMPONENT}. " + hint)
+    msvc = Path(found[0]) / "VC" / "Redist" / "MSVC"
+    versions = [d for d in msvc.iterdir() if d.is_dir() and re.fullmatch(r"\d+\.\d+\.\d+", d.name)] if msvc.is_dir() else []
+    for d in sorted(versions, key=lambda d: tuple(int(p) for p in d.name.split(".")), reverse=True):
+        crt = sorted((d / "x64").glob("Microsoft.VC*.CRT")) if (d / "x64").is_dir() else []
+        if crt:
+            return crt[-1]
+    raise BundleError(f"{msvc} holds no x64 Microsoft.VC14x.CRT folder. " + hint)
+
+
+def pe_machine(path: Path) -> int | None:
+    """The machine field of a PE file's header (0x8664 is x64), or None when the file is not a PE file."""
+    with open(path, "rb") as f:
+        head = f.read(4096)
+    if head[:2] != b"MZ" or len(head) < 0x40:
+        return None
+    pe = struct.unpack_from("<I", head, 0x3C)[0]
+    if pe + 6 > len(head) or head[pe:pe + 4] != b"PE\0\0":
+        return None
+    return struct.unpack_from("<H", head, pe + 4)[0]
+
+
+def file_version(path: Path) -> str:
+    """The file version ("14.51.36247.0") of a Windows binary, read from its version resource with version.dll."""
+    import ctypes
+    from ctypes import wintypes
+
+    if os.name != "nt":
+        raise BundleError("reading a file version needs Windows (version.dll)")
+    ver = ctypes.WinDLL("version", use_last_error=True)
+    ver.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+    ver.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+    ver.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    ver.GetFileVersionInfoW.restype = wintypes.BOOL
+    ver.VerQueryValueW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p),
+                                   ctypes.POINTER(wintypes.UINT)]
+    ver.VerQueryValueW.restype = wintypes.BOOL
+    size = ver.GetFileVersionInfoSizeW(str(path), None)
+    buf = ctypes.create_string_buffer(size) if size else None
+    ptr, length = ctypes.c_void_p(), wintypes.UINT()
+    if not size or not ver.GetFileVersionInfoW(str(path), 0, size, buf) or \
+            not ver.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(length)) or length.value < 16:
+        raise BundleError(f"{path} has no version resource")
+    ms, ls = struct.unpack("<II", ctypes.string_at(ptr.value + 8, 8))      # VS_FIXEDFILEINFO.dwFileVersionMS, LS
+    return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+
+
+def vc_runtime_notice(folder: Path, facts: dict) -> str:
+    lines = ["Microsoft Visual C++ runtime, as this bundle carries it in bin/ (beside the tools; the launchers put bin first",
+             "on PATH).", "",
+             "Files, copied unmodified from the Visual C++ Redistributable folder of the Visual Studio Build Tools that",
+             f"made this bundle ({facts['source']}):", ""]
+    for name, f in facts["files"].items():
+        lines.append(f"  {name}  version {f['version']}  sha256 {f['sha256']}")
+    lines += ["", "They are Microsoft's, not this project's, and are not covered by its licence. Microsoft lists the Visual C++",
+              "runtime files as distributable code: a licensed Visual Studio user may copy and distribute them unmodified with a",
+              "program, subject to the Microsoft Software License Terms of the edition that supplied them. The list and its",
+              f"terms: {VC_TERMS_URL}", ""]
+    return "\n".join(lines)
+
+
+def stage_vc_runtime(stage: Stage, folder: Path, version_of: Callable[[Path], str] = file_version,
+                     system_root: str | None = None) -> None:
+    """The three runtime DLLs of folder (an x64 Microsoft.VC14x.CRT folder) into bin/, unmodified, with their versions and
+    SHA-256 in the manifest (bundle.json, key vc_runtime) and a notice in licenses/vc-runtime/. Refused, by name: a folder
+    that does not exist, one inside the Windows folder (System32 holds the machine's own copies, not a redistributable
+    set), a missing DLL, a file that is not an x64 PE file."""
+    folder = Path(folder)
+    root = system_root if system_root is not None else (os.environ.get("SystemRoot") or os.environ.get("windir"))
+    if root and folder.resolve().is_relative_to(Path(root).resolve()):
+        raise BundleError(f"{folder} is inside the Windows folder: the runtime is taken from the Visual Studio "
+                          "redistributable folder, never from System32")
+    if not folder.is_dir():
+        raise BundleError(f"the Visual C++ redistributable folder {folder} does not exist")
+    files = {}
+    for name in VC_RUNTIME_DLLS:
+        path = folder / name
+        if not path.is_file():
+            raise BundleError(f"{name} is not in the redistributable folder {folder}")
+        machine = pe_machine(path)
+        if machine != PE_MACHINE_X64:
+            raise BundleError(f"{path} is not an x64 DLL (PE machine {machine if machine is None else hex(machine)})")
+        files[name] = {"version": version_of(path), "sha256": sha256_file(path), "bytes": path.stat().st_size}
+        stage.put("vc-runtime", f"{bundle_env.VC_RUNTIME}/{name}", path)
+    facts = {"source": "/".join(folder.parts[-5:]), "terms": VC_TERMS_URL, "files": files}
+    stage.facts["vc_runtime"] = facts
+    stage.put("vc-runtime", "licenses/vc-runtime/NOTICE.txt", vc_runtime_notice(folder, facts).encode("utf-8"))
+
+
+def check_required(stage: Stage, required: Iterable[str] = REQUIRED_FILES) -> None:
+    """Refuse a bundle that lacks a file every bundle must hold, naming each."""
+    lacking = [rel for rel in required if rel not in stage.owner]
+    if lacking:
+        raise BundleError(f"the bundle lacks {', '.join(lacking)}")
+
+
 def stage_zbic(stage: Stage, cache: Path, say: Callable[[str], None]) -> None:
     """The decoder's source archive, fetched and checked by the code prepare uses (tools/prepare/zbic.py), kept as the
     tar.gz it checked, with the licence files of the fork."""
@@ -643,6 +815,7 @@ def stage_zbic(stage: Stage, cache: Path, say: Callable[[str], None]) -> None:
 def readme_and_manifest(stage: Stage, version: str, commit: str, rows: list[dict]) -> dict:
     return {"bundle": BUNDLE_FORMAT, "version": version, "source_commit": commit,
             "pins": {p.name: {"url": p.url, "sha256": p.sha256} for p in PINS},
+            **stage.facts,
             "files": rows, "total_bytes": sum(r["bytes"] for r in rows)}
 
 
@@ -707,8 +880,10 @@ def check_kits(runtime_lib: Path | None, dav1d_dir: Path | None, opus_dir: Path 
 
 def build(root: Path, out: Path, cache: Path, xlate: Path | None, runtime_lib: Path | None,
           dav1d_dir: Path | None, opus_dir: Path | None, sdl3_dir: Path | None, vulkan_dir: Path | None, make_zip: bool,
-          say: Callable[[str], None] = print) -> Path:
+          say: Callable[[str], None] = print, pipebuild: Path | None = None, vc_redist: Path | None = None) -> Path:
     check_kits(runtime_lib, dav1d_dir, opus_dir, sdl3_dir, vulkan_dir)
+    # The redistributable folder is looked for first: a machine without it fails in seconds, not after the builds.
+    vc_folder = Path(vc_redist) if vc_redist else installed_vc_redist()
     commit = subprocess.run(["git", "-C", str(root), "rev-parse", "--short=12", "HEAD"], capture_output=True,
                             text=True).stdout.strip() or "unknown"
     version = f"oot2-native-bundle-{commit}"
@@ -731,8 +906,12 @@ def build(root: Path, out: Path, cache: Path, xlate: Path | None, runtime_lib: P
     stage_runtime(stage, runtime_lib, dav1d_dir, opus_dir, sdl3_dir, vulkan_dir)
     say("bundle: the shader translator")
     stage_translator(stage, xlate or build_translator(cache, say))
+    stage_pipebuild(stage, pipebuild or build_pipebuild(stage_dir, vulkan_dir, cache, say), vulkan_dir)
+    say(f"bundle: Microsoft's Visual C++ runtime from {vc_folder}")
+    stage_vc_runtime(stage, vc_folder)
     stage_zbic(stage, cache, say)
     stage_oot2(stage, root)
+    check_required(stage)
     rows = finish(stage, version, commit, notices_text, say)
     say(f"bundle: {len(rows)} files in {stage_dir}")
     if make_zip:
@@ -753,6 +932,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--opus-dir", type=Path, help="the libopus kit that library was built with")
     ap.add_argument("--sdl3-dir", type=Path, help="the SDL3 kit that library was built with")
     ap.add_argument("--vulkan-sdk", type=Path, help="the Vulkan SDK folder that library was built with")
+    ap.add_argument("--pipebuild", type=Path, help="a built pipebuild.exe (default: compile it with the bundle's clang)")
+    ap.add_argument("--vc-redist", type=Path, help="the x64 Microsoft.VC14x.CRT folder to take the Visual C++ runtime "
+                                                   "DLLs from (default: the newest Visual Studio found by vswhere)")
     ap.add_argument("--no-zip", action="store_true", help="leave the folder, write no zip")
     ap.add_argument("--allow-dirty", action="store_true", help="build from a working tree with uncommitted changes")
     args = ap.parse_args(argv)
@@ -764,7 +946,7 @@ def main(argv: list[str] | None = None) -> int:
                               "(--allow-dirty builds from the tree as it is)")
         cache = (args.cache or args.out / "cache").resolve()
         build(ROOT, args.out.resolve(), cache, args.xlate, args.runtime_lib, args.dav1d_dir, args.opus_dir, args.sdl3_dir,
-              args.vulkan_sdk, not args.no_zip)
+              args.vulkan_sdk, not args.no_zip, pipebuild=args.pipebuild, vc_redist=args.vc_redist)
     except BundleError as e:
         print(f"bundle: {e}", file=sys.stderr)
         return 1

@@ -31,6 +31,8 @@ LLVM_BIN = "llvm/bin"
 CLANG = f"llvm/bin/clang{EXE}"
 NINJA = f"bin/ninja{EXE}"
 XLATE = f"bin/oot2-xlate{EXE}"
+PIPEBUILD = f"bin/pipebuild{EXE}"      # the pipelines step's builder, made by tools/bundle.py with the bundle's compiler
+VC_RUNTIME = "bin"                     # Microsoft's Visual C++ runtime DLLs sit beside the tools; the launchers put bin first on PATH
 PYTHON_HOME = "python"
 RUNTIME_LIB = "runtime/liboot2rt.a"
 DAV1D_KIT = "runtime/dav1d"
@@ -86,6 +88,10 @@ def ninja() -> str | None:
 
 def translator() -> Path | None:
     return file(XLATE)
+
+
+def pipebuild() -> Path | None:
+    return file(PIPEBUILD)
 
 
 def runtime_lib() -> Path | None:

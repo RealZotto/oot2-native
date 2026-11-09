@@ -452,11 +452,24 @@ def ensure_builder(ctx: Context, scratch: Path) -> list[str]:
             return [str(exe)]
     except OSError:
         pass
+    compile_builder(tool.cc, tool.vulkan, tool.glslang, out)
+    stamp.write_text(want + "\n", encoding="utf-8")
+    return [str(exe)]
+
+
+def compile_builder(cc: str, vulkan: Path, glslang: str, out: Path, env: dict | None = None) -> Path:
+    """Compile the builder program into out (pipebuild.exe, or pipebuild off Windows) from the runtime's core, nvn and
+    gpu sources, the runtime's shaders embedded by glslang, and the placeholder layout header the builder needs (it loads
+    no game). The release bundle's builder (tools/bundle.py) is made by this same function, so a bundle's pipelines are
+    the ones a checkout's step would build."""
+    out = Path(out)
+    vulkan = Path(vulkan)
+    exe = out / ("pipebuild.exe" if os.name == "nt" else "pipebuild")
     out.mkdir(parents=True, exist_ok=True)
     exe.unlink(missing_ok=True)
     layout.write(layout.place({"main": MODULE_SIZE}), out)
     try:
-        glue = build_game.write_shader_glue(RUNTIME, out, tool.glslang)
+        glue = build_game.write_shader_glue(RUNTIME, out, glslang)
     except build_game.BuildError as e:
         raise PrepareError(str(e)) from None
     sources = [str(SOURCE)]
@@ -464,15 +477,14 @@ def ensure_builder(ctx: Context, scratch: Path) -> list[str]:
         sources += sorted(str(p) for p in (RUNTIME / part).glob("*.c"))
     sources.append(str(glue))
     extra = ["-Wl,--disable-high-entropy-va"] if os.name == "nt" else ["-pthread", "-ldl", "-lm"]
-    cmd = [tool.cc, "-std=gnu11", "-O1", "-march=x86-64-v3", "-fno-strict-aliasing", "-w",
+    cmd = [cc, "-std=gnu11", "-O1", "-march=x86-64-v3", "-fno-strict-aliasing", "-w",
            "-I", str(RUNTIME / "include"), "-I", str(RUNTIME / "core"), "-I", str(RUNTIME / "nvn"), "-I", str(out),
-           "-I", str(tool.vulkan), "-I", str(tool.vulkan / "Volk"), *sources, *extra, "-o", str(exe)]
-    done = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+           "-I", str(vulkan), "-I", str(vulkan / "Volk"), *sources, *extra, "-o", str(exe)]
+    done = subprocess.run(cmd, capture_output=True, text=True, errors="replace", env=env)
     if done.returncode or not exe.is_file():
-        raise PrepareError(f"the pipeline builder could not be compiled with {tool.cc}:\n"
+        raise PrepareError(f"the pipeline builder could not be compiled with {cc}:\n"
                            f"{(done.stderr or done.stdout).strip()[-800:]}")
-    stamp.write_text(want + "\n", encoding="utf-8")
-    return [str(exe)]
+    return exe
 
 
 def builder_identity(command: list[str]) -> dict:
