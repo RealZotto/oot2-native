@@ -484,7 +484,7 @@ static void null_guest_written(uint64_t addr, uint64_t size) {
     word_note((const volatile uint32_t *)(uintptr_t)addr, WRITER_CPU);
     plat_mutex_unlock(&g_lock);
 }
-static void null_guest_read(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
+static int null_guest_read(uint64_t addr, uint64_t size) { (void)addr, (void)size; return 0; }
 static void null_cpu_synced(uint64_t fence) { (void)fence; }
 
 const GfxBackend gfx_null_backend = {

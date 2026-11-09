@@ -214,6 +214,16 @@ static void op_gpu_wrote(uint64_t addr, uint64_t size, uint64_t value) {
     where(w, sizeof w, addr);
     lput(&g_ops, "op wrote %s 0x%llx frame %llu\n", w, (ull)size, (ull)value);
 }
+static struct { uint64_t addr, size, value; } g_cpu_writes[1024];
+static int g_ncpu_writes;
+static void op_cpu_write_pending(uint64_t addr, uint64_t size, uint64_t value) {
+    if (g_ncpu_writes < (int)(sizeof g_cpu_writes / sizeof g_cpu_writes[0])) {
+        g_cpu_writes[g_ncpu_writes].addr = addr;
+        g_cpu_writes[g_ncpu_writes].size = size;
+        g_cpu_writes[g_ncpu_writes].value = value;
+    }
+    g_ncpu_writes++;
+}
 static int op_target(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarget *out) {
     (void)value;
     if (storage) return 0;
@@ -304,7 +314,8 @@ static void op_query_results(VkQueryPool pool, uint32_t n, uint64_t *out) {
 static const VkReplayOps g_fake_ops = {
     .graphics = op_graphics, .compute = op_compute,
     .graphics_layout = (VkPipelineLayout)(uintptr_t)0x6100, .compute_layout = (VkPipelineLayout)(uintptr_t)0x6200,
-    .binds = op_binds, .resolve = op_resolve, .gpu_wrote = op_gpu_wrote, .target = op_target, .image = op_image,
+    .binds = op_binds, .resolve = op_resolve, .gpu_wrote = op_gpu_wrote, .cpu_write_pending = op_cpu_write_pending,
+    .target = op_target, .image = op_image,
     .acquire = op_acquire,
     .image_slot = op_image_slot, .storage_image = op_storage_image, .scratch = op_scratch,
     .buffer_address = op_buffer_address, .task_set = op_task_set, .raw = op_raw,
@@ -1285,6 +1296,13 @@ static void case_reports(void) {
     PUT(r, OP_RENDER_ENABLE, (p_flag){1});
     uint64_t h = rec_end(r);
     uint64_t v = vkr_submit(&h, 1);
+    CHECK(g_ncpu_writes == 5);
+    CHECK(g_cpu_writes[0].addr == HOST + 0x800 && g_cpu_writes[0].size == sizeof(NVNcounterData));
+    CHECK(g_cpu_writes[1].addr == HOST + 0x810 && g_cpu_writes[1].size == sizeof(NVNcounterData));
+    CHECK(g_cpu_writes[2].addr == (uint64_t)(uintptr_t)EV && g_cpu_writes[2].size == 4);
+    CHECK(g_cpu_writes[3].addr == (uint64_t)(uintptr_t)EV && g_cpu_writes[3].size == 4);
+    CHECK(g_cpu_writes[4].addr == HOST + 0xA00 && g_cpu_writes[4].size == sizeof(NVNcounterData));
+    for (int i = 0; i < g_ncpu_writes; i++) CHECK(g_cpu_writes[i].value == v);
     CHECK(gpu_sync_wait(v, 10000000000ull));
     r = rec_begin(1);
     draw_k(r, 8);                                                          // query 0 of the second pool
@@ -1292,7 +1310,13 @@ static void case_reports(void) {
     PUT(r, OP_RESET_COUNTER, (p_reset_counter){NVN_COUNTER_TYPE_SAMPLES_PASSED});
     PUT(r, OP_REPORT_COUNTER, (p_report_counter){NVN_COUNTER_TYPE_SAMPLES_PASSED, HOST + 0x830});
     h = rec_end(r);
-    CHECK(gpu_sync_wait(vkr_submit(&h, 1), 10000000000ull));
+    uint64_t v2 = vkr_submit(&h, 1);
+    CHECK(g_ncpu_writes == 7);
+    CHECK(g_cpu_writes[5].addr == HOST + 0x820 && g_cpu_writes[5].size == sizeof(NVNcounterData) &&
+          g_cpu_writes[5].value == v2);
+    CHECK(g_cpu_writes[6].addr == HOST + 0x830 && g_cpu_writes[6].size == sizeof(NVNcounterData) &&
+          g_cpu_writes[6].value == v2);
+    CHECK(gpu_sync_wait(v2, 10000000000ull));
     printf("event %u\n", *EV);
     printf("samples %llu %llu %llu\n", (ull)rd64(0x800), (ull)rd64(0x820), (ull)rd64(0x830));
     printf("timestamp counter %llu, ticks in order %d, nonzero %d\n", (ull)rd64(0x810),

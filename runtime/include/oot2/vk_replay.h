@@ -124,6 +124,8 @@ typedef struct VkReplayOps {
     // The backing map (backing_resolve, backing_gpu_wrote) in the frame's submission.
     void (*resolve)(uint64_t addr, uint64_t size, uint64_t value, BackingRef *out);
     void (*gpu_wrote)(uint64_t addr, uint64_t size, uint64_t value);
+    // A guest-memory write performed by a completion effect rather than by a GPU command.
+    void (*cpu_write_pending)(uint64_t addr, uint64_t size, uint64_t value);
     // A render target or storage image: the texture as the record holds it, for the frame `value`; 0 when no image
     // stands on its storage (a named stop follows). The view lives until the frame is done.
     int (*target)(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarget *out);

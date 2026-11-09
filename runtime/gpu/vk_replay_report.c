@@ -196,6 +196,8 @@ int vkr_report_op(const op_hdr *r) {
         Entry e = {.kind = E_REPORT};
         if (samples) g_counting = 1, vkr_report_pass_end(), e.q = R.nq;
         e.u.rep.type = p->type, e.u.rep.addr = report_addr(p->addr);
+        if (e.u.rep.addr && vkr_frame_ops()->cpu_write_pending)
+            vkr_frame_ops()->cpu_write_pending(e.u.rep.addr, sizeof(NVNcounterData), vkr_frame_value());
         if (vkr_stamp_at_replay) e.stamp = rt_ticks();
         push(e);
         pending_add(p->addr, vkr_frame_value(), samples);
@@ -212,6 +214,8 @@ int vkr_report_op(const op_hdr *r) {
         const p_signal_event *p = a;
         if (p->mode != NVN_EVENT_SIGNAL_MODE_WRITE && p->mode != NVN_EVENT_SIGNAL_MODE_ADD)
             vkr_stop("SignalEvent mode %u is not one of NVN's", p->mode);
+        if (vkr_frame_ops()->cpu_write_pending)
+            vkr_frame_ops()->cpu_write_pending((uint64_t)(uintptr_t)p->val, sizeof *p->val, vkr_frame_value());
         push((Entry){.kind = E_SIGNAL, .u.sig = *p});
         return 1;
     }

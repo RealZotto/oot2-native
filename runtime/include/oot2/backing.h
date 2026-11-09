@@ -69,8 +69,8 @@
 //   GPU to guest    a GPU write into a mirror is declared by whoever records it (backing_gpu_wrote: the replay's
 //                   storage writes, copies and fills); at the submission's end its bytes are copied out to staging, and
 //                   once the device reached the submission's value, on the completion thread and before the value is
-//                   done, they are written into guest memory. Never before: a CPU that waited for the fence reads them,
-//                   one that did not reads the old bytes, as on the console.
+//                   done, they are written into guest memory. An invalidation waits for overlapping in-flight writes,
+//                   including the completion effect that writes the bytes back.
 //   both            a copy into a mirror leaves out the bytes of GPU writes not yet written back, so a page the CPU and
 //                   the GPU both write keeps the GPU's bytes (DKB Recomp's shadow-storage rule).
 // A new backing over a run that holds older ones (a bind that grew the run) waits for the older submissions that used
@@ -225,11 +225,15 @@ void backing_submit_end(uint64_t value);
 // guest_written: the CPU wrote [addr, addr + size) (a flush, the front end's own writes): the pages are stamped, so the
 // mirrors over them are brought current at their next use.
 void backing_guest_written(uint64_t addr, uint64_t size);
-// guest_read and cpu_synced: what the GPU wrote into mirrors is in guest memory by the time a value is done, so these
-// check it: a write-back still waiting for a value that is done is a named fatal. A read of bytes a GPU write still in
-// flight will replace is counted (the game reads before its fence; the console gives it the old bytes too).
-void backing_guest_read(uint64_t addr, uint64_t size);
+// CPU-side completion effects that write guest memory must be declared before their submission is handed over.
+void backing_cpu_write_pending(uint64_t addr, uint64_t size, uint64_t value);
+// A read first waits for handed-out submissions to be issued, so their writes have all been declared. It then waits for
+// overlapping writes and for raw-access work, whose destination pages are known only at completion.
+// Neither the coherence lock nor a guest virtual core is held while waiting. OOT2_VK_READ_WAIT=0 disables the wait.
+// OOT2_VK_READ_TRACE=1 logs potential hits, including their guest callers, and the total at close.
+int backing_guest_read(uint64_t addr, uint64_t size);   // 1 when an in-flight write could reach the range
 void backing_cpu_synced(uint64_t fence);
+extern int backing_no_read_wait;
 
 // ---- the raw path (The raw path above)
 // Submission `value` holds a raw-access program: keep the invariant, bring the mirrors current and record it. On the
@@ -275,7 +279,7 @@ typedef struct BackingStats {
     uint64_t mirrors_made, mirrors_refused_budget, mirrors_refused_untracked, mirrors_stale, replace_waits;
     uint64_t mirror_syncs, uploads, upload_bytes;                      // syncs, and the copies into mirrors they made
     uint64_t writebacks, writeback_bytes, writebacks_skipped;          // GPU writes written back; into unmapped memory
-    uint64_t pending, reads_in_flight;                                 // GPU writes not written back yet; early reads
+    uint64_t pending, reads_in_flight;                                 // mirror writes pending; invalidations with in-flight writes
     uint64_t raw_begins, raw_passes;                                   // raw-access submissions; passes of the invariant
     uint64_t raw_fill_imports, raw_fill_bytes, raw_fill_extents;       // what those passes made
     uint64_t raw_waits;                                                // mirror copies that waited for raw stores

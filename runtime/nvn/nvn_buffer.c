@@ -103,5 +103,5 @@ NVN_API(nvnBufferFlushMappedRange) {
 // what the GPU wrote there
 NVN_API(nvnBufferInvalidateMappedRange) {
     uint64_t a = mapped_range(c, "Invalidate");
-    if (a) gfx_backend()->guest_read(a, arg_x(c, 2));
+    if (a) nvn_invalidate(c, a, arg_x(c, 2), "BufferInvalidateMappedRange");
 }

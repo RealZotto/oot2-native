@@ -257,7 +257,7 @@ static void vk_texture_release(const tex_t *t) { bindless_texture_release(t); }
 static void vk_program_release(const prog_t *p) { vkm_program_release(p->serial); }
 // The CPU's view of mirrored pool storage (oot2/backing.h, Mirrors).
 static void vk_guest_written(uint64_t addr, uint64_t size) { backing_guest_written(addr, size); }
-static void vk_guest_read(uint64_t addr, uint64_t size) { backing_guest_read(addr, size); }
+static int vk_guest_read(uint64_t addr, uint64_t size) { return backing_guest_read(addr, size); }
 static void vk_cpu_synced(uint64_t fence) { backing_cpu_synced(fence); }
 
 const GfxBackend gfx_vulkan_backend = {

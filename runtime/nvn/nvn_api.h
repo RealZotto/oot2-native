@@ -14,6 +14,8 @@
 // runtime/nvn_api.h at 8e09aaa (GPL-3.0-or-later).
 #pragma once
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "oot2/gfx.h"
 #include "oot2/nvn_obj.h"
@@ -38,6 +40,14 @@ enum {
     static void nvn_body_##n(Cpu *c)
 
 static inline int nvn_arg_bool(const Cpu *c, int i) { return (int)(arg_x(c, i) & 0xff); }   // NVNboolean: low 8 bits
+
+static inline void nvn_invalidate(Cpu *c, uint64_t addr, uint64_t size, const char *entry) {
+    int in_flight = gfx_backend()->guest_read(addr, size);
+    const char *trace = in_flight ? getenv("OOT2_VK_READ_TRACE") : NULL;
+    if (trace && !strcmp(trace, "1"))
+        rt_log("nvn: %s read %#llx+%#llx while GPU work could write it, caller %#llx",
+               entry, (unsigned long long)addr, (unsigned long long)size, (unsigned long long)c->x[30]);
+}
 
 // WaitEvent per call site (gfx_null.c), declared here and not in gfx.h: the null back end's own bookkeeping. Each
 // site's waits are split by the classes of GfxNullWaitClasses; the sites past the 64 the table holds share one bucket, so the

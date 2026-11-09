@@ -84,7 +84,7 @@ typedef struct GfxBackend {
     void (*write_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row,
                          uint64_t img);
     void (*guest_written)(uint64_t addr, uint64_t size);   // the CPU wrote pool storage: copies of it are stale
-    void (*guest_read)(uint64_t addr, uint64_t size);      // the CPU is about to read pool storage the GPU may write
+    int (*guest_read)(uint64_t addr, uint64_t size);       // 1 when in-flight GPU work could write the range
     void (*cpu_synced)(uint64_t fence);                    // the CPU waited for fence and will read what it wrote
     // Optional (NULL: not wanted); see Presents and pacing above. seq counts presents from 1, across windows.
     // Two windows presenting from two threads may reach these calls out of seq order: seq is the key, not arrival.

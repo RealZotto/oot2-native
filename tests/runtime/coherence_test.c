@@ -24,6 +24,10 @@
 //   writeback    a declared GPU write reaches guest memory only once the device reached its submission; a copy into the
 //                mirror meanwhile leaves its bytes out; guest_read counts a read before the fence, cpu_synced finds
 //                nothing left behind
+//   read_wait, read_import, read_effect, read_raw   an invalidation waits for an overlapping mirror or import write,
+//                a completion effect, or a possible raw store; a disjoint declared write does not delay a read
+//   read_unissued, read_replay, read_latest   the recorder is caught up before testing the ranges, and the newest
+//                overlapping submission is done before the read returns
 //   replace      a bind that grows a mirror's run waits for the submission in flight that wrote it, so the new mirror
 //                holds the GPU's write
 //   watch        (Windows; a skip line elsewhere) the real write watch: every hook and sync between a CPU write and the
@@ -418,8 +422,10 @@ static void case_writeback(void) {
     // left behind; a read of the bytes is counted as early.
     CHECK(words_are((void *)(uintptr_t)(p + 0x100), 0x200, 0xAAAAAAAAu) && stats().pending == 1);
     backing_cpu_synced(gpu_sync_done());
+    backing_no_read_wait = 1;
     backing_guest_read(p + 0x180, 4);
     backing_guest_read(p + 0x400, 4);
+    backing_no_read_wait = 0;
     CHECK(stats().reads_in_flight == 1);
     // Meanwhile the CPU writes another word of the page, and the next submission copies the page into the mirror:
     // the bytes of the GPU write are left out of the copy.
@@ -447,6 +453,177 @@ static void run_later(void *arg) {
     (void)arg;
     plat_sleep_ns(200 * 1000 * 1000);
     gpu_run(g_run_later, gpu_writes_dd);
+}
+
+static void finish_later(void *arg) {
+    (void)arg;
+    plat_sleep_ns(200 * 1000 * 1000);
+    gpu_run(g_run_later, NULL);
+}
+
+static void issue_later(void *arg) {
+    (void)arg;
+    plat_sleep_ns(200 * 1000 * 1000);
+    sub_end(g_run_later);
+    gpu_run(g_run_later, NULL);
+}
+
+static void write_effect(void *arg, uint64_t value);
+
+static void issue_write_later(void *arg) {
+    uint64_t addr = (uint64_t)(uintptr_t)arg;
+    plat_sleep_ns(200 * 1000 * 1000);
+    backing_cpu_write_pending(addr, 4, g_run_later);
+    gpu_sync_effect(write_effect, (void *)(uintptr_t)addr);
+    sub_end(g_run_later);
+    gpu_run(g_run_later, NULL);
+}
+
+static uint64_t g_run_first;
+static void finish_two_later(void *arg) {
+    (void)arg;
+    plat_sleep_ns(100 * 1000 * 1000);
+    gpu_run(g_run_first, NULL);
+    plat_sleep_ns(100 * 1000 * 1000);
+    gpu_run(g_run_later, NULL);
+}
+
+static void case_read_wait(void) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 1 * MiB);
+    cpu_fill(p, 1 * MiB, 0xAAAAAAAAu);
+    uint64_t v = sub_begin();
+    BackingRef r = resolve(p, 0x4000, v);
+    CHECK(r.kind == BACKING_MIRROR);
+    g_mirror = bytes(&r);
+    backing_gpu_wrote(p + 0x100, 0x100, v);
+    sub_end(v);
+    CHECK(*(volatile uint32_t *)(uintptr_t)(p + 0x100) == 0xAAAAAAAAu);
+    g_run_later = v;
+    CHECK(plat_thread_start(run_later, NULL, 256 * KiB));
+    backing_guest_read(p + 0x100, 4);
+    uint32_t observed = *(volatile uint32_t *)(uintptr_t)(p + 0x100);
+    CHECK(gpu_sync_wait(v, 5000000000ull));
+    CHECK(observed == 0xDDDDDDDDu);
+    backing_pool_fini(&pp);
+    done("read_wait");
+}
+
+static void case_read_import(void) {
+    setup(64 * MiB, 0);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 1 * MiB);
+    cpu_fill(p, 1 * MiB, 0xAAAAAAAAu);
+    uint64_t v = sub_begin();
+    BackingRef r = resolve(p, 0x4000, v);
+    CHECK(r.kind == BACKING_IMPORT);
+    g_mirror = bytes(&r);
+    backing_gpu_wrote(p + 0x100, 0x100, v);
+    sub_end(v);
+    // An adjacent range must not wait for this submission.
+    backing_guest_read(p + 0x200, 4);
+    CHECK(gpu_sync_done() < v && stats().reads_in_flight == 0);
+    g_run_later = v;
+    CHECK(plat_thread_start(run_later, NULL, 256 * KiB));
+    backing_guest_read(p + 0x100, 4);
+    CHECK(*(volatile uint32_t *)(uintptr_t)(p + 0x100) == 0xDDDDDDDDu);
+    CHECK(stats().reads_in_flight == 1);
+    backing_pool_fini(&pp);
+    done("read_import");
+}
+
+static void write_effect(void *arg, uint64_t value) {
+    (void)value;
+    *(uint32_t *)arg = 0x12345678u;
+}
+
+static void case_read_effect(void) {
+    setup(64 * MiB, 0);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 1 * MiB);
+    cpu_fill(p, 1 * MiB, 0);
+    uint64_t v = sub_begin();
+    backing_cpu_write_pending(p + 0x100, 4, v);
+    gpu_sync_effect(write_effect, (void *)(uintptr_t)(p + 0x100));
+    sub_end(v);
+    g_run_later = v;
+    CHECK(plat_thread_start(finish_later, NULL, 256 * KiB));
+    backing_guest_read(p + 0x100, 4);
+    CHECK(*(volatile uint32_t *)(uintptr_t)(p + 0x100) == 0x12345678u);
+    backing_pool_fini(&pp);
+    done("read_effect");
+}
+
+static void case_read_raw(void) {
+    setup(64 * MiB, 0);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 1 * MiB);
+    cpu_fill(p, 1 * MiB, 0);
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);
+    gpu_sync_effect(write_effect, (void *)(uintptr_t)(p + 0x100));
+    sub_end(v);
+    g_run_later = v;
+    CHECK(plat_thread_start(finish_later, NULL, 256 * KiB));
+    backing_guest_read(p + 0x100, 4);
+    CHECK(*(volatile uint32_t *)(uintptr_t)(p + 0x100) == 0x12345678u);
+    backing_pool_fini(&pp);
+    done("read_raw");
+}
+
+static void case_read_unissued(void) {
+    setup(64 * MiB, 0);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 1 * MiB);
+    cpu_fill(p, 1 * MiB, 0);
+    uint64_t v = sub_begin();
+    backing_cpu_write_pending(p + 0x100, 4, v);
+    gpu_sync_effect(write_effect, (void *)(uintptr_t)(p + 0x100));
+    CHECK(gpu_sync_issued() < v);
+    g_run_later = v;
+    CHECK(plat_thread_start(issue_later, NULL, 256 * KiB));
+    backing_guest_read(p + 0x100, 4);
+    CHECK(*(volatile uint32_t *)(uintptr_t)(p + 0x100) == 0x12345678u);
+    backing_pool_fini(&pp);
+    done("read_unissued");
+}
+
+static void case_read_replay(void) {
+    setup(64 * MiB, 0);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 1 * MiB);
+    cpu_fill(p, 1 * MiB, 0);
+    uint64_t v = sub_begin();
+    CHECK(gpu_sync_issued() < v);
+    g_run_later = v;
+    CHECK(plat_thread_start(issue_write_later, (void *)(uintptr_t)(p + 0x100), 256 * KiB));
+    backing_guest_read(p + 0x100, 4);
+    CHECK(*(volatile uint32_t *)(uintptr_t)(p + 0x100) == 0x12345678u);
+    backing_pool_fini(&pp);
+    done("read_replay");
+}
+
+static void case_read_latest(void) {
+    setup(64 * MiB, 0);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 1 * MiB);
+    cpu_fill(p, 1 * MiB, 0);
+    uint64_t first = sub_begin();
+    backing_cpu_write_pending(p + 0x100, 4, first);
+    sub_end(first);
+    uint64_t latest = sub_begin();
+    backing_cpu_write_pending(p + 0x100, 4, latest);
+    gpu_sync_effect(write_effect, (void *)(uintptr_t)(p + 0x100));
+    sub_end(latest);
+    g_run_first = first, g_run_later = latest;
+    CHECK(plat_thread_start(finish_two_later, NULL, 256 * KiB));
+    backing_guest_read(p + 0x100, 4);
+    CHECK(*(volatile uint32_t *)(uintptr_t)(p + 0x100) == 0x12345678u);
+    CHECK(gpu_sync_done() >= latest);
+    backing_pool_fini(&pp);
+    done("read_latest");
 }
 
 static void case_replace(void) {
@@ -1022,7 +1199,12 @@ int main(int argc, char **argv) {
     }
     static const struct { const char *name; void (*fn)(void); } cases[] = {
         {"generations", case_generations}, {"upload", case_upload},   {"admission", case_admission},
-        {"writeback", case_writeback},     {"replace", case_replace}, {"watch", case_watch},
+        {"writeback", case_writeback},     {"read_wait", case_read_wait},
+        {"read_import", case_read_import}, {"read_effect", case_read_effect}, {"read_raw", case_read_raw},
+        {"read_unissued", case_read_unissued},
+        {"read_replay", case_read_replay},
+        {"read_latest", case_read_latest},
+        {"replace", case_replace}, {"watch", case_watch},
         {"unwritten", case_unwritten},     {"replace_written", case_replace_written},
         {"raw_grow", case_raw_grow},       {"raw_grow_whole", case_raw_grow_whole},
         {"raw_grow_head", case_raw_grow_head},

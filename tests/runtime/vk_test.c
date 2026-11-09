@@ -623,7 +623,9 @@ static void case_mirror_writeback(void) {
     plat_sleep_ns(100 * 1000 * 1000);
     const void *at = (const void *)(uintptr_t)(g_heap + 4 * MiB + 64 * KiB);
     CHECK(gpu_sync_done() < v && words_are(at, 64 * KiB, 0xAAAAAAAAu));   // never before the fence
+    backing_no_read_wait = 1;
     gfx_vulkan_backend.guest_read(g_heap + 4 * MiB + 64 * KiB, 4);
+    backing_no_read_wait = 0;
     gfx_vulkan_backend.cpu_synced(gpu_sync_done());
     printf("held by a semaphore: guest memory kept the old bytes, a read before the fence was counted\n");
     VkSemaphoreSignalInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = gate, .value = 1};

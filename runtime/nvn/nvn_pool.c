@@ -345,7 +345,7 @@ NVN_API(nvnMemoryPoolInvalidateMappedRange) {
     uint64_t size = arg_x(c, 2), a = cpu_range(arg_p(c, 0), (int64_t)arg_x(c, 1), &size);
     if (a) {
         if (texheap_on()) texheap_range(TEXHEAP_INVALIDATE, a, size);
-        gfx_backend()->guest_read(a, size);
+        nvn_invalidate(c, a, size, "MemoryPoolInvalidateMappedRange");
     }
 }
 

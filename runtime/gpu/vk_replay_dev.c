@@ -332,7 +332,8 @@ static int dev_cpu_reads(uint64_t addr, uint64_t size) {
 const VkReplayOps *vkr_device_ops(void) {
     static VkReplayOps ops = {.graphics = vkm_graphics, .compute = vkm_compute, .program_bound = vkm_program_bound,
                               .binds = dev_binds,
-                              .resolve = backing_resolve, .gpu_wrote = backing_gpu_wrote, .target = dev_target,
+                              .resolve = backing_resolve, .gpu_wrote = backing_gpu_wrote,
+                              .cpu_write_pending = backing_cpu_write_pending, .target = dev_target,
                               .image = dev_image,
                               .acquire = dev_acquire, .image_slot = dev_image_slot,
                               .storage_image = dev_storage_image, .scratch = dev_scratch,

@@ -77,6 +77,8 @@ typedef void (*GpuEffect)(void *arg, uint64_t value);
 uint64_t gpu_sync_begin(void);
 void gpu_sync_effect(GpuEffect fn, void *arg);
 void gpu_sync_end(void);
+// Wait until an already handed-out value is submitted, without waiting for the device or its effects.
+void gpu_sync_wait_issued(uint64_t value);
 // 1 once value is done, 0 when timeout_ns passed first (UINT64_MAX: no limit); a value not handed out yet answers 0 at
 // once. The caller has given its virtual core up for the wait (D7).
 int gpu_sync_wait(uint64_t value, uint64_t timeout_ns);

@@ -67,7 +67,7 @@ static int rec_pool_map_virtual(pool_t *v, int n, const void *requests) {
     return 1;
 }
 static void rec_guest_written(uint64_t addr, uint64_t size) { rec.written++, rec.addr = addr, rec.size = size; }
-static void rec_guest_read(uint64_t addr, uint64_t size) { rec.read++, rec.addr = addr, rec.size = size; }
+static int rec_guest_read(uint64_t addr, uint64_t size) { rec.read++, rec.addr = addr, rec.size = size; return 0; }
 static GfxBackend recording;
 
 // Guest memory, an empty program and the host-function registry sealed; register_nvn says whether start-up gave the

@@ -4,7 +4,8 @@
 runtime/gpu/backing.c; runtime/include/oot2/pagegen.h, runtime/include/oot2/backing.h) that need no GPU: one owner of
 the write watch whose generations two consumers read alike, a CPU write read by the next submission, the admission rule
 and its fallback to an import, a GPU write written back only once its submission was reached, a mirror replaced only
-after the submission that wrote it, a bind in a raw-access submission that grows past a mirror its page table maps
+after the submission that wrote it, invalidation of pending writes after replay and completion, a bind in a raw-access
+submission that grows past a mirror its page table maps
 (the mirror keeps the part the bind leaves, an import takes the rest, no page has two copies), an import such a
 submission binds a range larger than a uniform's of that becomes a mirror at the next raw-access begin (brought current,
 in the page table, left alone when the submission bound it before its raw stage or the admission refuses, and not past
@@ -35,7 +36,9 @@ from test_runtime_gpu import EXIT_FATAL, LEVELS, ROOT, build_program, case_env, 
 
 TEST_SOURCE = ROOT / "tests" / "runtime" / "coherence_test.c"
 
-PASSING = ("generations", "upload", "admission", "writeback", "replace", "raw_grow", "raw_grow_head",
+PASSING = ("generations", "upload", "admission", "writeback", "read_wait", "read_import", "read_effect", "read_raw",
+           "read_unissued", "read_replay", "read_latest",
+           "replace", "raw_grow", "raw_grow_head",
            "raw_grow_whole", "raw_grow_beside", "raw_grow_wait", "raw_sync_wait", "raw_promote", "raw_promote_small",
            "raw_promote_wait", "raw_promote_cap")
 
@@ -92,9 +95,10 @@ class CoherenceTest(unittest.TestCase):
         if hasattr(cls, "tmp"):
             cls.tmp.cleanup()
 
-    def run_case(self, level: str, case: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    def run_case(self, level: str, case: str, timeout: int = 120,
+                 env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         return subprocess.run([str(self.exes[level]), case], capture_output=True, text=True, timeout=timeout,
-                              env=case_env())
+                              env=case_env(env))
 
     def test_passing_cases(self) -> None:
         for case in PASSING:
@@ -115,6 +119,20 @@ class CoherenceTest(unittest.TestCase):
                     self.skipTest("no write watch on this platform")
                 self.assertIn("ok watch", done.stdout)
                 self.assertEqual(fatal_lines(done.stderr), [])
+
+    def test_counter_run_without_the_invalidate_wait(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done = self.run_case(level, "read_wait", env={"OOT2_VK_READ_WAIT": "0"})
+                self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("observed == 0xDDDDDDDDu", done.stderr)
+
+    def test_counter_run_without_the_replay_wait(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done = self.run_case(level, "read_replay", env={"OOT2_VK_READ_WAIT": "0"})
+                self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("0x12345678u", done.stderr)
 
     def test_what_the_map_cannot_keep_coherent_stops_by_name(self) -> None:
         for case, text in FAILING.items():

@@ -138,6 +138,11 @@ typedef struct Pending { uint64_t value, lo, hi; Backing *m; } Pending;
 static Pending *g_pend;
 static int g_npend, g_pend_cap;
 static BackingStats g_cst;   // the coherence counters (g_coh)
+typedef struct ReadWrite { uint64_t value, lo, hi; } ReadWrite;
+static ReadWrite *g_read_writes;
+static int g_nread_writes, g_read_writes_cap;
+static uint64_t g_read_pruned_value;
+int backing_no_read_wait;
 
 // The raw path (backing.h, The raw path): the map's version, the newest raw-access submission, and what the last pass of
 // the invariant saw (g_lock).
@@ -1089,6 +1094,30 @@ void backing_resolve(uint64_t addr, uint64_t size, uint64_t value, BackingRef *o
 }
 
 // ---------- coherence (backing.h, Mirrors)
+static void read_writes_prune(uint64_t done) {
+    int k = 0;
+    for (int i = 0; i < g_nread_writes; i++)
+        if (g_read_writes[i].value > done) g_read_writes[k++] = g_read_writes[i];
+    g_nread_writes = k;
+}
+
+void backing_cpu_write_pending(uint64_t addr, uint64_t size, uint64_t value) {
+    if (!size) return;
+    if (addr + size < addr || !value)
+        rt_fatal("gfx: vulkan: backing map: a pending CPU-visible write over %#llx+%#llx has value %llu",
+                 (ull)addr, (ull)size, (ull)value);
+    uint64_t done = gpu_sync_done();
+    plat_mutex_lock(&g_coh);
+    if (g_read_pruned_value != value) {
+        read_writes_prune(done);
+        g_read_pruned_value = value;
+    }
+    g_read_writes = grow(g_read_writes, &g_read_writes_cap, g_nread_writes + 1, sizeof *g_read_writes,
+                         "the CPU-visible GPU writes");
+    g_read_writes[g_nread_writes++] = (ReadWrite){value, addr, addr + size};
+    plat_mutex_unlock(&g_coh);
+}
+
 void backing_gpu_wrote(uint64_t addr, uint64_t size, uint64_t value) {
     if (!size) return;
     if (addr + size < addr || !value)
@@ -1102,6 +1131,8 @@ void backing_gpu_wrote(uint64_t addr, uint64_t size, uint64_t value) {
         rt_fatal("gfx: vulkan: backing map: a GPU write declared over [%#llx, %#llx) in submission %llu, which no "
                  "resolve of that submission backed", (ull)addr, (ull)(addr + size), (ull)value);
     stamp(&b->written, value);
+    if (b->kind == BACKING_MIRROR || b->kind == BACKING_IMPORT)
+        backing_cpu_write_pending(a, size, value);
     if (b->kind == BACKING_MIRROR) {
         plat_mutex_lock(&g_coh);
         g_pend = grow(g_pend, &g_pend_cap, g_npend + 1, sizeof *g_pend, "the GPU writes to write back");
@@ -1186,16 +1217,40 @@ __attribute__((noreturn)) static void not_written_back(const Pending *p, const c
              "written back by the time its value was done (%s)", (ull)p->lo, (ull)p->hi, (ull)p->value, when);
 }
 
-void backing_guest_read(uint64_t addr, uint64_t size) {
+int backing_guest_read(uint64_t addr, uint64_t size) {
     if (!size) size = 1;
+    if (addr + size < addr)
+        rt_fatal("gfx: vulkan: backing map: a CPU read over %#llx+%#llx wraps", (ull)addr, (ull)size);
+    uint64_t handed = gpu_sync_handed();
+    if (!backing_no_read_wait && handed > gpu_sync_issued()) {
+        int token = rt_kernel_block_begin();
+        gpu_sync_wait_issued(handed);
+        rt_kernel_block_end(token);
+    }
     uint64_t done = gpu_sync_done();   // read first: a value done now had its write-back run before it was published
+    uint64_t wait = 0;
     plat_mutex_lock(&g_coh);
     for (int i = 0; i < g_npend; i++) {
         if (g_pend[i].hi <= addr || g_pend[i].lo >= addr + size) continue;
         if (g_pend[i].value <= done) not_written_back(&g_pend[i], "a CPU read of mapped memory");
-        g_cst.reads_in_flight++;
     }
+    read_writes_prune(done);
+    for (int i = 0; i < g_nread_writes; i++)
+        if (g_read_writes[i].lo < addr + size && g_read_writes[i].hi > addr &&
+            g_read_writes[i].value > wait)
+            wait = g_read_writes[i].value;
+    // Raw shaders can store through any page in their table; the touched pages are known only after completion.
+    uint64_t raw = raw_last();
+    if (raw > done && raw > wait) wait = raw;
+    if (wait) g_cst.reads_in_flight++;
     plat_mutex_unlock(&g_coh);
+    if (wait && !backing_no_read_wait) {
+        int token = rt_kernel_block_begin();
+        int ok = gpu_sync_wait(wait, UINT64_MAX);
+        rt_kernel_block_end(token);
+        if (!ok) rt_fatal("gfx: vulkan: backing map: CPU read could not wait for submission %llu", (ull)wait);
+    }
+    return wait != 0;
 }
 
 void backing_cpu_synced(uint64_t fence) {
@@ -1537,7 +1592,10 @@ void backing_open(const BackingOps *ops) {
     plat_mutex_lock(&g_coh);
     memset(&g_cst, 0, sizeof g_cst);
     g_npend = 0;
+    g_nread_writes = 0, g_read_pruned_value = 0;
     plat_mutex_unlock(&g_coh);
+    const char *read_wait = getenv("OOT2_VK_READ_WAIT");
+    backing_no_read_wait = read_wait && !strcmp(read_wait, "0");
     g_resolves = g_misses = 0;
     g_seen_epoch = rt_mem_ready() ? rt_mem_commit_epoch() : 0;
     g_raw_last = g_raw_prev = 0, g_filled = 0, g_pools_version = g_fill_pools = g_fill_epoch = 0;
@@ -1571,7 +1629,12 @@ void backing_close(void) {
     g_open = 0;
     plat_unlock(&g_lock);
     plat_mutex_lock(&g_coh);
+    const char *trace = getenv("OOT2_VK_READ_TRACE");
+    if (trace && !strcmp(trace, "1"))
+        rt_log("gfx: vulkan: backing map: %llu invalidations could overlap an in-flight write",
+               (ull)g_cst.reads_in_flight);
     g_npend = 0;   // every submission is done (gpu_sync_finish came first): their write-backs ran
+    g_nread_writes = 0;
     plat_mutex_unlock(&g_coh);
     free_all(&f);
     if (g_ops.close) g_ops.close();

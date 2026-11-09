@@ -156,8 +156,18 @@ void gpu_sync_end(void) {
     g_tail = &s->next;
     __atomic_store_n(&g_issued, s->value, __ATOMIC_RELEASE);
     plat_cond_broadcast(&g_work);
+    plat_cond_broadcast(&g_changed);
     g_gate_busy = 0;
     plat_cond_signal(&g_gate_free);
+    plat_mutex_unlock(&g_lock);
+}
+
+void gpu_sync_wait_issued(uint64_t value) {
+    if (value <= __atomic_load_n(&g_issued, __ATOMIC_ACQUIRE)) return;
+    plat_mutex_lock(&g_lock);
+    if (value > g_handed)
+        rt_fatal("gpu: cannot wait for submission %llu before it is handed out", (unsigned long long)value);
+    while (g_issued < value) plat_cond_wait(&g_changed, &g_lock);
     plat_mutex_unlock(&g_lock);
 }
 
