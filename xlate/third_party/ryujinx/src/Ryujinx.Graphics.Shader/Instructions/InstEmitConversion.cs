@@ -184,7 +184,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             Operand srcB = context.FPAbsNeg(src, absolute, negate, fpType);
 
-            Operand isNan = context.IsNan(srcB, fpType);
+            Operand isNan = srcType == DstFmt.F32 ? context.IsNan(srcB, fpType) : null;
 
             srcB = roundingMode switch
             {
@@ -228,8 +228,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             if (srcType == DstFmt.F32)
             {
-                // oot2-native: a NaN source gives 0, as the console's conversion does (OpConvertFToS and OpConvertFToU leave it undefined). A 64-bit
-                // source gives the integer's top bit instead, and no encoding of this front end reaches it
+                // oot2-native: a NaN single source gives 0, as the console's conversion does (OpConvertFToS and OpConvertFToU leave it undefined).
+                // A NaN double source is still left to the driver: the console gives the integer's top bit there (Inference from PTX's cvt rule)
                 srcB = context.ConditionalSelect(isNan, Const(0), srcB);
             }
 

@@ -4,7 +4,8 @@
 
 The console's rules (checked against NVIDIA's PTX documentation for the same operations):
 
-* FMNMX returns the other operand when one is NaN, NaN when both are; -0 is less than +0.
+* FMNMX returns the other operand when one is NaN, NaN when both are. (The console also orders -0 below +0; NMin and
+  NMax may return either zero unless the module asks for signed zeros, so that rule is not checked here.)
 * A saturated result (.SAT) that is NaN is 0.
 * F2I of NaN is 0 for a 32-bit integer (or smaller) from a single, 1 << 63 for a 64-bit integer.
 * HFMA2 and HMUL2 with .RELU leave a NaN a NaN.
@@ -359,9 +360,9 @@ class NanRulesTest(Harness):
     # -- FMNMX --
 
     MIN_CASES = [((NAN, 1.0), 1.0), ((1.0, NAN), 1.0), ((NAN, NAN), NAN), ((2.0, 3.0), 2.0), ((3.0, 2.0), 2.0),
-                 ((-INF, NAN), -INF), ((NAN, -5.0), -5.0), ((0.0, -0.0), -0.0), ((-0.0, 0.0), -0.0)]
+                 ((-INF, NAN), -INF), ((NAN, -5.0), -5.0)]
     MAX_CASES = [((NAN, 1.0), 1.0), ((1.0, NAN), 1.0), ((NAN, NAN), NAN), ((2.0, 3.0), 3.0), ((3.0, 2.0), 3.0),
-                 ((INF, NAN), INF), ((NAN, -5.0), -5.0), ((0.0, -0.0), 0.0), ((-0.0, 0.0), 0.0)]
+                 ((INF, NAN), INF), ((NAN, -5.0), -5.0)]
 
     def test_minimum_gives_the_other_operand_for_a_nan(self):
         spirv = self.module("fmin", fmnmx(False), store(OUT))
@@ -409,6 +410,7 @@ class NanRulesTest(Harness):
 
     def test_a_float_to_unsigned_integer_conversion_of_a_nan_is_zero(self):
         spirv = self.module("f2i_u32", f2i(False), store(OUT))
+        only_numeric_forms(self, spirv, "NMax")     # the clamp below zero; the NaN select alone would hide an FMax
         for x, want in [(NAN, 0), (3.9, 3), (-1.0, 0), (4000000000.0, 4000000000)]:
             self.assertEqual(evaluate(spirv, f32_bits(x)).stores, [want], x)
 
@@ -419,6 +421,7 @@ class NanRulesTest(Harness):
 
     def test_a_float_to_byte_conversion_pair_of_a_nan_is_zero(self):
         spirv = self.module("f2ip", F2IP_B, store(OUT))
+        only_numeric_forms(self, spirv, "NMax")     # its NaN select predates the change, so the stored value cannot tell
         for x, want in [(NAN, 0), (300.0, 255), (-4.0, 0), (17.9, 17)]:
             self.assertEqual(evaluate(spirv, f32_bits(x)).stores, [want], x)
 
