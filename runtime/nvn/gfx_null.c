@@ -53,11 +53,29 @@
 typedef unsigned long long ull;
 
 static PlatMutex g_lock = PLAT_MUTEX_INIT;   // replay and completion, one submission at a time
+static _Thread_local int g_locked_here;
 static PlatCond g_done_cond = PLAT_COND_INIT;
 static uint64_t g_submitted;                 // the newest fence value handed out (g_lock)
 static uint64_t g_done;                      // the newest fence value done (written under g_lock, read anywhere)
 static uint64_t g_presents, g_records;
 static uint64_t g_op_counts[OP_COUNT_];      // records replayed, by op (the second draw count)
+
+static void null_lock(void) {
+    plat_mutex_lock(&g_lock);
+    g_locked_here = 1;
+}
+
+static void null_unlock(void) {
+    g_locked_here = 0;
+    plat_mutex_unlock(&g_lock);
+}
+
+// A replay callback or a fatal stop hook can ask for the census while this thread already holds the submission lock.
+static int stats_lock(void) {
+    if (g_locked_here) return 0;
+    null_lock();
+    return 1;
+}
 
 static int null_pool_init(pool_t *p) { (void)p; return 1; }
 static void null_pool_fini(pool_t *p) { (void)p; }
@@ -197,10 +215,10 @@ static int g_nsites;
 static uint64_t g_waits, g_waits_unsatisfied;
 
 uint64_t gfx_null_wait_events(uint64_t *unsatisfied) {
-    plat_mutex_lock(&g_lock);
+    int took = stats_lock();
     uint64_t n = g_waits;
     if (unsatisfied) *unsatisfied = g_waits_unsatisfied;
-    plat_mutex_unlock(&g_lock);
+    if (took) null_unlock();
     return n;
 }
 
@@ -251,17 +269,17 @@ static int wait_ok(const p_wait_event *p, uint32_t *w) {
     return p->mode == NVN_EVENT_WAIT_MODE_EQUAL ? *w == p->value : (int32_t)(*w - p->value) >= 0;
 }
 void gfx_null_wait_classes(GfxNullWaitClasses *out) {
-    plat_mutex_lock(&g_lock);
+    int took = stats_lock();
     *out = g_classes;
     out->pending = (uint64_t)g_nwait_pending;
-    plat_mutex_unlock(&g_lock);
+    if (took) null_unlock();
 }
 static GfxNullWaitClasses *site_classes(int s) { return s >= 0 ? &g_sites[s].c : &g_other_sites; }
 
 // The sites in the order first met (at most WAIT_SITES, then the bucket for the rest), with their classes. out holds max
 // sites; *other is the bucket of the sites past the table (caller 0). Returns the sites listed.
 int gfx_null_wait_sites(NvnWaitSite *out, int max, NvnWaitSite *other) {
-    plat_mutex_lock(&g_lock);
+    int took = stats_lock();
     int n = g_nsites < max ? g_nsites : max;
     for (int i = 0; i < n; i++) out[i] = (NvnWaitSite){g_sites[i].caller, g_sites[i].c};
     if (other) *other = (NvnWaitSite){0, g_other_sites};
@@ -270,7 +288,7 @@ int gfx_null_wait_sites(NvnWaitSite *out, int max, NvnWaitSite *other) {
         if (s >= 0 && s < n) out[s].c.pending++;
         else if (s < 0 && other) other->c.pending++;
     }
-    plat_mutex_unlock(&g_lock);
+    if (took) null_unlock();
     return n;
 }
 
@@ -393,7 +411,7 @@ static void complete_held(uint64_t value) {
 // The lock spans the whole submission, so the results of submission k are written before fence k is published and
 // before submission k + 1 starts; a held submission waits in the list until its turn.
 static uint64_t null_submit(const uint64_t *handles, int n) {
-    plat_mutex_lock(&g_lock);
+    null_lock();
     uint64_t fence = ++g_submitted;
     g_now.fence = fence, g_now.used = 0, g_now.next = NULL;
     if (texheap_on()) texheap_submit(fence);
@@ -407,29 +425,29 @@ static uint64_t null_submit(const uint64_t *handles, int n) {
     } else {
         complete(&g_now);
     }
-    plat_mutex_unlock(&g_lock);
+    null_unlock();
     return fence;
 }
 
 void gfx_null_hold(int on) {
-    plat_mutex_lock(&g_lock);
+    null_lock();
     g_hold = on;
     if (!on) complete_held(0);
-    plat_mutex_unlock(&g_lock);
+    null_unlock();
 }
 
 uint64_t gfx_null_complete(uint64_t value) {
-    plat_mutex_lock(&g_lock);
+    null_lock();
     complete_held(value);
     uint64_t done = __atomic_load_n(&g_done, __ATOMIC_RELAXED);
-    plat_mutex_unlock(&g_lock);
+    null_unlock();
     return done;
 }
 
 // A value no submit has handed out is not reached by waiting here: the answer is immediate.
 static int null_fence_wait(uint64_t value, uint64_t timeout_ns) {
     if (value <= __atomic_load_n(&g_done, __ATOMIC_ACQUIRE)) return 1;
-    plat_mutex_lock(&g_lock);
+    null_lock();
     uint64_t start = plat_now_ns();
     while (value <= g_submitted && __atomic_load_n(&g_done, __ATOMIC_RELAXED) < value) {
         if (timeout_ns == UINT64_MAX) {
@@ -441,7 +459,7 @@ static int null_fence_wait(uint64_t value, uint64_t timeout_ns) {
         plat_cond_wait_ns(&g_done_cond, &g_lock, timeout_ns - spent);
     }
     int ok = __atomic_load_n(&g_done, __ATOMIC_RELAXED) >= value;
-    plat_mutex_unlock(&g_lock);
+    null_unlock();
     return ok;
 }
 
@@ -459,10 +477,10 @@ static uint64_t null_present_shown(uint64_t seq) {
 }
 
 static void null_finish(void) {
-    plat_mutex_lock(&g_lock);
+    null_lock();
     uint64_t target = g_submitted;
     while (__atomic_load_n(&g_done, __ATOMIC_RELAXED) < target) plat_cond_wait(&g_done_cond, &g_lock);
-    plat_mutex_unlock(&g_lock);
+    null_unlock();
 }
 
 static void null_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
@@ -480,9 +498,9 @@ static void null_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegi
 // nvnEventSignal reports the CPU's signal of an event word (4 bytes): the classifier notes it as the word's last writer
 static void null_guest_written(uint64_t addr, uint64_t size) {
     if (size != 4) return;
-    plat_mutex_lock(&g_lock);
+    null_lock();
     word_note((const volatile uint32_t *)(uintptr_t)addr, WRITER_CPU);
-    plat_mutex_unlock(&g_lock);
+    null_unlock();
 }
 static void null_guest_read(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
 static void null_cpu_synced(uint64_t fence) { (void)fence; }

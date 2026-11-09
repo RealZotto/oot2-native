@@ -686,6 +686,43 @@ static void case_virtual_texture(int imports) {
     finish_and_report("virtual_texture");
 }
 
+// ---------- a render target in CPU-visible storage
+// The game renders into an RG8 texture whose storage the CPU can see (after the intro: a 260x260 one). Such storage has no
+// image at registration; the pass takes its arena image, made current as a copy's is, so the CPU's bytes are uploaded first
+// and the pass draws over them. A later submission's copy reads the pass's texels, not the CPU's again.
+#define TGT_W 32
+static void case_cpu_target(int imports) {
+    setup(imports, 0);
+    const uint64_t at = P + 0x200000, out = P + 0x220000;
+    const tex_t t = tex_at(at, NVN_FORMAT_RG8, TGT_W, TGT_W);
+    CHECK(!vkb_image_get(&t));
+    static uint8_t cpu[TGT_W * TGT_W * 2];
+    for (unsigned i = 0; i < sizeof cpu; i++) cpu[i] = (uint8_t)(0xA0 | (i & 0x1F));
+    NVNcopyRegion whole = region(0, 0, TGT_W, TGT_W);
+    vkb_write_texels(&t, NULL, &whole, cpu, 2 * TGT_W, sizeof cpu);
+    Rec *r = rec_begin();
+    p_set_rt rt;
+    memset(&rt, 0, sizeof rt);
+    rt.n = 1;
+    rt.color[0] = trec(at, NVN_FORMAT_RG8, TGT_W, TGT_W);
+    put(r, OP_SET_RT, &rt, sizeof rt);
+    PUT(r, OP_SCISSOR, (p_scissor){.first = 0, .n = 1, .r = {{0, 0, TGT_W / 2, TGT_W}}});
+    PUT(r, OP_CLEAR_COLOR, (p_clear_color){.index = 0, .mask = 0xF, .rgba = {51 / 255.0f, 153 / 255.0f, 0, 0}});
+    wait_done(submit(r));
+    wait_done(copy_back(&rt.color[0], out));
+    int bad = 0;
+    for (uint32_t y = 0; y < TGT_W; y++)
+        for (uint32_t x = 0; x < TGT_W; x++) {
+            const uint8_t *px = (const uint8_t *)(uintptr_t)(out + 2 * ((uint64_t)y * TGT_W + x));
+            const uint8_t *was = cpu + 2 * ((size_t)y * TGT_W + x);
+            const uint8_t want[2] = {x < TGT_W / 2 ? 51 : was[0], x < TGT_W / 2 ? 153 : was[1]};
+            bad += memcmp(px, want, 2) != 0;
+        }
+    printf("render target in CPU-visible storage: %d of %d texels wrong\n", bad, TGT_W * TGT_W);
+    CHECK(bad == 0);
+    finish_and_report("cpu_target");
+}
+
 // ---------- head: the group counts in the driver bank c[0], which the module reads
 static void case_head(int imports, int gated, const char *pack) {
     setup(imports, gated);
@@ -753,6 +790,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "storage") && pack) case_storage(imports, gated, pack);
     else if (!strcmp(cs, "storage_image") && pack) case_storage_image(imports, pack);
     else if (!strcmp(cs, "virtual_texture")) case_virtual_texture(imports);
+    else if (!strcmp(cs, "cpu_target")) case_cpu_target(imports);
     else {
         fprintf(stderr, "unknown case %s\n", cs);
         return 2;

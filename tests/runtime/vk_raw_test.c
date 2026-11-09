@@ -23,6 +23,9 @@
 //            bound copy of the same bytes out: both stages used one table (the same push words), rewritten at the end,
 //            the second stage's loads, stores and atomics all landed, the bound copy and guest memory hold the same
 //            bytes, and the mirror's kept pages were written back
+//   grow_taken   a bound mirror grows without moving: bound and raw writes before and after the growth, including newly
+//                committed pages outside the bind, reach the same bytes on the device and in guest memory
+//   grow_guarded_head, grow_guarded_tail   a bound mirror grows beside a GPU-only extent used by the same submission
 //   heap MIB what the invariant costs over a guest heap of MIB MiB committed in 256 MiB pools, with a 256 MiB pool in the
 //            window: resident bytes and VRAM before and after the first raw-access submission, the invariant's pass and
 //            the table's build timed, then a second submission with the map unchanged (measured, not judged; the full
@@ -613,6 +616,172 @@ static void case_grow(const char *spv) {
     printf("ok grow\n");
 }
 
+static void case_grow_taken(const char *spv) {
+    open_all(spv);
+    Entry e[THREADS], first[THREADS], got_first;
+    pool_t t = table_pool(e);
+    const uint64_t p = g_heap + 16 * MiB;
+    const uint64_t old = p + 0x31000, fresh = p + 0x80000, slack = p + 0x13F000;
+    g_mirror_lo = p, g_mirror_hi = p + 1 * MiB;
+    pool_t pp = make_pool(p, 16 * MiB, 0);
+    fill_words(p, 256 * KiB, 0xAAAAAAAAu);
+    memcpy(first, e, sizeof first);
+    first[0] = (Entry){old + PROBE, old + PG, 0, 0, {0}};
+    e[0] = (Entry){old + PROBE + 4, old + PG, 0, 0, {0}};
+    e[1] = (Entry){fresh + PROBE, fresh + 0x800, 0, 0, {0}};
+    e[2] = (Entry){slack + PROBE, slack + 0x800, 0, 0, {0}};
+
+    backing_sync();
+    uint64_t v = gpu_vk_begin(GPU_VK_INTERNAL);
+    VkCommandBuffer cb = gpu_vk_cmd();
+    BackingRef entries, small, big;
+    backing_resolve(TABLE, THREADS * sizeof(Entry), v, &entries);
+    backing_resolve(old, 0x100, v, &small);
+    CHECK(small.kind == BACKING_MIRROR);
+    uint32_t push1[4], push2[4];
+    gpu_vk_raw_begin(v, push1);
+    barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdFillBuffer(cb, (VkBuffer)(uintptr_t)small.buffer, small.offset + PROBE, 4, 0x1234ABCDu);
+    backing_gpu_wrote(old + PROBE, 4, v);
+    stage(cb, first, push1, &entries);
+    barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBufferCopy first_copy = {.srcOffset = entries.offset, .dstOffset = 0, .size = sizeof(Entry)};
+    vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)entries.buffer, g_buf, 1, &first_copy);
+
+    backing_resolve(p + 0x30320, 1 * MiB, v, &big);
+    CHECK(big.kind == BACKING_MIRROR && big.address + 0x31000 - 0x30320 == small.address);
+    int committed;
+    CHECK(rt_mem_commit_run(slack, PG, &committed) != UINT64_MAX && committed);
+    gpu_vk_raw_begin(v, push2);
+    CHECK(!memcmp(push1, push2, sizeof push1));
+    stage(cb, e, push2, &entries);
+    barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBufferCopy old_copy = {.srcOffset = small.offset + PROBE, .dstOffset = 4096, .size = 16};
+    VkBufferCopy fresh_copy = {.srcOffset = big.offset + fresh - (p + 0x30320) + PROBE, .dstOffset = 8192, .size = 8};
+    vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)small.buffer, g_buf, 1, &old_copy);
+    vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)big.buffer, g_buf, 1, &fresh_copy);
+    barrier(cb, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    gpu_vk_raw_end(v);
+    finish(v);
+    memcpy(&got_first, (const void *)g_words, sizeof got_first);
+    uint32_t bound_old[3], bound_fresh[2];
+    for (int i = 0; i < 3; i++) bound_old[i] = g_words[4096 / 4 + i];
+    for (int i = 0; i < 2; i++) bound_fresh[i] = g_words[8192 / 4 + i];
+    read_back(TABLE, THREADS * sizeof(Entry));
+    memcpy(e, (const void *)g_words, 3 * sizeof(Entry));
+
+    CHECK(got_first.loaded == 0x1234ABCDu && got_first.old == 0xAAAAAAAAu);
+    CHECK(e[0].loaded == MARK && e[0].old == 0xAAAAAAABu);
+    CHECK(e[1].loaded == 0 && e[1].old == 0 && e[2].loaded == 0 && e[2].old == 0);
+    CHECK(bound_old[0] == 0x1234ABCDu && bound_old[1] == MARK && bound_old[2] == MARK);
+    CHECK(bound_fresh[0] == 0 && bound_fresh[1] == (MARK | 1));
+    CHECK(word_at(old + PROBE) == 0x1234ABCDu && word_at(old + PROBE + 4) == MARK &&
+          word_at(old + PROBE + 8) == MARK && word_at(old + PG) == 0xAAAAAAACu);
+    CHECK(word_at(fresh + PROBE + 4) == (MARK | 1) && word_at(fresh + 0x800) == 1);
+    CHECK(word_at(slack + PROBE + 4) == (MARK | 2) && word_at(slack + 0x800) == 1);
+    GpuVkRawStats s;
+    gpu_vk_raw_stats(&s);
+    CHECK(s.misses == 0 && s.submissions == 1 && s.refreshes == 1);
+    printf("one submission: the old and grown binds, both raw stages and guest write-back share the same bytes; "
+           "the committed page beyond the bind is mapped\n");
+    stats_line();
+    pool_t *all[] = {&pp, &t};
+    close_all(all, 2);
+    printf("ok grow_taken\n");
+}
+
+static void case_grow_guarded(const char *spv, int head) {
+    open_all(spv);
+    Entry e[THREADS], first[THREADS], got_first;
+    pool_t t = table_pool(e);
+    const uint64_t p = g_heap + 16 * MiB, q = WIN + 16 * MiB, old = p + 0x2000;
+    const uint64_t added = head ? p - 0x8000 : p + 0x18000;
+    const uint64_t start = head ? p - 0x5000 : p + 0x1000;
+    const uint64_t size = head ? 0x8000 : 0x11000;
+    g_mirror_lo = p - 1 * MiB, g_mirror_hi = p + 1 * MiB;
+    pool_t pp = make_pool(p - 1 * MiB, 16 * MiB, 0);
+    pool_t extent = make_pool(q, 64 * KiB, NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS);
+    fill_words(p, 64 * KiB, 0xAAAAAAAAu);
+
+    uint64_t v0 = gpu_vk_begin(GPU_VK_INTERNAL);
+    BackingRef small, blocker;
+    if (head) backing_resolve(q, 4, v0, &blocker);
+    backing_resolve(old, 0x100, v0, &small);
+    if (!head) backing_resolve(q, 4, v0, &blocker);
+    CHECK(small.kind == BACKING_MIRROR && blocker.kind == BACKING_EXTENT && small.buffer == blocker.buffer);
+    if (head) CHECK(blocker.offset + 64 * KiB + BACKING_MIRROR_GUARD + 0x2000 == small.offset);
+    else CHECK(small.offset - 0x2000 + 64 * KiB + BACKING_MIRROR_GUARD == blocker.offset);
+    VkCommandBuffer cb = gpu_vk_cmd();
+    barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdFillBuffer(cb, (VkBuffer)(uintptr_t)blocker.buffer, blocker.offset, 4, 0x11111111u);
+    finish(v0);
+
+    fill_words(added + PROBE, 4, 0xBBBBBBBBu);
+    memcpy(first, e, sizeof first);
+    first[0] = (Entry){old + PROBE, old + PG, 0, 0, {0}};
+    e[0] = (Entry){old + PROBE + 4, old + PG, 0, 0, {0}};
+    e[1] = (Entry){added + PROBE, added + 0x800, 0, 0, {0}};
+
+    backing_sync();
+    uint64_t v = gpu_vk_begin(GPU_VK_INTERNAL);
+    cb = gpu_vk_cmd();
+    BackingRef entries, big, fresh;
+    backing_resolve(TABLE, THREADS * sizeof(Entry), v, &entries);
+    backing_resolve(q, 4, v, &blocker);
+    backing_resolve(old, 0x100, v, &small);
+    uint32_t push1[4], push2[4];
+    gpu_vk_raw_begin(v, push1);
+    barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdFillBuffer(cb, (VkBuffer)(uintptr_t)blocker.buffer, blocker.offset, 4, 0xEEEEEEEEu);
+    vkCmdFillBuffer(cb, (VkBuffer)(uintptr_t)small.buffer, small.offset + PROBE, 4, 0x1234ABCDu);
+    backing_gpu_wrote(old + PROBE, 4, v);
+    stage(cb, first, push1, &entries);
+    barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBufferCopy first_copy = {.srcOffset = entries.offset, .dstOffset = 0, .size = sizeof(Entry)};
+    vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)entries.buffer, g_buf, 1, &first_copy);
+
+    backing_resolve(start, size, v, &big);
+    backing_resolve(added, PG, v, &fresh);
+    CHECK(big.kind == BACKING_MIRROR && fresh.kind == BACKING_MIRROR);
+    CHECK(big.address + old - start == small.address);
+    gpu_vk_raw_begin(v, push2);
+    CHECK(!memcmp(push1, push2, sizeof push1));
+    stage(cb, e, push2, &entries);
+    barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBufferCopy old_copy = {.srcOffset = small.offset + PROBE, .dstOffset = 4096, .size = 12};
+    VkBufferCopy added_copy = {.srcOffset = fresh.offset + PROBE, .dstOffset = 8192, .size = 8};
+    VkBufferCopy extent_copy = {.srcOffset = blocker.offset, .dstOffset = 12288, .size = 4};
+    vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)small.buffer, g_buf, 1, &old_copy);
+    vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)fresh.buffer, g_buf, 1, &added_copy);
+    vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)blocker.buffer, g_buf, 1, &extent_copy);
+    barrier(cb, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    gpu_vk_raw_end(v);
+    finish(v);
+
+    memcpy(&got_first, (const void *)g_words, sizeof got_first);
+    uint32_t bound_old[3], bound_added[2], bound_extent = g_words[12288 / 4];
+    for (int i = 0; i < 3; i++) bound_old[i] = g_words[4096 / 4 + i];
+    for (int i = 0; i < 2; i++) bound_added[i] = g_words[8192 / 4 + i];
+    read_back(TABLE, THREADS * sizeof(Entry));
+    memcpy(e, (const void *)g_words, 2 * sizeof(Entry));
+    CHECK(got_first.loaded == 0x1234ABCDu && got_first.old == 0xAAAAAAAAu);
+    CHECK(e[0].loaded == MARK && e[0].old == 0xAAAAAAABu);
+    CHECK(e[1].loaded == 0xBBBBBBBBu && e[1].old == 0);
+    CHECK(bound_old[0] == 0x1234ABCDu && bound_old[1] == MARK && bound_old[2] == MARK);
+    CHECK(bound_added[0] == 0xBBBBBBBBu && bound_added[1] == (MARK | 1));
+    CHECK(bound_extent == 0xEEEEEEEEu);
+    CHECK(word_at(old + PROBE) == 0x1234ABCDu && word_at(old + PROBE + 4) == MARK &&
+          word_at(old + PROBE + 8) == MARK && word_at(old + PG) == 0xAAAAAAACu);
+    CHECK(word_at(added + PROBE) == 0xBBBBBBBBu && word_at(added + PROBE + 4) == (MARK | 1));
+    GpuVkRawStats s;
+    gpu_vk_raw_stats(&s);
+    CHECK(s.misses == 0 && s.submissions == 1 && s.refreshes == 1);
+    stats_line();
+    pool_t *all[] = {&extent, &pp, &t};
+    close_all(all, 3);
+    printf("ok grow_guarded_%s\n", head ? "head" : "tail");
+}
+
 // ---------- heap
 static void mem_line(const char *when) {
     RtMemStats m;
@@ -698,6 +867,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "edges")) case_edges(spv);
     else if (!strcmp(cs, "reuse")) case_reuse(spv);
     else if (!strcmp(cs, "grow")) case_grow(spv);
+    else if (!strcmp(cs, "grow_taken")) case_grow_taken(spv);
+    else if (!strcmp(cs, "grow_guarded_head")) case_grow_guarded(spv, 1);
+    else if (!strcmp(cs, "grow_guarded_tail")) case_grow_guarded(spv, 0);
     else if (!strcmp(cs, "heap") && argc >= 4) case_heap(spv, strtoull(argv[3], NULL, 10));
     else {
         fprintf(stderr, "unknown case %s\n", cs);
