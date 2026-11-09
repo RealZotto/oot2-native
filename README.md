@@ -38,7 +38,7 @@ Open work that nobody has taken. Say in an issue that you are taking an item bef
 
 ## Planned
 
-- A prebuilt bundle with the toolchain, the shader translator and the runtime library, so that nothing has to be installed first. It will contain no file derived from the game either
+- A prebuilt bundle with the toolchain, the shader translator, the pipeline builder, the runtime library and Microsoft's Visual C++ runtime DLLs, so that nothing has to be installed first. It will contain no file derived from the game either
 - The title screen with its movie on the Vulkan back end, then the game itself: the target is 60 fps in Kokiri Forest, docked, at 2560 by 1440, on the reference machine below
 
 ## Installing
