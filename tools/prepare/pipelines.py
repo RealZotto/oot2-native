@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import check, pipesched
-from .runner import Context, PrepareError, Step, fingerprint
+from .runner import Context, PrepareError, Step, file_sha256, fingerprint
 
 TOOLS = Path(__file__).resolve().parent.parent
 if str(TOOLS) not in sys.path:
@@ -60,6 +60,7 @@ if str(TOOLS / "shaders") not in sys.path:
     sys.path.insert(0, str(TOOLS / "shaders"))
 
 import build_game  # noqa: E402  (tools/build_game.py)
+import bundle_env  # noqa: E402  (tools/bundle_env.py)
 import cache_pack  # noqa: E402  (tools/shaders/cache_pack.py)
 import layout  # noqa: E402  (tools/layout.py)
 
@@ -173,6 +174,18 @@ def key_files() -> list[Path]:
     return [SOURCE, *gpu, *[RUNTIME / "include" / "oot2" / h for h in KEY_HEADERS]]
 
 
+def bundled_builder(ctx: Context) -> Path | None:
+    """The release bundle's pipebuild.exe (tools/bundle.py makes it with the bundle's compiler from the same sources as the
+    bundle's runtime library), or None. It is used only with the bundle's own runtime library: a library named with
+    --runtime-lib or OOT2_RUNTIME_LIB is another runtime, and a builder from a different runtime would write pipelines the
+    game's create infos do not match."""
+    exe, lib = bundle_env.pipebuild(), check.runtime_lib(ctx)
+    ours = bundle_env.runtime_lib()
+    if exe is None or lib is None or ours is None or Path(lib).resolve() != ours.resolve():
+        return None
+    return exe
+
+
 class Pipelines(Step):
     id = "pipelines"
     needs = ("translate",)       # the base pack and the split it keeps
@@ -180,11 +193,14 @@ class Pipelines(Step):
     def key(self, ctx: Context) -> str:
         device, why = usable_device(ctx.state.get("host") or {})
         listed = list_keys(getattr(ctx.options, "pipelines_list", None))
+        bundled = bundled_builder(ctx)
+        # The runtime's sources are not in a bundle, so its builder's bytes stand for them (a checkout's key is unchanged).
+        builder = [f"bundled-builder={file_sha256(bundled)}"] if bundled else []
         return fingerprint(f"pipelines-{FORMAT}", f"device={device.identity if device else 'skipped: ' + why}",
                            f"runtime={','.join(f'{k}={v}' for k, v in sorted(RUNTIME_SAYS.items()))}",
                            f"skip={bool(getattr(ctx.options, 'skip_pipelines', False))}",
                            f"list={hashlib.sha256(chr(10).join(sorted(listed)).encode()).hexdigest() if listed else 'all'}",
-                           HERE / "pipelines.py", HERE / "pipesched.py", *key_files())
+                           *builder, HERE / "pipelines.py", HERE / "pipesched.py", *key_files())
 
     def current(self, ctx: Context, record: dict) -> bool:
         if record.get("skipped"):
@@ -212,10 +228,11 @@ class Pipelines(Step):
         if getattr(ctx.options, "skip_pipelines", False):
             rep.warning("pipelines: skipped, as --skip-pipelines asked. The game starts without prepared pipelines.")
             return {"skipped": "--skip-pipelines"}
-        if check.runtime_lib(ctx) is not None:
-            rep.warning("pipelines: skipped. A release bundle holds the runtime library already built and not the "
-                        "runtime's sources the pipeline builder is linked with, so it cannot build them yet. The game "
-                        "starts without prepared pipelines.")
+        if check.runtime_lib(ctx) is not None and bundled_builder(ctx) is None:
+            rep.warning("pipelines: skipped. A prebuilt runtime library comes without the runtime's sources the pipeline "
+                        "builder is linked with, and no pipeline builder of the release bundle goes with this library "
+                        "(bin/pipebuild.exe of the same bundle, with the bundle's own library). The game starts without "
+                        "prepared pipelines.")
             return {"skipped": "release bundle"}
         device, why = usable_device(ctx.state.get("host") or {})
         if device is None:
@@ -439,6 +456,9 @@ def ensure_builder(ctx: Context, scratch: Path) -> list[str]:
     given = getattr(ctx.options, "pipelines_builder", None)
     if given:
         return list(given)
+    bundled = bundled_builder(ctx)
+    if bundled is not None:                 # a release bundle: the program tools/bundle.py compiled, not the sources
+        return [str(bundled)]
     from .program import toolchain          # the compile step's compiler and the Vulkan SDK
     tool = toolchain(ctx)
     if tool.vulkan is None or not tool.glslang:

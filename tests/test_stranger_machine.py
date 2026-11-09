@@ -293,6 +293,63 @@ class BundleFirst(unittest.TestCase):
         self.assertEqual(record, {"skipped": "release bundle"})
         self.assertIn("release bundle", out.getvalue())
 
+    def with_builder(self, content: bytes = b"builder one") -> Path:
+        path = self.root / bundle_env.PIPEBUILD
+        path.write_bytes(content)
+        path.chmod(0o755)
+        return path
+
+    def pipelines_ctx(self, **options) -> Context:
+        return Context(tmp(self), argparse.Namespace(skip_pipelines=False, **options),
+                       Reporter(io.StringIO(), io.StringIO()), state=statefile.empty())
+
+    def test_a_bundle_with_its_builder_does_not_skip_the_pipelines_step(self):
+        from prepare import pipelines
+        builder = self.with_builder()
+        ctx = self.pipelines_ctx()
+        self.assertEqual(pipelines.bundled_builder(ctx), builder.resolve())
+        self.assertEqual(pipelines.ensure_builder(ctx, tmp(self)), [str(builder.resolve())])
+        record = pipelines.Pipelines().run(ctx)
+        self.assertNotEqual(record, {"skipped": "release bundle"})      # it went on to look for a GPU, which a test has none of
+        self.assertIn("skipped", record)
+
+    def test_the_step_key_names_the_bundled_builder_and_is_unchanged_without_one(self):
+        from prepare import pipelines
+        plain = pipelines.Pipelines().key(self.pipelines_ctx())
+        self.with_builder(b"builder one")
+        one = pipelines.Pipelines().key(self.pipelines_ctx())
+        self.with_builder(b"builder two")
+        two = pipelines.Pipelines().key(self.pipelines_ctx())
+        self.assertEqual(len({plain, one, two}), 3)
+        (self.root / bundle_env.PIPEBUILD).unlink()
+        self.assertEqual(pipelines.Pipelines().key(self.pipelines_ctx()), plain)
+        # Without a bundled builder no part is added at all, so a checkout's key is what it was before the builder shipped.
+        seen = []
+        real = pipelines.fingerprint
+        with mock.patch.object(pipelines, "fingerprint", lambda *parts: seen.append(parts) or real(*parts)):
+            pipelines.Pipelines().key(self.pipelines_ctx())
+            self.with_builder(b"builder one")
+            pipelines.Pipelines().key(self.pipelines_ctx())
+        without, with_one = seen
+        self.assertEqual([p for p in without if str(p).startswith("bundled-builder")], [])
+        self.assertEqual(len([p for p in with_one if str(p).startswith("bundled-builder")]), 1)
+        self.assertEqual(len(with_one), len(without) + 1)
+
+    def test_another_runtime_library_does_not_use_the_bundled_builder(self):
+        from prepare import pipelines
+        self.with_builder()
+        other = tmp(self) / "liboot2rt.a"
+        other.write_bytes(b"another runtime")
+        ctx = self.pipelines_ctx(runtime_lib=other)
+        self.assertIsNone(pipelines.bundled_builder(ctx))
+        self.assertEqual(pipelines.Pipelines().run(ctx), {"skipped": "release bundle"})
+
+    def test_without_a_bundle_there_is_no_bundled_builder(self):
+        from prepare import pipelines
+        self.with_builder()
+        with mock.patch.dict(os.environ, {"OOT2_BUNDLE_ROOT": str(self.root / "nowhere")}):
+            self.assertIsNone(pipelines.bundled_builder(self.pipelines_ctx()))
+
 
 class VulkanHeadersOnly(unittest.TestCase):
     def test_volk_is_asked_for_only_when_the_runtime_is_built(self):
