@@ -101,14 +101,14 @@ class QueueTest(unittest.TestCase):
         if hasattr(cls, "tmp"):
             cls.tmp.cleanup()
 
-    def run_case(self, level: str, case: str, **census: str) -> subprocess.CompletedProcess:
+    def run_case(self, level: str, case: str, *, timeout: int = TIMEOUT, **census: str) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items() if not k.startswith("OOT2_CENSUS")}
         env.update(census)
         try:
-            done = subprocess.run([str(self.exes[level]), case], capture_output=True, text=True, timeout=TIMEOUT,
+            done = subprocess.run([str(self.exes[level]), case], capture_output=True, text=True, timeout=timeout,
                                   env=env)
         except subprocess.TimeoutExpired as e:
-            self.fail(f"{case} at {level} ran past {TIMEOUT} s:\n{e.stdout or ''}{e.stderr or ''}")
+            self.fail(f"{case} at {level} ran past {timeout} s:\n{e.stdout or ''}{e.stderr or ''}")
         if done.returncode == EXIT_HUNG:
             self.fail(f"{case} at {level} hung (the case's watchdog):\n{done.stdout}{done.stderr}")
         return done
@@ -156,6 +156,29 @@ class QueueTest(unittest.TestCase):
     def test_syncwait_gives_its_core_up_while_it_blocks(self) -> None:
         for done in self.assert_passes("syncwait"):
             self.assertIn("order 1 2 3 4 result 1\n", done.stdout)
+
+    def test_null_census_can_be_read_during_replay_and_from_fatal_hooks(self) -> None:
+        cases = ("census_fatal_replay", "census_at_draw", "census_fatal_complete",
+                 "census_fatal_held_complete", "census_fatal_held_release")
+        for level in nvn.LEVELS:
+            for case in cases:
+                with self.subTest(level=level, case=case):
+                    done = self.run_case(level, case, timeout=5)
+                    self.assertEqual(done.returncode, 0 if case == "census_at_draw" else nvn.EXIT_FATAL,
+                                     done.stdout + done.stderr)
+                    self.assertIn("stat| waitevents 1 WaitEvents met 1, unsatisfied at completion 1\n", done.stdout)
+                    self.assertIn("unsatisfied 1 (later by GPU 0, later by CPU 0, not satisfied by the end 1, "
+                                  "dropped from the full list 0)", done.stdout)
+                    self.assertIn("stat| waitsite ", done.stdout)
+                    if case == "census_at_draw":
+                        self.assertIn("draw| census complete\nok census_at_draw\n", done.stdout)
+                    else:
+                        self.assertIn("stop| census complete\n", done.stdout)
+                        self.assertNotIn("fatal completion returned", done.stdout)
+                        self.assertEqual(len(re.findall(r"^FATAL:", done.stderr, re.M)), 1, done.stderr)
+
+    def test_null_census_on_another_thread_waits_for_the_submission_lock(self) -> None:
+        self.assert_passes("census_other_thread")
 
     def test_wait_events_are_counted_per_call_site_by_what_satisfied_them_and_the_sites_sum_to_the_totals(self) -> None:
         for done in self.assert_passes("wait_sites"):

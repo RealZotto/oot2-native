@@ -578,6 +578,84 @@ static void print_stat(void *ctx, const char *key, uint64_t count, const char *w
     printf("stat| %s %llu %s\n", key, (ull)count, why);
 }
 
+static void census_stop(int code, const char *line) {
+    printf("stop| %d %s\n", code, line);
+    nvn_census_stats(print_stat, NULL);
+    printf("stop| census complete\n");
+}
+
+static void census_at_draw(uint64_t fence, int index, const op_hdr *r, void *ctx) {
+    (void)fence, (void)index;
+    if (r->op != OP_DRAW) return;
+    if (ctx) rt_fatal("queue test: fatal while replaying a draw");
+    nvn_census_stats(print_stat, NULL);
+    printf("draw| census complete\n");
+}
+
+static struct {
+    PlatThread *thread;
+    int started, finished;
+    uint64_t waits, unsatisfied;
+} g_census_thread;
+
+static void census_on_other_thread(void *arg) {
+    (void)arg;
+    __atomic_store_n(&g_census_thread.started, 1, __ATOMIC_RELEASE);
+    g_census_thread.waits = gfx_null_wait_events(&g_census_thread.unsatisfied);
+    __atomic_store_n(&g_census_thread.finished, 1, __ATOMIC_RELEASE);
+}
+
+static void census_other_at_draw(uint64_t fence, int index, const op_hdr *r, void *ctx) {
+    (void)fence, (void)index, (void)ctx;
+    if (r->op != OP_DRAW) return;
+    g_census_thread.thread = plat_thread_start(census_on_other_thread, NULL, 1ull << 20);
+    CHECK(g_census_thread.thread);
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_census_thread.started, __ATOMIC_ACQUIRE); i++)
+        plat_sleep_ns(10000000);
+    CHECK(__atomic_load_n(&g_census_thread.started, __ATOMIC_ACQUIRE));
+    plat_sleep_ns(50000000);
+    CHECK(!__atomic_load_n(&g_census_thread.finished, __ATOMIC_ACQUIRE));
+}
+
+static void census_locked_case(int mode) {
+    setup(0, NULL);
+    objects();
+    uint64_t q = queue(), cb = command_buffer(), ev = event_object(g_pool, RESULTS);
+    NVN(nvnCommandBufferBeginRecording, cb);
+    NVN_AT(MB + 0x6000, nvnCommandBufferWaitEvent, cb, ev, EQUAL, 1);
+    submit(q, NVN(nvnCommandBufferEndRecording, cb));
+
+    rt_set_stop_hook(census_stop);
+    if (mode <= 1 || mode == 5) {
+        gfx_null_log_ops(mode == 5 ? census_other_at_draw : census_at_draw, mode == 1 ? &mode : NULL);
+        NVN(nvnCommandBufferBeginRecording, cb);
+        NVN(nvnCommandBufferDrawArrays, cb, 4, 0, 3);
+        submit(q, NVN(nvnCommandBufferEndRecording, cb));
+        gfx_null_log_ops(NULL, NULL);
+        if (mode == 5) {
+            for (int i = 0; i < 200 && !__atomic_load_n(&g_census_thread.finished, __ATOMIC_ACQUIRE); i++)
+                plat_sleep_ns(10000000);
+            CHECK(__atomic_load_n(&g_census_thread.finished, __ATOMIC_ACQUIRE));
+            CHECK(g_census_thread.waits == 1 && g_census_thread.unsatisfied == 1);
+            plat_thread_free(g_census_thread.thread);
+            printf("ok census_other_thread\n");
+        } else printf("ok census_at_draw\n");
+    } else {
+        if (mode >= 3) gfx_null_hold(1);
+        report_once(q, cb, TIMESTAMP, 0x1000);
+        if (mode == 3) gfx_null_complete(0);
+        if (mode == 4) gfx_null_hold(0);
+        printf("fatal completion returned\n");
+    }
+}
+
+static void case_census_at_draw(void) { census_locked_case(0); }
+static void case_census_fatal_replay(void) { census_locked_case(1); }
+static void case_census_fatal_complete(void) { census_locked_case(2); }
+static void case_census_fatal_held_complete(void) { census_locked_case(3); }
+static void case_census_fatal_held_release(void) { census_locked_case(4); }
+static void case_census_other_thread(void) { census_locked_case(5); }
+
 // ---------- case wait_events: each WaitEvent checked at completion, logged once per call site
 static void case_wait_events(void) {
     setup(0, NULL);
@@ -965,6 +1043,9 @@ int main(int argc, char **argv) {
         {"event_cpu_invisible", case_event_cpu_invisible}, {"sync_uninitialised", case_sync_uninitialised},
         {"present_past_textures", case_present_past_textures}, {"window_five", case_window_five},
         {"report_no_pool", case_report_no_pool}, {"census_default", case_census_default}, {"census_interval1", case_census_interval1},
+        {"census_at_draw", case_census_at_draw}, {"census_fatal_replay", case_census_fatal_replay},
+        {"census_fatal_complete", case_census_fatal_complete}, {"census_fatal_held_complete", case_census_fatal_held_complete},
+        {"census_fatal_held_release", case_census_fatal_held_release}, {"census_other_thread", case_census_other_thread},
         {"census_gap_default", case_census_gap_default}, {"census_mode", case_census_mode},
         {"census_cap", case_census_cap}, {"census_limit", case_census_limit}, {"census_flush", case_census_flush},
         {"census_boundary", case_census_boundary}, {"event_words", case_event_words},
