@@ -184,6 +184,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             Operand srcB = context.FPAbsNeg(src, absolute, negate, fpType);
 
+            Operand isNan = context.IsNan(srcB, fpType);
+
             srcB = roundingMode switch
             {
                 RoundMode2.Round => context.FPRound(srcB, fpType),
@@ -222,6 +224,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 srcB = isSignedInt
                     ? context.IClampS32(srcB, Const(min), Const(max))
                     : context.IClampU32(srcB, Const(min), Const(max));
+            }
+
+            if (srcType == DstFmt.F32)
+            {
+                // oot2-native: a NaN source gives 0, as the console's conversion does (OpConvertFToS and OpConvertFToU leave it undefined). A 64-bit
+                // source gives the integer's top bit instead, and no encoding of this front end reaches it
+                srcB = context.ConditionalSelect(isNan, Const(0), srcB);
             }
 
             Operand dest = GetDest(rd);

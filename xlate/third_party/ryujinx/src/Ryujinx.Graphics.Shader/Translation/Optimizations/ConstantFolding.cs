@@ -105,7 +105,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                     break;
 
                 case Instruction.FP32 | Instruction.Clamp:
-                    EvaluateFPTernary(operation, (x, y, z) => Math.Clamp(x, y, z));
+                    EvaluateFPTernary(operation, (x, y, z) => NMin(NMax(x, y), z));
                     break;
 
                 case Instruction.FP32 | Instruction.CompareEqual:
@@ -339,6 +339,11 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             operation.TurnIntoCopy(Const(op(x, y, z)));
         }
+
+        // oot2-native: the float minimum and maximum the console computes (and the SPIR-V NMin and NMax): the other operand when one is NaN
+        private static float NMax(float x, float y) => float.IsNaN(x) ? y : float.IsNaN(y) ? x : Math.Max(x, y);
+
+        private static float NMin(float x, float y) => float.IsNaN(x) ? y : float.IsNaN(y) ? x : Math.Min(x, y);
 
         private static void EvaluateFPTernary(Operation operation, Func<float, float, float, float> op)
         {

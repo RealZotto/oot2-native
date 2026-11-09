@@ -429,7 +429,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateClamp(CodeGenContext context, AstOperation operation)
         {
-            return GenerateTernary(context, operation, context.Delegates.GlslFClamp, context.Delegates.GlslSClamp);
+            // oot2-native: NClamp, not FClamp. A float clamp is the console's saturation or a min/max pair, and the console gives a number for
+            // a NaN operand (a NaN saturates to 0), where FClamp's result is left to the driver.
+            return GenerateTernary(context, operation, context.Delegates.GlslNClamp, context.Delegates.GlslSClamp);
         }
 
         private static OperationResult GenerateClampU32(CodeGenContext context, AstOperation operation)
@@ -1119,7 +1121,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateMaximum(CodeGenContext context, AstOperation operation)
         {
-            return GenerateBinary(context, operation, context.Delegates.GlslFMax, context.Delegates.GlslSMax);
+            // oot2-native: NMax, not FMax. The console's float maximum returns the other operand when one is NaN (and NaN when both are),
+            // which NMax defines and FMax leaves to the driver.
+            return GenerateBinary(context, operation, context.Delegates.GlslNMax, context.Delegates.GlslSMax);
         }
 
         private static OperationResult GenerateMaximumU32(CodeGenContext context, AstOperation operation)
@@ -1135,7 +1139,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateMinimum(CodeGenContext context, AstOperation operation)
         {
-            return GenerateBinary(context, operation, context.Delegates.GlslFMin, context.Delegates.GlslSMin);
+            // oot2-native: NMin, not FMin (see GenerateMaximum).
+            return GenerateBinary(context, operation, context.Delegates.GlslNMin, context.Delegates.GlslSMin);
         }
 
         private static OperationResult GenerateMinimumU32(CodeGenContext context, AstOperation operation)

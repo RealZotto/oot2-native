@@ -329,6 +329,12 @@ namespace Ryujinx.Graphics.Shader.Instructions
             Operand hi = context.FP32ConvertToU32(context.FPMultiply(f, ConstF(1.0f / 4294967296.0f)));
             Operand lo = context.FP32ConvertToU32(context.FPSubtract(f, context.FPMultiply(context.IConvertU32ToFP32(hi), ConstF(4294967296.0f))));
 
+            // oot2-native: a NaN gives the 64-bit integer's top bit, 1 << 63, where a conversion to a 32-bit integer gives 0
+            Operand nan = context.IsNan(f);
+
+            hi = context.ConditionalSelect(nan, Const(int.MinValue), hi);
+            lo = context.ConditionalSelect(nan, Const(0), lo);
+
             if (x.Rd < RegisterConsts.RegisterZeroIndex)
             {
                 context.Copy(Register(x.Rd, RegisterType.Gpr), lo);
@@ -547,8 +553,9 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             if (x.Bit(79) && (x.Opcode & 0x1ff) is 0x031 or 0x032)
             {
-                lo = context.FPMaximum(lo, ConstF(0));
-                hi = context.FPMaximum(hi, ConstF(0));
+                // oot2-native: a NaN stays NaN under .RELU (FPMaximum returns the other operand, 0, for a NaN)
+                lo = context.ConditionalSelect(context.IsNan(lo), lo, context.FPMaximum(lo, ConstF(0)));
+                hi = context.ConditionalSelect(context.IsNan(hi), hi, context.FPMaximum(hi, ConstF(0)));
             }
 
             if (x.Bit(78))

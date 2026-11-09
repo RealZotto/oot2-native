@@ -192,3 +192,25 @@ Changes of this project:
   the 5 that lose HMMA (one lost 45 of its 46), which now have as many helper
   calls as the program has HMMA, and 3 without HMMA that get back arithmetic
   fed by one result of an image load.
+- `CodeGen/Spirv/Instructions.cs`, `GenerateMaximum`, `GenerateMinimum`,
+  `GenerateClamp`; `CodeGen/Spirv/SpirvDelegates.cs`, `GlslNMax`, `GlslNMin`,
+  `GlslNClamp`; `Translation/Optimizations/ConstantFolding.cs`, the float clamp,
+  `NMax`, `NMin`; `Instructions/InstEmitConversion.cs`, `EmitF2I`;
+  `Instructions/InstEmitAmpereAlu.cs`, `AF2i64`, `AHalfResult`: the console's
+  NaN rules. A float maximum, minimum or clamp (FMNMX, HMNMX2, the saturation
+  of FADD, FMUL, FFMA, F2F, HADD2 and the other arithmetic, the pairs F2IP
+  builds) was emitted as `FMax`, `FMin` and `FClamp`, which Vulkan leaves to the
+  driver when an operand is NaN: NVIDIA's returns the other operand, AMD's can
+  return the NaN. The console's rule is "the other operand" (the NaN only when
+  both are NaN), and a saturated NaN is 0, so they are now `NMax`, `NMin` and
+  `NClamp` (`GLSL.std.450`, no capability), and the constant folder follows the
+  same rule instead of .NET's NaN-propagating `Math.Clamp`. F2I of a NaN is 0
+  for an integer of 32 bits or less (`OpConvertFToS` and `OpConvertFToU` leave
+  it undefined): `EmitF2I` selects 0 for a NaN source; the 64-bit form takes
+  the integer's top bit, as NVIDIA's documentation gives. The `.RELU` of HFMA2
+  and HMUL2 keeps a NaN a NaN, which `NMax` against 0 would turn into 0. Over
+  the 56,381 programs of the corpus, 50,926 modules change and nothing else:
+  8,041 only by the instruction number of the minimum, maximum or clamp, 42,885
+  also by a select around each float to integer conversion; all of them pass
+  spirv-val and none of their descriptions changes but the module's hash and
+  size.

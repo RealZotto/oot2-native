@@ -66,6 +66,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         public readonly FuncBinaryInstruction GlslFMax;
         public readonly FuncBinaryInstruction GlslSMax;
         public readonly FuncBinaryInstruction GlslFMin;
+        public readonly FuncBinaryInstruction GlslNMax;
+        public readonly FuncBinaryInstruction GlslNMin;
         public readonly FuncBinaryInstruction GlslSMin;
         public readonly FuncBinaryInstruction FMod;
         public readonly FuncBinaryInstruction FMul;
@@ -103,6 +105,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         // Ternary
         public readonly FuncTernaryInstruction GlslFClamp;
+        public readonly FuncTernaryInstruction GlslNClamp;
         public readonly FuncTernaryInstruction GlslSClamp;
         public readonly FuncTernaryInstruction GlslFma;
 
@@ -174,6 +177,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             GlslFMax = context.GlslFMax;
             GlslSMax = context.GlslSMax;
             GlslFMin = context.GlslFMin;
+            GlslNMax = context.GlslNMax;
+            GlslNMin = context.GlslNMin;
             GlslSMin = context.GlslSMin;
             FMod = context.FMod;
             FMul = context.FMul;
@@ -211,6 +216,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             // Ternary
             GlslFClamp = context.GlslFClamp;
+            GlslNClamp = context.GlslNClamp;
             GlslSClamp = context.GlslSClamp;
             GlslFma = context.GlslFma;
 
