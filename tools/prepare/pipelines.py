@@ -24,6 +24,12 @@ its ready line what it does (`zero_workgroup`); the key names what the step requ
 anything else stops the step with the reason, and the record keeps what the builder said, so a record made by an earlier
 runtime is not current and the step builds again.
 
+The seed. When the key changes the previous cache is not thrown away: pipeseed.py checks it (header, size, runtime, device
+and driver) and keeps it as the seed every builder starts from, so that the programs whose module did not change are served
+by the driver in a millisecond or so and only the changed ones build cold. A cache that fails a check is dropped, deleted,
+and the drop is named in the log and in the record (`seed`); the step then builds from an empty cache as it always did.
+`--pipelines-cold` takes no seed, because it exists to time a cold build.
+
 What it does not build. Task and mesh pipelines wait for the mesh draws ticket and are counted as not built, so the
 totals are a lower bound. Vertex libraries are built as translated, without padding: a pixel stage that reads an
 output its vertex stage does not write needs a padded vertex library, and those pairs are known only from play
@@ -50,7 +56,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import check, pipesched
+from . import check, pipesched, pipeseed
 from .runner import Context, PrepareError, Step, file_sha256, fingerprint
 
 TOOLS = Path(__file__).resolve().parent.parent
@@ -196,6 +202,9 @@ class Pipelines(Step):
         bundled = bundled_builder(ctx)
         # The runtime's sources are not in a bundle, so its builder's bytes stand for them (a checkout's key is unchanged).
         builder = [f"bundled-builder={file_sha256(bundled)}"] if bundled else []
+        # The runner drops the step's record before run, and the cache that record describes is the seed run may use: the
+        # runner computes the key (this call) while the record is still there, so it is kept in ctx.facts for run.
+        ctx.facts["pipelines_previous"] = ctx.record(self.id)
         return fingerprint(f"pipelines-{FORMAT}", f"device={device.identity if device else 'skipped: ' + why}",
                            f"runtime={','.join(f'{k}={v}' for k, v in sorted(RUNTIME_SAYS.items()))}",
                            f"skip={bool(getattr(ctx.options, 'skip_pipelines', False))}",
@@ -248,6 +257,12 @@ class Pipelines(Step):
         segments.mkdir(parents=True, exist_ok=True)
         logs.mkdir(parents=True, exist_ok=True)
         out.mkdir(parents=True, exist_ok=True)
+        cold = bool(getattr(ctx.options, "pipelines_cold", False))
+        # The previous cache becomes the seed (or is dropped, by name) before the step deletes its own outputs.
+        seed_dir = ctx.dest / check.TEMP / pipeseed.SEED_DIR
+        seed = pipeseed.settle(out / CACHE, seed_dir, expect=device.expect(), identity=device.identity,
+                               runtime=RUNTIME_SAYS, previous=ctx.facts.get("pipelines_previous"), cold=cold)
+        say_seed(rep, seed)
         for stale in (out / CACHE, out / TIMES):
             stale.unlink(missing_ok=True)       # write-once: a step that runs again deletes its own outputs first
 
@@ -266,14 +281,14 @@ class Pipelines(Step):
         todo = [i for i in items if i.key not in kept]
         free = pipesched.pool.available_ram() or 0
         workers, budget, sizing = pipesched.size_workers(free, os.cpu_count() or 4,
-                                                         getattr(ctx.options, "pipelines_jobs", None))
+                                                         getattr(ctx.options, "pipelines_jobs", None),
+                                                         seed.bytes if seed.used else 0)
         workers = max(1, min(workers, len(todo))) if todo else 1
         by_kind = {k: sum(1 for i in items if i.kind == k) for k in pipesched.KINDS}
         rep.say(f"pipelines: {len(items):,} programs to build ({by_kind['cs']:,} compute, {by_kind['vs']:,}"
                 f" vertex, {by_kind['ps']:,} pixel), {len(kept):,} kept from an interrupted run, {len(todo):,} to build on "
                 f"{workers} builder processes ({sizing}); {device.name}, identity {device.identity.split(':')[3][:8]}; "
                 f"not built (task {wl.not_built['ts']:,}, mesh {wl.not_built['ms']:,}), so every total is a lower bound")
-        cold = bool(getattr(ctx.options, "pipelines_cold", False))
         env = dict(os.environ, VK_LOADER_LAYERS_DISABLE="~implicit~", OOT2_VK_DEVICE=str(device.index))
         if cold:
             env["OOT2_VK_DRIVER_CACHE"] = "off"
@@ -290,10 +305,15 @@ class Pipelines(Step):
 
         gov = pipesched.Governor(budget)
         shown = Progress(rep, items, kept)
-        p = pipesched.Pool(lambda wid: builder + ["serve", "--pack", str(pack), "--segments", str(segments)], todo,
+        serve = ["serve", "--pack", str(pack), "--segments", str(segments)]
+        if seed.used:
+            serve += ["--cache", str(seed.path)]
+        p = pipesched.Pool(lambda wid: builder + serve, todo,
                            workers, gov, logs, segments, lambda rs, seg, size: record(rs), lambda r: record([r]),
                            next_segment=pipesched.next_segment_number(segments), env=env, on_result=shown.add,
                            expect=device.expect(), runtime=RUNTIME_SAYS)
+        if seed.used:
+            p.recycle_bytes += seed.bytes        # a builder holding the seed is not a builder holding a big build
         t0 = time.monotonic()
         try:
             if todo:
@@ -311,6 +331,7 @@ class Pipelines(Step):
         finally:
             progress_file.close()
         build_seconds = time.monotonic() - t0
+        seed = builders_judge_seed(rep, seed, p.cache_seen)
 
         done = {k: r for k, r in results.items() if r.status == "ok"}
         failed = sorted(k for k, r in results.items() if r.status != "ok")
@@ -322,6 +343,7 @@ class Pipelines(Step):
         merged = merge(ctx, builder, env, scratch, segments, out / CACHE)
         write_times(out / TIMES, results)
         shutil.rmtree(scratch, ignore_errors=True)
+        pipeseed.discard(seed_dir)               # the merged cache holds it
         if failed:
             named = "; ".join(f"{k}: {results[k].message}" for k in failed[:NAMED])
             rep.warning(f"{len(failed):,} of {len(items):,} programs got no pipeline "
@@ -364,6 +386,7 @@ class Pipelines(Step):
             "recycled": p.stats.recycled,
             "lost": p.stats.lost,
             "cold": cold,
+            "seed": {**seed.record(), "builders_loaded": p.cache_seen.get("loaded", 0)},
             "validation": env.get("OOT2_VK_VALIDATION") or "off",
             "validation_errors": p.stats.validation_errors,
             "validation_warnings": p.stats.validation_warnings,
@@ -371,6 +394,31 @@ class Pipelines(Step):
             "builder": builder_id,
             "runtime": dict(p.runtime_seen) or dict(RUNTIME_SAYS),     # no worker ran when every item was kept: the key held it
         }
+
+
+# --- the seed ---------------------------------------------------------------------------------------------------
+
+def say_seed(rep, seed: pipeseed.Seed) -> None:
+    if seed.outcome == pipeseed.KEPT:
+        rep.say(f"pipelines: the previous cache ({seed.bytes / GiB:.2f} GiB, {seed.source}) is the seed: the programs it "
+                "holds are served from it and only the others build cold")
+    elif seed.outcome == pipeseed.DROPPED:
+        rep.warning(f"pipelines: the previous cache ({seed.bytes:,} bytes, {seed.source}) is dropped, not used as a seed: "
+                    f"{seed.reason}. It is deleted and every program builds from an empty cache.")
+    elif seed.outcome == pipeseed.OFF:
+        rep.say(f"pipelines: no seed: {seed.reason}")
+
+
+def builders_judge_seed(rep, seed: pipeseed.Seed, seen: dict[str, int]) -> pipeseed.Seed:
+    """The builders judge the seed again when they start (pipebuild serve --cache) and say what they made of it in the
+    ready line. One that did not load it started from an empty cache, so the seed did not do its work: say so."""
+    refused = {state: n for state, n in seen.items() if state != "loaded"}
+    if not seed.used or not refused:
+        return seed
+    said = ", ".join(f"{n} said {state}" for state, n in sorted(refused.items()))
+    reason = f"the builder judged it unusable when it started ({said}) and began from an empty cache"
+    rep.warning(f"pipelines: the seed was not used by every builder: {reason}. The programs it holds built cold again.")
+    return pipeseed.Seed(pipeseed.DROPPED, seed.bytes, seed.source, reason)
 
 
 # --- the work ---------------------------------------------------------------------------------------------------

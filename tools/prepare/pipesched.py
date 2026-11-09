@@ -149,16 +149,17 @@ def runs_alone(item: Item) -> bool:
     return expected_bytes(item) >= ALONE_BYTES
 
 
-def size_workers(free: int, cpus: int, given: int | None = None) -> tuple[int, int, str]:
+def size_workers(free: int, cpus: int, given: int | None = None, seed_bytes: int = 0) -> tuple[int, int, str]:
     """Workers, the memory the pool may reserve, and why: the CPU count (at most MAX_WORKERS) capped by the free
-    memory at WORKER_BYTES a worker, unless the player gave a number."""
+    memory at WORKER_BYTES a worker (and the seed each one loads, when the cache is seeded), unless the player gave a
+    number."""
     budget = max(WORKER_BYTES, int(free * MEM_SHARE)) if free else 4 * GiB
     if given:
         return given, budget, "--pipelines-jobs"
     cpus = min(cpus, MAX_WORKERS)
     if not free:
         return cpus, budget, f"{cpus} CPUs, free memory unknown"
-    by_mem = max(1, int(free * MEM_SHARE) // WORKER_BYTES)
+    by_mem = max(1, int(free * MEM_SHARE) // (WORKER_BYTES + seed_bytes))
     return min(cpus, by_mem), budget, f"{cpus} CPUs, {free / GiB:.1f} GiB free memory allows {by_mem}"
 
 
@@ -376,6 +377,7 @@ class Pool:
         self.expect = expect or {}       # fields of the builder's ready line (vendor, device, driver, cache_uuid)
         self.runtime = runtime or {}     # fields of it that name the runtime the builder was linked with (zero_workgroup)
         self.runtime_seen: dict[str, str] = {}
+        self.cache_seen: dict[str, int] = {}   # what each builder's ready line said of the cache it was given (cache=)
         self.command, self.workers, self.gov = command, workers, governor
         self.logs, self.segments = Path(logs), Path(segments)
         self.on_saved, self.on_failed, self.on_result = on_saved, on_failed, on_result
@@ -450,6 +452,8 @@ class Pool:
                              "workgroup memory would build again, cold, at the first launch.")
         with self.lock:
             self.runtime_seen = {k: got[k] for k in self.runtime}
+            state = got.get("cache", "?")
+            self.cache_seen[state] = self.cache_seen.get(state, 0) + 1
             self.children[wid] = child
             if attempt:
                 self.stats.restarts += 1

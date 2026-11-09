@@ -252,6 +252,77 @@ class PipeBuildTest(DeviceTestCase):
             self.assertEqual((warm["items"], warm["hits"], warm["failed"]), (4, 4, 0))
             self.assertTrue(Pipelines().verify(ctx, rec))
 
+    def test_a_key_change_with_one_module_changed_serves_the_others_from_the_seed_and_builds_the_changed_one_cold(self) -> None:
+        """The seed of the pipelines step on a device: the step builds a synthetic pack, its key changes and one module of
+        the pack changes, and the step runs again. The previous cache is the seed: every unchanged module is served by
+        the driver from it, the changed one is built cold, and the new cache still holds the seed's entries."""
+        import argparse
+        import io
+        import json
+        import os
+        from unittest import mock
+
+        import cache_pack as cp
+        from prepare import check, pipelines, pipeseed
+        from prepare.pipelines import Pipelines
+        from prepare.runner import Context, Reporter, run_steps
+        from test_prepare_pipelines import FakeTranslate
+        from test_runtime_vk_pipeline import GLSL, synthetic_pack
+
+        tmp, _ = self.folder()
+        (tmp / "changed").mkdir()
+        with mock.patch.dict(GLSL, {"cs2.comp": GLSL["cs2.comp"].replace("= 1u", "= 2u")}):
+            changed_pack = synthetic_pack(tmp / "changed")             # the same pack with one compute module changed
+        dest = tmp / "dest"
+        (dest / "shaders" / "split").mkdir(parents=True)
+        shutil.copy(self.pack, dest / "shaders" / cp.BASE_FILE)
+        stages = {SYNTH_KEYS["vs.vert"]: "vs", SYNTH_KEYS["ps.frag"]: "ps", SYNTH_KEYS["cs.comp"]: "cs",
+                  SYNTH_KEYS["cs2.comp"]: "cs"}
+        (dest / "shaders" / "split" / "jobs.jsonl").write_text(
+            "".join(json.dumps({"key": k, "stage": s}) + "\n" for k, s in stages.items()), encoding="utf-8")
+        options = argparse.Namespace(cc=None, vulkan_sdk=None, pipelines_builder=None, pipelines_jobs=2,
+                                     pipelines_list=None, pipelines_cold=False)
+        ctx = Context(dest, options, Reporter(io.StringIO(), io.StringIO()))
+        ctx.state["host"] = check.run_probe(check.build_probe(check.compiler(ctx), tmp / "probe", check.vulkan_include(ctx)))
+        marker = tmp / "marker.txt"
+        base = pipelines.key_files()
+
+        def hits() -> dict[str, str]:
+            rows = (dest / "pipelines" / "times.tsv").read_text().splitlines()
+            head = rows[0].split("\t")
+            return {r.split("\t")[1]: r.split("\t")[head.index("hit")] for r in rows[1:]}
+
+        with mock.patch.dict(os.environ, {"OOT2_VK_VALIDATION": "sync"}), \
+                mock.patch.object(pipelines, "key_files", lambda: [*base, marker]):
+            marker.write_text("one")
+            self.assertEqual(run_steps([FakeTranslate(), Pipelines()], ctx), "ok", ctx.reporter.err.getvalue())
+            first = ctx.state["steps"]["pipelines"]
+            self.assertEqual(first["seed"]["outcome"], pipeseed.NONE)
+            self.assertEqual(set(hits()), set(stages))
+            cache = dest / "pipelines" / "pipeline.cache"
+            first_bytes = cache.stat().st_size
+
+            shutil.copy(changed_pack, dest / "shaders" / cp.BASE_FILE)    # one module changed ...
+            marker.write_text("two")                                      # ... and the step's key with it
+            status = run_steps([FakeTranslate(), Pipelines()], ctx)
+            said = ctx.reporter.out.getvalue() + ctx.reporter.err.getvalue()
+            self.assertEqual(status, "ok", said)
+            self.assertIn("pipelines: started (its inputs changed)", said)
+            second = ctx.state["steps"]["pipelines"]
+            self.assertEqual(second["seed"]["outcome"], pipeseed.KEPT, said)
+            self.assertEqual(second["seed"]["bytes"], first_bytes)
+            self.assertGreaterEqual(second["seed"]["builders_loaded"], 1)
+            served = hits()
+            self.assertEqual({k for k, v in served.items() if v == "0"}, {SYNTH_KEYS["cs2.comp"]}, served)   # built cold
+            self.assertEqual({k for k, v in served.items() if v == "1"},
+                             {SYNTH_KEYS["vs.vert"], SYNTH_KEYS["ps.frag"], SYNTH_KEYS["cs.comp"]}, served)   # served warm
+            self.assertEqual((second["failed"], second["validation_errors"], second["validation_warnings"]), (0, 0, 0))
+            self.assertGreaterEqual(cache.stat().st_size, first_bytes)    # the seed's entries are in the new cache
+            self.assertFalse((dest / "temp" / "pipelines-seed").exists())
+            items = pipelines.pipesched.order(pipelines.load_work(ctx, dest / "shaders" / cp.BASE_FILE, None).items)
+            warm = pipelines.warm_pass(ctx, items, cache)
+            self.assertEqual((warm["items"], warm["hits"], warm["failed"]), (4, 4, 0))   # all four are served now
+
     def test_the_command_line_is_checked(self) -> None:
         self.assertEqual(subprocess.run([str(self.exe)], capture_output=True).returncode, 2)
         self.assertEqual(subprocess.run([str(self.exe), "serve", "--pack", "x"], capture_output=True).returncode, 2)

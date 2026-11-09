@@ -38,7 +38,7 @@ from prepare.runner import Context, PrepareError, Reporter, Step, run_steps  # n
 TRANSLATOR = hashlib.sha256(b"synthetic translator of the pipeline step").hexdigest()
 
 STANDIN = r'''
-import json, os, sys, time
+import json, os, struct, sys, time
 cfg = json.load(open(os.environ["STANDIN_CONFIG"])) if os.environ.get("STANDIN_CONFIG") else {}
 log = os.environ.get("STANDIN_LOG")
 
@@ -50,20 +50,30 @@ def note(text):
         with open(log, "a") as f:
             f.write(text + "\n")
 
+def head():
+    """The 32-byte header of a Vulkan pipeline cache for the device the stand-in says it is (what the real builder's cache
+    files begin with), so that the step's checks of a seed have a header to read."""
+    return struct.pack("<IIII16s", 32, 1, int(cfg.get("vendor", "10de"), 16), int(cfg.get("device", "2486"), 16),
+                       bytes.fromhex(cfg.get("uuid", "ab" * 16)))
+
 def serve(args):
     opts = dict(zip(args[::2], args[1::2]))
     segments = opts["--segments"]
-    seeded = set()
+    seeded, state, seeded_bytes = [], "none", 0
     if "--cache" in opts and os.path.exists(opts["--cache"]):
-        seeded = set(open(opts["--cache"]).read().split())
+        raw = open(opts["--cache"], "rb").read()
+        state, seeded_bytes = cfg.get("cache_state", "loaded"), len(raw)
+        if state == "loaded":
+            seeded = raw[32:].decode().split()
+    note("serve " + ("--cache" if "--cache" in opts else "no-cache") + " " + state)
     if cfg.get("start_fail"):
         sys.stderr.write("FATAL: gfx: vulkan: stand-in has no device\n")
         sys.exit(70)
     say(f"ready vendor={cfg.get('vendor', '10de')} device={cfg.get('device', '2486')} driver={cfg.get('driver', '0009a000')} "
-        f"api=1.4.351 cache_uuid={cfg.get('uuid', 'ab' * 16)} cache=none seeded=0"
+        f"api=1.4.351 cache_uuid={cfg.get('uuid', 'ab' * 16)} cache={state} seeded={seeded_bytes}"
         + ("" if cfg.get("older_runtime") else f" zero_workgroup={cfg.get('zero_workgroup', 1)}")
         + " name=Stand-in")
-    built = []
+    built = list(seeded)               # the real builder's first segment holds the seed it was given
     for line in sys.stdin:
         w = line.split()
         if not w:
@@ -107,8 +117,9 @@ def serve(args):
             if key in cfg.get("hang", []):
                 time.sleep(60)
             time.sleep(cfg.get("delay", 0))
-            built.append(key)
-            say("ok", kind, key, 1000 + len(key), 1 if key in seeded else 0, 100 * (1 + len(key)))
+            if key not in built:
+                built.append(key)
+            say("ok", kind, key, 1000 + len(key), 1 if key in seeded and key not in cfg.get("cold_keys", []) else 0, 100 * (1 + len(key)))
         elif w[0] == "flush":
             if cfg.get("flush_fail"):
                 say("fail flush", w[1], "disk full")
@@ -135,9 +146,9 @@ def merge(args):
     for f in files:
         data = open(f).read()
         total += len(data)
-        keys += data.split()
-    with open(opts["--out"], "w") as out:
-        out.write("".join(k + "\n" for k in keys))
+        keys += [k for k in data.split() if k not in keys]
+    with open(opts["--out"], "wb") as out:
+        out.write(head() + "".join(k + "\n" for k in keys).encode())
     say("merged", len(files), total, os.path.getsize(opts["--out"]))
 
 {"serve": serve, "merge": merge}[sys.argv[1]](sys.argv[2:])
@@ -152,6 +163,11 @@ def description(key: str, mod: bytes) -> bytes:
     return json.dumps({"schema": cp.DESC_SCHEMA, "key": key, "translator_id": TRANSLATOR,
                        "answers": {"tex": {}, "img": {}, "attr": {}, "fout": {}}, "spv_bytes": len(mod),
                        "spv_sha256": hashlib.sha256(mod).hexdigest()}).encode()
+
+
+def cache_keys(path: Path) -> list[str]:
+    """The keys a stand-in cache file holds: the 32-byte header, then one key a line."""
+    return path.read_bytes()[32:].decode().split()
 
 
 def device(*, ok: bool = True, kind: int = 2, uuid: str = "ab" * 16, driver: int = 0x9a000, name: str = "Test GPU") -> dict:
@@ -423,7 +439,7 @@ class StepTest(unittest.TestCase):
         self.assertTrue(rec["lower_bound"])
         cache = env.dest / "pipelines" / "pipeline.cache"
         self.assertEqual(cache.stat().st_size, rec["cache_bytes"])
-        self.assertEqual(len(cache.read_text().split()), 10)                             # the merge holds every segment
+        self.assertEqual(len(cache_keys(cache)), 10)                             # the merge holds every segment
         rows = (env.dest / "pipelines" / "times.tsv").read_text().splitlines()
         self.assertEqual(len(rows), 11)
         self.assertEqual(rows[0].split("\t")[:3], ["status", "key", "kind"])
@@ -528,7 +544,7 @@ class StepTest(unittest.TestCase):
         self.assertIn("1 fail", env.say(ctx))
         # the dying builder saved what it had built, so nothing is built again and the cache holds the other nine
         self.assertEqual((len(env.builds()), rec["lost"]), (10, 0))
-        self.assertEqual(len((env.dest / "pipelines" / "pipeline.cache").read_text().split()), 9)
+        self.assertEqual(len(cache_keys(env.dest / "pipelines" / "pipeline.cache")), 9)
 
     def test_a_builder_that_dies_without_saving_loses_its_unsaved_items_which_are_built_again(self) -> None:
         bad = "v000000000000001.00000000"
@@ -538,7 +554,7 @@ class StepTest(unittest.TestCase):
         rec = ctx.state["steps"]["pipelines"]
         self.assertEqual(rec["lost"], 5)                    # four compute programs and the largest pixel program
         self.assertEqual(len(env.builds()), 15)
-        self.assertEqual(len((env.dest / "pipelines" / "pipeline.cache").read_text().split()), 9)
+        self.assertEqual(len(cache_keys(env.dest / "pipelines" / "pipeline.cache")), 9)
 
     def test_a_worker_that_dies_is_replaced_and_its_item_is_tried_again_alone(self) -> None:
         victim = "c000000000000003.00000000"
@@ -599,7 +615,7 @@ class RecycleTest(unittest.TestCase):
         rec = ctx.state["steps"]["pipelines"]
         self.assertGreaterEqual(rec["recycled"], 5)
         self.assertEqual((rec["lost"], rec["failed"], len(env.builds())), (0, 0, 10))
-        self.assertEqual(len((env.dest / "pipelines" / "pipeline.cache").read_text().split()), 10)
+        self.assertEqual(len(cache_keys(env.dest / "pipelines" / "pipeline.cache")), 10)
         self.assertGreater(rec["segments"], 5)               # each replaced builder saved its segment first
 
     def test_a_small_builder_is_kept(self) -> None:
@@ -735,7 +751,7 @@ class ResumeTest(unittest.TestCase):
         self.assertFalse(set(first) & set(second))
         self.assertEqual(ctx.state["steps"]["pipelines"]["kept_items"], 5)
         self.assertEqual(ctx.state["steps"]["pipelines"]["built"], {"cs": 4, "vs": 3, "ps": 3})
-        self.assertEqual(len((env.dest / "pipelines" / "pipeline.cache").read_text().split()), 10)
+        self.assertEqual(len(cache_keys(env.dest / "pipelines" / "pipeline.cache")), 10)
         self.assertEqual(len((env.dest / "pipelines" / "times.tsv").read_text().splitlines()), 11)
 
     def test_a_lost_segment_is_built_again(self) -> None:
