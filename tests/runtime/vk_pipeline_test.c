@@ -9,6 +9,8 @@
 //   keys                         vertex, mesh and task-mesh pipelines have distinct cache keys
 //   desc FILE                    a description parsed: stage, fit, interface by location, or the refusal
 //   pad VS_DESC PS_DESC          the padding a vertex stage needs for a pixel stage
+//   meshlink MS_DESC PS_DESC     the rule a mesh stage is linked to a pixel stage by: the ranges it does not write, or
+//                                the refusal
 //   binds FILE                   a description's bindings parsed (shd_parse_binds), or the refusal
 //   spvdecl MODULE               the capabilities and extensions a module declares
 //   spvpad IN OUT SPEC           a module with outputs added (SPEC "location:component:components:type,...")
@@ -217,6 +219,22 @@ static void case_pad(const char *vs, const char *ps) {
     shd_pad_text(pad, n, text, sizeof text);
     printf("pad %d %s\n", n, text);
     for (int i = 0; i < n; i++) printf("run %u %u %u %u\n", pad[i].location, pad[i].component, pad[i].components, pad[i].type);
+}
+
+static void case_meshlink(const char *ms, const char *ps) {
+    static ShaderDesc m, p;
+    char why[256];
+    CHECK(load_desc(ms, &m, why, sizeof why));
+    CHECK(load_desc(ps, &p, why, sizeof why));
+    ShdPad missing[16];
+    int n = shd_mesh_link(&m, &p, missing, 16, why, sizeof why);
+    if (n < 0) {
+        printf("refused: %s\n", why);
+        return;
+    }
+    char text[256];
+    shd_pad_text(missing, n, text, sizeof text);
+    printf("missing %d %s\n", n, text);
 }
 
 static void case_spvdecl(const char *path) {
@@ -1085,6 +1103,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "keys")) case_keys();
     else if (!strcmp(cs, "desc") && argc >= 3) case_desc(argv[2]);
     else if (!strcmp(cs, "pad") && argc >= 4) case_pad(argv[2], argv[3]);
+    else if (!strcmp(cs, "meshlink") && argc >= 4) case_meshlink(argv[2], argv[3]);
     else if (!strcmp(cs, "binds") && argc >= 3) case_binds(argv[2]);
     else if (!strcmp(cs, "spvdecl") && argc >= 3) case_spvdecl(argv[2]);
     else if (!strcmp(cs, "spvpad") && argc >= 5) case_spvpad(argv[2], argv[3], argv[4]);

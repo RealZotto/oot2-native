@@ -19,15 +19,19 @@ enum { SHD_FLOAT, SHD_SINT, SHD_UINT };
 #define SHD_MAX_IO 64          // user interface entries a description may list per direction
 #define SHD_MAX_LOCATIONS 64   // locations an entry or an array of entries may reach
 
-// One user input or output variable (a Location decoration). An array of length n takes n locations in a row.
+// One user input or output variable (a Location decoration). An array of length n takes n locations in a row, except
+// the outer array of a mesh stage's output: it holds one element per vertex or per primitive, all at the variable's own
+// location, so a mesh output takes one location whatever its vertex count (shd_mesh_link).
 typedef struct ShdIo {
     int32_t location;
     uint8_t component;     // first component used at the location (0 to 3)
     uint8_t components;    // 1 to 4
     uint8_t type;          // SHD_FLOAT, SHD_SINT or SHD_UINT
     uint8_t bits;          // 32 for every variable the translator declares today
-    int32_t array_length;  // 1 for a variable that is not an array
+    int32_t array_length;  // the outer array's length; 1 for a variable that is not an array
     uint8_t used;
+    int8_t array_depth;    // the array levels of the variable's type (0 for none); -1 when the description does not say
+    int8_t per_primitive;  // 1 for a PerPrimitiveEXT variable, 0 for one per vertex; -1 when the description does not say
 } ShdIo;
 
 typedef struct ShaderDesc {
@@ -58,6 +62,15 @@ typedef struct ShdPad {
 // in location and component order. Returns how many (at most max), or -1 with the reason in why when a variable cannot
 // be padded (more locations than SHD_MAX_LOCATIONS, a type that is not 32 bits, more runs than max).
 int shd_pad_set(const ShaderDesc *vs, const ShaderDesc *ps, ShdPad *out, int max, char *why, size_t cap);
+// The rule a mesh module is linked to a pixel module by. Each mesh output is an array with one element per vertex (or,
+// marked per_primitive, per primitive) of a scalar or vector at its one location; each pixel input reads its words at
+// the rate it is marked with. Returns the runs of words the pixel module reads and the mesh module does not write, as
+// shd_pad_set does (a mesh module is never padded: the caller stops on any), or -1 with the reason in why: an entry
+// whose description does not give its array depth or rate (a description older than these members), a shape the
+// builder does not link (a mesh output that is not one array level around its element, a pixel input array over
+// locations the mesh module writes), a word written at one rate and read at the other ("rate"), a word read as another
+// type or width than it is written ("type"), a location past SHD_MAX_LOCATIONS, or more runs than max.
+int shd_mesh_link(const ShaderDesc *ms, const ShaderDesc *ps, ShdPad *missing, int max, char *why, size_t cap);
 // The canonical text of a pad set ("l:c:n:t;" per run, empty for none), which keys the padded library.
 void shd_pad_text(const ShdPad *pad, int n, char *out, size_t cap);
 

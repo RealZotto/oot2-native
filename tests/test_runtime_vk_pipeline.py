@@ -396,6 +396,91 @@ class DescriptionTest(unittest.TestCase):
         self.assertTrue(out[0].startswith("refused: ") and "more than 16" in out[0], out)
 
 
+def mesh_out(location: int, component: int = 0, *, per_vertex: int = 160, depth: int | None = 1,
+             per_primitive: bool | None = False, type_: str = "float32") -> dict:
+    """One output of a mesh stage as the translator declares it: one float of one component per vertex (or per primitive),
+    an array whose length is the stage's vertex (or primitive) count."""
+    d = io(location, 1, component, type_, array_length=per_vertex)
+    if depth is not None:
+        d["array_depth"] = depth
+    if per_primitive is not None:
+        d["per_primitive"] = per_primitive
+    return d
+
+
+def pixel_in(location: int, components: int = 4, component: int = 0, *, per_primitive: bool | None = False,
+             type_: str = "float32", array_length: int | None = None, depth: int | None = None) -> dict:
+    d = io(location, components, component, type_, array_length=array_length)
+    d["array_depth"] = (0 if array_length is None else 1) if depth is None else depth
+    if per_primitive is not None:
+        d["per_primitive"] = per_primitive
+    return d
+
+
+class MeshLinkTest(unittest.TestCase):
+    """The rule a mesh stage is linked to a pixel stage by (shd_mesh_link, used by build_link): a mesh output's outer
+    array holds its vertices or primitives at one location, and rate, type and shape must agree with the pixel inputs."""
+
+    def setUp(self) -> None:
+        self.dir = scratch()
+
+    def link(self, ms_out: list[dict], ps_in: list[dict]) -> str:
+        mod = vertex_module()
+        m = self.dir / "m.json"
+        m.write_bytes(describe("m.1", "ms", mod, outputs=ms_out))
+        p = self.dir / "p.json"
+        p.write_bytes(describe("p.1", "ps", mod, inputs=ps_in))
+        done = run("meshlink", str(m), str(p))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        (line,) = done.stdout.splitlines()
+        return line
+
+    def refused(self, ms_out: list[dict], ps_in: list[dict], *needles: str) -> None:
+        line = self.link(ms_out, ps_in)
+        self.assertTrue(line.startswith("refused: "), line)
+        for needle in needles:
+            self.assertIn(needle, line)
+
+    def test_per_vertex_outputs_of_160_vertices_reach_location_63(self) -> None:
+        # 160 vertices: each output is a float[160]. Counted as 160 locations, location 1 would already reach 160.
+        outs = [mesh_out(loc, c) for loc in (1, 2, 40, 63) for c in range(4)]
+        self.assertEqual(self.link(outs, [pixel_in(loc) for loc in (1, 2, 40, 63)]), "missing 0 ")
+
+    def test_per_primitive_outputs_link_to_per_primitive_inputs(self) -> None:
+        outs = [mesh_out(5, c, per_vertex=128, per_primitive=True) for c in range(2)] + [mesh_out(6, c) for c in range(4)]
+        ins = [pixel_in(5, 2, per_primitive=True), pixel_in(6)]
+        self.assertEqual(self.link(outs, ins), "missing 0 ")
+
+    def test_what_the_mesh_stage_does_not_write_is_listed(self) -> None:
+        outs = [mesh_out(3, c) for c in (0, 1)]
+        self.assertEqual(self.link(outs, [pixel_in(3), pixel_in(9, 1, 2, type_="uint32")]), "missing 2 3:2:2:0;9:2:1:2;")
+
+    def test_a_rate_mismatch_is_refused_by_name(self) -> None:
+        outs = [mesh_out(4, c, per_vertex=128, per_primitive=True) for c in range(4)]
+        self.refused(outs, [pixel_in(4)], "rate", "location 4", "per vertex", "per primitive")
+        outs = [mesh_out(4, c) for c in range(4)]
+        self.refused(outs, [pixel_in(4, per_primitive=True)], "rate", "location 4", "per primitive", "per vertex")
+
+    def test_a_type_mismatch_is_refused_by_name(self) -> None:
+        outs = [mesh_out(7, c) for c in range(4)]
+        self.refused(outs, [pixel_in(7, 1, 3, type_="sint32")], "type", "location 7 component 3", "sint32", "float32")
+
+    def test_a_shape_the_builder_does_not_link_is_refused_by_name(self) -> None:
+        self.refused([mesh_out(2, depth=0)], [pixel_in(2, 1)], "shape", "mesh output at location 2", "0 array levels")
+        self.refused([mesh_out(2, depth=2)], [pixel_in(2, 1)], "shape", "mesh output at location 2", "2 array levels")
+        outs = [mesh_out(loc, c) for loc in (8, 9) for c in range(4)]
+        self.refused(outs, [pixel_in(8, array_length=2)], "shape", "pixel input at location 8", "array of 2")
+
+    def test_a_description_without_depth_or_rate_is_refused_by_name(self) -> None:
+        self.refused([mesh_out(1, depth=None)], [pixel_in(1, 1)], "mesh output at location 1", "translate")
+        self.refused([mesh_out(1, per_primitive=None)], [pixel_in(1, 1)], "mesh output at location 1", "translate")
+        self.refused([mesh_out(1)], [pixel_in(1, 1, per_primitive=None)], "pixel input at location 1", "translate")
+
+    def test_locations_past_the_builders_are_still_refused(self) -> None:
+        self.refused([mesh_out(64)], [pixel_in(1, 1)], "location 64", "past the 64")
+        self.refused([mesh_out(1)], [pixel_in(63, array_length=2)], "location 64", "past the 64")
+
+
 class BindingsTest(unittest.TestCase):
     """The bindings reader (shd_parse_binds): synthetic descriptions with the members xlate/host/ResultWriter.cs writes."""
 

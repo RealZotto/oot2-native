@@ -16,10 +16,14 @@ from __future__ import annotations
 
 import json
 import struct
+import sys
 from pathlib import Path
 
-from test_xlate_host import EXIT, SPIRV_VAL, Harness, ampere, bit, mesh_fields, validate
+from test_xlate_host import EXIT, ROOT, SPIRV_VAL, Harness, ampere, bit, mesh_fields, validate
 from test_xlate_uni import mov_cbuf, scheduled
+
+sys.path.insert(0, str(ROOT / "tools" / "firstdraw"))
+import mesh_programs as mp  # noqa: E402
 
 OP_EXTENSION, OP_ENTRY_POINT, OP_EXECUTION_MODE, OP_CAPABILITY = 10, 15, 16, 17
 OP_TYPE_ARRAY, OP_TYPE_POINTER, OP_CONSTANT, OP_FUNCTION, OP_FUNCTION_END = 28, 32, 43, 54, 56
@@ -409,6 +413,44 @@ class MeshDescriptionTest(MeshHarness):
         self.assertTrue(stage["requires_subgroup_32"])
         self.assertEqual(res["capabilities"].count("MeshShadingEXT"), 1)
         self.assertIn("SPV_EXT_mesh_shader", res["extensions"])
+
+    def wide_mesh(self, key: str, vertex: list, primitive: list) -> dict:
+        return self.job(key, "ms", [EXIT], max_vertices=160, max_primitives=128, vertex=POSITION + vertex, primitive=primitive,
+                        payload=128)
+
+    def pixel(self, key: str) -> dict:
+        """The synthetic pixel program of tools/firstdraw: generic attribute 0 read in its four components."""
+        path = self.dir / f"{key}.bin"
+        path.write_bytes(mp.pixel_program())
+        return {"key": key, "stage": "ps", "arch": "sm86", "code": str(path), "c1": ""}
+
+    def test_each_mesh_output_gives_its_rate_and_its_array_depth(self):
+        # Every output is an array over the 160 vertices or the 128 primitives, around one float at its location and component
+        _, res = self.translate(self.wide_mesh("d4", [[1, 0], [1, 1], [3, 2]], [[2, 0]]))
+        got = [(o["location"], o["component"], o["components"], o["type"], o["array_length"], o["array_depth"], o["per_primitive"])
+               for o in res["interface"]["outputs"]]
+        self.assertEqual(got, [(1, 0, 1, "float32", 160, 1, False), (1, 1, 1, "float32", 160, 1, False),
+                               (2, 0, 1, "float32", 128, 1, True), (3, 2, 1, "float32", 160, 1, False)])
+
+    def test_a_pixel_input_is_read_per_vertex_and_is_no_array(self):
+        _, res = self.translate(self.pixel("p4"))
+        got = [(i["location"], i["component"], i["components"], i["array_depth"], i["per_primitive"], "array_length" in i)
+               for i in res["interface"]["inputs"]]
+        self.assertEqual(got, [(0, 0, 4, 0, False, False)])
+
+    def test_the_runtime_links_these_descriptions_whatever_the_vertex_count(self):
+        # The runtime's own rule (shd_mesh_link, through tests/runtime/vk_pipeline_test.c) on the translator's descriptions:
+        # a float[160] at location 0 takes location 0 alone; counted as 160 locations it would reach past the builder's 64.
+        import test_runtime_vk_pipeline as vp
+        self.translate(self.wide_mesh("d5", [[0, c] for c in range(4)], []))
+        self.translate(self.pixel("p5"))
+        self.translate(self.wide_mesh("d6", [], [[0, c] for c in range(4)]))
+        link = lambda mesh: vp.run("meshlink", str(self.out / f"{mesh}.res.json"), str(self.out / "p5.res.json"))  # noqa: E731
+        done = link("d5")
+        self.assertEqual((done.returncode, done.stdout), (0, "missing 0 \n"), done.stderr)
+        done = link("d6")   # written per primitive, read per vertex
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(done.stdout.startswith("refused: rate: pixel input at location 0 component 0 is read per vertex"), done.stdout)
 
     def test_other_stages_have_no_mesh_description(self):
         from test_xlate_host import compute_job

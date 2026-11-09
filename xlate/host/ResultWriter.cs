@@ -524,6 +524,10 @@ internal static class ResultWriter
                 w.WriteNumber("array_length", v.ArrayLength);
             }
 
+            // The runtime links a mesh stage by these two (runtime/gpu/shader_desc.c, shd_mesh_link): a mesh output's outer
+            // array is over its vertices or primitives and takes one location, whatever its length.
+            w.WriteNumber("array_depth", v.ArrayDepth);
+            w.WriteBoolean("per_primitive", v.PerPrimitive);
             w.WriteBoolean("used", v.Used);
 
             if (job != null)

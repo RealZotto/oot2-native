@@ -14,7 +14,18 @@ internal sealed class InterfaceVariable
     public int Component { get; init; }
     public int Components { get; init; }
     public string Type { get; init; }
+    /// <summary>The outer array's length (0 for a variable that is not an array, -1 when the length is not a constant).</summary>
     public int ArrayLength { get; init; }
+
+    /// <summary>
+    /// How many array levels the variable's type has (0 for none). A mesh stage's output has one level more than what it
+    /// holds: the outer array is over its vertices or primitives and takes no location of its own.
+    /// </summary>
+    public int ArrayDepth { get; init; }
+
+    /// <summary>The variable is decorated PerPrimitiveEXT: a mesh output written, or a pixel input read, per primitive.</summary>
+    public bool PerPrimitive { get; init; }
+
     public bool Used { get; init; }
 }
 
@@ -31,7 +42,7 @@ internal sealed class ModuleInterface
     private const uint OpLoad = 61, OpStore = 62, OpCopyMemory = 63, OpAccessChain = 65, OpInBoundsAccessChain = 66;
     private const uint OpDecorate = 71, OpMemberDecorate = 72;
     private const uint DecorationBuiltIn = 11, DecorationLocation = 30, DecorationComponent = 31;
-    private const uint DecorationBinding = 33, DecorationDescriptorSet = 34;
+    private const uint DecorationBinding = 33, DecorationDescriptorSet = 34, DecorationPerPrimitive = 5271;
     private const uint StorageInput = 1, StorageUniform = 2, StorageOutput = 3;
 
     public List<InterfaceVariable> Inputs { get; } = new();
@@ -54,7 +65,7 @@ internal sealed class ModuleInterface
         Dictionary<uint, int> location = new(), component = new(), set = new(), binding = new();
         Dictionary<uint, uint> builtIn = new();
         Dictionary<uint, List<uint>> memberBuiltIns = new();
-        HashSet<uint> used = new();
+        HashSet<uint> used = new(), perPrimitive = new();
         bool inFunctions = false;
 
         for (int i = 5; i < w.Length;)
@@ -79,6 +90,7 @@ internal sealed class ModuleInterface
                         case DecorationBinding when n >= 4: binding[inst[1]] = (int)inst[3]; break;
                         case DecorationDescriptorSet when n >= 4: set[inst[1]] = (int)inst[3]; break;
                         case DecorationBuiltIn when n >= 4: builtIn[inst[1]] = inst[3]; break;
+                        case DecorationPerPrimitive: perPrimitive.Add(inst[1]); break;
                     }
 
                     break;
@@ -164,7 +176,7 @@ internal sealed class ModuleInterface
                 continue;
             }
 
-            uint pointee = Unarray(w, types, p.Pointee, out int arrayLength, constants);
+            uint pointee = Unarray(w, types, p.Pointee, out int arrayLength, out int arrayDepth, constants);
 
             if (types.TryGetValue(pointee, out var t) && t.Op == OpTypeStruct)
             {
@@ -194,6 +206,8 @@ internal sealed class ModuleInterface
                 Components = count,
                 Type = scalar,
                 ArrayLength = arrayLength,
+                ArrayDepth = arrayDepth,
+                PerPrimitive = perPrimitive.Contains(id),
                 Used = used.Contains(id),
             });
         }
@@ -204,14 +218,18 @@ internal sealed class ModuleInterface
         return mi;
     }
 
-    // The element type under any arrays (the per-vertex arrays of mesh outputs), with the outer array's length.
+    // The element type under any arrays (the per-vertex arrays of mesh outputs), with the outer array's length and the
+    // number of array levels.
     private static uint Unarray(ReadOnlySpan<uint> w, Dictionary<uint, (uint Op, int At)> types, uint type, out int length,
-        Dictionary<uint, uint> constants)
+        out int depth, Dictionary<uint, uint> constants)
     {
         length = 0;
+        depth = 0;
 
         while (types.TryGetValue(type, out var t) && t.Op == OpTypeArray)
         {
+            depth++;
+
             if (length == 0)
             {
                 length = constants.TryGetValue(w[t.At + 3], out uint l) ? (int)l : -1;

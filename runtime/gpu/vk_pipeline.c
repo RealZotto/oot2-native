@@ -546,14 +546,16 @@ static VkPipeline build_link(void *c) {
         if (x->task) vkp_module(x->task, SHD_TS, &tm);
         vkp_module(x->vs, SHD_MS, &mm);
         vkp_module(x->ps, SHD_PS, &pm);
-        char why[256], md[66], td[66], pd[66], ft[96];
-        ShdPad unused[MAX_PADS];
-        int missing = shd_pad_set(&mm.desc, &pm.desc, unused, MAX_PADS, why, sizeof why);
+        char why[256], md[66], td[66], pd[66], ft[96], ranges[MAX_PADS * 16 + 8];
+        ShdPad gaps[MAX_PADS];
+        int missing = shd_mesh_link(&mm.desc, &pm.desc, gaps, MAX_PADS, why, sizeof why);
         if (missing < 0)
             rt_fatal("gfx: vulkan: mesh stage %s cannot be linked to pixel stage %s: %s", x->vs->key, x->ps->key, why);
-        if (missing)
-            rt_fatal("gfx: vulkan: mesh stage %s does not write %d interface ranges read by pixel stage %s",
-                     x->vs->key, missing, x->ps->key);
+        if (missing) {
+            shd_pad_text(gaps, missing, ranges, sizeof ranges);
+            rt_fatal("gfx: vulkan: mesh stage %s does not write %d interface ranges read by pixel stage %s "
+                     "(location:component:components:type %s)", x->vs->key, missing, x->ps->key, ranges);
+        }
 
         MeshCtx mx = {.task = x->task, .mesh = x->vs, .task_module = x->task ? &tm : NULL, .mesh_module = &mm,
                       .late = x->late};

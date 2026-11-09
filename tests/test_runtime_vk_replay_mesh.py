@@ -51,7 +51,7 @@ def translator_path() -> Path | None:
     return result
 
 
-def stage_artifact(work: Path, name: str, stage: str, code: bytes) -> tuple[str, dict]:
+def stage_artifact(work: Path, name: str, stage: str, code: bytes, max_vertices: int = 3) -> tuple[str, dict]:
     ctl = bytearray(0xD0)
     struct.pack_into("<II", ctl, 0, 0x98761234, 0xC9)
     struct.pack_into("<I", ctl, 0x38, len(code))
@@ -63,7 +63,7 @@ def stage_artifact(work: Path, name: str, stage: str, code: bytes) -> tuple[str,
         ctl[0x56] = 7
         struct.pack_into("<HH", ctl, 0x58, 32, 32)
         ctl[0x5E] = 1
-        struct.pack_into("<HH", ctl, 0x60, 3, 1)
+        struct.pack_into("<HH", ctl, 0x60, max_vertices, 1)
     elif stage != "ps":
         raise AssertionError(stage)
     ctl_path, code_path = work / f"{name}.ctl", work / f"{name}.bin"
@@ -84,7 +84,7 @@ def stage_artifact(work: Path, name: str, stage: str, code: bytes) -> tuple[str,
     return key, job
 
 
-def synthetic_programs(work: Path) -> tuple[dict[str, tuple[str, Path, Path]], Path]:
+def synthetic_programs(work: Path, max_vertices: int = 3) -> tuple[dict[str, tuple[str, Path, Path]], Path]:
     work.mkdir(parents=True, exist_ok=True)
     xlate = translator_path()
     if xlate is None:
@@ -108,7 +108,7 @@ def synthetic_programs(work: Path) -> tuple[dict[str, tuple[str, Path, Path]], P
     records: dict[str, tuple[str, Path, Path]] = {}
     for name, code in programs.items():
         stage = name
-        key, job = stage_artifact(work, name, stage, code)
+        key, job = stage_artifact(work, name, stage, code, max_vertices)
         jobs.append((job, None))
         records[name] = (key, work / f"{name}.ctl", work / f"{name}.bin")
     translated: dict[str, tuple[bytes, bytes]] = {}
@@ -202,6 +202,8 @@ class TranslatorRequirementTest(unittest.TestCase):
 
 
 class MeshReplayTest(unittest.TestCase):
+    MAX_VERTICES = 3   # the mesh stage's declared vertex count: the length of each per-vertex output array
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.temp = tempfile.TemporaryDirectory(prefix="oot2-vkreplay-mesh-", ignore_cleanup_errors=True)
@@ -215,7 +217,7 @@ class MeshReplayTest(unittest.TestCase):
         probe = subprocess.run([str(cls.exe), "probe"], capture_output=True, text=True, timeout=60,
                                env=case_env({"OOT2_VK_VALIDATION": "off"}))
         require_usable_vulkan(probe)
-        cls.records, cls.pack_path = synthetic_programs(cls.work / "programs")
+        cls.records, cls.pack_path = synthetic_programs(cls.work / "programs", cls.MAX_VERTICES)
 
     def test_direct_and_indirect_mesh_draws_replay_with_nonzero_first_task(self) -> None:
         scenario = md.Scenario("replay", "direct", 3, 4)
@@ -252,6 +254,13 @@ class MeshReplayTest(unittest.TestCase):
             compared = md.compare(got, expected)
             self.assertGreater(compared["mismatches"], 0, f"{form}/first-zero unexpectedly matched: {compared}")
             self.assertNotEqual(compared["ran"], compared["expected_ran"], f"{form}/first-zero: {compared}")
+
+
+class WideMeshReplayTest(MeshReplayTest):
+    """The same draws with 96 declared vertices (3 written): the colour is a float[96] per component at location 0, which the
+    builder links as one location (shd_mesh_link); counted as 96 locations it would stop past the 64 it reads."""
+
+    MAX_VERTICES = 96
 
 
 if __name__ == "__main__":

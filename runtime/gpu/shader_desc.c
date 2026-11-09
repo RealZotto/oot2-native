@@ -190,6 +190,13 @@ static int io_member(J *j, const char *key, void *c) {
         int b;
         if (!jbool(j, &b)) return 0;
         x->cur.used = (uint8_t)b;
+    } else if (!strcmp(key, "array_depth")) {
+        if (!jint(j, &v)) return 0;
+        x->cur.array_depth = (int8_t)(v < 0 ? -1 : v > 8 ? 8 : v);
+    } else if (!strcmp(key, "per_primitive")) {
+        int b;
+        if (!jbool(j, &b)) return 0;
+        x->cur.per_primitive = (int8_t)b;
     } else if (!strcmp(key, "type")) {
         char t[16];
         if (!jstring(j, t, sizeof t)) return 0;
@@ -209,6 +216,7 @@ static int io_element(J *j, void *c) {
     Ctx *x = c;
     memset(&x->cur, 0, sizeof x->cur);
     x->cur.array_length = 1;
+    x->cur.array_depth = x->cur.per_primitive = -1;
     if (!jobject(j, io_member, x, 3)) return 0;
     if (*x->count >= SHD_MAX_IO) {
         x->overflow = 1;
@@ -352,6 +360,104 @@ int shd_pad_set(const ShaderDesc *vs, const ShaderDesc *ps, ShdPad *out, int max
             c = e;
         }
     }
+#undef REFUSE
+    return n;
+}
+
+// ---- the mesh link
+//
+// A mesh module's outputs are arrays over its vertices or primitives (xlate/host's mesh emission: one float per vertex
+// for each component the job's map names, at its location and component). The outer array is the rate, not a run of
+// locations: a float[160] at location 1 takes location 1 alone. A pixel input reads its words per vertex unless it is
+// marked per primitive; Vulkan matches the two sides word by word, so the rule checks rate, type and width per word.
+
+static const char *io_type_name(uint8_t type) { return type == SHD_SINT ? "sint" : type == SHD_UINT ? "uint" : "float"; }
+
+static const char *rate_name(int per_primitive) { return per_primitive ? "primitive" : "vertex"; }
+
+static int first_word(uint8_t words) {
+    int c = 0;
+    while (c < 3 && !(words >> c & 1)) c++;
+    return c;
+}
+
+int shd_mesh_link(const ShaderDesc *ms, const ShaderDesc *ps, ShdPad *missing, int max, char *why, size_t cap) {
+    uint8_t vert[SHD_MAX_LOCATIONS] = {0}, prim[SHD_MAX_LOCATIONS] = {0}, need[SHD_MAX_LOCATIONS] = {0};
+    uint8_t otype[SHD_MAX_LOCATIONS][4], obits[SHD_MAX_LOCATIONS][4], itype[SHD_MAX_LOCATIONS][4];
+    memset(otype, 0, sizeof otype);
+    memset(obits, 0, sizeof obits);
+    memset(itype, 0, sizeof itype);
+#define REFUSE(...)                                                                                                    \
+    do {                                                                                                               \
+        if (why && cap) snprintf(why, cap, __VA_ARGS__);                                                               \
+        return -1;                                                                                                     \
+    } while (0)
+#define OLDER(side, at, what)                                                                                          \
+    REFUSE("%s at location %d does not give its %s: its description is older than the mesh link rule, translate it "  \
+           "again", side, at, what)
+    for (uint32_t i = 0; i < ms->noutputs; i++) {
+        const ShdIo *o = &ms->outputs[i];
+        if (o->array_depth < 0) OLDER("mesh output", o->location, "array depth");
+        if (o->per_primitive < 0) OLDER("mesh output", o->location, "rate");
+        if (o->array_depth != 1)
+            REFUSE("shape: mesh output at location %d has %d array levels: the builder links one array per %s around a "
+                   "scalar or a vector", o->location, o->array_depth, rate_name(o->per_primitive));
+        if (o->component > 3 || o->components < 1 || o->component + o->components > 4)
+            REFUSE("mesh output %d has components %u..%u", o->location, o->component, o->component + o->components);
+        int l = o->location;
+        if (l < 0 || l >= SHD_MAX_LOCATIONS) REFUSE("mesh output location %d is past the %d the builder reads", l, SHD_MAX_LOCATIONS);
+        uint8_t words = (uint8_t)(((1u << o->components) - 1) << o->component);
+        if (words & (vert[l] | prim[l]))
+            REFUSE("mesh outputs overlap at location %d component %d", l, first_word((uint8_t)(words & (vert[l] | prim[l]))));
+        if (o->per_primitive) prim[l] |= words;
+        else vert[l] |= words;
+        for (int c = 0; c < 4; c++)
+            if (words >> c & 1) otype[l][c] = o->type, obits[l][c] = o->bits;
+    }
+    for (uint32_t i = 0; i < ps->ninputs; i++) {
+        const ShdIo *in = &ps->inputs[i];
+        if (in->array_depth < 0) OLDER("pixel input", in->location, "array depth");
+        if (in->per_primitive < 0) OLDER("pixel input", in->location, "rate");
+        if (in->array_depth > 1)
+            REFUSE("shape: pixel input at location %d has %d array levels", in->location, in->array_depth);
+        if (in->component > 3 || in->components < 1 || in->component + in->components > 4)
+            REFUSE("pixel input %d has components %u..%u", in->location, in->component, in->component + in->components);
+        uint8_t words = (uint8_t)(((1u << in->components) - 1) << in->component);
+        for (int k = 0; k < in->array_length; k++) {
+            int l = in->location + k;
+            if (l < 0 || l >= SHD_MAX_LOCATIONS) REFUSE("pixel input location %d is past the %d the builder reads", l, SHD_MAX_LOCATIONS);
+            uint8_t same = in->per_primitive ? prim[l] : vert[l], other = in->per_primitive ? vert[l] : prim[l];
+            if (words & other)
+                REFUSE("rate: pixel input at location %d component %d is read per %s, the mesh stage writes it per %s", l,
+                       first_word((uint8_t)(words & other)), rate_name(in->per_primitive), rate_name(!in->per_primitive));
+            if (in->array_length > 1 && (words & same))
+                REFUSE("shape: pixel input at location %d is an array of %d over locations the mesh stage writes one at a "
+                       "time", in->location, in->array_length);
+            for (int c = 0; c < 4; c++)
+                if ((words & same) >> c & 1 && (otype[l][c] != in->type || obits[l][c] != in->bits))
+                    REFUSE("type: pixel input at location %d component %d is %s%u, the mesh stage writes %s%u", l, c,
+                           io_type_name(in->type), in->bits, io_type_name(otype[l][c]), obits[l][c]);
+            for (int c = 0; c < 4; c++)
+                if (words >> c & 1) itype[l][c] = in->type;
+            need[l] |= words;
+        }
+    }
+    int n = 0;
+    for (int l = 0; l < SHD_MAX_LOCATIONS; l++) {
+        uint8_t miss = (uint8_t)(need[l] & ~(vert[l] | prim[l]));
+        for (int c = 0; c < 4;) {
+            if (!(miss >> c & 1)) {
+                c++;
+                continue;
+            }
+            int e = c + 1;
+            while (e < 4 && (miss >> e & 1) && itype[l][e] == itype[l][c]) e++;
+            if (n >= max) REFUSE("the pixel module reads more than %d ranges the mesh module does not write", max);
+            missing[n++] = (ShdPad){(uint16_t)l, (uint8_t)c, (uint8_t)(e - c), itype[l][c]};
+            c = e;
+        }
+    }
+#undef OLDER
 #undef REFUSE
     return n;
 }
