@@ -368,6 +368,11 @@ class GraphicsTest(ReplayBase):
         self.assertEqual(f.count("BindPipeline 0 0x9a"), 1)    # the first one bound nothing
         self.assertIn("stats draw_ops 2 draws 1 skipped 1 render_off 0 lost 0", out)
 
+    def test_the_games_shading_rate_is_replayed_at_full_rate(self) -> None:
+        out = self.passing("full_rate")
+        self.assertEqual(len([p for p in frame(out, 1) if p.startswith("Draw")]), 1)
+        self.assertIn("stats draws 1 full_rate 2 lost 0", out)   # the image and the nonzero mode, not their unbinds
+
     def test_a_draw_with_rendering_off_is_counted_as_that_and_not_as_lost(self) -> None:
         out = self.passing("skip_render_off")
         self.assertIn("stats draw_ops 3 draws 1 skipped 1 render_off 1 lost 0", out)

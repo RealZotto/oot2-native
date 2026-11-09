@@ -1397,6 +1397,28 @@ static void case_pending_across_frames(void) {
     printf("ok pending_across_frames\n");
 }
 
+// The game's variable rate shading is replayed at full rate: the draw after a bound shading rate image and a nonzero
+// rate mode is made, and both are counted.
+static void case_full_rate(void) {
+    open_fakes();
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    p_shading_rate_image img = {0};
+    img.tex.present = 1;
+    PUT(r, OP_SHADING_RATE_IMAGE, img);
+    PUT(r, OP_SHADING_RATE_MODE, (p_flag){.value = 1});
+    PUT(r, OP_DRAW, (p_draw){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 3, .instances = 1});
+    PUT(r, OP_SHADING_RATE_MODE, (p_flag){.value = 0});
+    PUT(r, OP_SHADING_RATE_IMAGE, (p_shading_rate_image){0});
+    uint64_t h = rec_end(r);
+    CHECK(gpu_sync_wait(vkr_submit(&h, 1), 10000000000ull));
+    VkrStats st;
+    vkr_stats(&st);
+    printf("stats draws %llu full_rate %llu lost %llu\n", (ull)st.draws, (ull)st.full_rate, (ull)st.lost);
+    close_fakes();
+    printf("ok full_rate\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
@@ -1422,6 +1444,7 @@ int main(int argc, char **argv) {
     const char *cs = argv[1];
     if (!strcmp(cs, "graphics")) case_graphics();
     else if (!strcmp(cs, "skip")) case_skip(0);
+    else if (!strcmp(cs, "full_rate")) case_full_rate();
     else if (!strcmp(cs, "skip_render_off")) case_skip(1);
     else if (!strcmp(cs, "depth")) case_depth();
     else if (!strcmp(cs, "compute")) case_compute();

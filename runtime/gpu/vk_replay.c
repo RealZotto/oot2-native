@@ -1338,6 +1338,17 @@ static void bind_state(const p_bind_state *s) {
     }
 }
 
+// The game's variable rate shading (a shading rate image read through its palettes, and the palette mode) is replayed
+// at full rate: every pixel runs its fragment shader, so the picture is as fine as the console's, and finer on the
+// draws the console shades coarser, for the GPU cost of those extra fragments. Logged once and counted
+// (VkrStats.full_rate) so a capture says where it differs from the console's coarser shading.
+static void full_rate(const char *what) {
+    static int logged;
+    if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+        rt_log("gfx: vulkan: the game set %s: replayed at full rate, one fragment per pixel (logged once)", what);
+    g_stats.full_rate++;
+}
+
 static void record(const op_hdr *r) {
     const void *a = r + 1;
     g_stats.records++;
@@ -1476,12 +1487,12 @@ static void record(const op_hdr *r) {
         break;
     }
     case OP_SHADING_RATE_IMAGE:
-        if (((const p_shading_rate_image *)a)->tex.present) stop("a shading rate image is not replayed yet");
+        if (((const p_shading_rate_image *)a)->tex.present) full_rate("a shading rate image");
         break;
     case OP_SHADING_RATE_MODE:
-        if (((const p_flag *)a)->value) stop("shading rate mode %d is not replayed yet", ((const p_flag *)a)->value);
+        if (((const p_flag *)a)->value) full_rate("a shading rate mode");
         break;
-    case OP_SHADING_RATE_PALETTE: break;   // read only through a shading rate image and mode, which stop above
+    case OP_SHADING_RATE_PALETTE: break;   // read only through a shading rate image and mode, at full rate above
     case OP_SCRATCH: break;   // the driver's local memory for spilled registers: the device's own on Vulkan
     case OP_HINT:   // scheduling and cache hints change nothing the GPU computes (nvn_obj.h), but the compute overlap
                     // mode, which acts as a full barrier (architecture: the semantics that must survive)

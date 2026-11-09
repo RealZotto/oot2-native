@@ -223,6 +223,8 @@ typedef struct VkrStats {
     // direction), 0 by contract; read it before judging a picture.
     uint64_t draw_ops, render_off, skipped, lost;
     uint64_t raw_binds;                             // draws and dispatches with a raw-access stage (D15)
+    uint64_t full_rate;                             // shading rate images and rate modes the game set, replayed at full
+                                                    // rate (vk_replay.c full_rate)
 } VkrStats;
 void vkr_stats(VkrStats *out);
 
