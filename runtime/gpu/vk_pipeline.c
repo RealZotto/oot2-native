@@ -643,14 +643,23 @@ void vkp_graphics_key(const VkpStage *vs, const VkpStage *task, const VkpStage *
     }
 }
 
-VkPipeline vkp_graphics_ex(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
-                           const int *late) {
-    if (!P.open) rt_fatal("gfx: vulkan: vkp_graphics before vkp_open");
+static VkPipeline graphics_get(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
+                               const int *late) {
     if (formats->ncolor > VKP_MAX_COLOR) rt_fatal("gfx: vulkan: a pipeline with %u colour attachments", formats->ncolor);
     LinkCtx x = {.vs = vs, .task = task, .ps = ps, .formats = formats, .late = late};
     char key[KEY_MAX];
     vkp_graphics_key(vs, task, ps, formats, key, sizeof key);
     return obj_get(key, task ? task->key : vs->key, vs->key, ps->key, build_link, &x);
+}
+
+VkPipeline vkp_graphics_ex(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
+                           const int *late) {
+    if (!P.open) rt_fatal("gfx: vulkan: vkp_graphics before vkp_open");
+    return graphics_get(vs, task, ps, formats, late);
+}
+
+VkPipeline vkp_graphics_unopened(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats) {
+    return graphics_get(vs, task, ps, formats, NULL);
 }
 
 VkPipeline vkp_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats) {

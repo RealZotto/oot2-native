@@ -1134,6 +1134,70 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(run("storeopen", str(self.pack), "-").stdout, "ok\n")
 
 
+def with_bindings(description: bytes) -> bytes:
+    """A description that also carries the members the bindings reader needs (the layout of BindingsTest's)."""
+    d = json.loads(description)
+    for k, v in BindingsTest.base(d["stage"]).items():
+        d.setdefault(k, v)
+    return json.dumps(d, indent=1).encode("utf-8")
+
+
+class NoDeviceBuilderTest(unittest.TestCase):
+    """What the pipeline builder and the replay's device ops decide before they touch the device, reached without one
+    (continuous integration runs them): the replay's cache of stage bindings, and the rule build_link links a pair by."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.dir = scratch()
+        mod = vertex_module()
+        wide = [mesh_out(loc, c) for loc in (1, 2, 40, 63) for c in range(4)]
+        wide_in = [pixel_in(loc) for loc in (1, 2, 40, 63)]
+        e = [
+            cp.Entry("ps.bind", mod, with_bindings(describe("ps.bind", "ps", mod, inputs=[io(0)], outputs=[io(0)]))),
+            cp.Entry("m.rate", mod, describe("m.rate", "ms", mod, outputs=[mesh_out(4, c, per_vertex=128, per_primitive=True)
+                                                                         for c in range(4)])),
+            cp.Entry("p.rate", mod, describe("p.rate", "ps", mod, inputs=[pixel_in(4)])),
+            cp.Entry("m.gap", mod, describe("m.gap", "ms", mod, outputs=wide)),
+            cp.Entry("p.gap", mod, describe("p.gap", "ps", mod, inputs=wide_in + [pixel_in(9, 1, 2, type_="uint32")])),
+            cp.Entry("v.wide", mod, describe("v.wide", "vs", mod, outputs=[])),
+            cp.Entry("p.wide", mod, describe("p.wide", "ps", mod, inputs=[io(0, type_="float64")])),
+        ]
+        cls.pack = write_pack(cls.dir / "base.bin", e)
+
+    def test_the_replays_binding_cache_keeps_every_bucket_index_inside_its_table(self) -> None:
+        # 4096 buckets: the index of a record is reduced after the digest is mixed in. Reduced before, 64 records reach
+        # an index of up to 2^32 and the lookup reads far past the table (an access violation, exit 3221225477).
+        done = run("devbinds", str(self.pack), "ps.bind", "64")
+        self.assertEqual(done.returncode, 0, f"exit {done.returncode}\n{done.stdout}{done.stderr}")
+        self.assertEqual(done.stdout.strip(), "binds 64 distinct 64 stable 64 kind ps")
+
+    def linked(self, kind: str, vkey: str, pkey: str) -> str:
+        done = run("linkchoice", str(self.pack), vkey, pkey, kind)
+        self.assertEqual(done.returncode, EXIT_FATAL, f"exit {done.returncode}\n{done.stdout}{done.stderr}")
+        self.assertNotIn("linked", done.stdout)
+        lines = fatal_lines(done.stderr)
+        self.assertEqual(len(lines), 1, done.stderr)
+        return lines[0]
+
+    def test_build_link_links_a_mesh_stage_by_the_rate_of_its_outputs(self) -> None:
+        text = self.linked("ms", "m.rate", "p.rate")
+        self.assertIn("mesh stage m.rate cannot be linked to pixel stage p.rate", text)
+        self.assertIn("rate", text)
+        self.assertIn("location 4", text)
+
+    def test_build_link_lists_what_a_mesh_stage_does_not_write_with_vertices_one_location_each(self) -> None:
+        # 160 vertices at location 63: the padding rule counts 160 locations from location 1 and cannot link this pair.
+        text = self.linked("ms", "m.gap", "p.gap")
+        self.assertIn("mesh stage m.gap does not write 1 interface ranges read by pixel stage p.gap", text)
+        self.assertIn("9:2:1:2;", text)
+
+    def test_build_link_still_links_a_vertex_stage_by_padding(self) -> None:
+        text = self.linked("vs", "v.wide", "p.wide")
+        self.assertIn("stage v.wide cannot be linked to stage p.wide", text)
+        self.assertIn("64 bits wide", text)
+        self.assertNotIn("mesh stage", text)
+
+
 # ---- on a device, with a synthetic pack of GLSL modules -----------------------------------
 
 GLSL = {

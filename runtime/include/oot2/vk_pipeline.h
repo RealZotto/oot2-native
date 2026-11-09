@@ -170,6 +170,10 @@ VkPipeline vkp_find_compute(const VkpStage *cs);
 // while a submission is in flight" yields, counted by the miss path). vkp_graphics is the call with late NULL.
 VkPipeline vkp_graphics_ex(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
                            const int *late);
+// For the tests that run without a device (tests/runtime/vk_pipeline_test.c): vkp_graphics without the check that the
+// builder is open, to reach the rule a pair is linked by in build_link. Only a pair that build_link refuses is safe to
+// ask for, since one that links goes on to create Vulkan objects and needs the device.
+VkPipeline vkp_graphics_unopened(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats);
 // vkp_compute for the miss path. A `late` that is not NULL (here and in vkp_graphics_ex) marks a build made by the miss
 // path with the submission gate held: the submission being replayed is then not counted as work in flight. Any other
 // caller keeps the strict rule.

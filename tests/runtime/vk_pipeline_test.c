@@ -22,6 +22,10 @@
 //   cachejudge                   cache file headers judged for a device
 //   store BASE VARIANTS KEY KIND SHAPE   a stage looked up in a pack of packs (VARIANTS "-" for none)
 //   storeopen BASE VARIANTS      the packs opened: "ok" or the refusal
+//   devbinds BASE KEY N          N stage records of one key asked for their bindings through the replay's device ops
+//                                (the cache whose bucket index must stay inside its table)
+//   linkchoice BASE VKEY PKEY KIND   a pair build_link refuses, asked for from a builder never opened: the fatal names
+//                                the rule it linked by (KIND "ms": the mesh rule, "vs": the padding rule)
 // Cases that need a device with every item of oot2/vk_required.h, on a synthetic pack of GLSL modules:
 //   usable                       how many devices have every item (exit 3 when there is no loader or device)
 //   layouts                      the layouts are made, valid under validation, and destroyed
@@ -53,6 +57,7 @@
 #include "oot2/spirv.h"
 #include "oot2/vk_caps.h"
 #include "oot2/vk_pipeline.h"
+#include "oot2/vk_replay.h"
 #include "plat.h"
 #include "vk_draw.h"
 
@@ -440,6 +445,63 @@ static void case_store(const char *base, const char *variants, const char *key, 
     vkp_module(&s, kind_of(kind), &m);
     printf("module %u bytes from %d, kind %s, fits %d, %u inputs, %u outputs\n", m.bytes, m.from, shd_kind_name(m.desc.kind),
            m.desc.fits, m.desc.ninputs, m.desc.noutputs);
+    vkp_store_close();
+}
+
+// The replay's cache of stage bindings (dev_binds in runtime/gpu/vk_replay_dev.c), asked through the device ops, which
+// need no device for it: N stage records of one pack key, each at its own address, each asked twice. The bucket index
+// of a record is a function of its address and the pack entry's digest, so many records reach many buckets.
+static void case_devbinds(const char *base, const char *key, int n) {
+    char why[512];
+    if (!vkp_store_open(base, NULL, why, sizeof why)) {
+        printf("refused: %s\n", why);
+        return;
+    }
+    CHECK(n > 0 && n <= 4096);
+    nvn_stage *recs = calloc((size_t)n, sizeof *recs);
+    const ShaderBinds **first = calloc((size_t)n, sizeof *first);
+    CHECK(recs && first);
+    const VkReplayOps *ops = vkr_device_ops();
+    CHECK(ops->binds);
+    int distinct = 0, stable = 0;
+    for (int i = 0; i < n; i++) {
+        recs[i] = (nvn_stage){.kind = NVN_STAGE_PS, .ctl_size = 0x57, .code_size = 0x1230, .inst_size = 0x1000};
+        snprintf(recs[i].key, sizeof recs[i].key, "%s", key);
+        VkpStage s = {.key = key, .answers = NULL, .shape = &recs[i]};
+        first[i] = ops->binds(&s);
+        CHECK(first[i]);
+        int seen = 0;
+        for (int j = 0; j < i; j++) seen |= first[j] == first[i];
+        distinct += !seen;
+    }
+    for (int i = 0; i < n; i++) {
+        VkpStage s = {.key = key, .answers = NULL, .shape = &recs[i]};
+        stable += ops->binds(&s) == first[i];
+    }
+    printf("binds %d distinct %d stable %d kind %s\n", n, distinct, stable, shd_kind_name(first[0]->kind));
+    free(first);
+    free(recs);
+    vkp_store_close();
+}
+
+// A graphics pair asked for from a builder that was never opened (vkp_graphics_unopened): build_link judges the pair's
+// link before it creates anything, so a pair it refuses ends in the named fatal of the rule it chose, with no device.
+// KIND "ms" gives the first stage the shape of a mesh stage, "vs" of a vertex stage.
+static void case_linkchoice(const char *base, const char *vkey, const char *pkey, const char *kind) {
+    char why[512];
+    if (!vkp_store_open(base, NULL, why, sizeof why)) {
+        printf("refused: %s\n", why);
+        return;
+    }
+    nvn_stage v = {.kind = !strcmp(kind, "ms") ? NVN_STAGE_MS : NVN_STAGE_VS, .ctl_size = 0x57, .code_size = 0x1230,
+                   .inst_size = 0x1000};
+    nvn_stage p = {.kind = NVN_STAGE_PS, .ctl_size = 0x57, .code_size = 0x1230, .inst_size = 0x1000};
+    snprintf(v.key, sizeof v.key, "%s", vkey);
+    snprintf(p.key, sizeof p.key, "%s", pkey);
+    VkpStage vs = {.key = vkey, .shape = &v}, ps = {.key = pkey, .shape = &p};
+    VkpFormats formats = {0};
+    vkp_graphics_unopened(&vs, NULL, &ps, &formats);
+    printf("linked\n");   // not reached by a pair the builder refuses
     vkp_store_close();
 }
 
@@ -1115,6 +1177,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "storemap") && argc >= 9)
         case_storemap(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8], argc > 9 ? argv[9] : "");
     else if (!strcmp(cs, "storeopen") && argc >= 4) case_storeopen(argv[2], argv[3]);
+    else if (!strcmp(cs, "devbinds") && argc >= 5) case_devbinds(argv[2], argv[3], atoi(argv[4]));
+    else if (!strcmp(cs, "linkchoice") && argc >= 6) case_linkchoice(argv[2], argv[3], argv[4], argv[5]);
     else if (!strcmp(cs, "usable")) case_usable();
     else if (!strcmp(cs, "caps") && argc >= 4) case_caps(argv[2], argv[3], argc - 4, argv + 4);
     else {
