@@ -186,7 +186,8 @@ static VkPipeline op_compute(const VkpStage *cs) {
     lput(&g_ops, "op compute %s\n", cs->key);
     return (VkPipeline)(uintptr_t)0x9C;
 }
-static const ShaderBinds *op_binds(const nvn_stage *s) {
+static const ShaderBinds *op_binds(const VkpStage *stage) {
+    const nvn_stage *s = stage->shape;
     return s == &g_vs ? &g_vs_binds : s == &g_ps ? &g_ps_binds : s == &g_cs ? &g_cs_binds
            : s == &g_ts ? &g_ts_binds : s == &g_ms ? &g_ms_binds : s == &g_mps ? &g_mps_binds
            : s == &g_vs_raw ? &g_vs_raw_binds : s == &g_cs_raw ? &g_cs_raw_binds : s == &g_cs_img ? &g_cs_img_binds : NULL;

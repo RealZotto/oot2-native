@@ -7,9 +7,9 @@
 // lookup is a binary search over the index that reads no entry but the one it returns. A pack is never written while
 // it is open, so lookups need no lock.
 //
-// Two packs, one layout: the base pack holds every job translated with the default answers (answers digest zero),
-// the variants pack the jobs translated again with a ledger row's answers (digest not zero). shc_set_find looks in
-// the variants pack first, for a digest other than zero, then takes the base pack's row of the key.
+// Two packs, one layout: the base pack holds every job translated with the default answers (answers digest zero), and
+// the variants pack holds jobs translated again with projected ledger answers. The variant map connects a stage key
+// and the full ledger-row digest to a projected digest or the base row. A missing map entry safely takes the base row.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -22,6 +22,10 @@
 #define SHC_DIGEST_BYTES 32u
 #define SHC_ENTRY_ALIGN 16u
 #define SHC_DESC_SCHEMA 2u       // the description schema this runtime reads: xlate/host/ResultWriter.cs Schema
+#define SHC_MAP_MAGIC "OOT2VM1"
+#define SHC_MAP_VERSION 1u
+#define SHC_MAP_HEADER_BYTES 96u
+#define SHC_MAP_ROW_BYTES 96u
 
 enum { SHC_ROLE_BASE = 1, SHC_ROLE_VARIANTS = 2 };
 enum { SHC_TRANSLATED = 0, SHC_FAILED = 1 };   // a row's status; a failed row holds the reason, no module
@@ -37,6 +41,7 @@ typedef enum ShcError {
     SHC_E_SCHEMA,            // descriptions of another schema than SHC_DESC_SCHEMA (or the one asked for)
     SHC_E_ROLE,              // a base pack where a variants pack was expected, or the reverse
     SHC_E_TRANSLATOR,        // a variants pack written by another translator than the base pack
+    SHC_E_MAP,               // a malformed or inconsistent ledger-to-variant map
     SHC_E_INDEX_TRUNCATED,   // the index ends past the end of the file
     SHC_E_INDEX_HASH,        // the index does not match its SHA-256
     SHC_E_ROW,               // a malformed row: key, digest for the role, status, sizes, alignment
@@ -83,13 +88,25 @@ int shc_entry_intact(const ShcEntry *e);
 typedef struct ShcSet {
     ShcPack base, variants;
     int has_variants;
+    const uint8_t *variant_map;
+    uint64_t variant_map_size, variant_map_count;
+    int owns_variant_map, has_variant_map;
 } ShcSet;
 enum { SHC_MISS = 0, SHC_FROM_BASE = 1, SHC_FROM_VARIANTS = 2 };
 
 // Open the base pack and, when variants is not NULL, the variants pack; both of the given schema and from one
 // translator. A variants pack is named only once the ledger step wrote it: a name that cannot be opened is refused.
 ShcError shc_set_open(ShcSet *s, const char *base, const char *variants, uint32_t schema, char *why, size_t cap);
+// Open the same packs and optionally the prepare step's full-ledger-digest map.
+ShcError shc_set_open_map(ShcSet *s, const char *base, const char *variants, const char *map, uint32_t schema,
+                          char *why, size_t cap);
 // The variants pack's row of (key, answers) when answers is not zero and the row exists, else the base pack's row of
 // key. Returns where the entry came from, or SHC_MISS.
 int shc_set_find(const ShcSet *s, const char *key, const uint8_t *answers, ShcEntry *out);
+// Resolve a full ledger-row digest through the map, returning its projected digest or zero for base. On a missing
+// mapping, returns 0 and also writes zero to target.
+int shc_set_resolve_ledger(const ShcSet *s, const char *key, const uint8_t *ledger_digest, uint8_t target[32]);
+// Resolve a full ledger-row digest and return the matching variant or base pack entry. `mapped` reports whether a
+// map row was found, including rows that explicitly select base.
+int shc_set_find_ledger(const ShcSet *s, const char *key, const uint8_t *ledger_digest, ShcEntry *out, int *mapped);
 void shc_set_close(ShcSet *s);

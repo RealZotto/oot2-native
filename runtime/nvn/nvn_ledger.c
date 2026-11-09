@@ -236,31 +236,35 @@ static int put_map(Buf *b, int first, const char *name, const uint8_t *v, int n,
     return 0;
 }
 
-static char *format_row(const RowBin *r) {
+static char *answers_text(const RowBin *r, uint8_t digest[32]) {
     Buf ans = {0};
     int first = 1;
     first = put_map(&ans, first, "attr", r->attr, LEDGER_ATTRS, 1, r);
     first = put_map(&ans, first, "fout", r->fout, LEDGER_TARGETS, 1, r);
     first = put_map(&ans, first, "img", r->img_type, LEDGER_IMG_SLOTS, 2, r);
     first = put_map(&ans, first, "tex", r->tex, LEDGER_TEX_SLOTS, 0, r);
-    char digest[65] = "0";
+    Buf wrapped = {0};
+    bput(&wrapped, "{%s}", ans.s ? ans.s : "");
+    free(ans.s);
+    if (first) memset(digest, 0, 32);
+    else rt_sha256(wrapped.s, wrapped.n, digest);
+    return wrapped.s;
+}
+
+static char *format_row(const RowBin *r) {
+    uint8_t digest[32];
+    char text_digest[65] = "0";
+    char *answers = answers_text(r, digest);
     Buf text = {0};
-    if (!first) {
-        uint8_t d[32];
-        char *body = NULL;
-        Buf wrapped = {0};
-        bput(&wrapped, "{%s}", ans.s);
-        body = wrapped.s;
-        rt_sha256(body, wrapped.n, d);
-        for (int i = 0; i < 32; i++) snprintf(digest + 2 * i, 3, "%02x", d[i]);
+    if (memcmp(digest, (uint8_t[32]){0}, 32)) {
+        for (int i = 0; i < 32; i++) snprintf(text_digest + 2 * i, 3, "%02x", digest[i]);
         bput(&text, "{\"key\":\"%s\",\"kind\":\"%s\",\"answers\":%s,\"digest\":\"%s\"", r->st->key,
-             nvn_stage_kind_name(r->st->kind), body, digest);
-        free(wrapped.s);
+             nvn_stage_kind_name(r->st->kind), answers, text_digest);
     } else {
         bput(&text, "{\"key\":\"%s\",\"kind\":\"%s\",\"answers\":{},\"digest\":\"0\"", r->st->key,
              nvn_stage_kind_name(r->st->kind));
     }
-    free(ans.s);
+    free(answers);
     if (r->raster) {
         bput(&text, ",\"attach\":{\"color\":[");
         for (int i = 0; i < r->ncolor; i++) bput(&text, "%s%u", i ? "," : "", r->color_fmt[i]);
@@ -390,6 +394,25 @@ void ledger_track_reset(LedgerTrack *t) {
     t->depth_fmt = -1;
 }
 
+static int tracker_slot(int kind) {
+    switch (kind) {
+    case NVN_STAGE_VS: return 0;
+    case NVN_STAGE_PS: return 1;
+    case NVN_STAGE_CS: return 2;
+    case NVN_STAGE_TS: return 3;
+    case NVN_STAGE_MS: return 4;
+    default: return -1;
+    }
+}
+
+static void invalidate_answers_digest(LedgerTrack *t, int stage) {
+    for (int i = 0; i < 5; i++)
+        if (KIND_STAGE[i] == stage) {
+            t->answers_digest_valid &= (uint8_t)~(1u << i);
+            return;
+        }
+}
+
 static int view_format(const nvn_tex_rec *r) { return r->has_view && r->view.set_format ? r->view.format : r->tex.d.format; }
 
 static void bind_program(LedgerTrack *t, const p_bind_program *p) {
@@ -407,6 +430,7 @@ static void bind_program(LedgerTrack *t, const p_bind_program *p) {
 
 static void bind_tex(LedgerTrack *t, const p_bind_handles *b, int image) {
     if (b->stage < 0 || b->stage >= LEDGER_STAGES) return;
+    invalidate_answers_digest(t, b->stage);
     for (int i = 0; i < b->n && i < 32; i++) {
         int slot = b->first + i;
         uint8_t type = 0;
@@ -425,6 +449,7 @@ static void bind_tex(LedgerTrack *t, const p_bind_handles *b, int image) {
 }
 
 static void set_rt(LedgerTrack *t, const p_set_rt *p) {
+    invalidate_answers_digest(t, 1);
     memset(t->fout, 0, sizeof t->fout);
     memset(t->color_fmt, 0, sizeof t->color_fmt);
     t->ncolor = 0, t->samples = 1;
@@ -442,6 +467,7 @@ static void set_rt(LedgerTrack *t, const p_set_rt *p) {
 }
 
 static void bind_vattr(LedgerTrack *t, const p_bind_vattr *p) {
+    invalidate_answers_digest(t, 0);
     for (int i = 0; i < p->n && i < NVN_VERTEX_BINDINGS; i++) {
         int loc = p->first + i;
         if (loc < 0 || loc >= LEDGER_ATTRS) continue;
@@ -471,7 +497,32 @@ static void emit(const LedgerTrack *t, int s, int raster) {
         r.ncolor = t->ncolor;
         r.samples = t->samples ? t->samples : 1;
     }
+
     add_row(&r);
+}
+
+void ledger_track_answers_digest(LedgerTrack *t, int kind, uint8_t out[32]) {
+    int slot = tracker_slot(kind);
+    if (slot < 0) {
+        memset(out, 0, 32);
+        return;
+    }
+    if (t->answers_digest_valid & (1u << slot)) {
+        memcpy(out, t->answers_digest[slot], 32);
+        return;
+    }
+    RowBin r;
+    memset(&r, 0, sizeof r);
+    int s = KIND_STAGE[slot];
+    memcpy(r.tex, t->tex[s], sizeof r.tex);
+    memcpy(r.img_type, t->img_type[s], sizeof r.img_type);
+    memcpy(r.img_fmt, t->img_fmt[s], sizeof r.img_fmt);
+    if (s == 0) memcpy(r.attr, t->attr, sizeof r.attr);
+    if (s == 1) memcpy(r.fout, t->fout, sizeof r.fout);
+    char *text = answers_text(&r, out);
+    free(text);
+    memcpy(t->answers_digest[slot], out, 32);
+    t->answers_digest_valid |= (uint8_t)(1u << slot);
 }
 
 void ledger_track_op(LedgerTrack *t, const op_hdr *h) {

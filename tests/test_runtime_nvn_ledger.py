@@ -33,6 +33,7 @@ Run: python -m unittest discover -s tests -v
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -166,6 +167,19 @@ class LedgerTest(unittest.TestCase):
             self.assertNotEqual(rows.rows[0]["answers"]["tex"], rows.rows[1]["answers"]["tex"])
             self.assertEqual(rows.rows[0]["digest"], digest_of(VS_ANSWERS))
             self.assertNotEqual(rows.rows[1]["digest"], ps2["digest"])
+
+    def test_runtime_full_digest_matches_sorted_ledger_answers_with_unknown_format(self) -> None:
+        answers = {"fout": {"0": "uint", "1": "float"},
+                   "img": {"2": {"fmt": "Unknown", "type": "2d"}},
+                   "tex": {"10": "3d"}}
+        canonical = json.dumps(answers, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        expected = hashlib.sha256(canonical).hexdigest()
+        for done in self.passes("digest"):
+            self.assertIn(f"digest {expected}", done.stdout)
+
+    def test_digest_cache_is_reused_and_invalidated_by_vertex_answer_changes(self) -> None:
+        for done in self.passes("digest-cache"):
+            self.assertIn("ok digest-cache", done.stdout)
 
     def test_a_recording_called_from_another_gives_the_callers_state(self) -> None:
         for done in self.passes("call"):

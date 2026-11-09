@@ -466,6 +466,42 @@ static void case_stop(const char *folder) {
     printf("ok stop\n");
 }
 
+static void case_digest(void) {
+    LedgerTrack track = {0};
+    track.tex[1][10] = 8;          // 3d
+    track.img_type[1][2] = 4;      // 2d
+    track.img_fmt[1][2] = 0;       // translator format "Unknown"
+    track.fout[0] = 3;             // uint
+    track.fout[1] = 1;             // float
+    uint8_t digest[32];
+    ledger_track_answers_digest(&track, NVN_STAGE_PS, digest);
+    printf("digest ");
+    for (size_t i = 0; i < sizeof digest; i++) printf("%02x", digest[i]);
+    printf("\nok digest\n");
+}
+
+static void case_digest_cache(void) {
+    LedgerTrack track = {0};
+    track.attr[0] = 1;
+    uint8_t first[32], repeated[32], changed[32], repeated_changed[32];
+    ledger_track_answers_digest(&track, NVN_STAGE_VS, first);
+    ledger_track_answers_digest(&track, NVN_STAGE_VS, repeated);
+
+    struct {
+        op_hdr h;
+        p_bind_vattr attr;
+    } op = {.h = {.op = OP_BIND_VATTR, .size = sizeof op}, .attr = {.first = 0, .n = 1}};
+    va_st va = {.fmt = NVN_FORMAT_R32UI};
+    memcpy(&op.attr.st[0], &va, sizeof va);
+    ledger_track_op(&track, &op.h);
+    ledger_track_answers_digest(&track, NVN_STAGE_VS, changed);
+    ledger_track_answers_digest(&track, NVN_STAGE_VS, repeated_changed);
+    CHECK(!memcmp(first, repeated, sizeof first));
+    CHECK(memcmp(first, changed, sizeof first));
+    CHECK(!memcmp(changed, repeated_changed, sizeof changed));
+    printf("ok digest-cache\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
@@ -478,6 +514,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "mesh")) case_mesh();
     else if (!strcmp(argv[1], "stop") && argc == 3) case_stop(argv[2]);
     else if (!strcmp(argv[1], "file") && argc == 3) case_file(argv[2]);
+    else if (!strcmp(argv[1], "digest")) case_digest();
+    else if (!strcmp(argv[1], "digest-cache")) case_digest_cache();
     else {
         fprintf(stderr, "unknown case %s\n", argv[1]);
         return 2;

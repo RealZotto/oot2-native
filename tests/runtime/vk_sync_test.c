@@ -224,8 +224,9 @@ static void stage(nvn_stage *s, const char *key, int kind) {
     s->ctl_size = NVN_STAGE_CTL_MAX;
 }
 static void cbuf(ShaderBinds *b, uint8_t slot, uint16_t binding) { b->cb[b->ncb++] = (ShdCbuf){slot, 1, binding}; }
-static const ShaderBinds *my_binds(const nvn_stage *s) {
-    return s == &g_vs ? &g_vs_binds : s == &g_ps ? &g_ps_binds : vkr_device_ops()->binds(s);
+static const ShaderBinds *my_binds(const VkpStage *stage) {
+    const nvn_stage *s = stage->shape;
+    return s == &g_vs ? &g_vs_binds : s == &g_ps ? &g_ps_binds : vkr_device_ops()->binds(stage);
 }
 
 // The test's pools are the back end's alone (no front end): the CPU reads whatever is outside the GPU window.

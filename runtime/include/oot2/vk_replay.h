@@ -120,7 +120,7 @@ typedef struct VkReplayOps {
     void (*program_bound)(uint64_t serial, const struct nvn_stage *const *stages, int n);
     VkPipelineLayout graphics_layout, compute_layout;
     // The description of a stage (oot2/shader_desc.h), parsed once per stage record and kept: NULL is a named stop.
-    const struct ShaderBinds *(*binds)(const struct nvn_stage *s);
+    const struct ShaderBinds *(*binds)(const VkpStage *stage);
     // The backing map (backing_resolve, backing_gpu_wrote) in the frame's submission.
     void (*resolve)(uint64_t addr, uint64_t size, uint64_t value, BackingRef *out);
     void (*gpu_wrote)(uint64_t addr, uint64_t size, uint64_t value);
