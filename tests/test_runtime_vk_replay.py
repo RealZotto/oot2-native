@@ -393,6 +393,16 @@ class GraphicsTest(ReplayBase):
                 self.assertEqual(line, "FATAL: gfx: vulkan: replay of submission 1, after 0 draws and dispatches: "
                                        f"GEOMETRY_MODE {value} is not replayed: only the modes 0 to 2 are")
 
+    def test_a_draw_that_stops_on_its_answers_leaves_its_rows_in_the_ledger(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="oot2-vkreplay-ledger-") as folder:
+            line = self.stopping("attr_stop", folder)
+            self.assertRegex(line, r"^FATAL: gfx: vulkan: replay of submission 1, after 0 draws and dispatches: vertex "
+                                   r"attribute 0 \(NVN format 0xb\) is of another scalar type than the module's input$")
+            rows = (Path(folder) / "ledger.jsonl").read_text(encoding="utf-8").splitlines()[1:]
+            vertex = [r for r in rows if '"kind":"vs"' in r]
+            self.assertEqual(len(vertex), 1, rows)
+            self.assertIn('"attr":{"0":"uint"}', vertex[0])
+
     def test_a_draw_with_rendering_off_is_counted_as_that_and_not_as_lost(self) -> None:
         out = self.passing("skip_render_off")
         self.assertIn("stats draw_ops 3 draws 1 skipped 1 render_off 1 lost 0", out)

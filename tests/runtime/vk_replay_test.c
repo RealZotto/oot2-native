@@ -24,6 +24,7 @@
 #include "oot2/bindless.h"
 #include "oot2/gpu.h"
 #include "oot2/gpu_vk.h"
+#include "oot2/ledger.h"
 #include "oot2/mesh_abi.h"
 #include "oot2/nvn.h"
 #include "oot2/nvn_obj.h"
@@ -1460,6 +1461,25 @@ static void case_geometry_stop(const char *mode_text) {
     printf("submit returned\n");
 }
 
+// A draw whose vertex attribute is another scalar type than the module's input stops by name, and the stop path writes
+// the ledger with the rows of that draw (the tracker sees a record after its replay, so without this the answers the
+// draw stopped on would never reach the next prepare).
+static void case_attr_stop(const char *folder) {
+    open_fakes();
+    ledger_set_folder(folder);
+    ledger_flush_on_stop();
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    va_st a = {.fmt = NVN_FORMAT_R32UI, .offset = 0, .stream = 0};   // the module's input at 0 is a float
+    p_bind_vattr va = {.first = 0, .n = 1};
+    memcpy(&va.st[0], &a, sizeof a);
+    put(r, OP_BIND_VATTR, &va, sizeof va);
+    PUT(r, OP_DRAW, (p_draw){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 3, .instances = 1});
+    uint64_t h = rec_end(r);
+    vkr_submit(&h, 1);
+    printf("submit returned\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
@@ -1488,6 +1508,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "full_rate")) case_full_rate();
     else if (!strcmp(cs, "geometry") && argc >= 3) case_geometry(argv[2]);
     else if (!strcmp(cs, "geometry_stop") && argc >= 3) case_geometry_stop(argv[2]);
+    else if (!strcmp(cs, "attr_stop") && argc >= 3) case_attr_stop(argv[2]);
     else if (!strcmp(cs, "skip_render_off")) case_skip(1);
     else if (!strcmp(cs, "depth")) case_depth();
     else if (!strcmp(cs, "compute")) case_compute();

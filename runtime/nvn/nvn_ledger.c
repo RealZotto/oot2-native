@@ -549,7 +549,11 @@ void ledger_track_op(LedgerTrack *t, const op_hdr *h) {
 }
 
 // ---------- the file
-static void stop_flush(void) { ledger_flush(); }
+static int flush_file(int stopping);
+// A stop ends the process, so a flush that waits for a safe point has no later one: from the stop path the file is written
+// even from inside a submission (a replay that stops on a draw is inside one, and the answers it stopped on are what the
+// next prepare needs). A thread that holds the rows is not waited for: a stop must end.
+static void stop_flush(void) { flush_file(1); }
 void ledger_flush_on_stop(void) { rt_set_stop_flush(stop_flush); }
 
 void ledger_frame_enter(void) { __atomic_fetch_add(&g_frame, 1, __ATOMIC_ACQ_REL); }
@@ -613,9 +617,15 @@ static int replace_file(const char *from, const char *to) {
 #endif
 }
 
-int ledger_flush(void) {
-    if (__atomic_load_n(&g_frame, __ATOMIC_ACQUIRE) > 0) return -1;
-    plat_mutex_lock(&g_lock);
+int ledger_flush(void) { return flush_file(0); }
+
+static int flush_file(int stopping) {
+    if (!stopping && __atomic_load_n(&g_frame, __ATOMIC_ACQUIRE) > 0) return -1;
+    if (stopping) {
+        if (!plat_mutex_trylock(&g_lock)) return -1;
+    } else {
+        plat_mutex_lock(&g_lock);
+    }
     int result = 0;
     if (g_dir[0] && g_dirty) {
         char **rows = malloc((g_text_n ? g_text_n : 1) * sizeof *rows);

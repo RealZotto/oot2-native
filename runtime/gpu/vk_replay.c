@@ -167,6 +167,7 @@ static struct {
     uint32_t pass_draws;                      // the open pass's draws and the stages of its first: the gpu timing's labels
     const char *pass_vs, *pass_fs;
     int noting;                               // a dispatch is gathering the buffers its gpu timing mark names
+    const op_hdr *cur;                        // the record being replayed, NULL between records
 } F;
 
 // What the frames in flight wrote (vkr_writes), a ring of FRAMES_KEPT by replayed frame (timeline values are shared with
@@ -215,12 +216,29 @@ __attribute__((constructor)) static void replay_init(void) { vkr_reset(); }
 
 // ---------- stops
 #define stop(...) vkr_stop(__VA_ARGS__)
+// The ledger tracker sees a record after it was replayed, so a replay that stops on a draw or a dispatch would leave the
+// answers it stopped on out of the ledger, and the next prepare could never translate the variant that answers it. The
+// stop gives the tracker the record first (it only reads the bound state to make the draw's rows; the stop's ledger
+// flush writes them).
+static int makes_rows(uint32_t op) {
+    switch (op) {
+    case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND: case OP_DRAW_MESH: case OP_DRAW_MESH_IND: case OP_DISPATCH:
+    case OP_DISPATCH_IND: return 1;
+    default: return 0;
+    }
+}
+
 void vkr_stop(const char *fmt, ...) {
     char line[512];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
+    if (F.cur && makes_rows(F.cur->op)) {
+        const op_hdr *r = F.cur;
+        F.cur = NULL;
+        ledger_track_op(&S.track, r);
+    }
     rt_fatal("gfx: vulkan: replay of submission %llu, after %u draws and dispatches: %s", (ull)F.value, F.draws, line);
 }
 
@@ -1365,6 +1383,7 @@ static void geometry_mode(int32_t mode) {
 static void record(const op_hdr *r) {
     const void *a = r + 1;
     g_stats.records++;
+    F.cur = r;
     switch (r->op) {
     case OP_BEGIN: case OP_END: break;
     case OP_SET_RT: {
@@ -1520,6 +1539,7 @@ static void record(const op_hdr *r) {
             stop_op(r->op);
         }
     }
+    F.cur = NULL;
     ledger_track_op(&S.track, r);
 }
 

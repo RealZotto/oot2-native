@@ -19,6 +19,8 @@ attributes.
   for is "Unknown".
 - mesh: a task, mesh and pixel program makes a row for each stage on a mesh draw, direct or indirect.
 - stop: the run's stop path (ExitProcess, a fatal) flushes the ledger like the end of main.
+- stopframe: a stop raised inside a submission (a replay that stops on a draw) writes the file all the same, with the
+  rows made so far, where a flush asked for at that point by anything else is refused.
 - file: nothing is written while frames run, a flush asked for inside a submission is refused, a flush at a safe point
   writes the file, and the next run reads the file and adds to it.
 
@@ -225,6 +227,15 @@ class LedgerTest(unittest.TestCase):
                 self.assertIn("ok stop", done.stdout)
                 lines = (Path(folder) / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
                 self.assertEqual(len(lines), 3)
+
+    def test_a_stop_inside_a_submission_writes_the_file(self) -> None:
+        for level in nvn.LEVELS:
+            with self.subTest(level=level), tempfile.TemporaryDirectory(prefix="oot2-ledger-") as folder:
+                done = self.run_case(level, "stopframe", folder)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("ok stopframe", done.stdout)
+                lines = (Path(folder) / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(lines), 3)   # the header and the draw's two rows
 
     def test_rows_are_written_at_a_safe_point_and_a_new_run_adds_to_the_file(self) -> None:
         for level in nvn.LEVELS:

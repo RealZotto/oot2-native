@@ -466,6 +466,31 @@ static void case_stop(const char *folder) {
     printf("ok stop\n");
 }
 
+// ---------- case stopframe: a fatal raised by the replay is inside a submission, and the file is written anyway
+static void stop_in_submit(uint64_t fence, int index, const op_hdr *r, void *ctx) {
+    (void)fence, (void)index, (void)ctx;
+    if (r->op == OP_DRAW && g_in_submit) rt_run_stop_hook(0, "");
+}
+static void case_stop_in_submit(const char *folder) {
+    scene();
+    ledger_set_folder(folder);
+    ledger_flush_on_stop();
+    uint64_t cb = command_buffer();
+    record_begin(cb);
+    bind_scene(cb);
+    bind_textures(cb);
+    NVN(nvnCommandBufferDrawArrays, cb, 4, 0, 3);
+    uint64_t h = record_end(cb);
+    g_in_submit = 1;
+    gfx_null_log_ops(stop_in_submit, NULL);
+    submit(h);
+    gfx_null_log_ops(NULL, NULL);
+    g_in_submit = 0;
+    // the stop ran inside the submission (a flush there is refused, case file), and the file is there all the same
+    CHECK(ledger_writes() == 1 && exists(folder, LEDGER_FILE));
+    printf("ok stopframe\n");
+}
+
 static void case_digest(void) {
     LedgerTrack track = {0};
     track.tex[1][10] = 8;          // 3d
@@ -514,6 +539,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "mesh")) case_mesh();
     else if (!strcmp(argv[1], "stop") && argc == 3) case_stop(argv[2]);
     else if (!strcmp(argv[1], "file") && argc == 3) case_file(argv[2]);
+    else if (!strcmp(argv[1], "stopframe") && argc == 3) case_stop_in_submit(argv[2]);
     else if (!strcmp(argv[1], "digest")) case_digest();
     else if (!strcmp(argv[1], "digest-cache")) case_digest_cache();
     else {

@@ -80,7 +80,9 @@ int ledger_flush(void);
 void ledger_frame_enter(void);
 void ledger_frame_leave(void);
 // Flush when the run stops (rt_set_stop_flush): a guest's ExitProcess, a fatal and a guest stop end the process
-// without returning to main, so the end of main is not the only safe point. Refused like any flush on the frame path.
+// without returning to main, so the end of main is not the only safe point. Not refused on the frame path, since a
+// replay that stops on a draw is inside a submission and the process ends right after (a thread that holds the rows
+// at that moment is not waited for, and the file is not written).
 void ledger_flush_on_stop(void);
 uint64_t ledger_rows(void);                  // rows held, loaded ones included
 const char *ledger_row_text(uint64_t i);     // row i in the order it was added, NULL past the end (one JSON object)
