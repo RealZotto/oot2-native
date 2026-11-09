@@ -9,11 +9,14 @@ builder serving a seeded cache on a device is test_pipebuild.py.
 What is held here: the header rule (version one, this vendor, device and cache UUID, a file longer than its header),
 the record rule (size, runtime, device and driver of the run that wrote the cache), what happens to the file (moved to
 the seed folder, deleted when dropped, removed once merged), that the builders are given it, that a builder which refuses
-it is reported, that an interrupted run keeps it for the next, and that a cold build takes none.
+it is reported, that an interrupted run keeps it for the next, that a cold build takes none, that a cache the full
+check failed on is not one, that a seeded builder is not flushed on a timer (a flush empties its cache, seed included),
+and that the step counts the seed in the memory it gives each worker.
 """
 
 from __future__ import annotations
 
+import io
 import struct
 import sys
 import tempfile
@@ -28,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from prepare import pipelines, pipesched, pipeseed  # noqa: E402
 from prepare.pipelines import Pipelines  # noqa: E402
-from prepare.runner import run_steps  # noqa: E402
+from prepare.runner import Context, Reporter, run_steps  # noqa: E402
 from test_prepare_pipelines import Env, FakeTranslate, cache_keys, device, host  # noqa: E402
 
 UUID = "ab" * 16
@@ -118,6 +121,11 @@ class SettleTest(unittest.TestCase):
         self.put(header() + b"x")
         self.assertEqual(self.settle({"skipped": "why"}).outcome, pipeseed.KEPT)
 
+    def test_a_cache_the_full_check_just_failed_on_is_dropped_by_name_whatever_its_header_says(self) -> None:
+        record = self.put(header() + b"x")
+        self.assert_dropped(self.settle(record, damaged=True), "full check failed")
+        self.assertEqual(self.settle(self.put(header() + b"x")).outcome, pipeseed.KEPT)     # the same cache, no failed check
+
     def test_a_cold_build_takes_no_seed_and_deletes_the_old_cache(self) -> None:
         seed = self.settle(self.put(header() + b"x"), cold=True)
         self.assertEqual(seed.outcome, pipeseed.OFF)
@@ -186,7 +194,7 @@ class StepSeedTest(unittest.TestCase):
         self.assertIn("pipelines: started (its inputs changed)", said)
         self.assertEqual(self.serves()[1:], ["serve --cache loaded"])
         rec = ctx.state["steps"]["pipelines"]
-        self.assertEqual((rec["seed"]["outcome"], rec["seed"]["builders_loaded"]), (pipeseed.KEPT, 1))
+        self.assertEqual((rec["seed"]["outcome"], rec["seed"]["starts_loaded"]), (pipeseed.KEPT, 1))
         self.assertGreater(rec["seed"]["bytes"], 32)
         hits = self.hits()
         self.assertEqual(len(hits), 10)
@@ -247,7 +255,7 @@ class StepSeedTest(unittest.TestCase):
         said = self.env.say(ctx)
         self.assertEqual(status, "ok", said)
         rec = ctx.state["steps"]["pipelines"]
-        self.assertEqual((rec["seed"]["outcome"], rec["seed"]["builders_loaded"]), (pipeseed.DROPPED, 0))
+        self.assertEqual((rec["seed"]["outcome"], rec["seed"]["starts_loaded"]), (pipeseed.DROPPED, 0))
         self.assertIn("other_driver", rec["seed"]["reason"])
         self.assertIn("the seed was not used by every builder", said)
 
@@ -275,6 +283,77 @@ class StepSeedTest(unittest.TestCase):
                          (pipeseed.KEPT, "the seed of an interrupted run"))
         self.assertEqual(set(self.hits().values()), {"1"})
         self.assertFalse(seed_dir.exists())
+
+    def run_spied(self):
+        """Run the step after a key change; return the pools it made and what size_workers was called with."""
+        self.change_key()
+        pools, sized = [], []
+        real_pool, real_size = pipesched.Pool, pipesched.size_workers
+
+        class Spy(real_pool):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                pools.append(self)
+
+        def size_spy(*args, **kw):
+            sized.append((args, kw))
+            return real_size(*args, **kw)
+
+        with mock.patch.object(pipesched, "Pool", Spy), mock.patch.object(pipesched, "size_workers", size_spy):
+            status, ctx = self.env.run(self.ctx)
+        self.assertEqual(status, "ok", self.env.say(ctx))
+        return pools, sized
+
+    def test_a_seeded_builder_does_not_flush_on_a_timer_so_the_seed_serves_every_unchanged_program(self) -> None:
+        # The real builder goes on with an empty cache after a flush (vkp_cache_flush), as the stand-in does: a builder
+        # flushed on a timer would serve the seed to its first program and build the rest cold.
+        changed = "c000000000000002.00000000"
+        self.change_key()
+        self.env.standin(cold_keys=[changed])
+        with mock.patch.object(pipesched, "FLUSH_SECONDS", 0.0):          # a flush after every program, were it asked
+            status, ctx = self.env.run(self.ctx)
+        self.assertEqual(status, "ok", self.env.say(ctx))
+        hits = self.hits()
+        self.assertEqual({k for k, v in hits.items() if v == "0"}, {changed}, hits)
+        self.assertEqual(ctx.state["steps"]["pipelines"]["segments"], 1)   # the final flush alone
+        self.assertEqual(sorted(cache_keys(self.cache)), self.first_keys)
+
+    def test_a_build_with_no_seed_still_flushes_on_its_timer(self) -> None:
+        self.change_key()
+        data = bytearray(self.cache.read_bytes())
+        data[16] ^= 0xFF                                       # a foreign seed is dropped, the build is unseeded
+        self.cache.write_bytes(bytes(data))
+        with mock.patch.object(pipesched, "FLUSH_SECONDS", 0.0):
+            status, ctx = self.env.run(self.ctx)
+        self.assertEqual(status, "ok", self.env.say(ctx))
+        self.assertEqual(ctx.state["steps"]["pipelines"]["seed"]["outcome"], pipeseed.DROPPED)
+        self.assertEqual(ctx.state["steps"]["pipelines"]["segments"], 10)  # one a program
+
+    def test_the_seed_is_counted_in_the_memory_a_builder_may_hold_before_it_is_replaced(self) -> None:
+        seed_bytes = self.cache.stat().st_size
+        pools, _ = self.run_spied()
+        self.assertEqual(pools[0].recycle_bytes, pipesched.RECYCLE_BYTES + seed_bytes)
+
+    def test_the_seed_is_counted_in_the_memory_each_worker_is_given(self) -> None:
+        seed_bytes = self.cache.stat().st_size
+        _, sized = self.run_spied()
+        args, kw = sized[0]
+        self.assertEqual(kw.get("seed_bytes", args[3] if len(args) > 3 else None), seed_bytes)
+
+    def test_a_cache_the_full_check_failed_on_is_not_the_seed_of_the_run_that_follows(self) -> None:
+        data = self.cache.read_bytes()
+        self.cache.write_bytes(data[:32] + b"x" * (len(data) - 32))     # the header and the size are whole, the keys are not
+        ctx = Context(self.env.dest, self.env.options(), Reporter(io.StringIO(), io.StringIO()), state=self.ctx.state,
+                      verify=True)
+        status, ctx = self.env.run(ctx)
+        said = self.env.say(ctx)
+        self.assertEqual(status, "ok", said)
+        self.assertIn("pipelines: started (its output failed the full check)", said)
+        rec = ctx.state["steps"]["pipelines"]
+        self.assertEqual(rec["seed"]["outcome"], pipeseed.DROPPED, said)
+        self.assertIn("full check failed", rec["seed"]["reason"])
+        self.assertEqual(self.serves()[-1], "serve no-cache none")      # (the full check's own warm pass is the one before)
+        self.assertEqual(set(self.hits().values()), {"0"})
 
 
 class SizingSeedTest(unittest.TestCase):

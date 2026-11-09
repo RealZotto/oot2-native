@@ -304,14 +304,18 @@ class PipeBuildTest(DeviceTestCase):
 
             shutil.copy(changed_pack, dest / "shaders" / cp.BASE_FILE)    # one module changed ...
             marker.write_text("two")                                      # ... and the step's key with it
-            status = run_steps([FakeTranslate(), Pipelines()], ctx)
+            # A flush interval of zero would flush a builder after every program and leave it an empty cache (the seed
+            # gone): a seeded builder must not be flushed on a timer, or only its first program is served warm.
+            with mock.patch.object(pipelines.pipesched, "FLUSH_SECONDS", 0.0):
+                status = run_steps([FakeTranslate(), Pipelines()], ctx)
             said = ctx.reporter.out.getvalue() + ctx.reporter.err.getvalue()
             self.assertEqual(status, "ok", said)
             self.assertIn("pipelines: started (its inputs changed)", said)
             second = ctx.state["steps"]["pipelines"]
             self.assertEqual(second["seed"]["outcome"], pipeseed.KEPT, said)
             self.assertEqual(second["seed"]["bytes"], first_bytes)
-            self.assertGreaterEqual(second["seed"]["builders_loaded"], 1)
+            self.assertGreaterEqual(second["seed"]["starts_loaded"], 1)
+            self.assertLessEqual(second["segments"], 2)                   # the final flush of each of the two builders only
             served = hits()
             self.assertEqual({k for k, v in served.items() if v == "0"}, {SYNTH_KEYS["cs2.comp"]}, served)   # built cold
             self.assertEqual({k for k, v in served.items() if v == "1"},

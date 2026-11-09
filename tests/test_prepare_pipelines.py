@@ -131,6 +131,7 @@ def serve(args):
             os.replace(path + ".tmp", path)
             note("flush " + w[1] + " " + " ".join(built))
             built = []
+            seeded = []                # like vkp_cache_flush: the builder goes on with an empty cache, the seed is gone
             say("saved", w[1], len(data))
         elif w[0] == "quit":
             break

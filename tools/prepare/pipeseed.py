@@ -4,9 +4,9 @@
 
 A change of the step's key (a translator fix, an edit to one of the runtime files the builder is made from, a new
 bundle) used to delete `pipelines/pipeline.cache` and build every library from an empty cache. The driver answers by create
-info, so the previous cache serves every program whose module and create info did not change in about a millisecond
-(research 60) and only the changed programs build cold. This file decides whether the previous cache may be used for
-that, and moves it out of the way of the step's own output:
+info, so the previous cache serves every program whose module and create info did not change in a lookup, a small
+fraction of the time of a build, and only the changed programs build cold. This file decides whether the previous cache
+may be used for that, and moves it out of the way of the step's own output:
 
   temp/pipelines-seed/pipeline.cache   the seed (moved from pipelines/pipeline.cache, which the step then writes anew)
   temp/pipelines-seed/seed.json        what was claimed of it when it was taken: size, device identity, runtime
@@ -21,14 +21,24 @@ deletes it, and the step builds from an empty cache as it always did:
   2. it is as large as the record of the run that wrote it says (a file cut short or changed since is not that cache),
   3. the run that wrote it used the same runtime (the runtime zeroes workgroup memory before the driver sees a compute
      module, so a cache of a runtime that did not holds other modules than a launch asks for),
-  4. that run used this device and driver.
+  4. that run used this device and driver,
+  5. the step's full check did not just fail on it (the runner says "damaged": that cache did not serve the programs it
+     was built for, so it is the last thing to feed the driver).
+
+Checks 2 to 4 need the record of the run that wrote the cache. A cache with no record at all (a state file that was lost
+while the cache stayed) is KEPT on its header alone: the builder judges the file again, and a cache of another runtime
+only costs the programs it holds wrongly, built cold, never a wrong answer. The seed of an interrupted run is held to the
+claims kept beside it instead, and is dropped when those are gone.
 
 The builder judges the file once more when it starts (pipebuild serve --cache), and the pool reports what it said.
 
 A seeded builder's first segment holds the whole seed (a Vulkan cache cannot be told to write only what it learned), so
-the merge unions as many copies of the seed as the builders that were started. The step counts the seed in the memory it
-gives each worker, and the cache it writes keeps the entries of modules that no longer exist: it grows by what a key
-change built, never shrinks, and the record says both sizes.
+the merge unions as many copies of the seed as the segments written. A flush hands the builder an empty cache, so a seeded
+builder does not flush on a timer (it would serve the seed only until its first flush): it saves when it is recycled and
+at the end, each time with the seed and what it built since it started. A run that is stopped therefore keeps nothing
+built since it started, only the seed, which serves in a lookup what it holds and so costs the changed programs alone. The
+step counts the seed in the memory it gives each worker, and the cache it writes keeps the entries of modules that no
+longer exist: it grows by what a key change built, never shrinks, and the record says both sizes.
 """
 
 from __future__ import annotations
@@ -126,12 +136,13 @@ def _read_meta(seed_dir: Path) -> dict | None:
 
 
 def settle(out_cache: Path, seed_dir: Path, *, expect: dict[str, str], identity: str, runtime: dict,
-           previous: dict | None, cold: bool = False) -> Seed:
+           previous: dict | None, cold: bool = False, damaged: bool = False) -> Seed:
     """Decide what becomes of the cache the step is about to replace. `out_cache` is the previous run's pipeline.cache
     (moved into `seed_dir` when it is kept, deleted when it is dropped), `seed_dir` may already hold the seed of a run that
     was interrupted, `expect` is Device.expect() (vendor, device and cache_uuid of the device the builders will open),
     `identity` is the device's identity string, `runtime` is what the builder must say of its runtime, and `previous` is
-    the step's record of the run that wrote out_cache (None for a first run)."""
+    the step's record of the run that wrote out_cache (None for a first run). `damaged` says the runner's full check just
+    failed on out_cache: that cache is dropped by name whatever its header says."""
     kept = seed_dir / CACHE
     if cold:
         out_cache.unlink(missing_ok=True)
@@ -151,6 +162,8 @@ def settle(out_cache: Path, seed_dir: Path, *, expect: dict[str, str], identity:
     head = _read_head(path)
     if head is None:
         why = "it cannot be read"
+    elif damaged and path is not kept:
+        why = "its full check failed (it did not serve the programs it was built for)"
     elif claims is None and path is kept:
         why = "what was claimed of it when it was kept is gone"
     else:

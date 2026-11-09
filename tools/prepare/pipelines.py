@@ -28,7 +28,9 @@ The seed. When the key changes the previous cache is not thrown away: pipeseed.p
 and driver) and keeps it as the seed every builder starts from, so that the programs whose module did not change are served
 by the driver in a millisecond or so and only the changed ones build cold. A cache that fails a check is dropped, deleted,
 and the drop is named in the log and in the record (`seed`); the step then builds from an empty cache as it always did.
-`--pipelines-cold` takes no seed, because it exists to time a cold build.
+`--pipelines-cold` takes no seed, because it exists to time a cold build. A seeded builder saves only when it is recycled
+and at the end (a flush would hand it an empty cache and the seed would stop serving), so a stopped seeded run keeps the
+seed and nothing built since it started.
 
 What it does not build. Task and mesh pipelines wait for the mesh draws ticket and are counted as not built, so the
 totals are a lower bound. Vertex libraries are built as translated, without padding: a pixel stage that reads an
@@ -202,8 +204,9 @@ class Pipelines(Step):
         bundled = bundled_builder(ctx)
         # The runtime's sources are not in a bundle, so its builder's bytes stand for them (a checkout's key is unchanged).
         builder = [f"bundled-builder={file_sha256(bundled)}"] if bundled else []
-        # The runner drops the step's record before run, and the cache that record describes is the seed run may use: the
-        # runner computes the key (this call) while the record is still there, so it is kept in ctx.facts for run.
+        # A snapshot of the step's record (the dict, as it stands now). The runner drops the record before run, and the
+        # cache that record describes is the seed run may use: the runner computes the key (this call) while the record is
+        # still there, so the snapshot is kept in ctx.facts for run.
         ctx.facts["pipelines_previous"] = ctx.record(self.id)
         return fingerprint(f"pipelines-{FORMAT}", f"device={device.identity if device else 'skipped: ' + why}",
                            f"runtime={','.join(f'{k}={v}' for k, v in sorted(RUNTIME_SAYS.items()))}",
@@ -261,7 +264,8 @@ class Pipelines(Step):
         # The previous cache becomes the seed (or is dropped, by name) before the step deletes its own outputs.
         seed_dir = ctx.dest / check.TEMP / pipeseed.SEED_DIR
         seed = pipeseed.settle(out / CACHE, seed_dir, expect=device.expect(), identity=device.identity,
-                               runtime=RUNTIME_SAYS, previous=ctx.facts.get("pipelines_previous"), cold=cold)
+                               runtime=RUNTIME_SAYS, previous=ctx.facts.get("pipelines_previous"), cold=cold,
+                               damaged=ctx.reasons.get(self.id) == "damaged")
         say_seed(rep, seed)
         for stale in (out / CACHE, out / TIMES):
             stale.unlink(missing_ok=True)       # write-once: a step that runs again deletes its own outputs first
@@ -311,7 +315,11 @@ class Pipelines(Step):
         p = pipesched.Pool(lambda wid: builder + serve, todo,
                            workers, gov, logs, segments, lambda rs, seg, size: record(rs), lambda r: record([r]),
                            next_segment=pipesched.next_segment_number(segments), env=env, on_result=shown.add,
-                           expect=device.expect(), runtime=RUNTIME_SAYS)
+                           expect=device.expect(), runtime=RUNTIME_SAYS,
+                           # A flush replaces the builder's cache with an empty one (vkp_cache_flush), so a seeded builder
+                           # that flushed on its timer would serve the seed only until the first flush and build every
+                           # later unchanged program cold. It saves when it is recycled and at the end instead.
+                           flush_seconds=float("inf") if seed.used else None)
         if seed.used:
             p.recycle_bytes += seed.bytes        # a builder holding the seed is not a builder holding a big build
         t0 = time.monotonic()
@@ -386,7 +394,7 @@ class Pipelines(Step):
             "recycled": p.stats.recycled,
             "lost": p.stats.lost,
             "cold": cold,
-            "seed": {**seed.record(), "builders_loaded": p.cache_seen.get("loaded", 0)},
+            "seed": {**seed.record(), "starts_loaded": p.cache_seen.get("loaded", 0)},   # builder starts, restarts included
             "validation": env.get("OOT2_VK_VALIDATION") or "off",
             "validation_errors": p.stats.validation_errors,
             "validation_warnings": p.stats.validation_warnings,
