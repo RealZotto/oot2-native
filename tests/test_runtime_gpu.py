@@ -350,7 +350,7 @@ class GpuTest(unittest.TestCase):
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
                 self.assertIn("gfx_open_game returned for vulkan", done.stdout)
                 self.assertEqual(fatal_lines(done.stderr), [])
-                self.assertRegex(done.stderr, r"gfx: vulkan: shader packs .*shader-base\.bin \(no variants pack\); "
+                self.assertRegex(done.stderr, r"gfx: vulkan: shader packs .*shader-base\.bin \(no variants pack\) \(no variant map\); "
                                               r"pipeline cache " + re.escape(state))
 
     def test_a_vulkan_setting_outside_its_values_stops_the_start_by_name(self) -> None:
