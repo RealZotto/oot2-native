@@ -204,6 +204,9 @@ jobs:
           "SDL3_DIR=$kit" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       # Here a missing clang, Ninja, translator, capstone, Vulkan SDK, Dear ImGui, dav1d, libopus or SDL3 fails the tests instead of skipping them.
+      # One module per process, up to four at a time, and the modules that assert a
+      # wall-clock bound alone afterwards (tools/run_tests.py): the tests were nearly all
+      # of the job on one core. The log ends with the usual Ran and OK lines.
       - name: Run the unit tests
         env:
           OOT2_REQUIRE_CLANG: "1"
@@ -216,4 +219,4 @@ jobs:
           OOT2_REQUIRE_SDL3: "1"
         run: |
           clang --version
-          python -m unittest discover -s tests -v
+          python tools/run_tests.py

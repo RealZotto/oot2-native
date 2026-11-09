@@ -346,7 +346,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("python tools/fetch_sdl3.py --dest $kit", step)
         self.assertIn('"SDL3_DIR=$kit" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV', step)
         self.assertIn('OOT2_REQUIRE_SDL3: "1"', text)
-        self.assertLess(text.index("python tools/fetch_sdl3.py"), text.index("python -m unittest discover -s tests -v"))
+        self.assertLess(text.index("python tools/fetch_sdl3.py"), text.index("python tools/run_tests.py"))
 
 
 class RealKitTest(unittest.TestCase):

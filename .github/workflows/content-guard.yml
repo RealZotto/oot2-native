@@ -151,6 +151,9 @@ jobs:
       # The runtime boundary and lifter tests build C with clang (preinstalled on the
       # runner, with the AArch64 assembler the lifter tests use); here a missing
       # compiler, Ninja, capstone, Vulkan SDK or Dear ImGui fails them instead of skipping them.
+      # One module per process, up to four at a time, and the modules that assert a
+      # wall-clock bound alone afterwards (tools/run_tests.py): the tests were nearly all
+      # of the job on one core. The log ends with the usual Ran and OK lines.
       - name: Run the unit tests
         env:
           OOT2_REQUIRE_CLANG: "1"
@@ -159,4 +162,4 @@ jobs:
           OOT2_REQUIRE_IMGUI: "1"
         run: |
           clang --version
-          python -m unittest discover -s tests -v
+          python tools/run_tests.py

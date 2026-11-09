@@ -350,14 +350,14 @@ class NoticesAndWorkflowsTest(unittest.TestCase):
         self.assertIn("python tools/fetch_opus.py --dest $kit", text)
         self.assertIn('"OPUS_DIR=$kit" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV', text)
         self.assertIn("key: opus-kit-${{ runner.os }}-${{ env.LLVM_MINGW }}-${{ hashFiles('tools/fetch_opus.py') }}", text)
-        self.assertLess(text.index("python tools/fetch_opus.py"), text.index("python -m unittest discover -s tests -v"))
+        self.assertLess(text.index("python tools/fetch_opus.py"), text.index("python tools/run_tests.py"))
 
     def test_linux_builds_the_kit_before_the_tests_and_may_skip_the_decoder_test_with_a_reason(self) -> None:
         text = self.workflow("content-guard.yml")
         self.assertIn('python tools/fetch_opus.py --dest "$RUNNER_TEMP/opus-kit"', text)
         self.assertIn('echo "OPUS_DIR=$RUNNER_TEMP/opus-kit" >> "$GITHUB_ENV"', text)
         self.assertIn("key: opus-kit-${{ runner.os }}-${{ hashFiles('tools/fetch_opus.py') }}", text)
-        self.assertLess(text.index("python tools/fetch_opus.py"), text.index("python -m unittest discover"))
+        self.assertLess(text.index("python tools/fetch_opus.py"), text.index("python tools/run_tests.py"))
         self.assertNotIn("OOT2_REQUIRE_OPUS", text)   # the Linux job is not a verdict on decoding
 
 
