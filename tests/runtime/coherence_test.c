@@ -24,6 +24,11 @@
 //   writeback    a declared GPU write reaches guest memory only once the device reached its submission; a copy into the
 //                mirror meanwhile leaves its bytes out; guest_read counts a read before the fence, cpu_synced finds
 //                nothing left behind
+//   writeback_no_reupload, writeback_partial_page, writeback_replaced, writeback_long_run   the pages a write-back put
+//                into guest memory are in the mirror already: the next sync does not hand them back (whole pages only),
+//                the guest sees the GPU's bytes, a CPU write into one is copied in, a mirror that replaced another takes
+//                every page, and a long run of write-backs leaves the record where it was
+//   gpu_mark     pagegen_mark_gpu: whole pages recorded and their echo in the write watch settled, partial ones stamped
 //   replace      a bind that grows a mirror's run waits for the submission in flight that wrote it, so the new mirror
 //                holds the GPU's write
 //   watch        (Windows; a skip line elsewhere) the real write watch: every hook and sync between a CPU write and the
@@ -35,6 +40,7 @@
 //   raw_grow_whole, raw_grow_beside   a bind over a whole mirror takes it; one beside a mirror leaves it whole
 //   raw_grow_wait   the mirror gives its pages up only once the older raw-access submission in flight is done
 //   raw_sync_wait   a mirror the CPU wrote is brought current for a raw-access submission after the older one in flight
+//   raw_sync_nowait the same with only a GPU-current page stamped since: no wait, nothing is copied over the older stores
 //   raw_promote, raw_promote_small, raw_promote_wait, raw_promote_cap   an import a raw-access submission binds a range larger than a
 //                uniform's of becomes a mirror at the next raw-access begin: brought current, in the page table, left alone when
 //                the submission bound it before its raw stage or the admission refuses, never for a small bind, after the older
@@ -97,17 +103,35 @@ static uint8_t *g_marks;
 static int g_untracked;
 static uint64_t g_src_calls;
 
+// The echo window: pages in [g_echo_lo, g_echo_hi) also count as written when their bytes differ from a copy taken at the
+// last query (or when the window was set), as the operating system's mark follows a write of any content by any code,
+// the runtime's own write-backs into guest memory included. 0 for none: the cases that do not model it never see it.
+static uint64_t g_echo_lo, g_echo_hi;
+static uint8_t *g_echo_shadow;
+
 static uint64_t src_written(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max, int reset) {
     g_src_calls++;
     if (g_untracked || addr < g_heap || addr + size > g_heap + g_heap_size) return UINT64_MAX;
     uint64_t n = 0;
     for (uint64_t a = addr & ~(PG - 1); a < addr + size && n < max; a += PG) {
         uint64_t i = (a - g_heap) / PG;
-        if (!g_marks[i]) continue;
+        int echo = a >= g_echo_lo && a < g_echo_hi && memcmp((void *)(uintptr_t)a, g_echo_shadow + (a - g_echo_lo), PG);
+        if (!g_marks[i] && !echo) continue;
         pages[n++] = a;
-        if (reset) g_marks[i] = 0;
+        if (reset) {
+            g_marks[i] = 0;
+            if (echo) memcpy(g_echo_shadow + (a - g_echo_lo), (void *)(uintptr_t)a, PG);
+        }
     }
     return n;
+}
+
+// From now on the pages of [lo, hi) are written when their content changes, whoever changed it.
+static void echo_on(uint64_t lo, uint64_t hi) {
+    g_echo_shadow = malloc((size_t)(hi - lo));
+    CHECK(g_echo_shadow);
+    memcpy(g_echo_shadow, (void *)(uintptr_t)lo, (size_t)(hi - lo));
+    g_echo_lo = lo, g_echo_hi = hi;
 }
 
 // The CPU writes word over [a, a + n), as the game's stores would: committed on first touch, marked.
@@ -439,6 +463,206 @@ static void case_writeback(void) {
     CHECK(pagegen_stamp(p) > 0 && pagegen_stamp(p) <= pagegen_now());
     backing_pool_fini(&pp);
     done("writeback");
+}
+
+// A GPU write the write-back put into guest memory is in the mirror already: the next sync must not hand it back
+// (the title movie's scratch buffers were copied out and in again every present), the guest's view of it is the GPU's
+// bytes (the write-back stays), and a CPU write into one of those pages is still copied in, with the GPU's bytes around
+// it. The write watch is modelled with its echo: the write-back's own copy into guest memory dirties the pages, as it does
+// in the operating system, and must not be taken for a CPU write.
+static void gpu_writes_cc_pages(void) { memset(g_mirror + 0x1000, 0xCC, 0x2000); }
+
+static void case_writeback_no_reupload(void) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 1 * MiB);
+    cpu_fill(p, 1 * MiB, 0xAAAAAAAAu);
+    echo_on(p, p + 1 * MiB);
+    uint64_t v1 = sub_begin();
+    BackingRef r = resolve(p, 0x4000, v1);
+    CHECK(r.kind == BACKING_MIRROR);
+    g_mirror = bytes(&r);
+    backing_gpu_wrote(p + 0x1000, 0x2000, v1);   // two whole pages
+    sub_end(v1);
+    uint64_t since = pagegen_now();   // what the mirror's own queries stamped is behind this
+    gpu_run(v1, gpu_writes_cc_pages);
+    // The guest sees the GPU's bytes (the view the lazy variants would have to keep), and the neighbours stay.
+    CHECK(words_are((void *)(uintptr_t)(p + 0x1000), 0x2000, 0xCCCCCCCCu));
+    CHECK(words_are((void *)(uintptr_t)(p + 0xF00), 0x100, 0xAAAAAAAAu) && words_are((void *)(uintptr_t)(p + 0x3000), 0x100, 0xAAAAAAAAu));
+    CHECK(pagegen_gpu_stamp(p + 0x1000) == pagegen_stamp(p + 0x1000) && pagegen_stamp(p + 0x2000) > 0);
+    uint64_t before = D.upload_bytes;
+    uint64_t v2 = sub_begin();
+    resolve(p, 0x4000, v2);       // the next sync must not hand the mirror its own bytes back
+    sub_end(v2);
+    CHECK(D.upload_bytes == before);
+    gpu_run(v2, NULL);
+    CHECK(words_are(g_mirror + 0x1000, 0x2000, 0xCCCCCCCCu));
+    // Another consumer still learns that the GPU changed the pages.
+    uint64_t pages;
+    runs(p, p + 1 * MiB, since, &pages);
+    CHECK(pages == 2);
+    // A CPU write into one of those pages is copied in: the page, with the GPU's bytes around the written word.
+    cpu_fill(p + 0x1800, 4, 0xBBBBBBBBu);
+    uint64_t v3 = sub_begin();
+    resolve(p, 0x4000, v3);
+    sub_end(v3);
+    CHECK(D.upload_bytes == before + PG);
+    gpu_run(v3, NULL);
+    CHECK(*(uint32_t *)(g_mirror + 0x1800) == 0xBBBBBBBBu && *(uint32_t *)(g_mirror + 0x17FC) == 0xCCCCCCCCu);
+    CHECK(*(uint32_t *)(g_mirror + 0x2000) == 0xCCCCCCCCu);
+    // The CPU's own write after that page was current again is the guest's view too, and the next sync is quiet.
+    uint64_t v4 = sub_begin();
+    resolve(p, 0x4000, v4);
+    sub_end(v4);
+    CHECK(D.upload_bytes == before + PG);
+    gpu_run(v4, NULL);
+    backing_pool_fini(&pp);
+    done("writeback_no_reupload");
+}
+
+// A write that covers its pages in part leaves the other bytes of those pages to the CPU, which may have written them
+// since the mirror took its copy: such a page is stamped as before and copied in again.
+static void case_writeback_partial_page(void) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 1 * MiB);
+    cpu_fill(p, 1 * MiB, 0xAAAAAAAAu);
+    echo_on(p, p + 1 * MiB);
+    uint64_t v1 = sub_begin();
+    BackingRef r = resolve(p, 0x4000, v1);
+    g_mirror = bytes(&r);
+    // 0x800 bytes of page 1 to 0x800 of page 3: the middle page whole, the other two in part.
+    backing_gpu_wrote(p + 0x1800, 0x2000, v1);
+    sub_end(v1);
+    gpu_run(v1, gpu_writes_cc_pages);   // writes 0xCC over [0x1000, 0x3000) of the mirror, which covers the declared range
+    CHECK(pagegen_gpu_stamp(p + 0x2000) == pagegen_stamp(p + 0x2000));
+    CHECK(pagegen_gpu_stamp(p + 0x1000) == 0 && pagegen_gpu_stamp(p + 0x3000) == 0);
+    uint64_t before = D.upload_bytes;
+    uint64_t v2 = sub_begin();
+    resolve(p, 0x4000, v2);
+    sub_end(v2);
+    CHECK(D.upload_bytes == before + 2 * PG);   // the two partial pages, not the whole one
+    gpu_run(v2, NULL);
+    backing_pool_fini(&pp);
+    done("writeback_partial_page");
+}
+
+// The mirror a retired one is replaced by is new, and takes every page from guest memory, the pages an older mirror's
+// write-back left GPU-current among them: the record is of the pages, not of a mirror, and a new mirror holds none of them.
+static void case_writeback_replaced(void) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 1 * MiB);
+    cpu_fill(p, 1 * MiB, 0xAAAAAAAAu);
+    echo_on(p, p + 1 * MiB);
+    uint64_t v1 = sub_begin();
+    BackingRef r = resolve(p, 0x4000, v1);
+    g_mirror = bytes(&r);
+    backing_gpu_wrote(p + 0x1000, 0x2000, v1);
+    sub_end(v1);
+    gpu_run(v1, gpu_writes_cc_pages);
+    uint64_t v2 = sub_begin();
+    resolve(p, 0x4000, v2);
+    sub_end(v2);
+    gpu_run(v2, NULL);
+    backing_pool_fini(&pp);   // the mirror is retired; a pool over the same pages makes another
+    pool_t pq = pool(p, 1 * MiB);
+    uint64_t v3 = sub_begin();
+    BackingRef r2 = resolve(p, 0x4000, v3);
+    CHECK(r2.kind == BACKING_MIRROR);
+    sub_end(v3);
+    gpu_run(v3, NULL);
+    CHECK(words_are(bytes(&r2) + 0x1000, 0x2000, 0xCCCCCCCCu) && words_are(bytes(&r2), 0x1000, 0xAAAAAAAAu));
+    CHECK(words_are(bytes(&r2) + 0x3000, 0x1000, 0xAAAAAAAAu));
+    backing_pool_fini(&pq);
+    done("writeback_replaced");
+}
+
+// What the record holds does not grow with the write-backs: a long run of them over the same pool keeps the page
+// generations' table at its one piece, copies in nothing but what the CPU wrote, and every one of them reaches guest memory.
+static uint64_t g_wr_off;
+static uint32_t g_wr_word;
+static void gpu_writes_rotating(void) {
+    for (uint64_t i = 0; i < PG; i += 4) *(uint32_t *)(g_mirror + g_wr_off + i) = g_wr_word;
+}
+
+static void case_writeback_long_run(void) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 1 * MiB);
+    cpu_fill(p, 1 * MiB, 0xAAAAAAAAu);
+    echo_on(p, p + 1 * MiB);
+    PagegenStats before_stats = {0};
+    uint64_t first = 0;
+    for (int i = 0; i < 1000; i++) {
+        uint64_t v = sub_begin();
+        BackingRef r = resolve(p, 0x4000, v);
+        g_mirror = bytes(&r);
+        g_wr_off = (uint64_t)(i % 200) * PG;
+        g_wr_word = 0x10000000u + (uint32_t)i;
+        backing_gpu_wrote(p + g_wr_off, PG, v);
+        sub_end(v);
+        gpu_run(v, gpu_writes_rotating);
+        CHECK(words_are((void *)(uintptr_t)(p + g_wr_off), PG, g_wr_word));
+        if (!i) first = D.upload_bytes, pagegen_stats(&before_stats);
+    }
+    CHECK(first == 1 * MiB && D.upload_bytes == first);   // the first sync's megabyte and nothing since
+    PagegenStats s;
+    pagegen_stats(&s);
+    CHECK(s.chunks == before_stats.chunks && s.gpu_marks == 1000 && s.gpu_mark_pages == 1000);
+    backing_pool_fini(&pp);
+    done("writeback_long_run");
+}
+
+// The page generations' record of a write-back (pagegen_mark_gpu): whole pages are recorded and have the echo settled,
+// pages covered in part are stamped and left to the next query.
+static void case_gpu_mark(void) {
+    setup(64 * MiB, 0);
+    uint64_t a = g_heap + 1 * MiB, pages;
+    cpu_fill(a, 8 * PG, 1);
+    echo_on(a, a + 8 * PG);
+    uint64_t g1 = pagegen_scan(a, a + 8 * PG);
+    // The runtime copies bytes over [a + 0x800, a + 3 * PG + 0x800): pages 1 and 2 whole, 0 and 3 in part.
+    memset((void *)(uintptr_t)(a + 0x800), 0x5A, 3 * PG);
+    uint64_t g = pagegen_mark_gpu(a + 0x800, a + 3 * PG + 0x800);
+    CHECK(g == g1 + 1);
+    for (int k = 0; k < 4; k++) CHECK(pagegen_stamp(a + (uint64_t)k * PG) == g);
+    CHECK(pagegen_stamp(a + 4 * PG) == g1);
+    CHECK(pagegen_gpu_stamp(a) == 0 && pagegen_gpu_stamp(a + PG) == g && pagegen_gpu_stamp(a + 2 * PG) == g &&
+          pagegen_gpu_stamp(a + 3 * PG) == 0);
+    // The query that follows reports the two pages the record left alone and not the two it settled.
+    uint64_t g2 = pagegen_scan(a, a + 8 * PG);
+    CHECK(pagegen_stamp(a) == g2 && pagegen_stamp(a + 3 * PG) == g2 && pagegen_stamp(a + PG) == g &&
+          pagegen_stamp(a + 2 * PG) == g);
+    runs(a, a + 8 * PG, g1, &pages);
+    CHECK(pages == 4);
+    Runs r = {.n = 0};
+    pages = pagegen_runs_cpu(a, a + 8 * PG, g1, collect, &r);
+    CHECK(pages == 2 && r.n == 2 && r.lo[0] == a && r.lo[1] == a + 3 * PG);
+    // A CPU write into a recorded page moves it past the record.
+    cpu_fill(a + PG + 8, 4, 7);
+    uint64_t g3 = pagegen_scan(a, a + 8 * PG);
+    CHECK(pagegen_stamp(a + PG) == g3 && pagegen_gpu_stamp(a + PG) == g);
+    Runs r2 = {.n = 0};
+    pages = pagegen_runs_cpu(a, a + 8 * PG, g2, collect, &r2);
+    CHECK(pages == 1 && r2.lo[0] == a + PG);
+    // A plain mark over a recorded page does too.
+    pagegen_mark(a + 2 * PG, a + 2 * PG + 4);
+    Runs r3 = {.n = 0};
+    pages = pagegen_runs_cpu(a, a + 8 * PG, g3, collect, &r3);
+    CHECK(pages == 1 && r3.lo[0] == a + 2 * PG);
+    PagegenStats s;
+    pagegen_stats(&s);
+    CHECK(s.gpu_marks == 1 && s.gpu_mark_pages == 2);
+    // The GPU window lies above the guest's space: no CPU sees it, and nothing is recorded.
+    pagegen_mark_gpu(GFX_GPU_WINDOW_BASE, GFX_GPU_WINDOW_BASE + PG);
+    pagegen_stats(&s);
+    CHECK(s.gpu_marks == 1);
+    done("gpu_mark");
 }
 
 static void gpu_writes_dd(void) { memset(g_mirror + 0x100, 0xDD, 0x100); }
@@ -773,6 +997,32 @@ static void case_raw_sync_wait(void) {
     done("raw_sync_wait");
 }
 
+// The same scene, but the only page stamped since the mirror was brought current is one a write-back left GPU-current: the
+// mirror holds its bytes, no copy of guest memory is made over the older submission's stores, so there is nothing to wait
+// for (the wait would put the older submission's whole run on the critical path of every present).
+static void case_raw_sync_nowait(void) {
+    uint64_t p;
+    pool_t pp;
+    BackingRef small;
+    uint64_t r = raw_scene(&p, &pp, &small);   // raw-access submission r, whose table maps the mirror
+    sub_end(r);
+    pagegen_mark_gpu(p + 0x1000, p + 0x2000);  // a write-back landed in guest memory: the page is GPU-current
+    uint64_t v = sub_begin();
+    g_older = r;
+    CHECK(plat_thread_start(run_older_later, NULL, 256 * KiB));
+    uint64_t t0 = plat_now_ns();
+    backing_raw_begin(v);
+    double waited = (double)(plat_now_ns() - t0) / 1e6;
+    CHECK(waited < 100.0 && stats().raw_waits == 0);
+    while (gpu_sync_done() < r) plat_sleep_ns(10 * 1000 * 1000);   // r runs on its own thread, 200 ms in
+    sub_end(v);
+    gpu_run(v, NULL);
+    printf("raw_sync_nowait: the mirror was brought current in %.1f ms, with the raw-access submission still in flight\n",
+           waited);
+    backing_pool_fini(&pp);
+    done("raw_sync_nowait");
+}
+
 // ---------- an import a raw-access submission binds a large range of becomes a mirror (backing.h, The raw path)
 // The page table's invariant imports every committed page, and a bind in a raw-access submission can only import. A bind of a
 // range larger than a uniform's marks the import hot; the next raw-access submission's begin gives it the mirror the rule
@@ -1022,12 +1272,15 @@ int main(int argc, char **argv) {
     }
     static const struct { const char *name; void (*fn)(void); } cases[] = {
         {"generations", case_generations}, {"upload", case_upload},   {"admission", case_admission},
-        {"writeback", case_writeback},     {"replace", case_replace}, {"watch", case_watch},
+        {"writeback", case_writeback},     {"writeback_no_reupload", case_writeback_no_reupload},
+        {"writeback_partial_page", case_writeback_partial_page}, {"writeback_replaced", case_writeback_replaced},
+        {"writeback_long_run", case_writeback_long_run}, {"gpu_mark", case_gpu_mark},
+        {"replace", case_replace},   {"watch", case_watch},
         {"unwritten", case_unwritten},     {"replace_written", case_replace_written},
         {"raw_grow", case_raw_grow},       {"raw_grow_whole", case_raw_grow_whole},
         {"raw_grow_head", case_raw_grow_head},
         {"raw_grow_beside", case_raw_grow_beside}, {"raw_grow_wait", case_raw_grow_wait},
-        {"raw_sync_wait", case_raw_sync_wait},
+        {"raw_sync_wait", case_raw_sync_wait}, {"raw_sync_nowait", case_raw_sync_nowait},
         {"raw_promote", case_raw_promote},   {"raw_promote_small", case_raw_promote_small},
         {"raw_promote_wait", case_raw_promote_wait}, {"raw_promote_cap", case_raw_promote_cap},
         {"raw_grow_taken", case_raw_grow_taken},

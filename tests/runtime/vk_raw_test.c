@@ -11,6 +11,8 @@
 //   kinds    16 threads into each backing kind: an import, a mirror, a VRAM extent and a virtual pool over a physical one
 //            in the window; each reads its page's word, its store lands, the 16 atomics of each kind land on one counter;
 //            the mirror's stores and counter reach guest memory once the value is done, and nothing beside them
+//   keep     a mirror's raw stores written back stay in the mirror: the next submission copies nothing into it, reads the
+//            stored words and counts on from the stored counter; a CPU write to a page of it is copied in, that page only
 //   miss     8 threads at guest memory no pool covers: their loads read 0, their stores and atomics are dropped (guest
 //            memory keeps its bytes), all 24 are in the miss log with the address, the kind and the reason; the next
 //            submission's misses are its own
@@ -381,6 +383,56 @@ static void case_kinds(const char *spv) {
     printf("ok kinds\n");
 }
 
+// ---------- keep
+// What a raw-access submission stored into a mirror, written back into guest memory, stays in the mirror: the next
+// submission copies none of it back (the write-back's own copy into guest memory is not a CPU write: the write watch's mark of
+// it is taken away), a raw load of it reads the stored word, the counter goes on counting from the stored value, and a CPU
+// write to one of those pages is copied in, a page and no more.
+static void case_keep(const char *spv) {
+    open_all(spv);
+    Entry e[THREADS];
+    pool_t t = table_pool(e);
+    const uint64_t mir = g_heap + 32 * MiB, counter = mir + 512 * KiB;
+    g_mirror_lo = mir, g_mirror_hi = mir + 1 * MiB;
+    pool_t pm = make_pool(mir, 1 * MiB, 0);
+    for (int i = 0; i < 16; i++) fill_words(mir + (uint64_t)i * PG, PG, 0x22000000u + (uint32_t)i);
+    fill_words(counter, PG, 0);
+    read_back(mir, 1 * MiB);   // the mirror is made at a bind, and brought current
+    for (int i = 0; i < 16; i++) e[i] = (Entry){mir + (uint64_t)i * PG + PROBE, counter, 0, 0, {0}};
+    dispatch(e);
+    for (int i = 0; i < 16; i++) CHECK(word_at(mir + (uint64_t)i * PG + PROBE + 4) == (MARK | (uint32_t)i));
+    CHECK(word_at(counter) == 16);
+    BackingStats b0;
+    backing_stats(&b0);
+    CHECK(b0.upload_bytes > 0);   // the committed pages of the mirror went in once
+    // The next submission reads the words the first stored, and counts on from 16, with nothing copied into the mirror.
+    for (int i = 0; i < 16; i++) e[i] = (Entry){mir + (uint64_t)i * PG + PROBE + 4, counter, 0, 0, {0}};
+    dispatch(e);
+    for (int i = 0; i < 16; i++) CHECK(e[i].loaded == (MARK | (uint32_t)i));
+    CHECK(word_at(counter) == 32);
+    BackingStats b1;
+    backing_stats(&b1);
+    CHECK(b1.upload_bytes == b0.upload_bytes);
+    GpuVkRawStats s;
+    gpu_vk_raw_stats(&s);
+    CHECK(s.submissions == 2 && s.misses == 0 && s.writebacks == 34 && s.writeback_bytes == 34 * PG);
+    // The CPU writes the counter's page: the third submission takes it from guest memory, one page, and counts from it.
+    fill_words(counter, PG, 100);
+    for (int i = 0; i < 16; i++) e[i] = (Entry){mir + (uint64_t)i * PG + PROBE + 4, counter, 0, 0, {0}};
+    dispatch(e);
+    CHECK(word_at(counter) == 116);
+    BackingStats b2;
+    backing_stats(&b2);
+    CHECK(b2.upload_bytes == b1.upload_bytes + PG);
+    printf("a mirror's raw stores, written back: the next submission copied %llu bytes into it (17 pages before the "
+           "change), a CPU write to a page of it %llu\n", (ull)(b1.upload_bytes - b0.upload_bytes),
+           (ull)(b2.upload_bytes - b1.upload_bytes));
+    stats_line();
+    pool_t *all[] = {&pm, &t};
+    close_all(all, 2);
+    printf("ok keep\n");
+}
+
 // ---------- miss
 static void case_miss(const char *spv) {
     open_all(spv);
@@ -693,6 +745,7 @@ int main(int argc, char **argv) {
     }
     const char *cs = argv[1], *spv = argv[2];
     if (!strcmp(cs, "kinds")) case_kinds(spv);
+    else if (!strcmp(cs, "keep")) case_keep(spv);
     else if (!strcmp(cs, "miss")) case_miss(spv);
     else if (!strcmp(cs, "commit")) case_commit(spv);
     else if (!strcmp(cs, "edges")) case_edges(spv);

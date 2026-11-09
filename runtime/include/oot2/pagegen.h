@@ -40,12 +40,24 @@ uint64_t pagegen_scan(uint64_t lo, uint64_t hi);
 // Stamp every page of [lo, hi) with a new generation without a query, and return it: the CPU said it wrote them (a
 // flush of a mapped range, the runtime's own writes, a write-back of GPU results).
 uint64_t pagegen_mark(uint64_t lo, uint64_t hi);
+// A mark for a write-back of GPU results into guest memory, called right after the runtime copied them in, on the
+// thread that copied them: every page [lo, hi) touches is stamped as pagegen_mark does, and every page it covers WHOLE is
+// also recorded as GPU-current (pagegen_gpu_stamp equals its stamp) and has the write watch's mark of the copy taken
+// away, so the next query does not report the runtime's own write as the CPU's. A mirror that holds the bytes the GPU
+// wrote, which the copy put in guest memory, needs those pages no copy of guest memory (pagegen_runs_cpu skips them) until
+// a later stamp (a CPU write, a mark) moves them past the record. The pages a bound covers in part keep the plain mark: a
+// copy of them into a mirror stays. A CPU write into a page between the copy and this call is taken for the copy's own
+// (the caller's contract: the CPU does not write bytes the GPU is writing).
+uint64_t pagegen_mark_gpu(uint64_t lo, uint64_t hi);
+uint64_t pagegen_gpu_stamp(uint64_t page);   // the stamp pagegen_mark_gpu gave the page (0: none)
 uint64_t pagegen_now(void);   // the newest generation handed out (0 before the first)
 
 // The runs of pages of [lo, hi) stamped after since, in address order: fn(ctx, run_lo, run_hi) for each run of
 // consecutive such pages. Returns the number of pages.
 typedef void (*PagegenRun)(void *ctx, uint64_t lo, uint64_t hi);
 uint64_t pagegen_runs(uint64_t lo, uint64_t hi, uint64_t since, PagegenRun fn, void *ctx);
+// The same, less the pages whose newest stamp is a pagegen_mark_gpu's: what the CPU wrote (or marked) since.
+uint64_t pagegen_runs_cpu(uint64_t lo, uint64_t hi, uint64_t since, PagegenRun fn, void *ctx);
 uint64_t pagegen_stamp(uint64_t page);   // the stamp of one page (0: never stamped)
 
 typedef struct PagegenStats {
@@ -55,6 +67,7 @@ typedef struct PagegenStats {
     uint64_t untracked;                     // queries the source did not watch
     uint64_t marks, mark_pages;             // marks and their pages
     uint64_t chunks;                        // 256 MiB pieces of the table made
+    uint64_t gpu_marks, gpu_mark_pages;     // write-back marks (pagegen_mark_gpu) and the pages they recorded GPU-current
 } PagegenStats;
 void pagegen_stats(PagegenStats *out);
 // Forget every stamp and counter, and restore rt_mem_written as the source (tests, between cases of one process).

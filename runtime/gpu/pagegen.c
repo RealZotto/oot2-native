@@ -4,9 +4,11 @@
 // Page generations (oot2/pagegen.h): the only caller of rt_mem_written.
 //
 // The table has two levels over the guest's address space: 2,048 pieces of 256 MiB, each made at the first stamp of
-// one of its pages, holding a 64-bit generation per 4 KiB page and the newest generation of each of its 2 MiB regions,
-// so a reader skips a region with nothing newer than what it asks for. A piece holds 512 KiB of stamps; a heap whose
-// every page a query reported needs 32 of them for 8 GiB.
+// one of its pages, holding two 64-bit generations per 4 KiB page (the page's stamp, and the stamp a GPU write-back gave
+// it, if the last stamp is that one) and the newest generation of each of its 2 MiB regions, so a reader skips a region
+// with nothing newer than what it asks for. A piece holds 1 MiB of stamps; a heap whose every page a query reported
+// needs 32 of them for 8 GiB. The GPU stamp is one slot a page, so its state is bounded by the address space however
+// many write-backs a run makes.
 //
 // Adapted from DKB Recomp runtime/vk_memory.c at 9d8fa02 (GPL-3.0-or-later; there adapted from LAS Recomp
 // runtime/nvn/vulkan/exec.c at da35b83, MIT, Copyright (c) 2026 Peiikai, licenses/lasrecomp-MIT.txt, and MacNativeGames
@@ -32,6 +34,7 @@
 
 typedef struct Piece {
     uint64_t page[PAGES_PER_PIECE];
+    uint64_t gpu[PAGES_PER_PIECE];        // the stamp a GPU write-back gave the page (pagegen_mark_gpu); 0 for none
     uint64_t region[REGIONS_PER_PIECE];   // the newest stamp of each 2 MiB region
 } Piece;
 
@@ -66,6 +69,9 @@ static void stamp(uint64_t page, uint64_t g) {
     p->region[(page >> REGION_SHIFT) & (REGIONS_PER_PIECE - 1)] = g;
 }
 
+// The write watch's query: the stand-in a test set, else the operating system's. g_lock held.
+static PagegenSource source(void) { return g_src ? g_src : rt_mem_written; }
+
 static int whole_pages(uint64_t lo, uint64_t hi) {
     return lo < hi && !(lo & (PAGEGEN_PAGE - 1)) && !(hi & (PAGEGEN_PAGE - 1)) && hi <= RT_ADDRESS_LIMIT;
 }
@@ -75,7 +81,7 @@ uint64_t pagegen_scan(uint64_t lo, uint64_t hi) {
         rt_fatal("page generations: a query of [%#llx, %#llx), which is not whole guest pages", (unsigned long long)lo,
                  (unsigned long long)hi);
     plat_mutex_lock(&g_lock);
-    PagegenSource src = g_src ? g_src : rt_mem_written;
+    PagegenSource src = source();
     uint64_t g = ++g_now, t0 = plat_now_ns(), found = 0;
     int tracked = 1;
     for (;;) {
@@ -107,6 +113,39 @@ uint64_t pagegen_mark(uint64_t lo, uint64_t hi) {
     return g;
 }
 
+uint64_t pagegen_mark_gpu(uint64_t lo, uint64_t hi) {
+    uint64_t alo = lo & ~(PAGEGEN_PAGE - 1), ahi = (hi + PAGEGEN_PAGE - 1) & ~(PAGEGEN_PAGE - 1);
+    uint64_t glo = (lo + PAGEGEN_PAGE - 1) & ~(PAGEGEN_PAGE - 1), ghi = hi & ~(PAGEGEN_PAGE - 1);   // the whole pages
+    plat_mutex_lock(&g_lock);
+    uint64_t g = ++g_now;
+    if (alo < ahi && ahi <= RT_ADDRESS_LIMIT) {
+        for (uint64_t a = alo; a < ahi; a += PAGEGEN_PAGE) stamp(a, g);
+        g_st.marks++, g_st.mark_pages += (ahi - alo) >> PAGE_SHIFT;
+        if (glo < ghi) {
+            for (uint64_t a = glo; a < ghi; a += PAGEGEN_PAGE)
+                piece(a, 1)->gpu[(a >> PAGE_SHIFT) & (PAGES_PER_PIECE - 1)] = g;
+            // The runtime's own copy dirtied these pages in the write watch: take that mark away (its pages are not
+            // stamped again, so they stay GPU-current), or the next query would report the write-back as a CPU write.
+            PagegenSource src = source();
+            for (;;) {
+                uint64_t n = src(glo, ghi - glo, g_batch, BATCH, 1);
+                if (n == UINT64_MAX || n < BATCH) break;
+            }
+            g_st.gpu_marks++, g_st.gpu_mark_pages += (ghi - glo) >> PAGE_SHIFT;
+        }
+    }
+    plat_mutex_unlock(&g_lock);
+    return g;
+}
+
+uint64_t pagegen_gpu_stamp(uint64_t page) {
+    plat_mutex_lock(&g_lock);
+    const Piece *p = page < RT_ADDRESS_LIMIT ? piece(page, 0) : NULL;
+    uint64_t g = p ? p->gpu[(page >> PAGE_SHIFT) & (PAGES_PER_PIECE - 1)] : 0;
+    plat_mutex_unlock(&g_lock);
+    return g;
+}
+
 uint64_t pagegen_now(void) {
     plat_mutex_lock(&g_lock);
     uint64_t g = g_now;
@@ -122,7 +161,7 @@ uint64_t pagegen_stamp(uint64_t page) {
     return g;
 }
 
-uint64_t pagegen_runs(uint64_t lo, uint64_t hi, uint64_t since, PagegenRun fn, void *ctx) {
+static uint64_t runs_of(uint64_t lo, uint64_t hi, uint64_t since, PagegenRun fn, void *ctx, int cpu_only) {
     lo &= ~(PAGEGEN_PAGE - 1);
     hi = (hi + PAGEGEN_PAGE - 1) & ~(PAGEGEN_PAGE - 1);
     if (hi > RT_ADDRESS_LIMIT) hi = RT_ADDRESS_LIMIT;
@@ -138,7 +177,10 @@ uint64_t pagegen_runs(uint64_t lo, uint64_t hi, uint64_t since, PagegenRun fn, v
             continue;
         }
         for (; a < region_end; a += PAGEGEN_PAGE) {
-            int newer = p->page[(a >> PAGE_SHIFT) & (PAGES_PER_PIECE - 1)] > since;
+            uint64_t k = (a >> PAGE_SHIFT) & (PAGES_PER_PIECE - 1);
+            // A page whose newest stamp is a GPU write-back's holds, in a mirror that took its bytes, what guest memory
+            // holds: the CPU did not write it since (cpu_only skips it).
+            int newer = p->page[k] > since && !(cpu_only && p->page[k] == p->gpu[k]);
             if (newer && !run) run = a;
             else if (!newer && run) fn(ctx, run, a), run = 0;
             pages += (uint64_t)newer;
@@ -147,6 +189,14 @@ uint64_t pagegen_runs(uint64_t lo, uint64_t hi, uint64_t since, PagegenRun fn, v
     if (run) fn(ctx, run, hi);
     plat_mutex_unlock(&g_lock);
     return pages;
+}
+
+uint64_t pagegen_runs(uint64_t lo, uint64_t hi, uint64_t since, PagegenRun fn, void *ctx) {
+    return runs_of(lo, hi, since, fn, ctx, 0);
+}
+
+uint64_t pagegen_runs_cpu(uint64_t lo, uint64_t hi, uint64_t since, PagegenRun fn, void *ctx) {
+    return runs_of(lo, hi, since, fn, ctx, 1);
 }
 
 void pagegen_stats(PagegenStats *out) {

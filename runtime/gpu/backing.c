@@ -770,8 +770,12 @@ static void mirror_bring(Backing *m, uint64_t value) {
         rt_fatal("gfx: vulkan: backing map: the write watch no longer covers the mirror of [%#llx, %#llx)",
                  (ull)m->gpu_lo, (ull)m->gpu_hi);
     Runs runs = {0};
+    // A new mirror holds nothing: every page goes in. An older one holds, besides every copied CPU write, the bytes of
+    // the GPU writes written back into guest memory (pagegen_mark_gpu): those pages are the same bytes in both places
+    // until a later stamp, so only the pages the CPU wrote since come in. A mirror that replaced another is new, so it
+    // never takes a page for GPU-current on the word of a write-back made into the one it replaced.
     if (m->fresh) runs_push(&runs, m->gpu_lo, m->gpu_hi);
-    else pagegen_runs(m->gpu_lo, m->gpu_hi, m->synced, runs_push, &runs);
+    else pagegen_runs_cpu(m->gpu_lo, m->gpu_hi, m->synced, runs_push, &runs);
     m->synced = g, m->fresh = 0;
     Ups u = {.m = m};
     for (int i = 0; i < runs.n; i++) up_range(&u, runs.r[i].lo, runs.r[i].hi, 0);
@@ -791,7 +795,7 @@ static void raw_stores_wait(Backing *m, uint64_t value) {
     uint64_t r = raw_before(value);   // not value's own: a raw-access submission waits for the ones before it
     if (m->fresh || !r || r >= value || r <= gpu_sync_done() || r > gpu_sync_issued()) return;
     if (pagegen_scan(m->gpu_lo, m->gpu_hi) == UINT64_MAX) return;   // mirror_bring stops by name
-    if (!pagegen_runs(m->gpu_lo, m->gpu_hi, m->synced, no_run, NULL)) return;
+    if (!pagegen_runs_cpu(m->gpu_lo, m->gpu_hi, m->synced, no_run, NULL)) return;   // a GPU-current page is not copied
     g_cst.raw_waits++;
     plat_mutex_unlock(&g_coh);
     wait_value(r);
@@ -1139,7 +1143,9 @@ static void writeback(void *arg, uint64_t value) {
             continue;
         }
         memcpy((void *)(uintptr_t)it->lo, it->host, it->size);
-        pagegen_mark(it->lo, it->lo + it->size);
+        // The mirror holds these bytes already: the pages the write covers whole are recorded as GPU-current, so the
+        // next sync does not hand them back (they are most of a large write); the rest are marked for a copy.
+        pagegen_mark_gpu(it->lo, it->lo + it->size);
         g_cst.writebacks++, g_cst.writeback_bytes += it->size;
     }
     int k = 0;

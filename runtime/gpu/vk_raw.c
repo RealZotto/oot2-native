@@ -355,6 +355,11 @@ static void miss_log(const uint32_t *head, uint64_t value) {
     }
 }
 
+static int key_order(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
 // The completion thread, once the device reached value and before it is done.
 static void ended(void *arg, uint64_t value) {
     Done *d = arg;
@@ -365,18 +370,40 @@ static void ended(void *arg, uint64_t value) {
         rt_fatal("gfx: vulkan: raw path: the raw stores of submission %llu reached %u mirrored pages, more than the %u "
                  "its write-back holds (RAW_WRITEBACK_PAGES)", (ull)value, taken, d->slots);
     uint64_t data = data_word(d->slots), bytes = 0, skipped = 0;
-    for (uint32_t i = 0; i < taken; i++) {
-        uint64_t guest = d->guest[w[OUT_HEAD + HEAD_WORDS + i]];
-        if (!rt_mem_commit_io(guest, PAGE, 1)) {
-            if (!skipped++)
-                rt_log("gfx: vulkan: raw path: a raw store of submission %llu into the mirror of %#llx lands in memory "
-                       "the guest no longer maps: left out", (ull)value, (ull)guest);
-            continue;
+    // The pages in address order (the mirrored pages' order), so that runs of neighbours are committed and marked once.
+    // The key is the page's index in the table's list, and the out buffer's slot below it.
+    uint64_t *order = malloc((size_t)(taken ? taken : 1) * sizeof *order);
+    if (!order) rt_fatal("gfx: vulkan: raw path: out of memory for %u written-back pages", taken);
+    for (uint32_t i = 0; i < taken; i++) order[i] = (uint64_t)w[OUT_HEAD + HEAD_WORDS + i] << 32 | i;
+    qsort(order, taken, sizeof *order, key_order);
+    for (uint32_t i = 0; i < taken;) {
+        uint32_t j = i;
+        uint64_t guest = d->guest[order[i] >> 32];
+        while (j + 1 < taken && d->guest[order[j + 1] >> 32] == d->guest[order[j] >> 32] + PAGE) j++;
+        uint64_t run = (uint64_t)(j - i + 1) * PAGE;
+        if (rt_mem_commit_io(guest, run, 1)) {
+            for (uint32_t k = i; k <= j; k++)
+                memcpy((void *)(uintptr_t)d->guest[order[k] >> 32],
+                       w + data + (uint64_t)(uint32_t)order[k] * PAGE_WORDS, PAGE);
+            pagegen_mark_gpu(guest, guest + run);   // the mirror holds these bytes: the next sync does not copy them back
+            bytes += run;
+        } else {   // part of the run is no longer mapped: page by page, leaving those out
+            for (uint32_t k = i; k <= j; k++) {
+                uint64_t page = d->guest[order[k] >> 32];
+                if (!rt_mem_commit_io(page, PAGE, 1)) {
+                    if (!skipped++)
+                        rt_log("gfx: vulkan: raw path: a raw store of submission %llu into the mirror of %#llx lands in "
+                               "memory the guest no longer maps: left out", (ull)value, (ull)page);
+                    continue;
+                }
+                memcpy((void *)(uintptr_t)page, w + data + (uint64_t)(uint32_t)order[k] * PAGE_WORDS, PAGE);
+                pagegen_mark_gpu(page, page + PAGE);
+                bytes += PAGE;
+            }
         }
-        memcpy((void *)(uintptr_t)guest, w + data + (uint64_t)i * PAGE_WORDS, PAGE);
-        pagegen_mark(guest, guest + PAGE);
-        bytes += PAGE;
+        i = j + 1;
     }
+    free(order);
     plat_mutex_lock(&g_lock);
     g_st.writebacks += taken - skipped, g_st.writeback_bytes += bytes, g_st.writebacks_skipped += skipped;
     d->out->next = g_free, g_free = d->out;

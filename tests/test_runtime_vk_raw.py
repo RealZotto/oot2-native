@@ -11,7 +11,8 @@ goes through the translator's raw-access helper, since its address comes from th
 
 tests/runtime/vk_raw_test.c says what each case checks: every backing kind (import, mirror, VRAM extent, virtual over a
 physical pool) read, written and counted by 32-bit atomics with the expected bytes after the fence, a raw store into a
-mirror reaching guest memory when its value is done, an unmapped address reading zero, dropping its write and named in
+mirror reaching guest memory when its value is done and staying in the mirror (the next submission copies nothing into
+it, and a CPU write to a page of it is copied in), an unmapped address reading zero, dropping its write and named in
 the miss log, a chunk committed after its pool was mapped reachable by the next submission, the lowest and the highest
 mapped page resolving, a range a finalized pool left and another pool took reached through the new pool, and a bind that
 grows past a mirror the table maps inside one submission of two raw-access stages (the table follows the map to the end
@@ -49,7 +50,7 @@ TID_X = 33
 THREADS = 64
 TABLE = (1 << 39) + 0x4000_0000   # the pointer table: vk_raw_test.c, TABLE
 ENTRY = 32
-CASES = ("kinds", "miss", "commit", "reuse", "edges", "grow")
+CASES = ("kinds", "keep", "miss", "commit", "reuse", "edges", "grow")
 
 
 def mov_imm(rd: int, imm: int) -> bytes:

@@ -35,9 +35,10 @@ from test_runtime_gpu import EXIT_FATAL, LEVELS, ROOT, build_program, case_env, 
 
 TEST_SOURCE = ROOT / "tests" / "runtime" / "coherence_test.c"
 
-PASSING = ("generations", "upload", "admission", "writeback", "replace", "raw_grow", "raw_grow_head",
-           "raw_grow_whole", "raw_grow_beside", "raw_grow_wait", "raw_sync_wait", "raw_promote", "raw_promote_small",
-           "raw_promote_wait", "raw_promote_cap")
+PASSING = ("generations", "upload", "admission", "writeback", "writeback_no_reupload", "writeback_partial_page",
+           "writeback_replaced", "writeback_long_run", "gpu_mark", "replace", "raw_grow", "raw_grow_head",
+           "raw_grow_whole", "raw_grow_beside", "raw_grow_wait", "raw_sync_wait", "raw_sync_nowait", "raw_promote",
+           "raw_promote_small", "raw_promote_wait", "raw_promote_cap")
 
 # case: text the one FATAL line must hold
 FAILING = {
