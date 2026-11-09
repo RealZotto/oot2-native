@@ -45,8 +45,9 @@ static const ShaderBinds *dev_binds(const VkpStage *stage) {
     const nvn_stage *s = stage->shape;
     uint8_t content_digest[SHC_DIGEST_BYTES];
     vkp_stage_content_digest(stage, content_digest);
-    uint32_t h = (uint32_t)(((uintptr_t)s >> 4) * 0x9E3779B1u) % BIND_BUCKETS;
+    uint32_t h = (uint32_t)(((uintptr_t)s >> 4) * 0x9E3779B1u);
     for (size_t i = 0; i < sizeof content_digest; i++) h = (h ^ content_digest[i]) * 0x01000193u;
+    h %= BIND_BUCKETS;   // after the digest is mixed in: the mixing leaves any 32-bit value
     plat_mutex_lock(&g_bind_lock);
     for (BindEntry *e = g_bind[h]; e; e = e->next)
         if (e->stage == s && !memcmp(e->content_digest, content_digest, sizeof content_digest)) {
