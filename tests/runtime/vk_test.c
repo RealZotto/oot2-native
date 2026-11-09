@@ -189,7 +189,7 @@ static void fill_effect(void *arg, uint64_t value) {
 static void submitter(void *arg) {
     uint64_t last = 0, handle = (uint64_t)(uintptr_t)g_empty;
     for (int i = 0; i < REPLAYS_PER_THREAD; i++) {
-        uint64_t v = gfx_vulkan_backend.submit(&handle, 1);
+        uint64_t v = gfx_vulkan_backend.submit(1, &handle, 1);
         CHECK(v > last);
         last = v;
         if (i % INTERNAL_EVERY == (int)(uintptr_t)arg) {
@@ -220,7 +220,7 @@ static void case_submits(void) {
     plat_mutex_lock(&g_join_lock);
     while (g_left) plat_cond_wait(&g_join_cond, &g_join_lock);
     plat_mutex_unlock(&g_join_lock);
-    gfx_vulkan_backend.finish();
+    gfx_vulkan_backend.finish(0);
     double ms = (double)(plat_now_ns() - t0) / 1e6;
     uint64_t handed = gpu_sync_handed(), counter = 0;
     CHECK(vkGetSemaphoreCounterValue(gpu_vk.device, gpu_vk.timeline, &counter) == VK_SUCCESS);
@@ -277,8 +277,8 @@ static void case_wait(void) {
     uint64_t handle = (uint64_t)(uintptr_t)g_empty;
     op_hdr rec[2] = {{OP_BEGIN, 8}, {OP_END, 8}};
     memcpy(g_empty, rec, sizeof rec);
-    for (int i = 0; i < 20; i++) gfx_vulkan_backend.submit(&handle, 1);
-    gfx_vulkan_backend.finish();
+    for (int i = 0; i < 20; i++) gfx_vulkan_backend.submit(1, &handle, 1);
+    gfx_vulkan_backend.finish(0);
     uint64_t counter = 0, handed = gpu_sync_handed();
     CHECK(vkGetSemaphoreCounterValue(gpu_vk.device, gpu_vk.timeline, &counter) == VK_SUCCESS);
     CHECK(gfx_vulkan_backend.fence_done() == handed && counter == handed && gpu_sync_issued() == handed);
@@ -748,11 +748,11 @@ static void case_loss_submit(const char *dir) {
     uint64_t handle = (uint64_t)(uintptr_t)g_empty;
     op_hdr rec[2] = {{OP_BEGIN, 8}, {OP_END, 8}};
     memcpy(g_empty, rec, sizeof rec);
-    for (int i = 0; i < 3; i++) gfx_vulkan_backend.submit(&handle, 1);
-    gfx_vulkan_backend.finish();
+    for (int i = 0; i < 3; i++) gfx_vulkan_backend.submit(1, &handle, 1);
+    gfx_vulkan_backend.finish(0);
     fake_queries();
     vkQueueSubmit2 = lost_submit;
-    gfx_vulkan_backend.submit(&handle, 1);   // the recorder thread submits the frame, and stops there
+    gfx_vulkan_backend.submit(1, &handle, 1);   // the recorder thread submits the frame, and stops there
     vkrec_idle();
     printf("submit returned after the loss\n");
 }

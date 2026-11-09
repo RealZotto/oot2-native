@@ -11,13 +11,36 @@
 // on the pointer. A command handle points at a recording in host memory (nvn_obj.h, command records), which the back
 // end reads during submit and keeps no pointer into afterwards.
 //
-// Synchronisation (architecture section 5). Every queue's submissions share one order: the fence values submit hands
-// out. A back end completes them in that order and writes a submission's CPU-visible results (event signals, counter
-// reports, buffer copies and clears, uniform updates, in op-stream order) before its fence value is done, so a fence
-// on one queue also covers what every queue submitted before it. Report timestamps are the guest's system tick (31.25
+// Synchronisation (architecture section 5). Every queue's submissions share one numbering: the fence values submit
+// hands out. A back end writes a submission's CPU-visible results (event signals, counter reports, buffer copies and
+// clears, uniform updates, in op-stream order) before its fence value is done, and a queue's submissions are done in
+// that queue's order; a fence on a queue covers that queue's earlier submissions and nothing of another queue's (rule 3
+// below). Report timestamps are the guest's system tick (31.25
 // MHz, rt_ticks) read from the host clock when the report completes; a counter the back end cannot measure reports 0.
 // Conditional rendering is decided when the back end replays the condition, from the reports before it: a report not
 // complete then counts as 0 when it is a timestamp and as visible when it is samples passed.
+//
+// WaitEvent and the order of replay (oot2/nvn_order.h). submit is told the queue. On the console a WaitEvent holds its
+// queue until the event word reaches its value, and another queue's SignalEvent or the CPU's EventSignal (which
+// reaches the back end as guest_written of the word's 4 bytes) releases it. A back end answers a wait by reordering and
+// never by blocking a thread: a wait that the work replayed so far does not satisfy holds that queue's later records,
+// and the later submissions of the queue, until a signal replayed after it, or a CPU write, satisfies it; the other
+// queues go on. So replay order may differ from fence order, and the rule above is kept by these:
+//   1. Fence values still grow by one per submission, across queues, in submit order.
+//   2. A queue's records are replayed in that queue's order.
+//   3. A fence value is done when its submission and every earlier submission of the same queue have been replayed whole
+//      and their results are written, in that queue's order. Another queue's submissions, held or not, are no condition
+//      of it: a thread that waits on queue B (finish(B), fence_wait on a fence value of B, SyncWait on a QueueFenceSync
+//      of B) never waits for a wait held on queue A, which on the console runs on its own, and the thread that makes the
+//      CPU signal A is waiting for can be that thread. The CPU sees the results of a queue as they complete, not in
+//      fence order across queues. A fence value behind a held wait of its own queue is not done. fence_done() is the
+//      highest value F such that every submission up to F, of every queue, is done (a lower bound of what is done).
+//   4. A present shows after every submission made before it is whole, held ones included (it is a display and
+//      blocks no thread).
+//   5. A wait nothing releases is a named stop and not a hang: when more than WO_BOUND_SUBMITS further submissions
+//      have been made, and, for a wait with no timeout on a fence value of the held queue, or on that queue's
+//      finish, after WO_STALL_NS from the start of that wait. A fence_wait with a timeout still answers 0 when the
+//      timeout passes.
 //
 // Presents and pacing. The front end's window rotates through the window's textures and hands each present to
 // present() below, which returns at once; the swap interval stays in the window, where the front end answers it. The
@@ -67,16 +90,19 @@ typedef struct GfxBackend {
     void (*texture_release)(const tex_t *t);
     void (*program_release)(const prog_t *p);
     // Run n recordings in order and return this submission's fence value. Fence values grow by one per submission,
-    // across every queue, and a value is done only when every submission up to it is done (section 5).
-    uint64_t (*submit)(const uint64_t *handles, int n);
-    // 1 once fence value `value` is done, 0 when timeout_ns passed first (UINT64_MAX: no limit). A value no submit has
-    // handed out yet answers 0 at once. The caller has given its virtual core up for the wait (D7).
+    // across every queue, and a value is done when its submission and the queue's earlier ones are (rule 3). queue is the
+    // serial the front end gave the NVN queue at QueueInitialize (never 0 from the front end; 0 stands for a caller
+    // with no queue): what the back end keys a WaitEvent's queue on, never the pointer of the game's queue.
+    uint64_t (*submit)(uint64_t queue, const uint64_t *handles, int n);
+    // 1 once fence value `value` is done (rule 3: a submission and its queue's earlier ones), 0 when timeout_ns passed
+    // first (UINT64_MAX: no limit; 0: a poll). A value no submit has handed out yet answers 0 at once. The caller has
+    // given its virtual core up for the wait (D7).
     int (*fence_wait)(uint64_t value, uint64_t timeout_ns);
-    uint64_t (*fence_done)(void);   // highest fence value whose side effects are all written
+    uint64_t (*fence_done)(void);   // highest fence value F such that every submission up to F has its side effects written
     // Queue texture t for display, cropped to crop (x, y, width, height); returns at once. It is shown after the work
     // submitted before the call.
     void (*present)(const tex_t *t, const int crop[4]);
-    void (*finish)(void);           // every submission so far is done when it returns
+    void (*finish)(uint64_t queue); // every submission so far of `queue` (0: of every queue) is done when it returns
     // Texel copies between a texture view and host memory (CopyTextureToBuffer and the CPU texel calls): row is the
     // bytes per row, img the bytes per two-dimensional image of the region.
     void (*read_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
@@ -90,6 +116,10 @@ typedef struct GfxBackend {
     // Two windows presenting from two threads may reach these calls out of seq order: seq is the key, not arrival.
     void (*present_pace)(uint64_t seq, uint64_t due_tick, uint64_t due_count);
     uint64_t (*present_shown)(uint64_t seq);
+    // Optional (NULL: not wanted): nvnEventInitialize made an event of the 4-byte word at addr. Nothing is written, but a
+    // back end that keeps a copy of event words (the order engine of the null back end) drops what it knew of this word
+    // from an earlier event at the same storage and reads it again.
+    void (*event_initialized)(uint64_t addr);
 } GfxBackend;
 
 extern const GfxBackend gfx_null_backend;
@@ -107,15 +137,26 @@ int gfx_null_render_enabled(void);
 // the held submissions up to fence value `value` (0: all of them) and returns the newest fence value done.
 void gfx_null_hold(int on);
 uint64_t gfx_null_complete(uint64_t value);
-// WaitEvents the null back end checked at completion, and how many of them what came before them in submission order
-// had not satisfied (*unsatisfied, when not NULL).
+// WaitEvents the null back end met, and how many of them did not hold at their place in the replay so far (*unsatisfied,
+// when not NULL): such a wait is counted when its queue parks at it, and once.
 uint64_t gfx_null_wait_events(uint64_t *unsatisfied);
-// The same waits sorted by what satisfied them (gfx_null.c): by a GPU signal earlier in submission order, by a CPU signal
-// made before, by neither (the word held the value already), not satisfied at completion, and of those later satisfied
-// by a GPU signal or a CPU signal (the hazard for a back end that replays at submit). unsatisfied = later_gpu + later_cpu +
-// pending (not satisfied yet when asked) + dropped (found the list of unsatisfied waits, which holds 64, full).
-typedef struct { uint64_t by_gpu, by_cpu, initial, unsatisfied, later_gpu, later_cpu, dropped, pending; } GfxNullWaitClasses;
+// The same waits sorted by what answered them (gfx_null.c): a GPU signal replayed before it, a CPU signal made before, by
+// neither (the word held the value from the start), not holding at its place, and of those later released by a GPU
+// signal of another queue or by a CPU signal. unsatisfied = later_gpu + later_cpu + pending (parked now). dropped stays
+// 0: a parked queue holds one wait, so nothing is left out. by_gpu_same and by_gpu_other split by_gpu by whether the
+// signal was made by the waiting queue itself (the only kind of GPU signal a queue can find before its own wait) or by
+// another one; later_gpu is always another queue's.
+typedef struct {
+    uint64_t by_gpu, by_cpu, initial, unsatisfied, later_gpu, later_cpu, dropped, pending;
+    uint64_t by_gpu_same, by_gpu_other;
+} GfxNullWaitClasses;
 void gfx_null_wait_classes(GfxNullWaitClasses *out);
+// The bounds of a wait nothing releases (WO_BOUND_SUBMITS and WO_STALL_NS when 0), for tests.
+void gfx_null_wait_bounds(uint64_t submits, uint64_t stall_ns);
+// Parked queues now, and the highest fence value whose submissions are all whole (the replay's own, before completion).
+int gfx_null_parked(void);
+uint64_t gfx_null_longest_hold(void);   // the most submissions made while one queue was held at one wait, once released
+uint64_t gfx_null_whole_through(void);
 // The back end the front end uses: the null back end until gfx_set_backend installs another, which it does before
 // rt_dispatch_init (fatal after it, or for a table with an operation missing).
 const GfxBackend *gfx_backend(void);
@@ -164,9 +205,10 @@ void nvn_census_stats(NvnStatRow emit, void *ctx);
 // ---- command recordings (runtime/nvn/nvn_cmd.c, architecture D11)
 // QueueSubmitCommands' work on the front end's side: every handle must be a live recording (a named stop otherwise),
 // the deferred binds and pushes take what the game's arrays hold now, the copies stay alive while the back end's
-// submit reads them, and that submit's fence value is returned. c is the calling guest thread.
+// submit reads them, and that submit's fence value is returned. c is the calling guest thread; queue is the serial of the
+// NVN queue (queue_t.serial) the recordings were submitted to.
 struct Cpu;
-uint64_t nvn_submit_recordings(struct Cpu *c, const uint64_t *handles, int n);
+uint64_t nvn_submit_recordings(struct Cpu *c, uint64_t queue, const uint64_t *handles, int n);
 uint64_t nvn_cmd_host_bytes(void);   // host memory command buffers, recording copies and their index hold now
 uint64_t nvn_cmd_copies(void);       // recording copies alive now
 

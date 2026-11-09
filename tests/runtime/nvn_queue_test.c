@@ -228,8 +228,8 @@ static void objects(void) {
     g_pool = memory_pool(POOL_SIZE, CPU_UNCACHED | GPU_CACHED, &g_pool_mem);
 }
 
-static uint64_t queue(void) {
-    uint64_t b = galloc(0x40, 16), q = galloc(0x2000, 16);
+static uint64_t queue_at(uint64_t q) {   // initialise (or initialise again) the queue object at q
+    uint64_t b = galloc(0x40, 16);
     NVN(nvnQueueBuilderSetDevice, b, g_dev);
     NVN(nvnQueueBuilderSetDefaults, b);
     NVN(nvnQueueBuilderSetFlags, b, 0);
@@ -242,6 +242,7 @@ static uint64_t queue(void) {
     CHECK((NVN(nvnQueueInitialize, q, b) & 0xff) == 1);
     return q;
 }
+static uint64_t queue(void) { return queue_at(galloc(0x2000, 16)); }
 
 static uint64_t sync_object(void) {
     uint64_t s = galloc(0x40, 16);
@@ -620,10 +621,11 @@ static void census_other_at_draw(uint64_t fence, int index, const op_hdr *r, voi
 static void census_locked_case(int mode) {
     setup(0, NULL);
     objects();
-    uint64_t q = queue(), cb = command_buffer(), ev = event_object(g_pool, RESULTS);
+    // The wait nothing releases holds a queue of its own, so the draw and the report on q still replay.
+    uint64_t q = queue(), qw = queue(), cb = command_buffer(), ev = event_object(g_pool, RESULTS);
     NVN(nvnCommandBufferBeginRecording, cb);
     NVN_AT(MB + 0x6000, nvnCommandBufferWaitEvent, cb, ev, EQUAL, 1);
-    submit(q, NVN(nvnCommandBufferEndRecording, cb));
+    submit(qw, NVN(nvnCommandBufferEndRecording, cb));
 
     rt_set_stop_hook(census_stop);
     if (mode <= 1 || mode == 5) {
@@ -656,11 +658,12 @@ static void case_census_fatal_held_complete(void) { census_locked_case(3); }
 static void case_census_fatal_held_release(void) { census_locked_case(4); }
 static void case_census_other_thread(void) { census_locked_case(5); }
 
-// ---------- case wait_events: each WaitEvent checked at completion, logged once per call site
+// ---------- case wait_events: each WaitEvent answered at its place in its queue's replay, logged once per call site. A queue
+// is held at a wait that nothing replayed so far satisfies, so the waits behind it are met only once it goes on.
 static void case_wait_events(void) {
     setup(0, NULL);
     objects();
-    uint64_t q = queue(), cb = command_buffer(), ev = event_object(g_pool, RESULTS);
+    uint64_t q = queue(), q2 = queue(), cb = command_buffer(), ev = event_object(g_pool, RESULTS);
     uint64_t evb = event_object(g_pool, RESULTS + 0x40), evc = event_object(g_pool, RESULTS + 0x80);
     NVN(nvnEventSignal, evb, WRITE, 5);   // the CPU signals before the submission: a wait on it is satisfied by the CPU
     NVN(nvnCommandBufferBeginRecording, cb);
@@ -669,51 +672,51 @@ static void case_wait_events(void) {
     NVN_AT(MB + 0x1000, nvnCommandBufferWaitEvent, cb, ev, GEQUAL_WRAP, 2);   // satisfied, the same site
     NVN_AT(MB + 0x1000, nvnCommandBufferWaitEvent, cb, evb, EQUAL, 5);        // satisfied by the CPU's earlier signal
     NVN_AT(MB + 0x1000, nvnCommandBufferWaitEvent, cb, evc, GEQUAL_WRAP, 0);  // satisfied by the word's own value
-    NVN_AT(MB + 0x2000, nvnCommandBufferWaitEvent, cb, ev, EQUAL, 9);         // not satisfied
-    NVN_AT(MB + 0x2000, nvnCommandBufferWaitEvent, cb, ev, GEQUAL_WRAP, 4);   // not satisfied, the same site
+    NVN_AT(MB + 0x2000, nvnCommandBufferWaitEvent, cb, ev, EQUAL, 9);         // not satisfied: the queue is held here
+    NVN_AT(MB + 0x2000, nvnCommandBufferWaitEvent, cb, ev, GEQUAL_WRAP, 4);   // behind it, the same site
     submit(q, NVN(nvnCommandBufferEndRecording, cb));
     uint64_t unsatisfied = 0;
-    CHECK(gfx_null_wait_events(&unsatisfied) == 6 && unsatisfied == 2);
+    CHECK(gfx_null_wait_events(&unsatisfied) == 5 && unsatisfied == 1 && gfx_null_parked() == 1);   // the last is not met yet
     GfxNullWaitClasses k;
     gfx_null_wait_classes(&k);
-    CHECK(k.by_gpu == 2 && k.by_cpu == 1 && k.initial == 1 && k.unsatisfied == 2 && k.later_gpu == 0 && k.later_cpu == 0);
-    // The CPU signals the word after the submission and a later completion finds both waits satisfied: by the CPU.
+    CHECK(k.by_gpu == 2 && k.by_cpu == 1 && k.initial == 1 && k.unsatisfied == 1 && k.pending == 1 && k.later_gpu == 0 &&
+          k.later_cpu == 0);
+    CHECK(k.by_gpu_same == 2 && k.by_gpu_other == 0);   // the signal was the waiting queue's own
+    // The CPU signals the word after the submission: the queue is released at once (later, by the CPU) and the wait behind
+    // it is met, satisfied by the word the CPU wrote.
     NVN(nvnEventSignal, ev, WRITE, 9);
-    NVN(nvnCommandBufferBeginRecording, cb);
-    NVN(nvnCommandBufferDrawArrays, cb, 4, 0, 3);
-    submit(q, NVN(nvnCommandBufferEndRecording, cb));
+    CHECK(gfx_null_parked() == 0);
     gfx_null_wait_classes(&k);
-    CHECK(k.later_cpu == 2 && k.later_gpu == 0);
-    // A wait that a GPU signal of a later submission satisfies: unsatisfied now, satisfied later by the GPU.
+    CHECK(k.later_cpu == 1 && k.later_gpu == 0 && k.by_cpu == 2 && k.pending == 0);
+    // A wait that a GPU signal of another queue satisfies: the queue is held, and the other queue's submission releases it.
     uint64_t evd = event_object(g_pool, RESULTS + 0xC0);
     NVN(nvnCommandBufferBeginRecording, cb);
     NVN_AT(MB + 0x3000, nvnCommandBufferWaitEvent, cb, evd, EQUAL, 7);
     submit(q, NVN(nvnCommandBufferEndRecording, cb));
     gfx_null_wait_classes(&k);
-    CHECK(k.unsatisfied == 3 && k.later_gpu == 0);
+    CHECK(k.unsatisfied == 2 && k.later_gpu == 0 && k.pending == 1);
     NVN(nvnCommandBufferBeginRecording, cb);
     NVN(nvnCommandBufferSignalEvent, cb, evd, WRITE, 2, 0, 7);
-    submit(q, NVN(nvnCommandBufferEndRecording, cb));
+    submit(q2, NVN(nvnCommandBufferEndRecording, cb));
     gfx_null_wait_classes(&k);
-    CHECK(k.later_gpu == 1 && k.later_cpu == 2);
-    CHECK(gfx_null_wait_events(&unsatisfied) == 7 && unsatisfied == 3);
+    CHECK(k.later_gpu == 1 && k.later_cpu == 1 && gfx_null_parked() == 0);
+    CHECK(gfx_null_wait_events(&unsatisfied) == 7 && unsatisfied == 2);
     printf("waits 7 unsatisfied %llu%s", (ull)unsatisfied, "\n");
     printf("classes gpu %llu cpu %llu initial %llu unsatisfied %llu later_gpu %llu later_cpu %llu\n", (ull)k.by_gpu,
            (ull)k.by_cpu, (ull)k.initial, (ull)k.unsatisfied, (ull)k.later_gpu, (ull)k.later_cpu);
     nvn_census_stats(print_stat, NULL);
-    // The list of unsatisfied waits is bounded (64): of 70 waits on a word nobody has signalled, a CPU signal and one
-    // more completion find 64 of them satisfied later by the CPU.
+    // 70 waits on a word nobody has signalled: the queue holds at the first, the other 69 are not met. One CPU signal
+    // releases it and finds them satisfied.
     uint64_t eve = event_object(g_pool, RESULTS + 0x100);
     NVN(nvnCommandBufferBeginRecording, cb);
     for (int i = 0; i < 70; i++) NVN_AT(MB + 0x4000, nvnCommandBufferWaitEvent, cb, eve, EQUAL, 1);
     submit(q, NVN(nvnCommandBufferEndRecording, cb));
-    NVN(nvnEventSignal, eve, WRITE, 1);
-    NVN(nvnCommandBufferBeginRecording, cb);
-    NVN(nvnCommandBufferDrawArrays, cb, 4, 0, 3);
-    submit(q, NVN(nvnCommandBufferEndRecording, cb));
     gfx_null_wait_classes(&k);
-    printf("bounded unsatisfied %llu later_cpu %llu dropped %llu pending %llu\n", (ull)k.unsatisfied, (ull)k.later_cpu,
-           (ull)k.dropped, (ull)k.pending);
+    CHECK(k.unsatisfied == 3 && k.pending == 1 && gfx_null_wait_events(&unsatisfied) == 8);
+    NVN(nvnEventSignal, eve, WRITE, 1);
+    gfx_null_wait_classes(&k);
+    printf("released unsatisfied %llu later_cpu %llu by_cpu %llu dropped %llu pending %llu\n", (ull)k.unsatisfied,
+           (ull)k.later_cpu, (ull)k.by_cpu, (ull)k.dropped, (ull)k.pending);
     // A wait on a word nobody signals stays unresolved: counted as pending, and the row for it says so.
     uint64_t evf = event_object(g_pool, RESULTS + 0x140);
     NVN(nvnCommandBufferBeginRecording, cb);
@@ -728,7 +731,7 @@ static void case_wait_events(void) {
     printf("ok wait_events\n");
 }
 
-// ---------- case wait_sites: WaitEvent counted per call site, by what satisfied it. A wait inside a recording that
+// ---------- case wait_sites: WaitEvent counted per call site, by what answered it. A wait inside a recording that
 // is called twice counts at its own site twice (CallCommands copies the record, caller included); 70 more sites than the
 // table holds go to one bucket; the sites and the bucket sum to the totals and to the classes.
 static const char *site_name(uint64_t caller, char *buf, int size) { return rt_guest_name(caller, buf, size); }
@@ -736,16 +739,17 @@ static void case_wait_sites(void) {
     setup(0, NULL);
     objects();
     uint64_t q = queue(), cb = command_buffer(), cb2 = command_buffer(), ev = event_object(g_pool, RESULTS);
+    uint64_t evi = event_object(g_pool, RESULTS + 0x40);   // never signalled: its waits are satisfied by its own value
     NVN(nvnCommandBufferBeginRecording, cb2);
-    NVN_AT(MB + 0x6000, nvnCommandBufferWaitEvent, cb2, ev, GEQUAL_WRAP, 0);   // satisfied by the word's own value, twice
-    NVN_AT(MB + 0x6000, nvnCommandBufferWaitEvent, cb2, ev, GEQUAL_WRAP, 0);   // per call of the recording
+    NVN_AT(MB + 0x6000, nvnCommandBufferWaitEvent, cb2, evi, GEQUAL_WRAP, 0);   // satisfied by the word's own value, twice
+    NVN_AT(MB + 0x6000, nvnCommandBufferWaitEvent, cb2, evi, GEQUAL_WRAP, 0);   // per call of the recording
     uint64_t called = NVN(nvnCommandBufferEndRecording, cb2), arr = galloc(8, 8);
     wr64(arr, called);
     NVN(nvnCommandBufferBeginRecording, cb);
     NVN(nvnCommandBufferCallCommands, cb, 1, arr);
     NVN(nvnCommandBufferCallCommands, cb, 1, arr);
     NVN_AT(MB + 0x7000, nvnCommandBufferWaitEvent, cb, ev, EQUAL, 9);          // not satisfied, until the CPU signals
-    for (int i = 0; i < 70; i++) NVN_AT(MB + 0x100 + 0x10 * (uint64_t)i, nvnCommandBufferWaitEvent, cb, ev, GEQUAL_WRAP, 0);
+    for (int i = 0; i < 70; i++) NVN_AT(MB + 0x100 + 0x10 * (uint64_t)i, nvnCommandBufferWaitEvent, cb, evi, GEQUAL_WRAP, 0);
     submit(q, NVN(nvnCommandBufferEndRecording, cb));
     NVN(nvnEventSignal, ev, WRITE, 9);
     NVN(nvnCommandBufferBeginRecording, cb);
@@ -782,25 +786,30 @@ static void case_wait_sites(void) {
     printf("ok wait_sites\n");
 }
 
-// Two pending waits at different sites, on words with different writers, satisfied in an order other than the one they were
-// submitted in: the first is satisfied by a GPU signal, which takes it off the pending list and moves the second into its
-// place; the second is then satisfied by a CPU signal. Each site must keep its own answer.
+// Two queues held at waits at different sites, on words with different writers: the first is released by a GPU signal of a
+// third queue, which takes it off the list of parked queues and leaves the second in place; the second is then released by
+// a CPU signal. Each site must keep its own answer.
 static void case_wait_sites_order(void) {
     setup(0, NULL);
     objects();
-    uint64_t q = queue(), cb = command_buffer();
+    uint64_t q1 = queue(), q2 = queue(), q3 = queue(), cb = command_buffer();
     uint64_t evg = event_object(g_pool, RESULTS + 0x200), evc = event_object(g_pool, RESULTS + 0x240);
     NVN(nvnCommandBufferBeginRecording, cb);
     NVN_AT(MB + 0x8000, nvnCommandBufferWaitEvent, cb, evg, EQUAL, 3);
+    submit(q1, NVN(nvnCommandBufferEndRecording, cb));
+    NVN(nvnCommandBufferBeginRecording, cb);
     NVN_AT(MB + 0x9000, nvnCommandBufferWaitEvent, cb, evc, EQUAL, 4);
-    submit(q, NVN(nvnCommandBufferEndRecording, cb));
+    submit(q2, NVN(nvnCommandBufferEndRecording, cb));
+    CHECK(gfx_null_parked() == 2);
     NVN(nvnCommandBufferBeginRecording, cb);
     NVN(nvnCommandBufferSignalEvent, cb, evg, WRITE, 2, 0, 3);
-    submit(q, NVN(nvnCommandBufferEndRecording, cb));
+    submit(q3, NVN(nvnCommandBufferEndRecording, cb));
+    CHECK(gfx_null_parked() == 1);
     NVN(nvnEventSignal, evc, WRITE, 4);
+    CHECK(gfx_null_parked() == 0);
     NVN(nvnCommandBufferBeginRecording, cb);
     NVN(nvnCommandBufferDrawArrays, cb, 4, 0, 3);
-    submit(q, NVN(nvnCommandBufferEndRecording, cb));
+    submit(q3, NVN(nvnCommandBufferEndRecording, cb));
     NvnWaitSite sites[64], other;
     int n = gfx_null_wait_sites(sites, 64, &other);
     CHECK(n == 2);
@@ -816,6 +825,90 @@ static void case_wait_sites_order(void) {
     printf("totals unsatisfied %llu later_gpu %llu later_cpu %llu pending %llu\n", (ull)k.unsatisfied, (ull)k.later_gpu,
            (ull)k.later_cpu, (ull)k.pending);
     printf("ok wait_sites_order\n");
+}
+
+// ---------- case two_queues: the queue of a submission reaches the back end (queue_t.serial, GfxBackend.submit). A wait on one
+// NVN queue is released by a signal submitted to another, and the two queues have two numbers; a queue copied by value
+// (the game may) keeps its own.
+static void case_two_queues(void) {
+    setup(0, NULL);
+    objects();
+    uint64_t q1 = queue(), q2 = queue(), cb = command_buffer(), ev = event_object(g_pool, RESULTS);
+    const queue_t *a = (const queue_t *)(uintptr_t)q1, *b = (const queue_t *)(uintptr_t)q2;
+    CHECK(a->serial && b->serial && a->serial != b->serial);
+    NVN(nvnCommandBufferBeginRecording, cb);
+    NVN_AT(MB + 0x1000, nvnCommandBufferWaitEvent, cb, ev, EQUAL, 1);
+    NVN(nvnCommandBufferDrawArrays, cb, 4, 0, 3);
+    submit(q1, NVN(nvnCommandBufferEndRecording, cb));
+    CHECK(gfx_null_parked() == 1 && gfx_backend()->fence_done() == 0);
+    NVN(nvnCommandBufferBeginRecording, cb);
+    NVN(nvnCommandBufferSignalEvent, cb, ev, WRITE, 2, 0, 1);
+    submit(q2, NVN(nvnCommandBufferEndRecording, cb));
+    CHECK(gfx_null_parked() == 0 && gfx_backend()->fence_done() == 2);
+    CHECK(*(const uint32_t *)(uintptr_t)(g_pool_mem + RESULTS) == 1);
+    printf("two queues released\n");
+
+    // A thread that waits on one NVN queue is not held by a wait on another (gfx.h, rule 3), whose release is a CPU signal
+    // this thread makes next: QueueFinish of q2 and a SyncWait on a fence of q2 return while q1 is held (a stop after 200
+    // ms if they waited for q1).
+    gfx_null_wait_bounds(0, 200000000u);
+    uint64_t evw = event_object(g_pool, RESULTS + 0x40), evs = event_object(g_pool, RESULTS + 0x80), s = sync_object();
+    NVN(nvnCommandBufferBeginRecording, cb);
+    NVN_AT(MB + 0x2000, nvnCommandBufferWaitEvent, cb, evw, EQUAL, 5);
+    submit(q1, NVN(nvnCommandBufferEndRecording, cb));
+    NVN(nvnCommandBufferBeginRecording, cb);
+    NVN(nvnCommandBufferSignalEvent, cb, evs, WRITE, 2, 0, 7);
+    submit(q2, NVN(nvnCommandBufferEndRecording, cb));
+    CHECK(gfx_null_parked() == 1 && gfx_backend()->fence_done() == 2);   // q1's held submission is the third, the prefix is 2
+    NVN(nvnQueueFinish, q2);
+    CHECK(*(const uint32_t *)(uintptr_t)(g_pool_mem + RESULTS + 0x80) == 7);   // q2's signal is visible while q1 is held
+    NVN(nvnQueueFenceSync, q2, s, 0, 0);
+    CHECK(sync_wait(s, UINT64_MAX) == ALREADY_SIGNALED);
+    CHECK(gfx_null_parked() == 1);
+    NVN(nvnEventSignal, evw, WRITE, 5);
+    CHECK(gfx_null_parked() == 0);
+    printf("queue 2 waited on while queue 1 was held\n");
+
+    // The serial of a queue copied by value is the original's (a signal made through the copy is q1's own), and a queue
+    // initialised again takes a new one.
+    uint64_t qc = galloc(0x2000, 16), evx = event_object(g_pool, RESULTS + 0xC0);
+    memcpy((void *)(uintptr_t)qc, (const void *)(uintptr_t)q1, sizeof(queue_t));
+    const queue_t *c1 = (const queue_t *)(uintptr_t)qc;
+    CHECK(c1->serial == a->serial);
+    NVN(nvnCommandBufferBeginRecording, cb);
+    NVN(nvnCommandBufferSignalEvent, cb, evx, WRITE, 2, 0, 1);
+    submit(qc, NVN(nvnCommandBufferEndRecording, cb));
+    NVN(nvnCommandBufferBeginRecording, cb);
+    NVN_AT(MB + 0x3000, nvnCommandBufferWaitEvent, cb, evx, EQUAL, 1);
+    submit(q1, NVN(nvnCommandBufferEndRecording, cb));
+    GfxNullWaitClasses k;
+    gfx_null_wait_classes(&k);
+    uint64_t same = k.by_gpu_same, other = k.by_gpu_other;
+    uint64_t old = a->serial;
+    queue_at(q1);   // initialised again
+    CHECK(a->serial != old && a->serial != b->serial);
+    NVN(nvnCommandBufferBeginRecording, cb);
+    NVN_AT(MB + 0x3100, nvnCommandBufferWaitEvent, cb, evx, EQUAL, 1);
+    submit(q1, NVN(nvnCommandBufferEndRecording, cb));
+    gfx_null_wait_classes(&k);
+    printf("copy same %llu other %llu then again same %llu other %llu\n", (ull)same, (ull)other, (ull)k.by_gpu_same,
+           (ull)k.by_gpu_other);
+    CHECK(k.by_gpu_same == same && k.by_gpu_other == other + 1);
+
+    // An event initialised again over the storage of an earlier one starts over: the back end's copy of the word (9, from
+    // a GPU signal) is dropped, and a wait for 0 on the new event holds at once
+    uint64_t evy = event_object(g_pool, RESULTS + 0x100);
+    NVN(nvnCommandBufferBeginRecording, cb);
+    NVN(nvnCommandBufferSignalEvent, cb, evy, WRITE, 2, 0, 9);
+    submit(q2, NVN(nvnCommandBufferEndRecording, cb));
+    CHECK(*(const uint32_t *)(uintptr_t)(g_pool_mem + RESULTS + 0x100) == 9);
+    *(volatile uint32_t *)(uintptr_t)(g_pool_mem + RESULTS + 0x100) = 0;   // the game reuses the storage
+    evy = event_object(g_pool, RESULTS + 0x100);
+    NVN(nvnCommandBufferBeginRecording, cb);
+    NVN_AT(MB + 0x4000, nvnCommandBufferWaitEvent, cb, evy, EQUAL, 0);
+    submit(q2, NVN(nvnCommandBufferEndRecording, cb));
+    CHECK(gfx_null_parked() == 0);
+    printf("ok two_queues\n");
 }
 
 // ---------- case event_words: the writer of every event word is remembered (a game makes hundreds of events), and only a
@@ -1039,7 +1132,7 @@ int main(int argc, char **argv) {
     const char *cs = argv[1];
     static const struct { const char *name; void (*fn)(void); } cases[] = {
         {"fences", case_fences}, {"timestamps", case_timestamps}, {"render_cond", case_render_cond},
-        {"window", case_window}, {"syncwait", case_syncwait}, {"wait_events", case_wait_events}, {"wait_sites", case_wait_sites}, {"wait_sites_order", case_wait_sites_order},
+        {"window", case_window}, {"syncwait", case_syncwait}, {"wait_events", case_wait_events}, {"wait_sites", case_wait_sites}, {"wait_sites_order", case_wait_sites_order}, {"two_queues", case_two_queues},
         {"event_cpu_invisible", case_event_cpu_invisible}, {"sync_uninitialised", case_sync_uninitialised},
         {"present_past_textures", case_present_past_textures}, {"window_five", case_window_five},
         {"report_no_pool", case_report_no_pool}, {"census_default", case_census_default}, {"census_interval1", case_census_interval1},

@@ -142,7 +142,7 @@ static void setup(int imports, int gated) {
 }
 
 static void finish_and_report(const char *name) {
-    gfx_vulkan_backend.finish();
+    gfx_vulkan_backend.finish(0);
     if (g_pack_open) vkp_close(), vkp_store_close();
     gfx_vulkan_backend.pool_fini(&g_gpool);
     gfx_vulkan_backend.pool_fini(&g_cpool);
@@ -191,7 +191,7 @@ static void update_ub(Rec *r, uint64_t dst, const void *data, uint32_t n) {
 static uint64_t submit(Rec *r) {
     put(r, OP_END, NULL, 0);
     uint64_t h = (uint64_t)(uintptr_t)r->b;
-    uint64_t v = gfx_vulkan_backend.submit(&h, 1);
+    uint64_t v = gfx_vulkan_backend.submit(1, &h, 1);
     CHECK(v);
     return v;
 }

@@ -877,7 +877,7 @@ static void resolve_deferred(nvn_copy *k) {
     }
 }
 
-uint64_t nvn_submit_recordings(Cpu *c, const uint64_t *handles, int n) {
+uint64_t nvn_submit_recordings(Cpu *c, uint64_t queue, const uint64_t *handles, int n) {
     if (n < 0 || n > SUBMIT_MAX || (n && !handles))
         rt_unimplemented(c, "nvn", "QueueSubmitCommands: %d handles at %p", n, (const void *)handles);
     nvn_copy *pins[SUBMIT_MAX];
@@ -905,7 +905,7 @@ uint64_t nvn_submit_recordings(Cpu *c, const uint64_t *handles, int n) {
             if (pins[i]->npr || nvn_probe_on()) pins[i]->probe_h = probe_copy_hash(pins[i]);   // the resolve is the front end's own write
         }
     ledger_frame_enter();
-    uint64_t fence = gfx_backend()->submit(handles, n);
+    uint64_t fence = gfx_backend()->submit(queue, handles, n);
     ledger_frame_leave();
     for (int i = 0; i < n; i++) copy_unpin(pins[i]);
     return fence;

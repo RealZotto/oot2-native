@@ -21,7 +21,8 @@
 // pass or at the next samples-passed report or reset (a query begun in a pass ends in it). A frame's queries come from
 // pools of its own, VKR_QUERIES at a time (VkReplayOps.queries, reset in the frame's prologue), up to VKR_QUERY_POOLS. The completion thread keeps the running count:
 // each query's result is added in order, a reset sets the count to 0 after the queries before it, a report writes it.
-// The back end sees every queue's work in one order and is not told which queue made it, so the channel has one count.
+// The back end sees every queue's work in one order and does not use the queue that made it (vk_submit.c), so the channel
+// has one count.
 // Draws before counting started are not counted.
 //
 // Conditional rendering is decided at replay, from the counter words at addr and addr + 16: read from memory, except

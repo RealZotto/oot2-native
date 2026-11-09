@@ -194,6 +194,29 @@ class TexheapTest(unittest.TestCase):
                 self.assertEqual(len(read_file(folder)["read"]), 1)
                 self.assertEqual(read_file(folder)["end"][-1]["fields"][0], str(EXIT_FATAL))
 
+    def test_a_bind_of_a_held_queue_belongs_to_its_own_submission(self) -> None:
+        # queue 1 is held at a wait before its bind; queue 2 binds another texture and is whole; the CPU releases queue 1,
+        # whose bind is replayed after queue 2's. Completing fence value 1 alone selects queue 1's texture and not queue 2's.
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, _ = self.passing(level, "held_bind", release="release")
+                after1 = re.search(r"^after-1 selected (\d+) expected (\d+)$", done.stdout, re.M)
+                after2 = re.search(r"^after-2 selected (\d+) expected (\d+)$", done.stdout, re.M)
+                self.assertIsNotNone(after1)
+                self.assertIsNotNone(after2)
+                self.assertGreater(int(after1[2]), 10)
+                self.assertEqual(after1[1], after1[2])
+                self.assertEqual(after2[1], after2[2])
+
+    def test_a_submission_completes_by_itself_while_an_earlier_one_of_another_queue_is_held(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, _ = self.passing(level, "held_complete", release="release")
+                for line in ("while-held", "released"):
+                    m = re.search(rf"^{line} selected (\d+) expected (\d+)$", done.stdout, re.M)
+                    self.assertIsNotNone(m, done.stdout)
+                    self.assertEqual(m[1], m[2])
+
     def test_writes_per_frame_and_what_the_rule_would_select(self) -> None:
         for level in LEVELS:
             with self.subTest(level=level):

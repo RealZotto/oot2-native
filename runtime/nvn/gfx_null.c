@@ -5,14 +5,15 @@
 // counted and texel reads return zeros. It is the back end of the front end's CPU-side tests, and of a run that needs
 // no picture.
 //
-// A submission is replayed when it is made and completed after, in submission order whichever queue made it: at once,
-// or, while completion is held (gfx_null_hold), when gfx_null_complete or the end of the hold completes it. Replay
-// walks every record of every recording, checks that each is whole (OP_BEGIN first, sizes that stay 8-byte aligned,
-// known ops, no call or jump, OP_END last), decides conditional rendering, shows the record to the op log a test
-// installs, and copies each record with a CPU-visible result, since the recording is not the back end's once submit
-// returns. Completion writes those results in op-stream order (event signals, counter reports, buffer copies and
-// clears, uniform updates), checks each WaitEvent, then publishes the fence value: a fence value is done only once
-// everything up to it is written.
+// A submission is replayed when it is made, unless a WaitEvent holds its queue (below), and completed after: at once, or,
+// while completion is held (gfx_null_hold), when gfx_null_complete or the end of the hold completes it. Queues complete
+// independently, each in its own order, and in fence order among the submissions that are whole at the same time. Replay checks that each recording is whole (OP_BEGIN first,
+// sizes that stay 8-byte aligned, known ops, no call or jump, OP_END last), walks every record in the order the queues'
+// waits allow, decides conditional rendering, shows the record to the op log a test installs, and copies each record
+// with a CPU-visible result, since the recording is not the back end's once submit returns. Completion writes those
+// results in op-stream order (event signals, counter reports, buffer copies and clears, uniform updates), then marks the
+// fence value done: a fence value is done once its submission and the queue's earlier ones are written, whatever another
+// queue is held at (fence_done is the highest value with every submission up to it done).
 //
 // Counter reports are {counter, timestamp}: the timestamp is the guest's system tick (31.25 MHz, rt_ticks) read from
 // the host clock when the report completes; the counter is 0 for every type, samples passed included, since nothing is
@@ -25,12 +26,17 @@
 // the work the condition would have saved). RenderEnable and the condition hold across submissions, as on one GPU
 // channel.
 //
-// WaitEvent is not waited for: completion runs in submission order, so a wait that the work before it satisfies costs
-// nothing. Completion checks each one against memory at its place in that order. The first wait met at each call site
-// is logged with its answer, and so is a site's first unsatisfied wait: on the console that wait would have held its
-// queue until another queue or the CPU signalled, which work in submission order cannot honour (architecture section 5).
-// Every queue's work is merged into that one order and a wait or a signal does not say which queue it came from here, so
-// a wait that a later submission satisfies may be one queue waiting for another, which runs concurrently on the console.
+// WaitEvent is answered by reordering (oot2/nvn_order.h, gfx.h): the records of every queue pass through the order
+// engine, which shows a queue's records in that queue's order and parks the queue at a wait that the replay so far does
+// not satisfy, until a signal replayed on another queue, or the CPU's signal (guest_written of the word), satisfies it.
+// Replay order can then differ from fence order. Results are copied per fence value at replay and written once the
+// submission is whole, and so is its fence value done; a queue's submissions are whole in the queue's order, and another
+// queue's held wait is no condition (a thread that finishes or waits on one queue is never held by another's wait, gfx.h
+// rule 3). A fence value behind a parked wait of its own queue is not done; a wait nothing releases is a named stop (after
+// WO_BOUND_SUBMITS further submissions, or, for a wait with no timeout on a fence value of the queue or on the queue's
+// finish, after WO_STALL_NS from the start of that wait). The first wait met at each call site is
+// logged with its answer, and so is a site's first unsatisfied wait: the queue is parked there until another queue or
+// the CPU signals. Presents are counted once every submission made before them is whole.
 //
 // Adapted from TotK Recomp runtime/gfx_null.c (MIT, Copyright (c) 2026 Valiantsin Dzerakh; licenses/totk-MIT.txt), as
 // DKB Recomp carries it at 9d8fa02 and oot-pc-recomp at 8e09aaa (GPL-3.0-or-later): the back-end table, the fence
@@ -48,6 +54,7 @@
 
 #include "nvn_api.h"
 #include "oot2/ledger.h"
+#include "oot2/nvn_order.h"
 #include "plat.h"
 
 typedef unsigned long long ull;
@@ -56,7 +63,7 @@ static PlatMutex g_lock = PLAT_MUTEX_INIT;   // replay and completion, one submi
 static _Thread_local int g_locked_here;
 static PlatCond g_done_cond = PLAT_COND_INIT;
 static uint64_t g_submitted;                 // the newest fence value handed out (g_lock)
-static uint64_t g_done;                      // the newest fence value done (written under g_lock, read anywhere)
+static uint64_t g_done;                      // every fence value up to this is done (written under g_lock, read anywhere)
 static uint64_t g_presents, g_records;
 static uint64_t g_op_counts[OP_COUNT_];      // records replayed, by op (the second draw count)
 
@@ -97,26 +104,53 @@ void gfx_null_op_counts(uint64_t *out) {
 }
 
 // ---------- what a submission leaves to completion: copies of its records with CPU-visible results, in stream order
+// One per fence value above g_done, oldest first. The records of one fence value can be replayed in pieces, with those of
+// other fence values between them (a queue held at a wait), so each keeps its own buffer. `whole`: every record of the
+// submission has been replayed. `done`: its results are written (it stays in the list until every value below is done).
 typedef struct results {
     struct results *next;
-    uint64_t fence;
+    uint64_t fence, queue;
     uint8_t *buf;
     size_t used, size;
+    int whole, done;
 } results;
-static results g_now;                              // the submission being replayed; its buffer is kept for the next
-static results *g_held, **g_held_tail = &g_held;   // replayed, not complete yet, oldest first
+static results *g_res, **g_res_tail = &g_res;
 static int g_hold;
 
-static void keep(const op_hdr *r) {
-    if (g_now.size - g_now.used < r->size) {
-        size_t size = g_now.size ? g_now.size : 4096;
-        while (size - g_now.used < r->size) size *= 2;
-        uint8_t *b = realloc(g_now.buf, size);
+static WoOrder g_wo;                         // the order the queues' records are replayed in (g_lock)
+static uint64_t g_bound_submits, g_bound_ns; // the bounds of a wait nothing releases; 0: WO_BOUND_SUBMITS, WO_STALL_NS
+
+static results *results_find(uint64_t fence) {
+    for (results *k = g_res; k; k = k->next)
+        if (k->fence == fence) return k;
+    return NULL;
+}
+
+static results *results_for(uint64_t fence) {
+    results *k = results_find(fence);
+    if (!k) rt_fatal("gfx: null back end: a record of submission %llu, which was not made", (ull)fence);
+    return k;
+}
+
+// Fence value `fence` is done (g_lock held): below the prefix, or its results are written. A value not in the list and
+// above the prefix is one no submit has handed out.
+static int fence_is_done(uint64_t fence) {
+    if (fence <= g_done) return 1;
+    const results *k = results_find(fence);
+    return k && k->done;
+}
+
+static void keep(uint64_t fence, const op_hdr *r) {
+    results *k = results_for(fence);
+    if (k->size - k->used < r->size) {
+        size_t size = k->size ? k->size : 4096;
+        while (size - k->used < r->size) size *= 2;
+        uint8_t *b = realloc(k->buf, size);
         if (!b) rt_fatal("gfx: null back end: %zu bytes of results", size);
-        g_now.buf = b, g_now.size = size;
+        k->buf = b, k->size = size;
     }
-    memcpy(g_now.buf + g_now.used, r, r->size);
-    g_now.used += r->size;
+    memcpy(k->buf + k->used, r, r->size);
+    k->used += r->size;
 }
 
 // ---------- conditional rendering, at replay
@@ -129,10 +163,9 @@ int gfx_null_render_enabled(void) { return g_render; }
 
 // 1: *v read; 2: a samples-passed report not complete (unknown); 0: the CPU cannot read the word.
 static int counter_word(uint64_t addr, uint64_t *v) {
-    uint64_t done = __atomic_load_n(&g_done, __ATOMIC_RELAXED);
     for (unsigned k = 1; k <= PENDING && k <= g_pending_head; k++) {
         unsigned i = (g_pending_head - k) % PENDING;
-        if (g_pending[i].addr == addr && g_pending[i].fence > done) return *v = 0, g_pending[i].samples ? 2 : 1;
+        if (g_pending[i].addr == addr && !fence_is_done(g_pending[i].fence)) return *v = 0, g_pending[i].samples ? 2 : 1;
     }
     if (gfx_gpu_only(addr) || !nvn_pool_find(addr, sizeof *v)) return 0;
     memcpy(v, (const void *)(uintptr_t)addr, sizeof *v);
@@ -163,17 +196,19 @@ static void replay(uint64_t fence, const op_hdr *r) {
         unsigned i = g_pending_head++ % PENDING;
         g_pending[i].addr = p->addr, g_pending[i].fence = fence;
         g_pending[i].samples = p->type == NVN_COUNTER_TYPE_SAMPLES_PASSED;
-        keep(r);
+        keep(fence, r);
         break;
     }
-    case OP_SIGNAL_EVENT: case OP_COPY_B2B: case OP_CLEAR_BUF: case OP_UPDATE_UB: case OP_WAIT_EVENT: keep(r); break;
+    case OP_SIGNAL_EVENT: case OP_COPY_B2B: case OP_CLEAR_BUF: case OP_UPDATE_UB: keep(fence, r); break;
     default: break;
     }
 }
 
 static LedgerTrack g_track = {.depth_fmt = -1, .samples = 1};                  // the bound state across records and submissions (g_lock)
 
-static void walk(uint64_t fence, int index, uint64_t handle) {
+// A recording is whole: OP_BEGIN first, sizes that stay 8-byte aligned, known ops, no call or jump, OP_END last. Checked
+// when the submission is made, before any record of it is replayed.
+static void check_whole(uint64_t fence, int index, uint64_t handle) {
     const uint8_t *p = (const uint8_t *)(uintptr_t)handle;
     for (size_t at = 0;;) {
         op_hdr h;
@@ -182,13 +217,6 @@ static void walk(uint64_t fence, int index, uint64_t handle) {
             (at == 0) != (h.op == OP_BEGIN))
             rt_fatal("gfx: null back end: recording %d of submission %llu is not whole at +%zu (op %u, %u bytes)", index,
                      (ull)fence, at, h.op, h.size);
-        __atomic_fetch_add(&g_records, 1, __ATOMIC_RELAXED);
-        __atomic_fetch_add(&g_op_counts[h.op], 1, __ATOMIC_RELAXED);
-        const op_hdr *r = (const op_hdr *)(const void *)(p + at);
-        replay(fence, r);
-        ledger_track_op(&g_track, r);
-        if (texheap_on()) texheap_op(r);
-        if (g_log) g_log(fence, index, r, g_log_ctx);
         at += h.size;
         if (h.op == OP_END) return;
     }
@@ -205,7 +233,7 @@ static void *cpu_addr(uint64_t addr, uint64_t size, const char *what) {
     return (void *)(uintptr_t)addr;
 }
 
-// WaitEvent call sites met, with what was logged for each and what each one's waits were satisfied by: the
+// WaitEvent call sites met, with what was logged for each and what each one's waits were answered by: the
 // same classes as the totals, kept per site, and one bucket for the sites past the table, so that the sites' counts always
 // sum to the totals. The site of a wait is the guest return address in its record, which CallCommands copies unchanged.
 #define WAIT_SITES 64
@@ -222,56 +250,16 @@ uint64_t gfx_null_wait_events(uint64_t *unsatisfied) {
     return n;
 }
 
-// Who wrote each event word last, as this back end saw it: a GPU signal at completion (in submission order) or the CPU
-// (nvnEventSignal, reported through guest_written). A WaitEvent is judged against the word at completion, which in a run
-// that completes at submit cannot tell a harmless order from a hazard; the classes below can: satisfied by the work before
-// it, by a CPU signal made before, or by neither (initial value), and the unsatisfied waits kept in a pending list that
-// each later completion checks again (satisfied later by a CPU signal is the case a back end replaying at submit cannot
-// honour, since the console holds the queue until the CPU signals). The words are kept in a table that grows with the
-// words signalled (a game makes hundreds of events), so no word is forgotten; the list of unsatisfied waits holds
-// PENDING_WAITS, and a wait that finds it full is counted as dropped. Under g_lock.
-enum { WRITER_NONE, WRITER_GPU, WRITER_CPU };
-#define PENDING_WAITS 64
-typedef struct { const volatile uint32_t *val; int writer; } WordRec;   // val NULL: a free slot
-static WordRec *g_words;                                                // open addressing, a power of two long
-static size_t g_word_cap, g_word_count;
-static p_wait_event g_wait_pending[PENDING_WAITS];
-static int g_wait_pending_site[PENDING_WAITS];   // the site of each pending wait: an index in g_sites, or -1 for the bucket
-static int g_nwait_pending;
+// The queues parked now, each at one wait: the queue and the site of its wait (an index in g_sites, or -1 for the bucket).
+// A queue holds one wait at a time, so the list is as long as the queues are many. Under g_lock.
+static struct { uint64_t queue; int site; } *g_parked;
+static int g_nparked, g_cparked;
 static GfxNullWaitClasses g_classes;
 
-static size_t word_slot(const WordRec *t, size_t cap, const volatile uint32_t *val) {
-    size_t i = (size_t)(((uint64_t)(uintptr_t)val >> 2) * 0x9E3779B97F4A7C15ull >> 32) & (cap - 1);
-    while (t[i].val && t[i].val != val) i = (i + 1) & (cap - 1);
-    return i;
-}
-static void word_note(const volatile uint32_t *val, int writer) {
-    if (!g_word_cap || 2 * (g_word_count + 1) > g_word_cap) {   // at most half full
-        size_t cap = g_word_cap ? 2 * g_word_cap : 1024;
-        WordRec *t = calloc(cap, sizeof *t);
-        if (!t) rt_fatal("gfx: null back end: the table of event words");
-        for (size_t i = 0; i < g_word_cap; i++)
-            if (g_words[i].val) t[word_slot(t, cap, g_words[i].val)] = g_words[i];
-        free(g_words);
-        g_words = t, g_word_cap = cap;
-    }
-    WordRec *r = &g_words[word_slot(g_words, g_word_cap, val)];
-    if (!r->val) g_word_count++;
-    r->val = val, r->writer = writer;
-}
-static int word_writer(const volatile uint32_t *val) {
-    if (!g_word_cap) return WRITER_NONE;
-    const WordRec *r = &g_words[word_slot(g_words, g_word_cap, val)];
-    return r->val ? r->writer : WRITER_NONE;
-}
-static int wait_ok(const p_wait_event *p, uint32_t *w) {
-    *w = __atomic_load_n(p->val, __ATOMIC_ACQUIRE);
-    return p->mode == NVN_EVENT_WAIT_MODE_EQUAL ? *w == p->value : (int32_t)(*w - p->value) >= 0;
-}
 void gfx_null_wait_classes(GfxNullWaitClasses *out) {
     int took = stats_lock();
     *out = g_classes;
-    out->pending = (uint64_t)g_nwait_pending;
+    out->pending = (uint64_t)g_nparked;
     if (took) null_unlock();
 }
 static GfxNullWaitClasses *site_classes(int s) { return s >= 0 ? &g_sites[s].c : &g_other_sites; }
@@ -283,8 +271,8 @@ int gfx_null_wait_sites(NvnWaitSite *out, int max, NvnWaitSite *other) {
     int n = g_nsites < max ? g_nsites : max;
     for (int i = 0; i < n; i++) out[i] = (NvnWaitSite){g_sites[i].caller, g_sites[i].c};
     if (other) *other = (NvnWaitSite){0, g_other_sites};
-    for (int i = 0; i < g_nwait_pending; i++) {   // not satisfied yet: counted at the site that waits
-        int s = g_wait_pending_site[i];
+    for (int i = 0; i < g_nparked; i++) {   // not released yet: counted at the site that waits
+        int s = g_parked[i].site;
         if (s >= 0 && s < n) out[s].c.pending++;
         else if (s < 0 && other) other->c.pending++;
     }
@@ -292,61 +280,116 @@ int gfx_null_wait_sites(NvnWaitSite *out, int max, NvnWaitSite *other) {
     return n;
 }
 
-// Called after each completion: an unsatisfied wait whose word has reached its value since is satisfied later, by the
-// writer that wrote the word last.
-static void recheck_pending(void) {
-    for (int i = 0; i < g_nwait_pending;) {
-        uint32_t w;
-        if (!wait_ok(&g_wait_pending[i], &w)) {
-            i++;
-            continue;
-        }
-        GfxNullWaitClasses *sc = site_classes(g_wait_pending_site[i]);
-        if (word_writer(g_wait_pending[i].val) == WRITER_CPU) g_classes.later_cpu++, sc->later_cpu++;
-        else g_classes.later_gpu++, sc->later_gpu++;
-        g_wait_pending[i] = g_wait_pending[--g_nwait_pending];
-        g_wait_pending_site[i] = g_wait_pending_site[g_nwait_pending];
-    }
+void gfx_null_wait_bounds(uint64_t submits, uint64_t stall_ns) {
+    null_lock();
+    g_bound_submits = submits, g_bound_ns = stall_ns;
+    null_unlock();
 }
 
-static void wait_event(const p_wait_event *p) {
-    uint32_t w;
-    int ok = wait_ok(p, &w);
-    g_waits++;
-    if (!ok) g_waits_unsatisfied++;
+int gfx_null_parked(void) {
+    int took = stats_lock();
+    int n = wo_parked(&g_wo);
+    if (took) null_unlock();
+    return n;
+}
+
+uint64_t gfx_null_longest_hold(void) {
+    int took = stats_lock();
+    uint64_t n = g_wo.longest_hold;
+    if (took) null_unlock();
+    return n;
+}
+
+uint64_t gfx_null_whole_through(void) {
+    int took = stats_lock();
+    uint64_t n = wo_whole_through(&g_wo);
+    if (took) null_unlock();
+    return n;
+}
+
+static int site_of(uint64_t caller, int *first) {
     int s = 0;
-    while (s < g_nsites && g_sites[s].caller != p->caller) s++;
-    int first = s == g_nsites;
-    if (first && g_nsites < WAIT_SITES) g_sites[g_nsites++].caller = p->caller;
-    else if (first) s = -1;   // past the table: such a site is not logged, and its waits go to the bucket
-    GfxNullWaitClasses *sc = site_classes(s);
-    if (ok) {
-        int who = word_writer(p->val);
-        if (who == WRITER_GPU) g_classes.by_gpu++, sc->by_gpu++;
-        else if (who == WRITER_CPU) g_classes.by_cpu++, sc->by_cpu++;
-        else g_classes.initial++, sc->initial++;
-    } else {
-        g_classes.unsatisfied++, sc->unsatisfied++;
-        if (g_nwait_pending < PENDING_WAITS) {
-            g_wait_pending_site[g_nwait_pending] = s;
-            g_wait_pending[g_nwait_pending++] = *p;
-        } else {
-            g_classes.dropped++, sc->dropped++;
-        }
-    }
+    while (s < g_nsites && g_sites[s].caller != caller) s++;
+    *first = s == g_nsites;
+    if (*first && g_nsites < WAIT_SITES) g_sites[g_nsites++].caller = caller;
+    else if (*first) s = -1;   // past the table: such a site is not logged, and its waits go to the bucket
+    return s;
+}
+
+static void log_wait(const p_wait_event *p, const WoWait *how, int ok) {
     char where[96];
-    if (s >= 0 && (first || (!ok && !g_sites[s].unsatisfied_logged))) {
-        int who = word_writer(p->val);
-        rt_log("nvn: WaitEvent at %s on the event word %p (%s %u, the word holds %u) is %s at its place in submission "
-               "order (the word was last written by %s)", rt_guest_name(p->caller, where, (int)sizeof where),
-               (const void *)p->val, p->mode == NVN_EVENT_WAIT_MODE_EQUAL ? "equal to" : "at least", p->value, w,
-               ok ? "satisfied" : "NOT satisfied",
-               who == WRITER_GPU ? "a GPU signal" : who == WRITER_CPU ? "a CPU signal" : "nothing yet");
-        if (!ok) g_sites[s].unsatisfied_logged = 1;
+    rt_log("nvn: WaitEvent at %s on the event word %p (%s %u, the word holds %u) is %s at its place in its queue's "
+           "replay (the word was last written by %s)", rt_guest_name(p->caller, where, (int)sizeof where),
+           (const void *)p->val, p->mode == NVN_EVENT_WAIT_MODE_EQUAL ? "equal to" : "at least", p->value, how->seen,
+           ok ? "satisfied" : "NOT satisfied",
+           how->writer == WO_WRITER_GPU ? "a GPU signal" : how->writer == WO_WRITER_CPU ? "a CPU signal" : "nothing yet");
+}
+
+// A wait that does not hold at its place: counted once, here, and its queue is parked.
+static void sink_parked(void *ctx, uint64_t queue, uint64_t fence, int index, const p_wait_event *p, const WoWait *how) {
+    (void)ctx, (void)fence, (void)index;
+    int first;
+    int s = site_of(p->caller, &first);
+    GfxNullWaitClasses *sc = site_classes(s);
+    g_waits++, g_waits_unsatisfied++;
+    g_classes.unsatisfied++, sc->unsatisfied++;
+    if (g_nparked == g_cparked) {
+        g_cparked = g_cparked ? 2 * g_cparked : 16;
+        g_parked = realloc(g_parked, sizeof *g_parked * (size_t)g_cparked);
+        if (!g_parked) rt_fatal("gfx: null back end: the list of parked queues");
+    }
+    g_parked[g_nparked].queue = queue, g_parked[g_nparked++].site = s;
+    if (s >= 0 && (first || !g_sites[s].unsatisfied_logged)) {
+        log_wait(p, how, 0);
+        g_sites[s].unsatisfied_logged = 1;
     }
 }
 
-static void complete(const results *k) {
+// A wait shown: it held at its place (counted here), or it was parked and is released now (counted when it parked).
+static void sink_wait(uint64_t queue, const p_wait_event *p, const WoWait *how) {
+    int first;
+    int s = site_of(p->caller, &first);
+    GfxNullWaitClasses *sc = site_classes(s);
+    if (how->parked) {
+        for (int i = 0; i < g_nparked; i++)
+            if (g_parked[i].queue == queue) {
+                g_parked[i] = g_parked[--g_nparked];
+                break;
+            }
+        if (how->writer == WO_WRITER_GPU) g_classes.later_gpu++, sc->later_gpu++;
+        else g_classes.later_cpu++, sc->later_cpu++;
+        return;
+    }
+    g_waits++;
+    if (how->writer == WO_WRITER_GPU) {
+        g_classes.by_gpu++, sc->by_gpu++;
+        if (how->signaller == queue) g_classes.by_gpu_same++, sc->by_gpu_same++;
+        else g_classes.by_gpu_other++, sc->by_gpu_other++;
+    } else if (how->writer == WO_WRITER_CPU) {
+        g_classes.by_cpu++, sc->by_cpu++;
+    } else {
+        g_classes.initial++, sc->initial++;
+    }
+    if (s >= 0 && first) log_wait(p, how, 1);
+}
+
+static void sink_record(void *ctx, uint64_t queue, uint64_t fence, int index, const op_hdr *r, const WoWait *how) {
+    (void)ctx;
+    __atomic_fetch_add(&g_records, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_op_counts[r->op], 1, __ATOMIC_RELAXED);
+    replay(fence, r);
+    ledger_track_op(&g_track, r);
+    if (texheap_on()) texheap_op(fence, r);
+    if (g_log) g_log(fence, index, r, g_log_ctx);
+    if (how) sink_wait(queue, (const p_wait_event *)(const void *)(r + 1), how);
+}
+
+static void sink_whole(void *ctx, uint64_t queue, uint64_t fence) {
+    (void)ctx, (void)queue;
+    results_for(fence)->whole = 1;
+}
+
+static void complete(results *k) {
     for (size_t at = 0; at < k->used;) {
         const op_hdr *r = (const op_hdr *)(const void *)(k->buf + at);
         const void *a = r + 1;
@@ -357,7 +400,7 @@ static void complete(const results *k) {
             if (p->mode == NVN_EVENT_SIGNAL_MODE_ADD) __atomic_fetch_add(p->val, p->value, __ATOMIC_RELEASE);
             else if (p->mode == NVN_EVENT_SIGNAL_MODE_WRITE) __atomic_store_n(p->val, p->value, __ATOMIC_RELEASE);
             else rt_fatal("gfx: null back end: SignalEvent mode %u is not one of NVN's", p->mode);
-            word_note(p->val, WRITER_GPU);
+            wo_signal_written(&g_wo, p->val, p->mode, p->value);   // the order engine's copy no longer owes an ADD to memory
             break;
         }
         case OP_REPORT_COUNTER: {
@@ -386,45 +429,88 @@ static void complete(const results *k) {
             if (d && p->size) memcpy(d, p->data, p->size);
             break;
         }
-        case OP_WAIT_EVENT: wait_event(a); break;
         default: break;
         }
     }
-    recheck_pending();
     if (texheap_on()) texheap_complete(k->fence);
-    __atomic_store_n(&g_done, k->fence, __ATOMIC_RELEASE);
+    free(k->buf);
+    k->buf = NULL, k->used = k->size = 0;
+    k->done = 1;
+}
+
+// Complete the submissions that are whole, oldest first, up to fence value `value` (0: all of them). A submission held at
+// a wait, or behind one of its queue, is not whole and is skipped, not waited for: the queues that are not held complete
+// (a queue's own submissions are whole in its own order, so none completes ahead of an earlier one of its queue). The
+// done prefix then moves up over the values that are done.
+static void complete_ready(uint64_t value) {
+    for (results *k = g_res; k && (!value || k->fence <= value); k = k->next)
+        if (k->whole && !k->done) complete(k);
+    while (g_res && g_res->done) {
+        results *k = g_res;
+        g_res = k->next;
+        if (!g_res) g_res_tail = &g_res;
+        __atomic_store_n(&g_done, k->fence, __ATOMIC_RELEASE);
+        free(k);
+    }
     plat_cond_broadcast(&g_done_cond);
 }
 
-static void complete_held(uint64_t value) {
-    while (g_held && (!value || g_held->fence <= value)) {
-        results *k = g_held;
-        g_held = k->next;
-        if (!g_held) g_held_tail = &g_held;
-        complete(k);
-        free(k->buf);
-        free(k);
+// ---------- presents, counted once the work before them is whole
+// A present made while a queue is held at a wait would show a picture the held work has not drawn: it waits for
+// every submission made before it (gfx.h, rule 4).
+static struct { uint64_t after; } *g_present_wait;
+static size_t g_npresent_wait, g_cpresent_wait;
+
+static void presents_release(void) {
+    uint64_t through = wo_whole_through(&g_wo);
+    size_t kept = 0;
+    for (size_t i = 0; i < g_npresent_wait; i++) {
+        if (g_present_wait[i].after <= through) __atomic_fetch_add(&g_presents, 1, __ATOMIC_RELAXED);
+        else g_present_wait[kept++] = g_present_wait[i];
     }
+    g_npresent_wait = kept;
 }
 
+// After the order engine moved: complete what is whole (unless completion is held) and release the presents.
+static void settle(void) {
+    if (!g_hold) complete_ready(0);
+    presents_release();
+}
+
+// ---------- the bounds of a wait nothing releases
+static uint64_t now_ns(void) { return plat_now_ns(); }
+
+static void stop_waiting(const WoStall *st, const char *why) {
+    char where[96];
+    rt_fatal("gfx: null back end: the WaitEvent of queue %llu at %s (submission %llu, recording %d) on the event word %p "
+             "(%s %u, the word holds %u) was released by no signal in %llu submissions and %llu ms: %s",
+             (ull)st->queue, rt_guest_name(st->wait.caller, where, (int)sizeof where), (ull)st->fence, st->index,
+             (const void *)st->wait.val, st->wait.mode == NVN_EVENT_WAIT_MODE_EQUAL ? "equal to" : "at least",
+             st->wait.value, st->seen, (ull)st->submits_since, (ull)(st->waited_ns / 1000000u), why);
+}
+
+static uint64_t bound_submits(void) { return g_bound_submits ? g_bound_submits : WO_BOUND_SUBMITS; }
+static uint64_t bound_ns(void) { return g_bound_ns ? g_bound_ns : WO_STALL_NS; }
+
 // ---------- the back-end operations
-// The lock spans the whole submission, so the results of submission k are written before fence k is published and
-// before submission k + 1 starts; a held submission waits in the list until its turn.
-static uint64_t null_submit(const uint64_t *handles, int n) {
+// The lock spans the whole submission: its records are replayed (those the queue's waits let through), the signals they
+// make release the other queues, and what is whole is completed in fence order before the next submission starts.
+static uint64_t null_submit(uint64_t queue, const uint64_t *handles, int n) {
     null_lock();
-    uint64_t fence = ++g_submitted;
-    g_now.fence = fence, g_now.used = 0, g_now.next = NULL;
+    uint64_t fence = g_submitted + 1;
+    for (int i = 0; i < n; i++) check_whole(fence, i, handles[i]);
+    g_submitted = fence;
+    results *k = calloc(1, sizeof *k);
+    if (!k) rt_fatal("gfx: null back end: a submission");
+    k->fence = fence, k->queue = queue;
+    *g_res_tail = k, g_res_tail = &k->next;
+    if (!g_wo.sink.record) wo_start(&g_wo, &(WoSink){NULL, sink_parked, sink_record, sink_whole, now_ns});
     if (texheap_on()) texheap_submit(fence);
-    for (int i = 0; i < n; i++) walk(fence, i, handles[i]);
-    if (g_hold || g_held) {
-        results *k = malloc(sizeof *k);
-        if (!k) rt_fatal("gfx: null back end: a held submission");
-        *k = g_now;
-        g_now.buf = NULL, g_now.size = 0;
-        *g_held_tail = k, g_held_tail = &k->next;
-    } else {
-        complete(&g_now);
-    }
+    wo_submit(&g_wo, queue, fence, handles, n);
+    settle();
+    WoStall st;
+    if (wo_stalled(&g_wo, &(WoStallQuery){.max_submits = bound_submits(), .queue = WO_ANY_QUEUE}, &st))
+        stop_waiting(&st, "the bound on submissions");
     null_unlock();
     return fence;
 }
@@ -432,42 +518,81 @@ static uint64_t null_submit(const uint64_t *handles, int n) {
 void gfx_null_hold(int on) {
     null_lock();
     g_hold = on;
-    if (!on) complete_held(0);
+    if (!on) complete_ready(0);
     null_unlock();
 }
 
 uint64_t gfx_null_complete(uint64_t value) {
     null_lock();
-    complete_held(value);
+    complete_ready(value);
     uint64_t done = __atomic_load_n(&g_done, __ATOMIC_RELAXED);
     null_unlock();
     return done;
 }
 
-// A value no submit has handed out is not reached by waiting here: the answer is immediate.
+// Wait on the done count (g_lock held, as plat_cond_wait wants), up to timeout_ns (UINT64_MAX: none) from start. An
+// unlimited wait wakes every 20 ms to look for its queue parked longer than the bound: it is the one wait that nothing
+// ends when the wait it sits behind is never released.
+static void wait_done(uint64_t start, uint64_t timeout_ns) {
+    uint64_t slice = 20000000u;
+    if (timeout_ns != UINT64_MAX) {
+        uint64_t spent = plat_now_ns() - start;
+        if (spent >= timeout_ns) return;
+        if (timeout_ns - spent < slice) slice = timeout_ns - spent;
+    }
+    plat_cond_wait_ns(&g_done_cond, &g_lock, slice);
+}
+
+// The wait that began at `start` for fence values up to `upto` of `queue` (WO_ANY_QUEUE, 0: all of them) has sat behind a
+// parked queue past the time bound: a stop. The time counts from the later of the park and `start`, so a queue parked
+// long before a wait began (a slow CPU release, a debugger pause) does not make that wait stop at once; and a queue
+// parked that this wait does not depend on is not looked at.
+static void check_stall(uint64_t queue, uint64_t upto, uint64_t start) {
+    WoStall st;
+    if (wo_stalled(&g_wo, &(WoStallQuery){.max_ns = bound_ns(), .since_ns = start, .queue = queue, .upto_fence = upto}, &st))
+        stop_waiting(&st, "a wait with no timeout for work held behind it");
+}
+
+// A value no submit has handed out is not reached by waiting here: the answer is immediate. A value is done when its
+// own queue's work up to it is (gfx.h, rule 3): a queue held at a wait is waited for by the threads that wait on that
+// queue and no others.
 static int null_fence_wait(uint64_t value, uint64_t timeout_ns) {
     if (value <= __atomic_load_n(&g_done, __ATOMIC_ACQUIRE)) return 1;
     null_lock();
     uint64_t start = plat_now_ns();
-    while (value <= g_submitted && __atomic_load_n(&g_done, __ATOMIC_RELAXED) < value) {
-        if (timeout_ns == UINT64_MAX) {
-            plat_cond_wait(&g_done_cond, &g_lock);
-            continue;
+    int ok = 0;
+    for (;;) {
+        if (value > g_submitted) break;
+        const results *k = results_find(value);
+        if (!k || k->done) {   // not in the list: below the prefix
+            ok = 1;
+            break;
         }
-        uint64_t spent = plat_now_ns() - start;
-        if (spent >= timeout_ns) break;
-        plat_cond_wait_ns(&g_done_cond, &g_lock, timeout_ns - spent);
+        if (timeout_ns != UINT64_MAX && plat_now_ns() - start >= timeout_ns) break;
+        wait_done(start, timeout_ns);
+        if (timeout_ns == UINT64_MAX && (k = results_find(value)) && !k->done) check_stall(k->queue, value, start);
     }
-    int ok = __atomic_load_n(&g_done, __ATOMIC_RELAXED) >= value;
     null_unlock();
     return ok;
 }
 
 static uint64_t null_fence_done(void) { return __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); }
 
+// Shown when the work before it is whole, which is at once unless a queue is held at a wait.
 static void null_present(const tex_t *t, const int crop[4]) {
     (void)t, (void)crop;
-    __atomic_fetch_add(&g_presents, 1, __ATOMIC_RELAXED);
+    null_lock();
+    if (g_submitted <= wo_whole_through(&g_wo)) {
+        __atomic_fetch_add(&g_presents, 1, __ATOMIC_RELAXED);
+    } else {
+        if (g_npresent_wait == g_cpresent_wait) {
+            g_cpresent_wait = g_cpresent_wait ? 2 * g_cpresent_wait : 16;
+            g_present_wait = realloc(g_present_wait, sizeof *g_present_wait * g_cpresent_wait);
+            if (!g_present_wait) rt_fatal("gfx: null back end: the list of presents held for a wait");
+        }
+        g_present_wait[g_npresent_wait++].after = g_submitted;
+    }
+    null_unlock();
 }
 
 // No present timing: every shown tick is unknown, and the answer is immediate.
@@ -476,10 +601,18 @@ static uint64_t null_present_shown(uint64_t seq) {
     return 0;
 }
 
-static void null_finish(void) {
+// Every submission so far of `queue` (0: of every queue) is done.
+static void null_finish(uint64_t queue) {
     null_lock();
-    uint64_t target = g_submitted;
-    while (__atomic_load_n(&g_done, __ATOMIC_RELAXED) < target) plat_cond_wait(&g_done_cond, &g_lock);
+    uint64_t target = 0, start = plat_now_ns();
+    for (const results *k = g_res; k; k = k->next)
+        if (!k->done && (!queue || k->queue == queue)) target = k->fence;
+    for (;;) {
+        const results *k = target ? results_find(target) : NULL;
+        if (!k || k->done) break;
+        wait_done(start, UINT64_MAX);
+        check_stall(queue ? queue : WO_ANY_QUEUE, target, start);
+    }
     null_unlock();
 }
 
@@ -495,11 +628,22 @@ static void null_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegi
     (void)t, (void)v, (void)r, (void)src, (void)row, (void)img;
 }
 
-// nvnEventSignal reports the CPU's signal of an event word (4 bytes): the classifier notes it as the word's last writer
+// nvnEventSignal reports the CPU's signal of an event word (4 bytes): a queue held at a wait on it may go on. Any other
+// 4-byte write the CPU reports is treated the same way, and the engine only remembers a word it has not met as written by
+// the CPU.
 static void null_guest_written(uint64_t addr, uint64_t size) {
     if (size != 4) return;
     null_lock();
-    word_note((const volatile uint32_t *)(uintptr_t)addr, WRITER_CPU);
+    if (!g_wo.sink.record) wo_start(&g_wo, &(WoSink){NULL, sink_parked, sink_record, sink_whole, now_ns});
+    wo_cpu_write(&g_wo, (const volatile uint32_t *)(uintptr_t)addr);
+    settle();
+    null_unlock();
+}
+static void null_event_initialized(uint64_t addr) {
+    null_lock();
+    if (!g_wo.sink.record) wo_start(&g_wo, &(WoSink){NULL, sink_parked, sink_record, sink_whole, now_ns});
+    wo_word_reset(&g_wo, (const volatile uint32_t *)(uintptr_t)addr);
+    settle();
     null_unlock();
 }
 static void null_guest_read(uint64_t addr, uint64_t size) { (void)addr, (void)size; }
@@ -525,6 +669,7 @@ const GfxBackend gfx_null_backend = {
     .guest_read = null_guest_read,
     .cpu_synced = null_cpu_synced,
     .present_shown = null_present_shown,
+    .event_initialized = null_event_initialized,
 };
 
 uint64_t gfx_null_presents(void) { return __atomic_load_n(&g_presents, __ATOMIC_RELAXED); }

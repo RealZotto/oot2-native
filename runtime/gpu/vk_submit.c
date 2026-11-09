@@ -222,11 +222,20 @@ static int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
 // The replay (oot2/vk_replay.h) resolves its bindings in the submission (a mirror's first resolve brings it current in
 // the prologue) and declares its GPU writes (backing_gpu_wrote); its end reads back what it wrote into mirrors. The
 // recorder thread submits the frame.
-static uint64_t vk_submit(const uint64_t *handles, int n) { return vkr_submit(handles, n); }
+// The queue is not used yet: the replay merges every queue into one frame per submission and answers no WaitEvent by
+// order (it checks and logs the wait at completion, vk_replay_report.c). Parking a queue at a wait splits that frame; the
+// order engine of the null back end (oot2/nvn_order.h) is shaped for it, and the device checks decide the wiring.
+static uint64_t vk_submit(uint64_t queue, const uint64_t *handles, int n) {
+    (void)queue;
+    return vkr_submit(handles, n);
+}
 
 static int vk_fence_wait(uint64_t value, uint64_t timeout_ns) { return gpu_sync_wait(value, timeout_ns); }
 static uint64_t vk_fence_done(void) { return gpu_sync_done(); }
-static void vk_finish(void) { gpu_sync_finish(); }
+static void vk_finish(uint64_t queue) {   // one timeline: every queue's work is finished, which covers the queue's
+    (void)queue;
+    gpu_sync_finish();
+}
 
 // The bindless tables (oot2/bindless.h): a registration changes one entry of its pool's shadow table and appends one
 // record to the change log; the copies of set 0 take it when a submission does.

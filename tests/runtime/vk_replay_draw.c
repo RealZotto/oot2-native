@@ -910,7 +910,7 @@ static void run_draw(const Opts *o) {
     print_stats();
 
     // close the way the device tests do: the recorder, the pipelines, the device, then the layer's counts
-    gfx_backend()->finish();
+    gfx_backend()->finish(0);
     vkrec_idle();
     vkrec_close();
     vkp_close();

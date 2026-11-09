@@ -494,10 +494,10 @@ int main(int argc, char **argv) {
         CHECK(strstr(t, "\nnvn-stat\trecordings\timplemented\t1\t\tinline 0, slow 1, ended with a handle 1, ended empty 1\n"));
         CHECK(strstr(t, "\nnvn-stat\tcallbacks\timplemented\t0\t\tmemory callbacks: control 0, command 0; recordings begun "
                         "over left-out records 0\n"));
-        CHECK(strstr(t, "\nnvn-stat\twaitevents\timplemented\t0\t\tWaitEvents met 0, unsatisfied at completion 0\n"));
+        CHECK(strstr(t, "\nnvn-stat\twaitevents\timplemented\t0\t\tWaitEvents met 0, unsatisfied at their place 0\n"));
         CHECK(strstr(t, "\nnvn-stat\twaitclasses\timplemented\t0\t\tby a GPU signal in order 0, by a CPU signal before 0, "
                         "already satisfied 0, unsatisfied 0 (later by GPU 0, later by CPU 0, not satisfied by the end 0, "
-                        "dropped from the full list 0)\n"));
+                        "dropped from the full list 0); GPU signals in order: of its own queue 0, of another 0\n"));
         CHECK(strstr(t, "\nnvn-stat\tpools\timplemented\t0\t\tmemory pools made 0, live 0 (most at once 0), 0 bytes live "
                         "(most 0); made with GPU_NO_ACCESS 0; GPU address window in use 0 bytes (most 0 of 68719476736)\n"));
         CHECK(strstr(t, "\nnvn-stat\tpools-virtual\timplemented\t0\t\tmade 0, live 0 (most at once 0), 0 bytes live "

@@ -114,7 +114,7 @@ static Rec *rec_begin(void) {
 static uint64_t submit(Rec *r) {
     put(r, OP_END, NULL, 0);
     uint64_t h = (uint64_t)(uintptr_t)r->b;
-    uint64_t v = gfx_vulkan_backend.submit(&h, 1);
+    uint64_t v = gfx_vulkan_backend.submit(1, &h, 1);
     CHECK(v);
     return v;
 }
@@ -183,7 +183,7 @@ static void setup(int w, int h, int with_ui) {
 }
 
 static void finish_and_report(const char *name) {
-    gfx_vulkan_backend.finish();
+    gfx_vulkan_backend.finish(0);
     gfx_vulkan_backend.pool_fini(&g_gpool);
     gpu_vk_close();
     win_close();
@@ -487,7 +487,7 @@ static void case_pixels(void) {
         clear_tex(r, &g_tex[k], region(OUT_W / 2, 0, OUT_W / 2, OUT_H), blue);
         submit(r);
     }
-    gfx_vulkan_backend.finish();
+    gfx_vulkan_backend.finish(0);
     g_fixed = 1;   // the frames that follow present these textures as they are
     CHECK(settle_at(W, H));
     int ox, oy;

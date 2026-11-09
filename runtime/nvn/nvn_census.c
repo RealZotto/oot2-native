@@ -14,6 +14,7 @@
 #include "nvn_api.h"
 #include "nvn_cmd.h"
 #include "oot2/memory.h"
+#include "oot2/nvn_order.h"
 #include "oot2/nvn_pace.h"
 #include "plat.h"
 
@@ -304,21 +305,22 @@ void nvn_census_stats(NvnStatRow emit, void *ctx) {
     NvnCmdCounts k;
     nvn_cmd_counts(&k);
     uint64_t unsat = 0, waits = gfx_null_wait_events(&unsat);
-    char why[400];
+    char why[640];
     snprintf(why, sizeof why, "inline %llu, slow %llu, ended with a handle %llu, ended empty %llu", (ull)k.begin_inline,
              (ull)k.begin_slow, (ull)k.end_handle, (ull)k.end_empty);
     emit(ctx, "recordings", k.begin_inline + k.begin_slow, why);
     snprintf(why, sizeof why, "memory callbacks: control %llu, command %llu; recordings begun over left-out records %llu",
              (ull)k.callback_control, (ull)k.callback_command, (ull)k.left_out);
     emit(ctx, "callbacks", k.callback_control + k.callback_command, why);
-    snprintf(why, sizeof why, "WaitEvents met %llu, unsatisfied at completion %llu", (ull)waits, (ull)unsat);
+    snprintf(why, sizeof why, "WaitEvents met %llu, unsatisfied at their place %llu", (ull)waits, (ull)unsat);
     emit(ctx, "waitevents", waits, why);
     GfxNullWaitClasses w;
     gfx_null_wait_classes(&w);
     snprintf(why, sizeof why, "by a GPU signal in order %llu, by a CPU signal before %llu, already satisfied %llu, "
              "unsatisfied %llu (later by GPU %llu, later by CPU %llu, not satisfied by the end %llu, dropped from the "
-             "full list %llu)", (ull)w.by_gpu, (ull)w.by_cpu, (ull)w.initial, (ull)w.unsatisfied, (ull)w.later_gpu,
-             (ull)w.later_cpu, (ull)w.pending, (ull)w.dropped);
+             "full list %llu); GPU signals in order: of its own queue %llu, of another %llu", (ull)w.by_gpu, (ull)w.by_cpu,
+             (ull)w.initial, (ull)w.unsatisfied, (ull)w.later_gpu, (ull)w.later_cpu, (ull)w.pending, (ull)w.dropped,
+             (ull)w.by_gpu_same, (ull)w.by_gpu_other);
     emit(ctx, "waitclasses", w.by_gpu + w.by_cpu + w.initial + w.unsatisfied, why);
     // WaitEvent per call site, the same classes: one row per site, then the bucket of the sites past the
     // table's 64, so the rows sum to the row above. The site is the guest function the wait was recorded from.
@@ -338,7 +340,16 @@ void nvn_census_stats(NvnStatRow emit, void *ctx) {
                      (ull)s->c.later_gpu, (ull)s->c.later_cpu, (ull)s->c.pending, (ull)s->c.dropped);
             emit(ctx, key, s->c.by_gpu + s->c.by_cpu + s->c.initial + s->c.unsatisfied, why);
         }
-        emit(ctx, "waitqueues", 0, "not measured: the queue of a wait and of its signal is not recorded at submit (left to the replay work)");
+        // The same waits by the queue pair: a GPU signal's queue against the waiting queue's, and a CPU signal's release.
+        snprintf(why, sizeof why, "GPU signal in order: of the waiting queue itself %llu, of another queue %llu; GPU signal of "
+                 "another queue after the wait parked its queue %llu; CPU signal: before %llu, after the wait parked its "
+                 "queue %llu", (ull)w.by_gpu_same, (ull)w.by_gpu_other, (ull)w.later_gpu, (ull)w.by_cpu, (ull)w.later_cpu);
+        emit(ctx, "waitqueues", w.by_gpu_same + w.by_gpu_other + w.later_gpu, why);
+        // How long a held queue waited: the bound (a stop) is calibrated on this.
+        snprintf(why, sizeof why, "queues held at a wait %llu; longest hold %llu submissions made meanwhile (a stop at %u, or "
+                 "%llu s for a wait with no timeout); held now %llu", (ull)w.unsatisfied, (ull)gfx_null_longest_hold(),
+                 (unsigned)WO_BOUND_SUBMITS, (ull)(WO_STALL_NS / 1000000000ull), (ull)w.pending);
+        emit(ctx, "waitholds", w.unsatisfied, why);
     }
     NvnPoolStats ps;
     nvn_pool_stats(&ps);

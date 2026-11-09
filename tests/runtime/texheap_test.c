@@ -158,7 +158,8 @@ static uint64_t tex_size(uint64_t t) { return NVN(nvnTextureGetStorageSize, t); 
 
 // One flat recording: bind the texture IDs (and, when rt is not NULL, set it as the colour target), then submit it. The
 // null back end walks it and completes it before the call returns.
-static void submit_binding(uint64_t table, const uint32_t *ids, int n, const tex_t *rt) {
+static void submit_on(uint64_t queue, uint64_t table, const uint32_t *ids, int n, const tex_t *rt,
+                      volatile uint32_t *wait_on) {
     static uint8_t buf[4096] __attribute__((aligned(8)));
     size_t at = 0;
 #define PUT(op_, payload, bytes)                                                       \
@@ -169,6 +170,10 @@ static void submit_binding(uint64_t table, const uint32_t *ids, int n, const tex
         at += h_.size;                                                                 \
     } while (0)
     PUT(OP_BEGIN, NULL, 0);
+    if (wait_on) {   // the queue is held here until the word is 1
+        p_wait_event we = {wait_on, NVN_EVENT_WAIT_MODE_EQUAL, 1, 0x1000};
+        PUT(OP_WAIT_EVENT, &we, sizeof we);
+    }
     p_set_pool sp = {{table, 64, 0}};
     PUT(OP_SET_TEX_POOL, &sp, sizeof sp);
     p_bind_handles bh;
@@ -185,7 +190,10 @@ static void submit_binding(uint64_t table, const uint32_t *ids, int n, const tex
     }
     PUT(OP_END, NULL, 0);
     uint64_t handle = (uint64_t)(uintptr_t)buf;
-    CHECK(gfx_backend()->submit(&handle, 1) != 0);
+    CHECK(gfx_backend()->submit(queue, &handle, 1) != 0);
+}
+static void submit_binding(uint64_t table, const uint32_t *ids, int n, const tex_t *rt) {
+    submit_on(1, table, ids, n, rt, NULL);
 }
 static void present(void) {   // as nvnQueuePresentTexture calls it
     ++g_seq;
@@ -320,6 +328,57 @@ static void case_rewrite(void) {
     printf("ok rewrite\n");
 }
 
+// Two queues: the first is held at a wait before its bind, the second binds another texture and is whole. A held queue's
+// records are replayed after later submissions' and queues complete independently, so a bind belongs to the submission it
+// was made in, not to the newest one, and a completed submission completes itself and no earlier one. Completion is
+// held in held_bind (the bind is replayed while both submissions are in flight, and each is completed by its fence value)
+// and is not in held_complete (the second completes while the first is held).
+static volatile uint32_t g_ev;
+static uint64_t t5_pages(void) { return (last_page(w.base + OFF_T5, tex_size(w.t5)) - first_page(w.base + OFF_T5)) / P4; }
+static void case_held_bind(void) {
+    if (no_write_watch()) return (void)printf("skip held_bind\n");
+    world();
+    write_cpu_textures();
+    static const uint32_t t1[] = {0}, t5[] = {4};
+    gfx_null_hold(1);
+    submit_on(1, tp_addr(), t1, 1, NULL, &g_ev);   // held at the wait, before the bind
+    submit_on(2, tp_addr(), t5, 1, NULL, NULL);    // whole, its bind replayed first
+    g_ev = 1;
+    gfx_backend()->guest_written((uint64_t)(uintptr_t)&g_ev, 4);   // the first queue goes on: its bind is replayed last
+    CHECK(gfx_null_parked() == 0);
+    CHECK(gfx_null_complete(1) == 1);   // fence value 1 only
+    present();
+    RtPageStats s;
+    uint64_t first = stats().released;
+    printf("after-1 selected %llu expected %llu\n", (ull)first, (ull)t1_expected());
+    CHECK(first == t1_expected());      // the bind made in submission 1 is submission 1's
+    CHECK(gfx_null_complete(2) == 2);
+    present();
+    s = stats();
+    printf("after-2 selected %llu expected %llu\n", (ull)s.released, (ull)(t1_expected() + t5_pages()));
+    CHECK(s.released == t1_expected() + t5_pages());
+    printf("ok held_bind\n");
+}
+static void case_held_complete(void) {
+    if (no_write_watch()) return (void)printf("skip held_complete\n");
+    world();
+    write_cpu_textures();
+    static const uint32_t t1[] = {0}, t5[] = {4};
+    submit_on(1, tp_addr(), t1, 1, NULL, &g_ev);   // held at the wait
+    submit_on(2, tp_addr(), t5, 1, NULL, NULL);    // whole and complete at once, while fence value 1 is held
+    present();
+    uint64_t first = stats().released;
+    printf("while-held selected %llu expected %llu\n", (ull)first, (ull)t5_pages());
+    CHECK(first == t5_pages());
+    g_ev = 1;
+    gfx_backend()->guest_written((uint64_t)(uintptr_t)&g_ev, 4);
+    present();
+    RtPageStats s = stats();
+    printf("released selected %llu expected %llu\n", (ull)s.released, (ull)(t1_expected() + t5_pages()));
+    CHECK(s.released == t1_expected() + t5_pages());
+    printf("ok held_complete\n");
+}
+
 // Counting mode: a read of an armed page is counted as guest code's or the runtime's, the first of each texture is
 // written to the file, and the page is restored.
 static void case_count(void) {
@@ -379,6 +438,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "count")) case_count();
     else if (!strcmp(cs, "read_released")) case_read_released();
     else if (!strcmp(cs, "frames")) case_frames();
+    else if (!strcmp(cs, "held_bind")) case_held_bind();
+    else if (!strcmp(cs, "held_complete")) case_held_complete();
     else return 2;
     return 0;
 }

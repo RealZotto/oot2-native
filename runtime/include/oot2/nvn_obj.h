@@ -49,8 +49,9 @@ typedef struct { uint32_t magic, flags, origin, depth_mode; void *dbg_cb, *dbg_d
 
 typedef struct { NVNdevice *dev; uint32_t flags; uint64_t cmd_sz, comp_sz, ctl_sz, flush; void *mem; uint64_t mem_sz; } queue_builder_t;
 FITS(queue_builder_t, NVNqueueBuilder);
-// last: the fence value of the queue's newest submission (0: none yet), what QueueFenceSync waits for
-typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits, last; } queue_t;           FITS(queue_t, NVNqueue);
+// last: the fence value of the queue's newest submission (0: none yet), what QueueFenceSync waits for; serial: this queue's
+// number, from 1 in the order the game initialised queues, what the back end knows the queue by (gfx.h, WaitEvent)
+typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits, last, serial; } queue_t;   FITS(queue_t, NVNqueue);
 
 typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } pool_builder_t;  FITS(pool_builder_t, NVNmemoryPoolBuilder);
 // A memory pool (runtime/nvn/nvn_pool.c, architecture D10, D14). mem is its GPU address: the game's storage when the

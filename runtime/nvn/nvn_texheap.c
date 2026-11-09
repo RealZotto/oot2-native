@@ -720,7 +720,7 @@ static uint64_t region_bytes(const nvn_tex_rec *t, const NVNcopyRegion *r) {
 
 static uint32_t rec_of_tex(const nvn_tex_rec *t) { return t->present ? rec_find((uintptr_t)t->tex.mem, t->tex.L.size) : 0; }
 
-void texheap_op(const op_hdr *h) {
+void texheap_op(uint64_t fence, const op_hdr *h) {
     switch (h->op) {
     case OP_SET_TEX_POOL: case OP_BIND_TEX: case OP_BIND_IMG: case OP_SET_RT: case OP_COPY_B2T: case OP_COPY_T2B:
     case OP_COPY_T2T: case OP_CLEAR_TEX: break;
@@ -732,7 +732,12 @@ void texheap_op(const op_hdr *h) {
     case OP_SET_TEX_POOL: g_tex_pool = ((const p_set_pool *)a)->pool.addr; break;
     case OP_BIND_TEX: {
         const p_bind_handles *b = a;
-        Sub *s = g_sub_n ? g_subs[g_sub_head + g_sub_n - 1] : NULL;
+        Sub *s = NULL;   // the record's own submission: a held queue's records are replayed after later submissions' (gfx.h)
+        for (size_t k = g_sub_n; k-- > 0;)
+            if (g_subs[g_sub_head + k]->fence == fence) {
+                s = g_subs[g_sub_head + k];
+                break;
+            }
         for (int i = 0; s && i < b->n && i < 32; i++) {
             uint32_t ir = desc_find(g_tex_pool, nvn_handle_texture_id(b->h[i]));
             g_n.bind_ids++;
@@ -800,14 +805,16 @@ void texheap_op(const op_hdr *h) {
     plat_mutex_unlock(&g_lock);
 }
 
-// Every submission up to fence is complete: each texture it bound is bound, and, if the CPU has not written it since its
-// last bind, queued for the next present. The writes before this bind are read first, so that a page written before the
-// bind is not taken for a write after it.
+// The submission with fence value `fence` is complete (and only it: queues complete independently, so a later fence value
+// can be complete while an earlier one, held at a wait, is not): each texture it bound is bound, and, if the CPU has not
+// written it since its last bind, queued for the next present. The writes before this bind are read first, so that a page
+// written before the bind is not taken for a write after it.
 void texheap_complete(uint64_t fence) {
     plat_mutex_lock(&g_lock);
     ensure();
-    while (g_sub_n && g_subs[g_sub_head]->fence <= fence) {
-        Sub *s = g_subs[g_sub_head];
+    for (size_t at = 0; at < g_sub_n; at++) {
+        Sub *s = g_subs[g_sub_head + at];
+        if (s->fence != fence) continue;
         for (uint32_t k = 0; k < s->n; k++) {
             Rec *r = rec_at(s->recs[k]);
             r->binds++;
@@ -816,7 +823,9 @@ void texheap_complete(uint64_t fence) {
         }
         free(s->recs);
         free(s);
-        g_sub_head++, g_sub_n--;
+        memmove(g_subs + g_sub_head + at, g_subs + g_sub_head + at + 1, (g_sub_n - at - 1) * sizeof *g_subs);
+        g_sub_n--;
+        break;
     }
     if (!g_sub_n) g_sub_head = 0;
     plat_mutex_unlock(&g_lock);

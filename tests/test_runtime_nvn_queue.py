@@ -21,8 +21,10 @@ it prints.
   for the work before that texture's last present.
 - syncwait: a SyncWait on a held fence gives its virtual core up, so a guest
   thread of worse priority on the same core runs and completes it.
-- wait_events: every WaitEvent checked at completion, one log line per call
-  site, and one more for a site's first unsatisfied wait.
+- wait_events: every WaitEvent answered at its place in its queue's replay,
+  one log line per call site, and one more for a site's first unsatisfied wait;
+  a wait that does not hold parks its queue until a signal of another queue or
+  the CPU's releases it.
 - failing cases: what the front end cannot honour stops by name.
 
 Needs clang for x86-64 (OOT2_CC, else clang on PATH). Without one the tests
@@ -166,7 +168,7 @@ class QueueTest(unittest.TestCase):
                     done = self.run_case(level, case, timeout=5)
                     self.assertEqual(done.returncode, 0 if case == "census_at_draw" else nvn.EXIT_FATAL,
                                      done.stdout + done.stderr)
-                    self.assertIn("stat| waitevents 1 WaitEvents met 1, unsatisfied at completion 1\n", done.stdout)
+                    self.assertIn("stat| waitevents 1 WaitEvents met 1, unsatisfied at their place 1\n", done.stdout)
                     self.assertIn("unsatisfied 1 (later by GPU 0, later by CPU 0, not satisfied by the end 1, "
                                   "dropped from the full list 0)", done.stdout)
                     self.assertIn("stat| waitsite ", done.stdout)
@@ -207,6 +209,15 @@ class QueueTest(unittest.TestCase):
                                           r"held 0 x60, frame rate target 120 a second on 60 \(the game's interval is "
                                           r"ignored on those\)$")
 
+    def test_two_nvn_queues_reach_the_back_end_as_two_queues(self) -> None:
+        for done in self.assert_passes("two_queues"):
+            self.assertIn("two queues released\n", done.stdout)
+            # QueueFinish and SyncWait on queue 2 return while queue 1 is held at a wait the same thread releases next
+            self.assertIn("queue 2 waited on while queue 1 was held\n", done.stdout)
+            # a queue copied by value keeps its serial (the signal made through the copy is its own), one initialised again
+            # takes a new one (the same signal is another queue's)
+            self.assertIn("copy same 1 other 0 then again same 1 other 1\n", done.stdout)
+
     def test_two_pending_waits_keep_their_own_site_when_the_first_is_satisfied_first(self) -> None:
         for done in self.assert_passes("wait_sites_order"):
             out = done.stdout
@@ -217,24 +228,33 @@ class QueueTest(unittest.TestCase):
 
     def test_each_wait_event_site_is_logged_with_its_answer(self) -> None:
         for done in self.assert_passes("wait_events"):
-            self.assertIn("waits 7 unsatisfied 3\n", done.stdout)
-            # sorted by what satisfied them: the GPU in order, a CPU signal before, the word's own value; the
-            # unsatisfied waits are satisfied later by the CPU (two: the case a back end replaying at submit cannot
-            # honour) or by the GPU of a later submission (one)
-            self.assertIn("classes gpu 2 cpu 1 initial 1 unsatisfied 3 later_gpu 1 later_cpu 2\n", done.stdout)
+            self.assertIn("waits 7 unsatisfied 2\n", done.stdout)
+            # sorted by what answered them: the GPU in order (the waiting queue's own signal), a CPU signal before, the
+            # word's own value; the two waits that did not hold at their place held their queue: one is released
+            # later by the CPU, one by the GPU of another queue
+            self.assertIn("classes gpu 2 cpu 2 initial 1 unsatisfied 2 later_gpu 1 later_cpu 1\n", done.stdout)
             # the census rows of the same counters: kind nvn-stat, one per key, the count then the words
-            self.assertIn("stat| waitevents 7 WaitEvents met 7, unsatisfied at completion 3\n", done.stdout)
-            self.assertIn("stat| waitclasses 7 by a GPU signal in order 2, by a CPU signal before 1, already satisfied 1, "
-                          "unsatisfied 3 (later by GPU 1, later by CPU 2, not satisfied by the end 0, dropped from the "
-                          "full list 0)\n", done.stdout)
-            self.assertIn("stat| recordings 4 inline 0, slow 4, ended with a handle 4, ended empty 0\n", done.stdout)
-            # the list of unsatisfied waits holds 64: of 70 more waits, 64 are found satisfied later by the CPU
-            self.assertIn("bounded unsatisfied 73 later_cpu 66 dropped 6 pending 0\n", done.stdout)
-            # six of the 70 found the list full and are counted as dropped; a wait on a word nobody signals is pending
-            self.assertIn("unresolved unsatisfied 74 pending 1 dropped 6\n", done.stdout)
-            self.assertIn("stat| waitclasses 78 by a GPU signal in order 2, by a CPU signal before 1, already satisfied 1, "
-                          "unsatisfied 74 (later by GPU 1, later by CPU 66, not satisfied by the end 1, dropped from the "
-                          "full list 6)\n", done.stdout)
+            self.assertIn("stat| waitevents 7 WaitEvents met 7, unsatisfied at their place 2\n", done.stdout)
+            self.assertIn("stat| waitclasses 7 by a GPU signal in order 2, by a CPU signal before 2, already satisfied 1, "
+                          "unsatisfied 2 (later by GPU 1, later by CPU 1, not satisfied by the end 0, dropped from the "
+                          "full list 0); GPU signals in order: of its own queue 2, of another 0\n", done.stdout)
+            self.assertIn("stat| waitqueues 3 GPU signal in order: of the waiting queue itself 2, of another queue 0; GPU "
+                          "signal of another queue after the wait parked its queue 1; CPU signal: before 2, after the wait "
+                          "parked its queue 1\n", done.stdout)
+            # how long a queue was held: the CPU's release came with no submission between, the other queue's after one
+            self.assertIn("stat| waitholds 2 queues held at a wait 2; longest hold 1 submissions made meanwhile (a stop at "
+                          "1024, or 10 s for a wait with no timeout); held now 0\n", done.stdout)
+            self.assertIn("stat| waitholds 4 queues held at a wait 4; longest hold 1 submissions made meanwhile (a stop at "
+                          "1024, or 10 s for a wait with no timeout); held now 1\n", done.stdout)
+            self.assertIn("stat| recordings 5 inline 0, slow 5, ended with a handle 5, ended empty 0\n", done.stdout)
+            # 70 waits on one word nobody signalled hold the queue at the first; the CPU's signal releases it and finds
+            # the other 69 satisfied, so nothing is left out of a list: dropped stays 0
+            self.assertIn("released unsatisfied 3 later_cpu 2 by_cpu 71 dropped 0 pending 0\n", done.stdout)
+            # a wait on a word nobody signals is pending
+            self.assertIn("unresolved unsatisfied 4 pending 1 dropped 0\n", done.stdout)
+            self.assertIn("stat| waitclasses 78 by a GPU signal in order 2, by a CPU signal before 71, already satisfied 1, "
+                          "unsatisfied 4 (later by GPU 1, later by CPU 2, not satisfied by the end 1, dropped from the "
+                          "full list 0); GPU signals in order: of its own queue 2, of another 0\n", done.stdout)
             # the pool rows tell pools made from pools live: the case's 4 MiB pool, and a second one (64 KiB, a window range, no
             # GPU access) that it made and ended
             self.assertIn("stat| pools 2 memory pools made 2, live 1 (most at once 2), 4194304 bytes live (most 4259840); "
@@ -247,17 +267,17 @@ class QueueTest(unittest.TestCase):
             self.assertEqual(len(lines), 5, done.stderr)
             # each line names the word's last writer: a GPU signal, a CPU signal or nothing yet (its own value)
             self.assertRegex(lines[0], r"\(main\+0x1000\) on the event word \S+ \(equal to 3, the word holds 3\) is "
-                                       r"satisfied at its place in submission order \(the word was last written by a GPU "
+                                       r"satisfied at its place in its queue's replay \(the word was last written by a GPU "
                                        r"signal\)$")
             self.assertRegex(lines[1], r"\(main\+0x2000\) on the event word \S+ \(equal to 9, the word holds 3\) is NOT "
-                                       r"satisfied at its place in submission order \(the word was last written by a GPU "
+                                       r"satisfied at its place in its queue's replay \(the word was last written by a GPU "
                                        r"signal\)$")
             self.assertRegex(lines[2], r"\(main\+0x3000\) on the event word \S+ \(equal to 7, the word holds 0\) is NOT "
-                                       r"satisfied at its place in submission order \(the word was last written by "
+                                       r"satisfied at its place in its queue's replay \(the word was last written by "
                                        r"nothing yet\)$")
-            self.assertRegex(lines[3], r"\(main\+0x4000\) .* is NOT satisfied at its place in submission order \(the "
+            self.assertRegex(lines[3], r"\(main\+0x4000\) .* is NOT satisfied at its place in its queue's replay \(the "
                                        r"word was last written by nothing yet\)$")
-            self.assertRegex(lines[4], r"\(main\+0x5000\) .* is NOT satisfied at its place in submission order")
+            self.assertRegex(lines[4], r"\(main\+0x5000\) .* is NOT satisfied at its place in its queue's replay")
 
     def test_every_event_word_is_remembered_and_only_a_four_byte_write_is_a_signal(self) -> None:
         for done in self.assert_passes("event_words"):
@@ -269,11 +289,11 @@ class QueueTest(unittest.TestCase):
             # words' (a CPU signal), and the 8-byte write's word (nothing: that write is no signal)
             lines = [line for line in done.stderr.splitlines() if "nvn: WaitEvent at " in line]
             self.assertEqual(len(lines), 3, done.stderr)
-            self.assertRegex(lines[0], r"\(main\+0x1000\) .* is satisfied at its place in submission order \(the word was "
+            self.assertRegex(lines[0], r"\(main\+0x1000\) .* is satisfied at its place in its queue's replay \(the word was "
                                        r"last written by a GPU signal\)$")
-            self.assertRegex(lines[1], r"\(main\+0x1100\) .* is satisfied at its place in submission order \(the word was "
+            self.assertRegex(lines[1], r"\(main\+0x1100\) .* is satisfied at its place in its queue's replay \(the word was "
                                        r"last written by a CPU signal\)$")
-            self.assertRegex(lines[2], r"\(main\+0x2000\) .* is satisfied at its place in submission order \(the word was "
+            self.assertRegex(lines[2], r"\(main\+0x2000\) .* is satisfied at its place in its queue's replay \(the word was "
                                        r"last written by nothing yet\)$")
 
     def test_what_the_front_end_cannot_honour_stops_by_name(self) -> None:
@@ -375,15 +395,15 @@ class QueueTest(unittest.TestCase):
             # the front end's own counters, as census rows: 130 recordings begun through the entry point, 130 presents
             stats = [line[len("stat| "):] for line in done.stdout.splitlines() if line.startswith("stat| ")]
             self.assertEqual([x.split(" ", 2)[:2] for x in stats],
-                             [["recordings", "130"], ["callbacks", "0"], ["waitevents", "0"], ["waitclasses", "0"], ["waitqueues", "0"],
+                             [["recordings", "130"], ["callbacks", "0"], ["waitevents", "0"], ["waitclasses", "0"], ["waitqueues", "0"], ["waitholds", "0"],
                               ["pools", "1"], ["pools-cpu", "1"], ["pools-cpu-no-access", "0"], ["pools-physical", "0"],
                               ["pools-virtual", "0"], ["presents", "130"]], stats)
             # the case's one memory pool, 4 MiB the CPU can see; no window range in use
-            self.assertEqual(stats[5], "pools 1 memory pools made 1, live 1 (most at once 1), 4194304 bytes live (most "
+            self.assertEqual(stats[6], "pools 1 memory pools made 1, live 1 (most at once 1), 4194304 bytes live (most "
                                        "4194304); made with GPU_NO_ACCESS 0; GPU address window in use 0 bytes (most 0 of "
                                        "68719476736)")
-            self.assertEqual(stats[6], "pools-cpu 1 made 1, live 1 (most at once 1), 4194304 bytes live (most 4194304)")
-            self.assertEqual(stats[9], "pools-virtual 0 made 0, live 0 (most at once 0), 0 bytes live (most 0)")
+            self.assertEqual(stats[7], "pools-cpu 1 made 1, live 1 (most at once 1), 4194304 bytes live (most 4194304)")
+            self.assertEqual(stats[10], "pools-virtual 0 made 0, live 0 (most at once 0), 0 bytes live (most 0)")
             self.assertIn("inline 0, slow 130, ended with a handle 130, ended empty 0", stats[0])
             # the table is read live: the two gap calls after the last present are in its tail and in the whole
             self.assertEqual(table[("tail", "nvnQueueSetDebugLabel")][2], 2)

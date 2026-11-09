@@ -202,7 +202,7 @@ static void op_log(uint64_t fence, int index, const op_hdr *r, void *ctx) {
     if (g_print_ops) printf("rec %llu %d %s\n", (ull)fence, index, nvn_op_name(r->op));
     if (g_check) g_check(r, index);
 }
-static uint64_t submit(const uint64_t *handles, int n) { return nvn_submit_recordings(&c, handles, n); }
+static uint64_t submit(const uint64_t *handles, int n) { return nvn_submit_recordings(&c, 1, handles, n); }
 
 // ---- objects in the front end's layouts
 static uint64_t texture(uint32_t width, uint64_t serial) {

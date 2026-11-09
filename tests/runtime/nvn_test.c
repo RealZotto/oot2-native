@@ -255,7 +255,7 @@ static void case_null_backend(void) {
     CHECK(b == &gfx_null_backend && !strcmp(b->name, "null"));
     CHECK(b->fence_done() == 0 && b->fence_wait(0, 0) == 1 && b->fence_wait(1, 0) == 0);
     for (uint64_t k = 1; k <= 3; k++) {
-        CHECK(b->submit(NULL, 0) == k);
+        CHECK(b->submit(1, NULL, 0) == k);
         CHECK(b->fence_done() == k);
         CHECK(b->fence_wait(k, 0) == 1 && b->fence_wait(k + 1, 0) == 0);
     }
@@ -269,7 +269,7 @@ static void case_null_backend(void) {
     b->read_texels(NULL, NULL, &r, texels[0], 16, 64);   // two images of two 16-byte rows
     for (int z = 0; z < 2; z++)
         for (int i = 0; i < 64; i++) CHECK(texels[z][i] == (i < 32 ? 0 : 0xAB));
-    b->finish();
+    b->finish(0);
     CHECK(b->pool_init(NULL) == 1);
     printf("ok null_backend\n");
 }

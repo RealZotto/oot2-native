@@ -4,19 +4,23 @@
 // The NVN2 front end's queues, syncs, events and timestamps (architecture section 5, D7). Windows and
 // QueuePresentTexture are in nvn_window.c.
 //
-// Queues. Every queue's submissions share the back end's one order (gfx.h): QueueSubmitCommands hands the recordings
-// over (nvn_submit_recordings, nvn_cmd.c) and keeps the fence value it got as the queue's newest; QueueFlush has nothing
-// left to send; QueueFinish waits until everything submitted so far is done, with its virtual core given up. A queue's
+// Queues. Every queue's submissions share the back end's one numbering of fence values (gfx.h): QueueSubmitCommands hands
+// the recordings over with the queue's serial (nvn_submit_recordings, nvn_cmd.c), so that the back end knows which queue a
+// WaitEvent and a SignalEvent belong to, and keeps the fence value it got as the queue's newest; QueueFlush has nothing
+// left to send; QueueFinish waits until everything this queue submitted so far is done (never another queue's work, which
+// a WaitEvent may hold), with its virtual core given up. A queue's
 // memory is only accounted: the game allocates what QueueBuilderGetQueueMemorySize answers, and nothing is written there.
 //
 // Syncs. A sync is a fence value. QueueFenceSync gives it the queue's newest one: every command submitted to that queue
-// so far. SyncWait answers at once when that value is done; otherwise it gives its virtual core up (D7) and waits, first
-// for a queue to fence the sync when none has yet, then for the value, until the timeout. QueueWaitSync is a wait on the
-// GPU: the fence's submission comes before every later one in the one order, so it holds nothing back on the host. A
-// sync no queue has fenced holds nothing back either, as in DKB Recomp, nxnative and oot-pc-recomp; it is logged once.
+// so far. SyncWait answers at once when that value is done (the value's own queue's work, gfx.h rule 3); otherwise it
+// gives its virtual core up (D7) and waits, first for a queue to fence the sync when none has yet, then for the value,
+// until the timeout. QueueWaitSync is a wait on the GPU: the fence's submission is made before every later one, so it
+// holds nothing back on the host. A sync no queue has fenced holds nothing back either, as in DKB Recomp, nxnative and
+// oot-pc-recomp; it is logged once.
 //
 // Events live in a memory pool the CPU sees: the GPU's signals land there when their submission completes, the CPU's at
-// once.
+// once. The CPU's signal also reaches the back end (guest_written of the word's 4 bytes), where it can release a queue
+// that a WaitEvent holds (gfx.h, oot2/nvn_order.h).
 //
 // Timestamps. A counter report's timestamp is the guest's system tick (31.25 MHz, rt_ticks), so
 // GetTimestampInNanoseconds converts at that rate and GetCurrentTimestampInNanoseconds reads the same clock. The
@@ -97,7 +101,8 @@ NVN_API(nvnQueueBuilderSetQueueMemory) {
     b->mem = arg_p(c, 1), b->mem_sz = arg_x(c, 2);
 }
 // void nvnQueueBuilderSetPrimaryQueue(NVNqueueBuilder *b, NVNqueue *primary) (NVN2): a queue tied to another. Every
-// queue already shares one submission order here, so nothing is kept; the first call is logged.
+// queue already shares one order of fence values here and the back end orders their WaitEvents by queue, so nothing is
+// kept; the first call is logged.
 NVN_API(nvnQueueBuilderSetPrimaryQueue) {
     static int logged;
     if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
@@ -108,7 +113,9 @@ NVN_API(nvnQueueBuilderSetPrimaryQueue) {
 // NVNboolean nvnQueueInitialize(NVNqueue *q, const NVNqueueBuilder *b)
 NVN_API(nvnQueueInitialize) {
     queue_t *q = arg_p(c, 0);
-    *q = (queue_t){QUEUE_MAGIC, ((const queue_builder_t *)arg_p(c, 1))->dev, 0, 0};
+    static uint64_t serials;   // queues initialised so far: each takes the next number, and a queue initialised again a new one
+    *q = (queue_t){QUEUE_MAGIC, ((const queue_builder_t *)arg_p(c, 1))->dev, 0, 0,
+                   __atomic_add_fetch(&serials, 1, __ATOMIC_RELAXED)};
     ret_x(c, 1);
 }
 // void nvnQueueFinalize(NVNqueue *q)
@@ -117,7 +124,7 @@ NVN_API(nvnQueueFinalize) { nvn_queue_arg(c, 0, "QueueFinalize")->magic = 0; }
 // value it was given, even when two threads submit to it at once
 NVN_API(nvnQueueSubmitCommands) {
     queue_t *q = nvn_queue_arg(c, 0, "QueueSubmitCommands");
-    uint64_t fence = nvn_submit_recordings(c, arg_p(c, 2), (int)arg_x(c, 1));
+    uint64_t fence = nvn_submit_recordings(c, q->serial, arg_p(c, 2), (int)arg_x(c, 1));
     __atomic_fetch_add(&q->submits, 1, __ATOMIC_RELAXED);
     uint64_t last = __atomic_load_n(&q->last, __ATOMIC_RELAXED);
     while (fence > last &&
@@ -129,10 +136,10 @@ NVN_API(nvnQueueSubmitCommands) {
 NVN_API(nvnQueueFlush) { nvn_queue_arg(c, 0, "QueueFlush"); }
 // void nvnQueueFinish(NVNqueue *q)
 NVN_API(nvnQueueFinish) {
-    nvn_queue_arg(c, 0, "QueueFinish");
+    const queue_t *q = nvn_queue_arg(c, 0, "QueueFinish");
     const GfxBackend *b = gfx_backend();
     int token = rt_kernel_block_begin();
-    b->finish();
+    b->finish(q->serial);   // this queue's work, never another queue's held at a wait (gfx.h, rule 3)
     rt_kernel_block_end(token);
     b->cpu_synced(b->fence_done());
 }
@@ -242,7 +249,7 @@ NVN_API(nvnSyncWait) {
         nvn_trace("sync-enter", 0, "timeout %llu ready %llu fenced %u", (unsigned long long)timeout,
                   (unsigned long long)rt_sched_slot_of(ready, RT_VSYNC_HZ), fenced);   // the tick it falls in
     if (fenced) {
-        if (b->fence_done() >= fence && (!ready || rt_vsync_counter() >= ready)) {
+        if ((b->fence_done() >= fence || b->fence_wait(fence, 0)) && (!ready || rt_vsync_counter() >= ready)) {
             b->cpu_synced(fence);
             sync_return(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED, traced, began);
             return;
@@ -296,6 +303,9 @@ NVN_API(nvnEventInitialize) {
                          "has no word to signal or read", (const void *)p);
     *(ev_t *)arg_p(c, 0) = (ev_t){EVENT_MAGIC, (volatile uint32_t *)(p->mem + b->off)};
     if (texheap_on()) texheap_range(TEXHEAP_OBJECT, (uintptr_t)(p->mem + b->off), 4);
+    // Nothing is written, but a word the back end knows from an earlier event at this storage (the game reuses pool
+    // memory) is read again: the back end's copy of its value must not outlive the event it belonged to.
+    if (gfx_backend()->event_initialized) gfx_backend()->event_initialized((uintptr_t)(p->mem + b->off));
     ret_x(c, 1);
 }
 // void nvnEventFinalize(NVNevent *e)

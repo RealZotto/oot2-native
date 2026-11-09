@@ -105,9 +105,11 @@ void texheap_read_texels(void);   // a nvnTextureReadTexels call
 
 void texheap_desc(const dpool_ref *pool, int id, const tex_t *t);
 
-// The null back end's replay: a submission begins, each of its records, and every submission up to fence is complete.
+// The null back end's replay: a submission begins, each of its records, and the submission is complete. Queues complete
+// independently and a queue held at a wait replays its records after later submissions', so each record and each
+// completion names its submission's fence value.
 void texheap_submit(uint64_t fence);
-void texheap_op(const op_hdr *r);
-void texheap_complete(uint64_t fence);
+void texheap_op(uint64_t fence, const op_hdr *r);   // a record of the submission with fence value `fence`
+void texheap_complete(uint64_t fence);              // that submission only
 
 void texheap_present(uint64_t seq);
