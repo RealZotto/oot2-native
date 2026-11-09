@@ -573,6 +573,25 @@ class PipebuildAndVcRuntimeInTheBundle(unittest.TestCase):
                 bundle.build(ROOT, self.dir / "out", self.dir / "cache", None, None, None, None, None, None, False)
         self.assertIn("no redistributable", str(cm.exception))
 
+    def test_a_build_given_a_wrong_folder_fails_before_any_download_or_build(self):
+        (self.crt / "vcruntime140_1.dll").unlink()
+        for given, word in ((self.dir / "nowhere", "nowhere"), (self.crt, "vcruntime140_1.dll")):
+            with mock.patch.object(bundle, "fetch", side_effect=AssertionError("a download before the folder was checked")), \
+                    mock.patch.object(bundle, "installed_vc_redist", side_effect=AssertionError("vswhere despite --vc-redist")):
+                with self.assertRaises(bundle.BundleError) as cm:
+                    bundle.build(ROOT, self.dir / "out", self.dir / "cache", None, None, None, None, None, None, False,
+                                 vc_redist=given)
+            self.assertIn(word, str(cm.exception))
+
+    def test_the_manifest_names_the_folder_from_redist_on_and_never_its_drive(self):
+        self.assertEqual(bundle.vc_source(Path("C:/Program Files/VS/VC/Redist/MSVC/14.51.36231/x64/Microsoft.VC145.CRT")),
+                         "Redist/MSVC/14.51.36231/x64/Microsoft.VC145.CRT")
+        self.assertEqual(bundle.vc_source(Path("C:/Users/someone/crt")), "crt")
+        self.stage_runtime()
+        self.assertEqual(self.stage.facts["vc_runtime"]["source"], "crt")
+        notice = (self.stage.root / "licenses/vc-runtime/NOTICE.txt").read_text(encoding="utf-8")
+        self.assertNotIn(str(self.dir), notice)
+
     def test_the_builder_is_staged_with_the_licence_texts_of_what_is_in_it(self):
         exe = fake_dll(self.dir / "pipebuild.exe")
         kit = self.dir / "kit"

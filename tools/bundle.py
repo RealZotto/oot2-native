@@ -755,12 +755,11 @@ def vc_runtime_notice(folder: Path, facts: dict) -> str:
     return "\n".join(lines)
 
 
-def stage_vc_runtime(stage: Stage, folder: Path, version_of: Callable[[Path], str] = file_version,
-                     system_root: str | None = None) -> None:
-    """The three runtime DLLs of folder (an x64 Microsoft.VC14x.CRT folder) into bin/, unmodified, with their versions and
-    SHA-256 in the manifest (bundle.json, key vc_runtime) and a notice in licenses/vc-runtime/. Refused, by name: a folder
-    that does not exist, one inside the Windows folder (System32 holds the machine's own copies, not a redistributable
-    set), a missing DLL, a file that is not an x64 PE file."""
+def check_vc_folder(folder: Path, system_root: str | None = None) -> Path:
+    """Refuse, by name, a redistributable folder the bundle cannot take the runtime from: one that does not exist, one
+    inside the Windows folder (System32 holds the machine's own copies, not a redistributable set), one that lacks a DLL,
+    one whose DLL is not an x64 PE file. build() calls it before any download, for a folder given with --vc-redist as
+    well as for the one vswhere finds, so a wrong folder fails in seconds."""
     folder = Path(folder)
     root = system_root if system_root is not None else (os.environ.get("SystemRoot") or os.environ.get("windir"))
     if root and folder.resolve().is_relative_to(Path(root).resolve()):
@@ -768,7 +767,6 @@ def stage_vc_runtime(stage: Stage, folder: Path, version_of: Callable[[Path], st
                           "redistributable folder, never from System32")
     if not folder.is_dir():
         raise BundleError(f"the Visual C++ redistributable folder {folder} does not exist")
-    files = {}
     for name in VC_RUNTIME_DLLS:
         path = folder / name
         if not path.is_file():
@@ -776,9 +774,29 @@ def stage_vc_runtime(stage: Stage, folder: Path, version_of: Callable[[Path], st
         machine = pe_machine(path)
         if machine != PE_MACHINE_X64:
             raise BundleError(f"{path} is not an x64 DLL (PE machine {machine if machine is None else hex(machine)})")
+    return folder
+
+
+def vc_source(folder: Path) -> str:
+    """How the manifest and the notice name the folder: from its Redist part on (Redist/MSVC/<version>/x64/<CRT>), or
+    only its own name for a folder outside such a tree, so that no drive or account folder reaches a published bundle."""
+    parts = Path(folder).parts
+    tail = [i for i, p in enumerate(parts) if p.lower() == "redist"]
+    return "/".join(parts[tail[-1]:]) if tail else Path(folder).name
+
+
+def stage_vc_runtime(stage: Stage, folder: Path, version_of: Callable[[Path], str] = file_version,
+                     system_root: str | None = None) -> None:
+    """The three runtime DLLs of folder (an x64 Microsoft.VC14x.CRT folder) into bin/, unmodified, with their versions and
+    SHA-256 in the manifest (bundle.json, key vc_runtime) and a notice in licenses/vc-runtime/. The folder is checked
+    first by check_vc_folder."""
+    folder = check_vc_folder(folder, system_root)
+    files = {}
+    for name in VC_RUNTIME_DLLS:
+        path = folder / name
         files[name] = {"version": version_of(path), "sha256": sha256_file(path), "bytes": path.stat().st_size}
         stage.put("vc-runtime", f"{bundle_env.VC_RUNTIME}/{name}", path)
-    facts = {"source": "/".join(folder.parts[-5:]), "terms": VC_TERMS_URL, "files": files}
+    facts = {"source": vc_source(folder), "terms": VC_TERMS_URL, "files": files}
     stage.facts["vc_runtime"] = facts
     stage.put("vc-runtime", "licenses/vc-runtime/NOTICE.txt", vc_runtime_notice(folder, facts).encode("utf-8"))
 
@@ -882,8 +900,9 @@ def build(root: Path, out: Path, cache: Path, xlate: Path | None, runtime_lib: P
           dav1d_dir: Path | None, opus_dir: Path | None, sdl3_dir: Path | None, vulkan_dir: Path | None, make_zip: bool,
           say: Callable[[str], None] = print, pipebuild: Path | None = None, vc_redist: Path | None = None) -> Path:
     check_kits(runtime_lib, dav1d_dir, opus_dir, sdl3_dir, vulkan_dir)
-    # The redistributable folder is looked for first: a machine without it fails in seconds, not after the builds.
-    vc_folder = Path(vc_redist) if vc_redist else installed_vc_redist()
+    # The redistributable folder is looked for and checked first: a machine without it, or a wrong folder given with
+    # --vc-redist, fails in seconds, not after the downloads and the builds.
+    vc_folder = check_vc_folder(Path(vc_redist) if vc_redist else installed_vc_redist())
     commit = subprocess.run(["git", "-C", str(root), "rev-parse", "--short=12", "HEAD"], capture_output=True,
                             text=True).stdout.strip() or "unknown"
     version = f"oot2-native-bundle-{commit}"
