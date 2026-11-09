@@ -16,6 +16,9 @@
 // storage holds, which would overwrite a neighbour, or the pool is a virtual one mapped over memory the CPU can see, which
 // the backing map keeps as a mirror or an import and never as an extent: an image bound into a mirror's span would share
 // its bytes with the copy of the CPU's pages, backing_extent_pool) gets memory of its own and is counted as unaliased.
+// An image of ASTC decoded to RGBA8 (the device does not sample ASTC) is never placed either: the game's storage holds
+// blocks, not texels. It gets memory of its own, and a storage view or a texel copy of it stops by name (vkf_decoded,
+// oot2/vk_format.h).
 // Storage the CPU can see (textures the CPU writes) gets no image at registration: its image is made in the texture
 // arena when the replay binds the texture (vkb_view_demand), and the entry shows the table's placeholder until then. A
 // format with no image (the formats of oot2/vk_format.h that need an upload expansion or a transcode, or that the device

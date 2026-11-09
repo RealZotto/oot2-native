@@ -120,6 +120,31 @@ static void case_formats(void) {
     printf("classes ok\n");
 }
 
+// What an image of decoded ASTC may serve (vkf_decoded, vkf_extent_ok, vkf_decoded_stop), over every format with a Vulkan
+// format. The image is made in the linear twin of the format the device picked, as vk_image.c makes it: for an ASTC row that
+// is the row's alt (RGBA8) on a device that does not sample ASTC, and the row's own format on one that does.
+static const char *or_none(const char *s) { return s ? s : "none"; }
+
+static void case_decoded(void) {
+    printf("null row decoded=%d ok=%d\n", vkf_decoded(NULL, VK_FORMAT_R8G8B8A8_UNORM),
+           vkf_extent_ok(NULL, VK_FORMAT_R8G8B8A8_UNORM));
+    for (int f = VKF_FIRST; f <= VKF_LAST; f++) {
+        const VkfRow *r = vkf_row(f);
+        if (!r || r->vk == VK_FORMAT_UNDEFINED) continue;
+        VkFormat own = vkf_linear_twin(r->vk);
+        if (!(r->flags & VKF_ASTC)) {
+            printf("plain fmt %02x decoded=%d ok=%d storage=[%s] copy=[%s]\n", f, vkf_decoded(r, own), vkf_extent_ok(r, own),
+                   or_none(vkf_decoded_stop(r, own, VKF_USE_STORAGE_VIEW)), or_none(vkf_decoded_stop(r, own, VKF_USE_TEXEL_COPY)));
+            continue;
+        }
+        VkFormat alt = vkf_linear_twin(r->alt);
+        printf("astc fmt %02x decoded=%d ok=%d storage=[%s] copy=[%s] | sampled decoded=%d ok=%d storage=[%s] copy=[%s]\n", f,
+               vkf_decoded(r, alt), vkf_extent_ok(r, alt), or_none(vkf_decoded_stop(r, alt, VKF_USE_STORAGE_VIEW)),
+               or_none(vkf_decoded_stop(r, alt, VKF_USE_TEXEL_COPY)), vkf_decoded(r, own), vkf_extent_ok(r, own),
+               or_none(vkf_decoded_stop(r, own, VKF_USE_STORAGE_VIEW)), or_none(vkf_decoded_stop(r, own, VKF_USE_TEXEL_COPY)));
+    }
+}
+
 // ---------- stand-ins for the host
 
 #define FAKE_IMAGES 1024
@@ -768,6 +793,7 @@ int main(int argc, char **argv) {
     }
     const char *cs = argv[1];
     if (!strcmp(cs, "formats")) case_formats();
+    else if (!strcmp(cs, "decoded")) case_decoded();
     else if (!strcmp(cs, "tables")) case_tables();
     else if (!strcmp(cs, "demand")) case_demand(), printf("ok demand\n");
     else if (!strcmp(cs, "id_fatal")) case_id_fatal();

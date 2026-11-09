@@ -23,7 +23,7 @@ and indirect dispatches and mesh draws become their packets (a mesh draw's first
 address, and an indirect `{count, first}` record is converted by GPU copies); an indirect dispatch's counts are copied by
 the GPU into a bank of its own; a GPU write over a copied uniform range drops the copy, so that every later read of the range is live; copies,
 fills, updates and texture clears are one transfer command each behind a full barrier, with the channel's strides, their
-writes into memory the CPU can see declared once; every op of the list is replayed or stops by name with its ticket; a recording that is not whole stops by name.
+writes into memory the CPU can see declared once; every op of the list is replayed or stops by name with its ticket; the geometry processing mode is replayed for the modes 0 to 2 (logged once per mode, no state set) and any other mode stops by name; a recording that is not whole stops by name.
 Reports, events and waits are done by the completion thread in op-stream order (an event WRITE then ADD leaves their
 sum; a samples-passed report writes the running sum of the occlusion queries before it, one per pass from the first
 reset, ended at each samples-passed report or reset and at the pass's end; a reset sets the count to 0; a timestamp
@@ -68,7 +68,7 @@ REPLAYED = {
     "HINT", "COPY_B2B", "UPDATE_UB", "COPY_B2T", "COPY_STRIDE", "COPY_T2B", "COPY_T2T", "CLEAR_TEX", "CLEAR_BUF",
     "COPY_IMAGE_STRIDE", "SIGNAL_EVENT", "REPORT_COUNTER", "RESET_COUNTER", "RENDER_COND", "WAIT_EVENT",
     "SHADING_RATE_PALETTE",
-    "DRAW_MESH", "DRAW_MESH_IND",
+    "DRAW_MESH", "DRAW_MESH_IND", "GEOMETRY_MODE",
 }
 
 
@@ -372,6 +372,26 @@ class GraphicsTest(ReplayBase):
         out = self.passing("full_rate")
         self.assertEqual(len([p for p in frame(out, 1) if p.startswith("Draw")]), 1)
         self.assertIn("stats draws 1 full_rate 2 lost 0", out)   # the image and the nonzero mode, not their unbinds
+
+    def test_the_geometry_processing_modes_0_to_2_are_accepted_and_logged_once_each(self) -> None:
+        for mode in (0, 1, 2):
+            with self.subTest(mode=mode):
+                done = self.run_case("geometry", str(mode))
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("ok geometry", done.stdout)
+                self.assertIn("stats draws 2 lost 0", done.stdout)   # one draw in each of two submissions, mode set 4 times
+                lines = [ln for ln in done.stderr.splitlines() if "geometry processing mode" in ln]
+                self.assertEqual(len(lines), 1, done.stderr)
+                self.assertIn(f"the game set geometry processing mode {mode}:", lines[0])
+                self.assertEqual(fatal_lines(done.stderr), [])
+
+    def test_a_geometry_processing_mode_beyond_2_stops_by_name(self) -> None:
+        for mode in ("3", "-1", "0x7fffffff"):
+            with self.subTest(mode=mode):
+                line = self.stopping("geometry_stop", mode)
+                value = int(mode, 0)
+                self.assertEqual(line, "FATAL: gfx: vulkan: replay of submission 1, after 0 draws and dispatches: "
+                                       f"GEOMETRY_MODE {value} is not replayed: only the modes 0 to 2 are")
 
     def test_a_draw_with_rendering_off_is_counted_as_that_and_not_as_lost(self) -> None:
         out = self.passing("skip_render_off")

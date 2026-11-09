@@ -1419,6 +1419,37 @@ static void case_full_rate(void) {
     printf("ok full_rate\n");
 }
 
+// The geometry processing mode (NVN2) is accepted for the modes 0 to 2 and logged once per mode, however many times it is
+// set and across submissions; the draws around it are made as if it had not been set. Any other mode stops by name.
+static void case_geometry(const char *mode_text) {
+    int32_t mode = (int32_t)strtol(mode_text, NULL, 0);
+    open_fakes();
+    for (int pass = 0; pass < 2; pass++) {
+        Rec *r = rec_begin(pass);
+        graphics_state(r);
+        PUT(r, OP_GEOMETRY_MODE, (p_flag){.value = mode});
+        PUT(r, OP_DRAW, (p_draw){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 3, .instances = 1});
+        PUT(r, OP_GEOMETRY_MODE, (p_flag){.value = mode});
+        uint64_t h = rec_end(r);
+        CHECK(gpu_sync_wait(vkr_submit(&h, 1), 10000000000ull));
+    }
+    VkrStats st;
+    vkr_stats(&st);
+    printf("stats draws %llu lost %llu\n", (ull)st.draws, (ull)st.lost);
+    close_fakes();
+    printf("ok geometry\n");
+}
+
+static void case_geometry_stop(const char *mode_text) {
+    open_fakes();
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    PUT(r, OP_GEOMETRY_MODE, (p_flag){.value = (int32_t)strtol(mode_text, NULL, 0)});
+    uint64_t h = rec_end(r);
+    vkr_submit(&h, 1);
+    printf("submit returned\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
@@ -1445,6 +1476,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cs, "graphics")) case_graphics();
     else if (!strcmp(cs, "skip")) case_skip(0);
     else if (!strcmp(cs, "full_rate")) case_full_rate();
+    else if (!strcmp(cs, "geometry") && argc >= 3) case_geometry(argv[2]);
+    else if (!strcmp(cs, "geometry_stop") && argc >= 3) case_geometry_stop(argv[2]);
     else if (!strcmp(cs, "skip_render_off")) case_skip(1);
     else if (!strcmp(cs, "depth")) case_depth();
     else if (!strcmp(cs, "compute")) case_compute();

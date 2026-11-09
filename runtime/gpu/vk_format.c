@@ -216,3 +216,22 @@ VkFormat vkf_linear_twin(VkFormat f) {
         return (VkFormat)(f - 1);
     return f;
 }
+
+// ---------- images of decoded ASTC
+
+int vkf_decoded(const VkfRow *r, VkFormat made) {
+    if (!r || !(r->flags & VKF_ASTC)) return 0;
+    int c = vkf_class(made);
+    return !(c >= 2001 && c < 4000);   // not in the BC and ASTC families: the device took the stand-in
+}
+
+int vkf_extent_ok(const VkfRow *r, VkFormat made) { return !vkf_decoded(r, made); }
+
+const char *vkf_decoded_stop(const VkfRow *r, VkFormat made, VkfUse use) {
+    if (!vkf_decoded(r, made)) return NULL;
+    switch (use) {
+    case VKF_USE_STORAGE_VIEW: return "a storage view";
+    case VKF_USE_TEXEL_COPY: return "a texel copy";
+    }
+    return NULL;
+}

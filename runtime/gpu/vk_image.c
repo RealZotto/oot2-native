@@ -179,7 +179,7 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
     VkImageCreateFlags flags = sh->flags | (arena ? 0 : VK_IMAGE_CREATE_ALIAS_BIT);
     if (!(row->flags & (VKF_DEPTH | VKF_STENCIL))) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     const int compressed = vkf_class(fmt) >= 2001 && vkf_class(fmt) < 4000;   // the BC and ASTC families
-    const int decoded = (row->flags & VKF_ASTC) && !compressed;
+    const int decoded = vkf_decoded(row, fmt);   // an ASTC texture the device does not sample: its image holds RGBA8 texels
     int raw_storage = 0;
     if (compressed && (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
         flags |= RAW_VIEW_FLAGS;
@@ -231,8 +231,10 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
     // when it has none to give). Any other is placed at the pool offset: bound into the extent (the extent is made here
     // when no bind made it), where the game's storage lies, when the offset has the alignment the driver asks, the memory
     // type fits and the image takes no more than the game's storage (it would overwrite the neighbour otherwise). An
-    // image stands in an extent only. A texture in a virtual pool mapped over memory the CPU can see has no extent: the
-    // backing map keeps that memory as a mirror (a VRAM copy of the CPU's pages) or an import, and an image bound into a
+    // image stands in an extent only. An image of decoded ASTC (the row is ASTC, the image RGBA8) never stands in one: the
+    // game's storage there holds the compressed blocks, which the image would read as RGBA8 texels, and the decode would
+    // overwrite them for the textures aliased over the same bytes (vkf_extent_ok). A texture in a virtual pool mapped over
+    // memory the CPU can see has no extent: the backing map keeps that memory as a mirror (a VRAM copy of the CPU's pages) or an import, and an image bound into a
     // mirror's span shares its bytes with the copy: the refresh writes the CPU's pages over the texels, the texels over
     // the copy, and the span, once the mirror is replaced by a larger one, goes to the next mirror that takes it. So the
     // image gets memory of its own, and no mirror is made for it.
@@ -243,6 +245,8 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
         texarena_alloc(mr.size, mr.alignment, mr.memoryTypeBits, &ext);
         GPU_VK_OK(vkBindImageMemory(gpu_vk.device, image, (VkDeviceMemory)(uintptr_t)ext.block, ext.offset),
                   "vkBindImageMemory (an image of the texture arena)");
+    } else if (!vkf_extent_ok(row, fmt)) {
+        // memory of its own, below
     } else if ((extent_pool = backing_extent_pool(key->storage, L.size ? L.size : 1))) {
         backing_resolve(key->storage, L.size ? L.size : 1, 0, &ref);
         placed = ref.kind == BACKING_EXTENT && ref.memory && ref.offset % mr.alignment == 0 && mr.size <= L.size &&
@@ -262,7 +266,11 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
         GPU_VK_OK(vkAllocateMemory(gpu_vk.device, &alloc, NULL, &dedicated), "vkAllocateMemory (an unaliased image)");
         GPU_VK_OK(vkBindImageMemory(gpu_vk.device, image, dedicated, 0), "vkBindImageMemory (an unaliased image)");
         g_st.unaliased++;
-        if (!extent_pool)
+        if (!vkf_extent_ok(row, fmt))
+            rt_log("gfx: vulkan: the image of the ASTC texture at %#llx holds its decoded RGBA8 texels, not the game's blocks, so "
+                   "it does not stand in its pool's extent: it has memory of its own and loses the game's aliasing",
+                   (ull)key->storage);
+        else if (!extent_pool)
             rt_log("gfx: vulkan: the image of the texture at %#llx stands over memory the CPU can see (a virtual pool mapped "
                    "over a CPU-visible one), which has no extent: it has memory of its own and loses the game's aliasing",
                    (ull)key->storage);
@@ -279,7 +287,8 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
                                                                                               : VK_IMAGE_ASPECT_COLOR_BIT;
     i->all_aspects = i->aspect | ((row->flags & (VKF_DEPTH | VKF_STENCIL)) == (VKF_DEPTH | VKF_STENCIL) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     i->size = L.size, i->placed = placed;
-    if (arena) i->arena = 1, i->ext = ext, i->desc = t->d, i->decoded = decoded;
+    i->decoded = decoded;
+    if (arena) i->arena = 1, i->ext = ext, i->desc = t->d;
     g_st.made++, g_st.live++;
     if (placed) g_st.placed++;
     if (arena) g_st.arena++;
@@ -632,6 +641,11 @@ VkImageView vkb_storage_view(const tex_t *t, const view_t *v, int type, uint64_t
     if (!img)
         rt_fatal("gfx: vulkan: a storage image over the texture at %#llx (NVN format %#x) has no image on this device",
                  (ull)(uintptr_t)t->mem, nvn_format);
+    const char *refused = vkf_decoded_stop(vkf_row(t->d.format), img->format, VKF_USE_STORAGE_VIEW);
+    if (refused)
+        rt_fatal("gfx: vulkan: %s over the texture at %#llx (NVN format %#x) reaches an image of ASTC blocks decoded to RGBA8: "
+                 "a program would store texels where it expects the game's blocks, which this layer does not serve yet",
+                 refused, (ull)img->key.storage, nvn_format);
     if (!(img->usage & VK_IMAGE_USAGE_STORAGE_BIT) || !view_ok(img, type))
         rt_fatal("gfx: vulkan: a storage image over the texture at %#llx (NVN format %#x, view type %d): its image was made "
                  "without storage usage or cannot be seen as that type", (ull)img->key.storage, nvn_format, type);
@@ -743,6 +757,11 @@ static Xfer xfer_of(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uin
         rt_fatal("gfx: vulkan: a texel copy over the texture at %p (NVN format %#x, target %d): this layer makes no image "
                  "for it", (const void *)t->mem, t->d.format, t->d.target);
     const VkfRow *fr = vkf_row(t->d.format);
+    const char *refused = vkf_decoded_stop(fr, img->format, VKF_USE_TEXEL_COPY);
+    if (refused)
+        rt_fatal("gfx: vulkan: %s over the texture at %p (NVN format %#x, target %d) reaches an image of ASTC blocks decoded "
+                 "to RGBA8, which holds texels where the copy addresses the game's blocks: this layer does not serve it yet",
+                 refused, (const void *)t->mem, t->d.format, t->d.target);
     uint64_t bpb = fr->bpb;
     if (row % bpb)
         rt_fatal("gfx: vulkan: a texel copy with a row pitch of %llu bytes over blocks of %llu", (ull)row, (ull)bpb);

@@ -66,13 +66,12 @@ const char *vkr_op_ticket(uint32_t op) {
     case OP_DISPATCH: case OP_DISPATCH_IND: case OP_BARRIER: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL:
     case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: case OP_PRIM_RESTART:
     case OP_PUSH_CONST: case OP_WAIT_SYNC: case OP_SAMPLE_MASK: case OP_DEPTH_BOUNDS: case OP_CONSERVATIVE:
-    case OP_DRAW_MESH: case OP_DRAW_MESH_IND:
+    case OP_DRAW_MESH: case OP_DRAW_MESH_IND: case OP_GEOMETRY_MODE:
     case OP_SHADING_RATE_IMAGE: case OP_SHADING_RATE_PALETTE: case OP_SHADING_RATE_MODE: case OP_SCRATCH: case OP_HINT:
     case OP_COPY_B2B: case OP_UPDATE_UB: case OP_COPY_B2T: case OP_COPY_STRIDE: case OP_COPY_T2B: case OP_COPY_T2T:
     case OP_CLEAR_TEX: case OP_CLEAR_BUF: case OP_COPY_IMAGE_STRIDE:
     case OP_SIGNAL_EVENT: case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_COND: case OP_WAIT_EVENT:
         return VKR_REPLAYED;
-    case OP_GEOMETRY_MODE: return "geometry processing mode (mesh outputs declare their primitive mode)";
     case OP_BIND_ACCEL: return "acceleration structures (no ticket: the replay has no ray tracing)";
     case OP_JUMP: case OP_CALL: return "a called recording (the front end inlines every one)";
     default: return "unknown";
@@ -1349,6 +1348,20 @@ static void full_rate(const char *what) {
     g_stats.full_rate++;
 }
 
+// The geometry processing mode (NVN2, nvnCommandBufferSetGeometryProcessingMode) is one of the modes 0 to 2. It selects
+// how the console's front end runs the geometry stages of the draws that follow (the path the work takes), not what the
+// draws produce: a mesh draw declares its primitive mode in its own outputs and a classic draw takes its topology from the
+// draw. Vulkan has no state that matches, so nothing is set and each draw is made as it would be without the call; the mode
+// is only logged, once per value, so that a capture shows which ones the game used. A value outside 0 to 2 is one whose
+// meaning this code does not know, and stops by name.
+static void geometry_mode(int32_t mode) {
+    static int logged[3];
+    if (mode < 0 || mode > 2) stop("GEOMETRY_MODE %d is not replayed: only the modes 0 to 2 are", (int)mode);
+    if (!__atomic_exchange_n(&logged[mode], 1, __ATOMIC_RELAXED))
+        rt_log("gfx: vulkan: the game set geometry processing mode %d: nothing to set in Vulkan, the draws are made the same "
+               "(logged once per mode)", (int)mode);
+}
+
 static void record(const op_hdr *r) {
     const void *a = r + 1;
     g_stats.records++;
@@ -1486,6 +1499,7 @@ static void record(const op_hdr *r) {
         if (p->which == 0) S.conservative = p->value != 0;
         break;
     }
+    case OP_GEOMETRY_MODE: geometry_mode(((const p_flag *)a)->value); break;
     case OP_SHADING_RATE_IMAGE:
         if (((const p_shading_rate_image *)a)->tex.present) full_rate("a shading rate image");
         break;

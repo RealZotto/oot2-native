@@ -68,3 +68,18 @@ int vkf_class(VkFormat f);
 // The sRGB format's linear twin, or f itself (the image is made in the linear one, so that storage writes and every
 // view format of the class are legal).
 VkFormat vkf_linear_twin(VkFormat f);
+
+// ---- images of decoded ASTC. A device that does not sample ASTC takes the row's alt (RGBA8, or sRGB) for an ASTC texture,
+// and the upload decodes the game's blocks into it: such an image holds texels, not the game's blocks. Without a device.
+// 1 when an image made in format `made` for row r is that image of decoded texels (the row is ASTC and `made` is no BC or
+// ASTC format); 0 for every other image, an ASTC one the device samples as blocks included.
+int vkf_decoded(const VkfRow *r, VkFormat made);
+// 1 when an image made so may stand in its pool's extent, where the game's storage lies in the row's own layout. An image of
+// decoded texels never may: it would read the compressed blocks as RGBA8 texels, and its upload would overwrite them. It
+// gets memory of its own.
+int vkf_extent_ok(const VkfRow *r, VkFormat made);
+// What a decoded image cannot serve: a program's stores (a storage view) and a copy of linear texel data in the row's block
+// layout (a texel copy), which would address blocks of 16 bytes in an image of 4-byte texels.
+typedef enum { VKF_USE_STORAGE_VIEW = 1, VKF_USE_TEXEL_COPY = 2 } VkfUse;
+// The words naming `use` (for a stop) when an image made in `made` for row r is a decoded one, else NULL (the use is allowed).
+const char *vkf_decoded_stop(const VkfRow *r, VkFormat made, VkfUse use);

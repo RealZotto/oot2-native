@@ -12,7 +12,9 @@ Two groups, by what they need:
   (nvn_fmt_bpb); and the mapping of (texture pool, ID) to the global arrays with stand-ins for the host: one registration
   changes one entry, the same registration again none, an ID registered again under a pending submission takes another
   copy and leaves the pending one as it was, a released serial clears no entry, 4,096 sampler registrations with 300
-  distinct states hold 300 host samplers, second views, two pools, a copy far behind the log, retirement.
+  distinct states hold 300 host samplers, second views, two pools, a copy far behind the log, retirement; and what an image of
+  ASTC decoded to RGBA8 may do (it never stands in its pool's extent, and a storage view or a texel copy of one is refused
+  by name), over every ASTC format.
 - On a device with every item of oot2/vk_required.h (the desktop; the device is the RTX 3060 Ti): images stand at their
   pool offsets in the pool's extent and the texel copies return what they wrote; a registration changes one entry; an ID
   registered again while a gated earlier submission reads the old image leaves that submission's result right; an entry
@@ -152,6 +154,46 @@ def parse_rows(out: str) -> dict[int, dict[str, int | str]]:
             row[k] = int(v) if re.fullmatch(r"-?\d+", v) else v
         rows[int(m.group(1), 16)] = row
     return rows
+
+
+class DecodedAstcTest(unittest.TestCase):
+    """An ASTC texture on a device that does not sample ASTC is an image of RGBA8 texels the upload decodes (no device is
+    needed to decide what such an image may do: vkf_decoded, vkf_extent_ok and vkf_decoded_stop of oot2/vk_format.h)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        done = run("decoded")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert "ok decoded" in done.stdout, done.stdout
+        cls.out = done.stdout
+        cls.astc = re.findall(r"^astc fmt (\w+) decoded=(\d) ok=(\d) storage=\[([^\]]*)\] copy=\[([^\]]*)\] \| sampled decoded=(\d) "
+                              r"ok=(\d) storage=\[([^\]]*)\] copy=\[([^\]]*)\]$", cls.out, re.M)
+        cls.plain = re.findall(r"^plain fmt (\w+) decoded=(\d) ok=(\d) storage=\[([^\]]*)\] copy=\[([^\]]*)\]$", cls.out, re.M)
+
+    def test_every_astc_format_has_a_decoded_image_on_a_device_that_does_not_sample_it(self) -> None:
+        self.assertEqual(len(self.astc), 28)   # 14 block sizes, linear and sRGB
+        for fmt, dec, *_ in self.astc:
+            self.assertEqual(dec, "1", f"ASTC format {fmt}")
+
+    def test_a_decoded_image_never_stands_in_the_extent(self) -> None:
+        self.assertEqual(len(self.astc), 28)
+        for fmt, _, ok, *_ in self.astc:
+            self.assertEqual(ok, "0", f"ASTC format {fmt}")
+
+    def test_a_storage_view_and_a_texel_copy_of_a_decoded_image_are_refused_by_name(self) -> None:
+        self.assertEqual(len(self.astc), 28)
+        for fmt, _, _, storage, copy, *_ in self.astc:
+            self.assertEqual((storage, copy), ("a storage view", "a texel copy"), f"ASTC format {fmt}")
+
+    def test_an_astc_image_the_device_samples_as_blocks_stands_in_the_extent_and_serves_both(self) -> None:
+        for fmt, *_, sdec, sok, sstorage, scopy in self.astc:
+            self.assertEqual((sdec, sok, sstorage, scopy), ("0", "1", "none", "none"), fmt)
+
+    def test_every_other_image_stands_in_the_extent_and_serves_both(self) -> None:
+        self.assertGreater(len(self.plain), 100)
+        for fmt, dec, ok, storage, copy in self.plain:
+            self.assertEqual((dec, ok, storage, copy), ("0", "1", "none", "none"), fmt)
+        self.assertIn("null row decoded=0 ok=1", self.out)
 
 
 class FormatTableTest(unittest.TestCase):
