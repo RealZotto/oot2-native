@@ -153,6 +153,26 @@ void plat_process_memory(PlatProcMem *out) {
     *out = (PlatProcMem){c.PrivateUsage, c.WorkingSetSize, c.PeakWorkingSetSize};
 }
 
+// A first touch of guest memory is an access violation that the vectored handler below settles. Windows delivers it by
+// building the exception frame on the faulting thread's own stack, under its stack pointer: the CONTEXT with the
+// processor's extended state, about 1.8 KB on an AVX2 processor and ten times that where the vector state is larger
+// (AVX-512, AMX), plus the record. The kernel grows a stack only a few pages past its committed end (measured on
+// Windows 10: about 12 KB), and a thread starts with a few KB committed, so on a processor with a large state a fault
+// taken early in a thread's life (the guest's first store to its stack or heap) could not be dispatched at all: the
+// process ended with the violation itself, exit code 0xC0000005, and the handler never ran. Every thread therefore
+// commits stack headroom before it runs anything; the pages stay committed for its life.
+#define STACK_HEADROOM (256ull << 10)
+
+static __attribute__((noinline)) void stack_commit(uint64_t bytes) {
+    if (bytes < 4096) return;
+    volatile char *p = __builtin_alloca((size_t)bytes);
+    for (uint64_t off = 0; off < bytes; off += 4096) p[bytes - 1 - off] = 0;   // from the top, a page at a time
+    p[0] = 0;
+}
+
+// The headroom of a thread that reserved reserve bytes of stack: a quarter of the reserve at most.
+static uint64_t stack_headroom(uint64_t reserve) { return reserve / 4 < STACK_HEADROOM ? (reserve / 4) & ~4095ull : STACK_HEADROOM; }
+
 // First in the chain, so a guest touch is settled before any crash reporter sees it.
 static LONG CALLBACK fault_filter(EXCEPTION_POINTERS *e) {
     const EXCEPTION_RECORD *r = e->ExceptionRecord;
@@ -165,7 +185,14 @@ static LONG CALLBACK fault_filter(EXCEPTION_POINTERS *e) {
 }
 
 void plat_fault_hook(int (*hook)(uint64_t addr, int write, uint64_t host_pc)) {
-    if (!g_fault_hook) AddVectoredExceptionHandler(1, fault_filter);
+    if (!g_fault_hook) {
+        // the calling thread is the process's first: its stack reserves 1 MiB by default
+        void *sp = __builtin_frame_address(0);
+        MEMORY_BASIC_INFORMATION m;
+        if (VirtualQuery(sp, &m, sizeof m) == sizeof m && (uintptr_t)sp > (uintptr_t)m.AllocationBase)
+            stack_commit(stack_headroom((uint64_t)((uintptr_t)sp - (uintptr_t)m.AllocationBase)));
+        AddVectoredExceptionHandler(1, fault_filter);
+    }
     g_fault_hook = hook;
 }
 
@@ -221,10 +248,12 @@ struct PlatThread {
     HANDLE h;
     void (*fn)(void *arg);
     void *arg;
+    uint64_t headroom;   // stack committed before fn runs
 };
 
 static DWORD WINAPI thread_start(void *p) {
     PlatThread *t = p;
+    stack_commit(t->headroom);
     t->fn(t->arg);   // t is not touched after fn returns: plat_thread_free may already have run
     return 0;
 }
@@ -234,6 +263,7 @@ PlatThread *plat_thread_start(void (*fn)(void *arg), void *arg, uint64_t stack_r
     if (!t) return NULL;
     t->fn = fn;
     t->arg = arg;
+    t->headroom = stack_headroom(stack_reserve);
     t->h = CreateThread(NULL, (SIZE_T)stack_reserve, thread_start, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!t->h) {
         free(t);
@@ -394,6 +424,7 @@ struct PlatFibre {
     void *h;
     void (*fn)(void *arg);
     void *arg;
+    uint64_t headroom;   // stack committed before fn runs, as for a thread
 };
 
 PlatFibre *plat_fibre_self(void) {
@@ -414,6 +445,7 @@ void plat_fibre_unself(PlatFibre *own) {
 
 static void WINAPI fibre_start(void *p) {
     PlatFibre *f = p;
+    stack_commit(f->headroom);   // a guest fibre takes its first violations early too (see stack_commit)
     f->fn(f->arg);
 }
 
@@ -422,6 +454,7 @@ PlatFibre *plat_fibre_new(uint64_t stack_reserve, void (*fn)(void *arg), void *a
     if (!f) return NULL;
     f->fn = fn;
     f->arg = arg;
+    f->headroom = stack_headroom(stack_reserve);
     f->h = CreateFiberEx(0x10000, (SIZE_T)stack_reserve, FIBER_FLAG_FLOAT_SWITCH, fibre_start, f);
     if (!f->h) {
         free(f);
