@@ -268,6 +268,21 @@ class SaveTxnTest(unittest.TestCase):
                      "st_publish_prefix("):
             self.assertIn(call, code)
 
+    def test_a_save_write_that_cannot_start_its_shadow_returns_an_error(self) -> None:
+        # A full disk, a name too long for a shadow, or a file deleted under an open handle must not end the process:
+        # the first two come back as the write's result, the last keeps writing to the handle that is open.
+        code = "\n".join(l.split("//", 1)[0] for l in (HOS / "ov_fs.c").read_text(encoding="utf-8").splitlines())
+        start = code.index("static HostFile *file_bound(")
+        body = code[start:code.index("\n}\n", start)]
+        self.assertNotIn("rt_fatal", body)
+        self.assertIn("rc == HF_NOT_FOUND", body)
+        self.assertIn("*err = rc", body)
+        for name in ("write_file(", "set_file_size("):
+            at = code.index("static uint32_t " + name)
+            fn = code[at:code.index("\n}\n", at)]
+            self.assertRegex(fn, r"file_bound\(h, NULL, 1, &berr\)", name)
+            self.assertIn("fs_result(berr)", fn, name)
+
 
 if __name__ == "__main__":
     unittest.main()

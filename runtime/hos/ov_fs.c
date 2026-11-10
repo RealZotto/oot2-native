@@ -435,7 +435,11 @@ static HostFile *take_file(uint64_t h) {
 // The host file to use for handle h (NULL when h is not an open host file). A save handle first follows its file: when the
 // file has a shadow the handle is not on (or no longer has the one it was on, after a Commit), it is reopened on the right
 // one; for_write on a handle open for writing starts the shadow, so the file itself is never written. *mode: the open mode.
-static HostFile *file_bound(uint64_t h, int *mode, int for_write) {
+// NULL with *err set (an HF_ code) when the shadow cannot be started (disk full, a name too long for a shadow); *err stays
+// HF_OK when h is not an open host file. A file deleted or renamed under the handle has no shadow to start: the handle keeps
+// the file it is already on.
+static HostFile *file_bound(uint64_t h, int *mode, int for_write, int *err) {
+    if (err) *err = HF_OK;
     HostFile *f;
     int md;
     if (!file_get(h, &f, &md)) return NULL;
@@ -448,8 +452,14 @@ static HostFile *file_bound(uint64_t h, int *mode, int for_write) {
     plat_mutex_unlock(&fs_lock);
     if (!has) return f;
     uint64_t want = st_serial(real);
-    if (!want && for_write && (md & FS_OPEN_WRITE) && st_begin(real, &want) != HF_OK)
-        rt_fatal("fs: cannot start the shadow of a save file");
+    if (!want && for_write && (md & FS_OPEN_WRITE)) {
+        int rc = st_begin(real, &want);
+        if (rc == HF_NOT_FOUND) want = 0;   // the file is gone from its path: write to the handle that is open
+        else if (rc != HF_OK) {
+            if (err) *err = rc;
+            return NULL;
+        }
+    }
     if (want == bound) return f;
     char target[HOST_PATH];
     if (want) st_shadow_path(real, target, sizeof target);
@@ -548,7 +558,7 @@ static uint32_t read_core(uint64_t h, int64_t offset, uint64_t buf, uint64_t siz
     }
     HostFile *f;
     int mode;
-    if (offset < 0 || (!buf && size) || !(f = file_bound(h, &mode, 0))) return FS_R_INVALID_ARGUMENT;
+    if (offset < 0 || (!buf && size) || !(f = file_bound(h, &mode, 0, NULL))) return FS_R_INVALID_ARGUMENT;
     if (!(mode & FS_OPEN_READ)) return FS_R_OPEN_MODE;
     return guest_read(buf, size, (uint64_t)offset, host_pread, f, 1, got, "host file");
 }
@@ -560,8 +570,9 @@ static uint32_t write_file(uint64_t h, int64_t offset, uint64_t buf, uint64_t si
     int mode;
     if (offset < 0 || (!buf && size) || !file_get(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
     if (!(mode & FS_OPEN_WRITE)) return FS_R_OPEN_MODE;
-    f = file_bound(h, NULL, 1);   // a save file's changes go to its shadow
-    if (!f) return FS_R_INVALID_ARGUMENT;
+    int berr;
+    f = file_bound(h, NULL, 1, &berr);   // a save file's changes go to its shadow
+    if (!f) return berr ? fs_result(berr) : FS_R_INVALID_ARGUMENT;
     uint32_t flags = 0;
     if (option && !hos_in(&flags, option, 4)) return FS_R_INVALID_ARGUMENT;
     uint64_t cur = 0;
@@ -588,7 +599,7 @@ static uint32_t file_size(uint64_t out, uint64_t h) {
     } else {
         HostFile *f;
         uint64_t size = 0;
-        if (!(f = file_bound(h, NULL, 0)) || !hf_size(f, &size)) return FS_R_INVALID_ARGUMENT;
+        if (!(f = file_bound(h, NULL, 0, NULL)) || !hf_size(f, &size)) return FS_R_INVALID_ARGUMENT;
         v = (int64_t)size;
     }
     return hos_out(out, &v, 8) ? 0 : FS_R_INVALID_ARGUMENT;
@@ -600,7 +611,8 @@ static uint32_t set_file_size(uint64_t h, int64_t size) {
     int mode;
     if (size < 0 || !file_get(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
     if (!(mode & FS_OPEN_WRITE)) return FS_R_OPEN_MODE;
-    if (!(f = file_bound(h, NULL, 1))) return FS_R_INVALID_ARGUMENT;
+    int berr;
+    if (!(f = file_bound(h, NULL, 1, &berr))) return berr ? fs_result(berr) : FS_R_INVALID_ARGUMENT;
     return fs_result(hf_set_size(f, (uint64_t)size));
 }
 
@@ -608,7 +620,7 @@ static uint32_t flush_file(uint64_t h) {
     if (romfs_handle(h)) return 0;   // nothing was written
     HostFile *f;
     int mode;
-    if (!(f = file_bound(h, &mode, 0))) return FS_R_INVALID_ARGUMENT;
+    if (!(f = file_bound(h, &mode, 0, NULL))) return FS_R_INVALID_ARGUMENT;
     if (mode & FS_OPEN_WRITE) hf_sync(f);
     return 0;
 }
