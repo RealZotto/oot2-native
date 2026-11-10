@@ -43,6 +43,12 @@
 //
 // Item 42 is 8-bit indices (VK_KHR_index_type_uint8): the title draws with NVN's unsigned byte index type, which Vulkan
 // 1.3 takes only through this extension; primitive restart at 0xFF comes with it.
+//
+// Item 43 is the Vulkan memory model with device scope: SPV_KHR_cooperative_matrix requires it of a module that declares a
+// cooperative matrix, which the translated tensor programs' native HMMA does (oot2/vk_hmma.h). Vulkan 1.3 makes both
+// features required of every device (the specification's appendix on versions), so the first item already implies it.
+// The native HMMA also needs 16-bit floats, which no item asks for: shader_float16 is an optional feature, and a device
+// without it runs the helper the modules keep (vk_hmma.c's gate).
 #pragma once
 #include <stdint.h>
 #include <string.h>
@@ -151,7 +157,10 @@
       (e->features.dualSrcBlend = VK_TRUE))                                                                            \
     X(draw_indirect_first_instance, "indirect draws with a first instance",                                            \
       f->features.drawIndirectFirstInstance,                                                                           \
-      (e->features.drawIndirectFirstInstance = VK_TRUE))                                                                   X(index_type_uint8, "8-bit indices", f->index_u8.indexTypeUint8, (e->index_u8.indexTypeUint8 = VK_TRUE))
+      (e->features.drawIndirectFirstInstance = VK_TRUE))                                                                   X(index_type_uint8, "8-bit indices", f->index_u8.indexTypeUint8, (e->index_u8.indexTypeUint8 = VK_TRUE)) \
+    X(vulkan_memory_model, "the Vulkan memory model with device scope",                                               \
+      f->f12.vulkanMemoryModel && f->f12.vulkanMemoryModelDeviceScope,                                                \
+      (e->f12.vulkanMemoryModel = e->f12.vulkanMemoryModelDeviceScope = VK_TRUE))
 
 // The features the device enables when the GPU reports them and does not require: OOT2_VK_OPTIONAL(X) expands
 // X(id, enable) once per feature. A device without one is still chosen, and none is an item (the check,
@@ -161,12 +170,15 @@
 // feature is allowed exactly when the feature was enabled. zero_initialize_workgroup_memory is a Vulkan 1.3 core
 // feature, so every device the items choose has it; it stays optional because no capability depends on it: the pipeline
 // builder zero-initializes a compute module's workgroup memory (spv_zero_workgroup) when it was enabled and leaves the
-// module as translated when it was not.
+// module as translated when it was not. shader_float16 is the 16-bit floats of the translated modules' native HMMA
+// (oot2/vk_hmma.h): with it off, the start-up gate keeps the helper and the pipeline builder takes the native function and
+// its Float16 declaration out of every module (spv_hmma_fallback).
 #define OOT2_VK_OPTIONAL(X)                                                                                            \
     X(storage_image_array_indexing,                                                                                    \
       (e->f12.shaderStorageImageArrayNonUniformIndexing = f->f12.shaderStorageImageArrayNonUniformIndexing))          \
     X(zero_initialize_workgroup_memory,                                                                                \
-      (e->f13.shaderZeroInitializeWorkgroupMemory = f->f13.shaderZeroInitializeWorkgroupMemory))
+      (e->f13.shaderZeroInitializeWorkgroupMemory = f->f13.shaderZeroInitializeWorkgroupMemory))                      \
+    X(shader_float16, (e->f12.shaderFloat16 = f->f12.shaderFloat16))
 
 // The device extensions the items read, E(id, name), and the ones they depend on below Vulkan 1.4 (pipeline_library
 // for graphics_pipeline_library, maintenance5 for pipeline_binary). The device the back end creates enables every one

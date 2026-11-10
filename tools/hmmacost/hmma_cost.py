@@ -18,8 +18,10 @@ against a CPU model of the same instructions written from NVIDIA's documented fr
 
 Variants (each at --count instructions per lane and at half of it; the cost per instruction is
 the difference of the two medians over the difference of the instruction counts):
-  scratch       HMMA.16816 with an f16 accumulator, the form every HMMA of the game's tensor
-                programs takes: the translator calls its scratch-memory helper
+  scratch       HMMA.16816 with an f16 accumulator in the translator's scratch-memory helper,
+                the form every HMMA of the game's tensor programs took before they ran on
+                cooperative matrices (translated with the job option hmma = "helper"; the
+                game's modules keep the helper for the runtime's fallback)
   shuffle       HMMA.16816 with an f32 accumulator: the translator gathers the fragments with
                 subgroup shuffles, the form D20b describes
   *-plain       the same without the per-HMMA operand perturbation (a uniform XOR of the low
@@ -650,12 +652,15 @@ def cpu_busy_percent(seconds: float = 1.0) -> float | None:
 
 # --- running -----------------------------------------------------------------------------------------
 
-def translate(xlate: Path, p: Program, work: Path) -> tuple[Path, dict]:
+def translate(xlate: Path, p: Program, work: Path, hmma: str | None = None) -> tuple[Path, dict]:
+    """hmma: the job option of that name ("coop", the translator's default, or "helper"); None leaves the default."""
     code = work / f"{p.name}-{p.count}.bin"
     code.write_bytes(p.binary())
-    key = f"t50{p.name.replace('-', '')}{p.count}"
+    key = f"t50{p.name.replace('-', '')}{p.count}{hmma or ''}"
     job = {"key": key, "stage": "cs", "arch": "sm86", "code": str(code), "c1": "",
            "nvn2_cs": [0, 0, 0, 16, 0, 0, 0], "local": [LOCAL, 1, 1], "shared": p.shared}
+    if hmma:
+        job["options"] = {"hmma": hmma}
     results, _ = pool.run_pool([str(xlate)], [(job, work)], 1, work / "logs", timeout=600)
     r = results[0]
     if r.status != "ok":
@@ -764,7 +769,9 @@ def build_variant(name: str, count: int, xlate: Path, work: Path, seed: int, gro
             p = ldsm_program(count) if name == "ldsm" else movm_program(count)
         else:
             p = hmma_program(count, f32, not name.endswith("-plain"))
-        spv, res = translate(xlate, p, work)
+        # the scratch variants measure the scratch-memory helper, which the translator now keeps for the runtime's fallback
+        # and writes as the only form with the job option hmma = "helper" (its default runs HMMA on cooperative matrices)
+        spv, res = translate(xlate, p, work, "helper" if name.startswith("scratch") else None)
         if mutate == "shuffle" and name == "shuffle":
             spv.write_bytes(swap_shuffle_lanes(spv.read_bytes()))
             info["mutated"] = "a shuffle reads one fixed lane"

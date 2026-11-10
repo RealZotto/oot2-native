@@ -214,3 +214,26 @@ Changes of this project:
   also by a select around each float to integer conversion; all of them pass
   spirv-val and none of their descriptions changes but the module's hash and
   size.
+- `CodeGen/Spirv/CoopHmma.cs` (new), `CodeGen/Spirv/SpirvGenerator.cs`,
+  `Generate` and `GenerateCoopHmma`, `CodeGen/Spirv/CodeGenContext.cs`,
+  `GetArgumentPointer`; `Translation/HelperFunctionManager.cs`,
+  `GenerateHmma16816F16Coop`; `Translation/HelperFunctionName.cs`;
+  `Translation/Transforms/TensorPass.cs`, `RunPass`; `IGpuAccessor.cs`,
+  `QueryHostCooperativeHmma` (default false); `Spv.Generator/CoopMatrixGrammar.cs`
+  (new, under `ryujinx/src/`): HMMA.16816 with an f16 accumulator in a SPIR-V
+  compute program calls `dmsh_hmma16816_coop`, which moves each lane's fragment
+  registers into `VK_KHR_cooperative_matrix` matrices in the device's component
+  order, multiplies with one `OpCooperativeMatrixMulAddKHR` and moves D back out,
+  instead of the scratch-memory helper `dmsh_hmma16816_f16`, which stays in the
+  module uncalled with the same arguments: the runtime turns every call of the
+  one into a call of the other, by name, on a device whose start-up probe refuses
+  the native form. A module with the native function takes the Vulkan memory
+  model, which the extension requires of a Shader module; its workgroup loads and
+  stores get `NonPrivatePointer` and `MakePointerVisible` or
+  `MakePointerAvailable` at workgroup scope, as glslang writes a `shared`
+  variable, and nothing else of the module changes. A module with a Coherent
+  image keeps the helper (its native function is a call of the helper). The
+  host's job option `hmma` chooses: `coop` (the default) or `helper`, the form
+  every module had before. On the movie's ten tensor programs every module
+  passes spirv-val (Vulkan 1.3), and the driver's code for the largest falls
+  from 1,621,632 to 221,568 bytes.

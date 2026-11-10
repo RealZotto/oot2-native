@@ -21,6 +21,8 @@
 //                                added and stored (a ":p" after a run: read per primitive), held to the device's mesh output
 //                                limits when they are given, the output memory and the task payload together to the last
 //   spvzero IN OUT               a module with its workgroup variables given the null initializer: how many, or why not
+//   spvhmma IN OUT               a module's native HMMA turned into the helper (spv_hmma_fallback): unchanged, the new size,
+//                                or why not
 //   capcheck MODULE [storage-image-indexing] [drop CAP]   a module judged against the capabilities of a device that has
 //                                every item (with the optional feature when the argument names it; a capability may be dropped)
 //   optional                     the required list's ids and count, and for facts without and with the optional features:
@@ -58,6 +60,9 @@
 //   synth_release PACK           a stage's objects released and made again
 //   synth_threads PACK           eight threads ask for one pipeline: it is made once
 //   synth_absent PACK            a stage the pack lacks: a named fatal with its shape
+//   hmma_probe                   the device and the builder opened and closed: the start-up probe's decision on HMMA
+//                                (oot2/vk_hmma.h)
+//   hmma_build PACK KEY          a translated compute module with HMMA built in the form the probe chose
 // Cases on the player's own pack (the desktop, never in continuous integration):
 //   firstdraw DRAW PACK VKEY PKEY OUT   tools/firstdraw's draw, built from the pack through the builder
 //   corpus_pairs PACK PAIRS THREADS CACHE [save]   pairs built and linked for two formats
@@ -76,6 +81,7 @@
 #include "oot2/shader_desc.h"
 #include "oot2/spirv.h"
 #include "oot2/vk_caps.h"
+#include "oot2/vk_hmma.h"
 #include "oot2/vk_pipeline.h"
 #include "oot2/vk_replay.h"
 #include "plat.h"
@@ -377,6 +383,25 @@ static void case_meshpayload(const char *path) {
     printf("payload %u\n", d.mesh_payload_bytes);
 }
 
+// A module's native HMMA turned into the helper (spv_hmma_fallback), written to out when it changed.
+static void case_spvhmma(const char *in, const char *out) {
+    size_t n;
+    uint32_t *w = read_all(in, &n);
+    uint32_t *o = NULL;
+    size_t words = 0;
+    char why[256];
+    int r = spv_hmma_fallback(w, n / 4, &o, &words, why, sizeof why);
+    if (r < 0) printf("refused: %s\n", why);
+    else if (!r) printf("unchanged\n");
+    else {
+        FILE *f = fopen(out, "wb");
+        CHECK(f && fwrite(o, 4, words, f) == words);
+        fclose(f);
+        printf("helper: %zu words to %zu\n", n / 4, words);
+    }
+    free(o), free(w);
+}
+
 static void case_spvzero(const char *in, const char *out) {
     size_t n;
     uint32_t *w = read_all(in, &n);
@@ -470,6 +495,7 @@ static void case_optional(void) {
         facts_with_every_item(&f);
         f.f12.shaderStorageImageArrayNonUniformIndexing = present ? VK_TRUE : VK_FALSE;
         f.f13.shaderZeroInitializeWorkgroupMemory = present ? VK_TRUE : VK_FALSE;
+        f.f12.shaderFloat16 = present ? VK_TRUE : VK_FALSE;
         unsigned char has[OOT2_VK_ITEM_COUNT];
         printf("%s: has %d of %d\n", tag, oot2_vk_judge(&f, has), OOT2_VK_ITEM_COUNT);
         for (int i = 0; i < OOT2_VK_ITEM_COUNT; i++)
@@ -477,6 +503,7 @@ static void case_optional(void) {
         oot2_vk_enable(&f, &en);
         printf("%s: enabled %d\n", tag, en.f12.shaderStorageImageArrayNonUniformIndexing ? 1 : 0);
         printf("%s: zero-initialized workgroup memory enabled %d\n", tag, en.f13.shaderZeroInitializeWorkgroupMemory ? 1 : 0);
+        printf("%s: 16-bit floats enabled %d\n", tag, en.f12.shaderFloat16 ? 1 : 0);
         VkcList l;
         vkc_list(&f, &l);
         printf("%s: capability 5309 %s\n", tag, vkc_has_cap(&l, 5309) ? "allowed" : "refused");
@@ -1122,6 +1149,31 @@ static void case_synth_absent(const char *pack) {
     printf("returned\n");
 }
 
+// HMMA on cooperative matrices: the device and the pipeline builder opened (the builder's open runs the start-up probe,
+// which logs the decision) and closed again.
+static void case_hmma_probe(void) {
+    gpu_vk_open();
+    vkp_open(NULL);
+    printf("hmma native %d%s%s\n", vkh_native(), vkh_native() ? "" : ": ", vkh_reason());
+    vkp_close();
+    gpu_vk_close();
+    uint64_t errors, warnings;
+    gpu_vk_validation_counts(&errors, &warnings);
+    printf("validation errors %llu warnings %llu\n", (unsigned long long)errors, (unsigned long long)warnings);
+}
+
+// A translated compute module with HMMA built through the builder, in the form the probe chose (OOT2_VK_HMMA=helper: the
+// helper, the native function taken out by spv_hmma_fallback).
+static void case_hmma_build(const char *pack, const char *key) {
+    open_all(pack, NULL);
+    printf("hmma native %d\n", vkh_native());
+    VkpStage cs = {.key = key};
+    CHECK(vkp_compute(&cs));
+    print_stats("hmma");
+    close_and_report();
+    printf("ok hmma_build\n");
+}
+
 // ---------- the player's own pack
 
 typedef struct Job {
@@ -1418,6 +1470,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "meshlibkey") && argc >= 4) case_meshlibkey(argv[2], argc - 3, argv + 3);
     else if (!strcmp(cs, "meshpayload") && argc >= 3) case_meshpayload(argv[2]);
     else if (!strcmp(cs, "spvzero") && argc >= 4) case_spvzero(argv[2], argv[3]);
+    else if (!strcmp(cs, "spvhmma") && argc >= 4) case_spvhmma(argv[2], argv[3]);
     else if (!strcmp(cs, "capcheck") && argc >= 3) case_capcheck(argv[2], argc - 3, argv + 3);
     else if (!strcmp(cs, "optional")) case_optional();
     else if (!strcmp(cs, "cachejudge")) case_cachejudge();
@@ -1448,6 +1501,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(cs, "synth_release") && argc >= 3) case_synth_release(argv[2]);
         else if (!strcmp(cs, "synth_threads") && argc >= 3) case_synth_threads(argv[2]);
         else if (!strcmp(cs, "synth_absent") && argc >= 3) case_synth_absent(argv[2]);
+        else if (!strcmp(cs, "hmma_probe")) case_hmma_probe();
+        else if (!strcmp(cs, "hmma_build") && argc >= 4) case_hmma_build(argv[2], argv[3]);
         else if (!strcmp(cs, "firstdraw") && argc >= 7) case_firstdraw(argv[2], argv[3], argv[4], argv[5], argv[6]);
         else if (!strcmp(cs, "corpus_pairs") && argc >= 6) case_corpus(argv[2], argv[3], 1, atoi(argv[4]), argv[5], argc >= 7);
         else if (!strcmp(cs, "corpus_compute") && argc >= 6) case_corpus(argv[2], argv[3], 0, atoi(argv[4]), argv[5], argc >= 7);

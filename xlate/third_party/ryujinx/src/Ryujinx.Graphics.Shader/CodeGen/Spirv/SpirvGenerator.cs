@@ -84,6 +84,10 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             context.AddCapability(Capability.Shader);
 
+            // oot2-native: HMMA on VK_KHR_cooperative_matrix (CoopHmma) takes the Vulkan memory model, which that extension requires of a Shader module
+            bool nativeHmma = CoopHmma.IsNative(context, info);
+            MemoryModel memoryModel = nativeHmma ? MemoryModel.Vulkan : MemoryModel.GLSL450;
+
             // nxnative: raw global memory goes through physical storage buffer pointers (ShaderProperties.UsesPhysicalPointers), which take 64-bit physical addressing
             // oot2-native: the draw's first task is read by device address too (MeshAbi)
             if (context.Properties.UsesPhysicalPointers || context.Properties.UsesFirstTask)
@@ -91,11 +95,19 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 context.AddCapability(Capability.PhysicalStorageBufferAddresses);
                 context.AddCapability(Capability.Int64);
                 context.AddExtension("SPV_KHR_physical_storage_buffer");
-                context.SetMemoryModel(AddressingModel.PhysicalStorageBuffer64, MemoryModel.GLSL450);
+                context.SetMemoryModel(AddressingModel.PhysicalStorageBuffer64, memoryModel);
             }
             else
             {
-                context.SetMemoryModel(AddressingModel.Logical, MemoryModel.GLSL450);
+                context.SetMemoryModel(AddressingModel.Logical, memoryModel);
+            }
+
+            uint workgroupScope = 0;
+
+            if (nativeHmma)
+            {
+                CoopHmma.Declare(context);
+                workgroupScope = context.Constant(context.TypeU32(), (int)Scope.Workgroup).Id;
             }
 
             context.AddCapability(Capability.GroupNonUniformBallot);
@@ -231,7 +243,14 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             for (int funcIndex = 0; funcIndex < info.Functions.Count; funcIndex++)
             {
-                Generate(context, info, funcIndex);
+                if (info.Functions[funcIndex].Name == HelperFunctionManager.HmmaCoopName)
+                {
+                    GenerateCoopHmma(context, info, funcIndex, nativeHmma);
+                }
+                else
+                {
+                    Generate(context, info, funcIndex);
+                }
             }
 
             if (context.Definitions.MeshStage != null)
@@ -248,7 +267,32 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 _integerPool.Release(integerPool);
             }
 
-            return result;
+            // oot2-native: the workgroup accesses under the Vulkan memory model's rules (CoopHmma.ToVulkanMemoryModel)
+            return nativeHmma ? CoopHmma.ToVulkanMemoryModel(result, workgroupScope) : result;
+        }
+
+        // oot2-native: the HMMA function on VK_KHR_cooperative_matrix, whose body the IR does not hold (HelperFunctionManager.GenerateHmma16816F16Coop):
+        // the native body, or in a module that keeps the helper (CoopHmma.IsNative) a call of the helper
+        private static void GenerateCoopHmma(CodeGenContext context, StructuredProgramInfo info, int funcIndex, bool native)
+        {
+            (StructuredFunction function, SpvInstruction spvFunc) = context.GetFunction(funcIndex);
+
+            context.CurrentFunction = function;
+            context.AddFunction(spvFunc);
+            context.StartFunction(isMainFunction: false);
+
+            Declarations.DeclareParameters(context, function);
+
+            if (native)
+            {
+                CoopHmma.EmitBody(context);
+            }
+            else
+            {
+                CoopHmma.EmitHelperCall(context, context.GetFunction(CoopHmma.FindFunction(info, HelperFunctionManager.HmmaHelperName)).Item2);
+            }
+
+            context.FunctionEnd();
         }
 
         private static void Generate(CodeGenContext context, StructuredProgramInfo info, int funcIndex)

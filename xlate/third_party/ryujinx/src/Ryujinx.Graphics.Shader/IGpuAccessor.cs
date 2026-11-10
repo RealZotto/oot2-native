@@ -231,6 +231,15 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// oot2-native: queries host about whether HMMA.16816 with an f16 accumulator runs on VK_KHR_cooperative_matrix (Transforms/TensorPass.cs).
+        /// </summary>
+        /// <returns>True for the native form, which keeps the helper in the module for the runtime's fallback; false for the helper alone</returns>
+        bool QueryHostCooperativeHmma()
+        {
+            return false;
+        }
+
+        /// <summary>
         /// Queries host about the presence of the FrontFacing built-in variable bug.
         /// </summary>
         /// <returns>True if the bug is present on the host device used, false otherwise</returns>

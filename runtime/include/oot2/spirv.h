@@ -88,3 +88,13 @@ uint32_t *spv_add_mesh_outputs(const uint32_t *words, size_t nwords, const SpvMe
 // nothing (it has no such variable), else *out is a malloc'd module of *out_words words; -1 with the reason in why (not
 // SPIR-V, a variable whose type this cannot name, out of memory).
 int spv_zero_workgroup(const uint32_t *words, size_t nwords, uint32_t **out, size_t *out_words, char *why, size_t cap);
+
+// The module with its native HMMA turned into the helper (oot2/vk_hmma.h), for a device whose start-up probe refused the
+// native form: every OpFunctionCall of the function named dmsh_hmma16816_coop calls the function named
+// dmsh_hmma16816_f16 instead (the two take the same arguments), and the native function, the cooperative matrix types,
+// the 16-bit float types and constants only it used, their names and decorations, the capabilities CooperativeMatrixKHR
+// and Float16 and the extension SPV_KHR_cooperative_matrix are taken out. The Vulkan memory model stays (an item of the
+// required list). Returns 0 with *out NULL when the module declares no cooperative matrix (nothing to do), 1 with *out a
+// malloc'd module of *out_words words, or -1 with the reason in why (not SPIR-V, a malformed instruction, a module with
+// cooperative matrices but not both functions, a 16-bit float used outside the native function, out of memory).
+int spv_hmma_fallback(const uint32_t *words, size_t nwords, uint32_t **out, size_t *out_words, char *why, size_t cap);

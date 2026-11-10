@@ -403,6 +403,9 @@ internal sealed class Accessor : IGpuAccessor
 
     public bool QueryHostReducedPrecision() => _job.Options.Reduced;
 
+    // HMMA on VK_KHR_cooperative_matrix (the job option hmma, JobOptions.Hmma)
+    public bool QueryHostCooperativeHmma() => _job.Options.Hmma == JobOptions.HmmaCoop;
+
     public bool QueryHostSupportsShaderNonUniformIndexing() => _job.Options.NonUniformIndexing;
 
     // The host binds each storage buffer at its guest address rounded down to the

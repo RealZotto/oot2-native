@@ -161,7 +161,31 @@ typedef struct {
     PFN_vkGetPhysicalDeviceFeatures2 features2;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memory2;
     PFN_vkEnumerateDeviceExtensionProperties extensions;
+#ifdef VK_KHR_cooperative_matrix
+    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR coopmat;   // NULL when the loader does not give it
+#endif
 } Fns;
+
+#ifdef VK_KHR_cooperative_matrix
+// Whether the device lists the cooperative matrix the translated tensor programs' native HMMA uses (oot2/vk_hmma.h):
+// 16x8x16 on a subgroup, f16 A, B, C and result, without saturation. The runtime's start-up gate asks the same.
+static int coop_hmma_shape(const Fns *fn, VkPhysicalDevice dev) {
+    uint32_t n = 0;
+    if (!fn->coopmat || fn->coopmat(dev, &n, NULL) != VK_SUCCESS || !n) return 0;
+    VkCooperativeMatrixPropertiesKHR *p = calloc(n, sizeof *p);
+    if (!p) return 0;
+    for (uint32_t i = 0; i < n; i++) p[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    int shape = 0;
+    if (fn->coopmat(dev, &n, p) == VK_SUCCESS)
+        for (uint32_t i = 0; i < n; i++)
+            shape |= p[i].MSize == 16 && p[i].NSize == 8 && p[i].KSize == 16 && p[i].AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                     p[i].BType == VK_COMPONENT_TYPE_FLOAT16_KHR && p[i].CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                     p[i].ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR && !p[i].saturatingAccumulation &&
+                     p[i].scope == VK_SCOPE_SUBGROUP_KHR;
+    free(p);
+    return shape;
+}
+#endif
 
 static void probe_properties(const Fns *fn, VkPhysicalDevice dev, const VkPhysicalDeviceProperties *p,
                              const VkExtensionProperties *ext, uint32_t ne) {
@@ -298,6 +322,8 @@ static void probe_features(const Fns *fn, VkPhysicalDevice dev, const VkPhysical
         kbool("runtime_descriptor_array", f12.runtimeDescriptorArray);
         kbool("timeline_semaphore", f12.timelineSemaphore);
         kbool("vulkan_memory_model", f12.vulkanMemoryModel);
+        kbool("vulkan_memory_model_device_scope", f12.vulkanMemoryModelDeviceScope);
+        kbool("shader_float16", f12.shaderFloat16);   // the native HMMA's 16-bit floats (oot2/vk_hmma.h)
     }
     if (v13) {
         kbool("dynamic_rendering", f13.dynamicRendering);
@@ -325,7 +351,10 @@ static void probe_features(const Fns *fn, VkPhysicalDevice dev, const VkPhysical
     if (vi) kbool("vertex_input_dynamic_state", fvi.vertexInputDynamicState);
 #endif
 #ifdef VK_KHR_cooperative_matrix
-    if (cm) kbool("cooperative_matrix", fcm.cooperativeMatrix);
+    if (cm) {
+        kbool("cooperative_matrix", fcm.cooperativeMatrix);
+        kbool("cooperative_matrix_16x8x16_f16", coop_hmma_shape(fn, dev));
+    }
 #endif
 #ifdef VK_EXT_device_fault
     if (fault) kbool("device_fault", ffault.deviceFault);
@@ -454,6 +483,10 @@ static void probe_vulkan(void) {
         .features2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(inst, "vkGetPhysicalDeviceFeatures2"),
         .memory2 = (PFN_vkGetPhysicalDeviceMemoryProperties2)gipa(inst, "vkGetPhysicalDeviceMemoryProperties2"),
         .extensions = (PFN_vkEnumerateDeviceExtensionProperties)gipa(inst, "vkEnumerateDeviceExtensionProperties"),
+#ifdef VK_KHR_cooperative_matrix
+        .coopmat = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)gipa(
+            inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"),
+#endif
     };
     VkPhysicalDevice devs[16];
     uint32_t n = 16;

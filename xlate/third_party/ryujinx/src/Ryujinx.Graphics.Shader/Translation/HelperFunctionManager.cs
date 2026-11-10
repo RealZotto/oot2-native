@@ -178,8 +178,28 @@ namespace Ryujinx.Graphics.Shader.Translation
                 HelperFunctionName.SharedStore8 => GenerateSharedStore8(id),
                 HelperFunctionName.SharedStore16 => GenerateSharedStore16(id),
                 HelperFunctionName.Hmma16816F16 => GenerateHmma16816F16(id),
+                HelperFunctionName.Hmma16816F16Coop => GenerateHmma16816F16Coop(),
                 _ => throw new ArgumentException($"Invalid function name {functionName}"),
             };
+        }
+
+        // oot2-native: the names of the two HMMA functions. The runtime finds them by these names (OpName) and, where the native one cannot run,
+        // turns every call of the native one into a call of the helper (runtime/gpu/spirv.c, spv_hmma_fallback)
+        public const string HmmaHelperName = "dmsh_hmma16816_f16";
+        public const string HmmaCoopName = "dmsh_hmma16816_coop";
+
+        // oot2-native: HMMA.16816 with an f16 accumulator on VK_KHR_cooperative_matrix, with the helper's contract (the same ten arguments and the
+        // out argument, so that a call of one can become a call of the other). The IR has no matrix type, so this body is a stand-in that the IR
+        // passes leave alone: the SPIR-V generator writes the function's real body (CodeGen/Spirv/CoopHmma.cs), the fragments moved into
+        // cooperative matrices in the device's element order, one OpCooperativeMatrixMulAddKHR, and D moved back out
+        private static Function GenerateHmma16816F16Coop()
+        {
+            EmitterContext context = new();
+
+            context.Copy(Argument(10), Const(0));
+            context.Return(Const(0));
+
+            return new Function(ControlFlowGraph.Create(context.GetOperations()).Blocks, HmmaCoopName, true, 10, 1);
         }
 
         private static Function GenerateSharedAtomicSigned(int id, bool isMin)

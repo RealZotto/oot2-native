@@ -671,3 +671,94 @@ int spv_zero_workgroup(const uint32_t *w, size_t n, uint32_t **out, size_t *out_
     free(pointee), free(null_of);
     return (int)targets;
 }
+
+// ---- HMMA's native form out (oot2/vk_hmma.h)
+
+enum {
+    OP_UNDEF = 1, OP_NAME = 5, OP_MEMBER_NAME = 6, OP_CONSTANT_TRUE = 41, OP_SPEC_CONSTANT_OP = 52, OP_FUNCTION_END = 56,
+    OP_FUNCTION_CALL = 57, OP_TYPE_COOPERATIVE_MATRIX = 4456, CAP_FLOAT16 = 9, CAP_COOPERATIVE_MATRIX = 6022
+};
+
+// 1 when the string operand starting at word i of an instruction ending at word end is name.
+static int string_is(const uint32_t *w, size_t i, size_t end, const char *name) {
+    size_t len = strlen(name) + 1;
+    char text[64];
+    if (len > sizeof text || (end - i) * 4 < len) return 0;
+    memcpy(text, w + i, len);
+    return !memcmp(text, name, len);
+}
+
+static int is_type(uint32_t op) { return (op >= 19 && op <= OP_TYPE_FORWARD_POINTER) || op == OP_TYPE_COOPERATIVE_MATRIX; }
+static int is_value_declaration(uint32_t op) {   // [result type, result]: constants and undefined values
+    return op == OP_UNDEF || (op >= OP_CONSTANT_TRUE && op <= OP_SPEC_CONSTANT_OP);
+}
+
+int spv_hmma_fallback(const uint32_t *w, size_t n, uint32_t **out, size_t *out_words, char *why, size_t cap) {
+    *out = NULL, *out_words = 0;
+    if (n < 5 || w[0] != SPV_MAGIC) FAIL("not a SPIR-V module (%zu words)", n);
+    uint32_t bound = w[3], coop = 0, helper = 0;
+    int matrices = 0;
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) FAIL("malformed instruction at word %zu", i);
+        if (op == OP_CAPABILITY && len == 2 && w[i + 1] == CAP_COOPERATIVE_MATRIX) matrices = 1;
+        if (op == OP_NAME && len >= 3) {
+            if (string_is(w, i + 2, i + len, "dmsh_hmma16816_coop")) coop = w[i + 1];
+            if (string_is(w, i + 2, i + len, "dmsh_hmma16816_f16")) helper = w[i + 1];
+        }
+        i += len;
+    }
+    if (!matrices) return 0;
+    if (!coop || !helper || coop >= bound || helper >= bound)
+        FAIL("a module with cooperative matrices but without both functions dmsh_hmma16816_coop and dmsh_hmma16816_f16");
+    // What goes: the matrix types, the 16-bit float types and everything declared of them, in declaration order, which
+    // puts every type before its uses; and the native function.
+    unsigned char *gone = calloc(bound, 1);
+    uint32_t *o = malloc(n * sizeof *o), *q = o;
+    if (!gone || !o) {
+        free(gone), free(o);
+        FAIL("out of memory");
+    }
+    int halves = 0;
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == OP_FUNCTION) break;
+        if (op == OP_TYPE_COOPERATIVE_MATRIX && len >= 2 && w[i + 1] < bound) gone[w[i + 1]] = 1;
+        else if (op == OP_TYPE_FLOAT && len == 3 && w[i + 2] == 16 && w[i + 1] < bound) gone[w[i + 1]] = 1, halves = 1;
+        else if (op == OP_TYPE_VECTOR && len == 4 && w[i + 1] < bound && w[i + 2] < bound && gone[w[i + 2]]) gone[w[i + 1]] = 1;
+        else if (op == OP_TYPE_POINTER && len == 4 && w[i + 1] < bound && w[i + 3] < bound && gone[w[i + 3]]) gone[w[i + 1]] = 1;
+        else if (is_value_declaration(op) && len >= 3 && w[i + 1] < bound && w[i + 2] < bound && gone[w[i + 1]]) gone[w[i + 2]] = 1;
+        i += len;
+    }
+    gone[coop] = 1;
+    memcpy(q, w, 5 * 4), q += 5;
+    int functions = 0, inside = 0;   // past the declarations; within the native function
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16, keep = 1;
+        if (op == OP_FUNCTION) functions = 1, inside = len >= 3 && w[i + 2] == coop;
+        if (inside) keep = 0;
+        else if (op == OP_CAPABILITY && len == 2)
+            keep = w[i + 1] != CAP_COOPERATIVE_MATRIX && !(halves && w[i + 1] == CAP_FLOAT16);
+        else if (op == OP_EXTENSION) keep = !string_is(w, i + 1, i + len, "SPV_KHR_cooperative_matrix");
+        else if ((op == OP_NAME || op == OP_MEMBER_NAME || is_annotation(op)) && len >= 2)
+            keep = !(w[i + 1] < bound && gone[w[i + 1]]);
+        else if (!functions && is_type(op) && len >= 2) keep = !(w[i + 1] < bound && gone[w[i + 1]]);
+        else if (!functions && is_value_declaration(op) && len >= 3) keep = !(w[i + 2] < bound && gone[w[i + 2]]);
+        else if (functions && len >= 2 && w[i + 1] < bound && gone[w[i + 1]] && w[i + 1] != coop) {
+            // every id is defined once, so word 1 names a removed type only where an instruction has it as its type
+            uint32_t id = w[i + 1];
+            free(gone), free(o);
+            FAIL("an instruction (opcode %u) outside dmsh_hmma16816_coop has %u, a matrix or 16-bit float type", op, id);
+        }
+        if (keep) {
+            memcpy(q, w + i, (size_t)len * 4);
+            if (op == OP_FUNCTION_CALL && len >= 4 && q[3] == coop) q[3] = helper;
+            q += len;
+        }
+        if (op == OP_FUNCTION_END) inside = 0;
+        i += len;
+    }
+    free(gone);
+    *out = o, *out_words = (size_t)(q - o);
+    return 1;
+}

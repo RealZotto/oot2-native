@@ -292,6 +292,12 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             return _funcArgs[funcArg.Value];
         }
 
+        // oot2-native: argument index's parameter, for a body the generator writes itself (CoopHmma)
+        public Instruction GetArgumentPointer(int index)
+        {
+            return _funcArgs[index];
+        }
+
         public Instruction GetLocal(AggregateType dstType, AstOperand local)
         {
             AggregateType srcType = local.VarType;

@@ -40,6 +40,7 @@
 #include "oot2/runtime.h"
 #include "oot2/spirv.h"
 #include "oot2/vk_caps.h"
+#include "oot2/vk_hmma.h"
 #include "oot2/vk_pipeline.h"
 #include "plat.h"
 
@@ -735,6 +736,18 @@ static VkPipeline build_compute(void *c) {
     VkpModule m;
     vkp_module(s, SHD_CS, &m);
     require_idle("a compute pipeline would be created", s->key, ((ComputeCtx *)c)->late);
+    // A module whose HMMA runs on cooperative matrices calls the helper instead where the start-up probe refused the
+    // native form (oot2/vk_hmma.h): the capabilities are checked on the module that is created.
+    uint32_t *helper = NULL;
+    size_t hwords = 0;
+    if (!vkh_native()) {
+        char why[256], shape[256];
+        if (spv_hmma_fallback(m.code, m.bytes / 4, &helper, &hwords, why, sizeof why) < 0) {
+            shape_text(s, shape, sizeof shape);
+            rt_fatal("gfx: vulkan: stage %s cannot have its native HMMA turned into the helper: %s (%s)", s->key, why, shape);
+        }
+        if (helper) m.code = helper, m.bytes = (uint32_t)(hwords * 4);
+    }
     check_capabilities(s, &m);
     // A compute module's workgroup memory starts as the null value of its type when the device was made with the
     // zero-initialization feature (spv_zero_workgroup says why): the module made from the pack's differs from it only in
@@ -752,6 +765,7 @@ static VkPipeline build_compute(void *c) {
     }
     VkShaderModule sm = make_module(code, words);
     free(zeroed);
+    free(helper);
     VkPipelineCreationFeedback fb = {0}, stage_fb = {0};
     VkPipelineCreationFeedbackCreateInfo fbi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
                                                 .pPipelineCreationFeedback = &fb, .pipelineStageCreationFeedbackCount = 1,
@@ -1358,6 +1372,7 @@ void vkp_open(const char *cache_path) {
     Oot2VkFacts en;
     oot2_vk_enable(&gpu_vk.facts, &en);
     P.zero_workgroup = en.f13.shaderZeroInitializeWorkgroupMemory == VK_TRUE;
+    vkh_probe();   // whether the modules' native HMMA runs on this device (oot2/vk_hmma.h), before any module is built
     cache_open(cache_path);
     PipeInfo pi;
     pipe_info(&pi, PART_VERTEX_INPUT, VK_NULL_HANDLE, NULL);

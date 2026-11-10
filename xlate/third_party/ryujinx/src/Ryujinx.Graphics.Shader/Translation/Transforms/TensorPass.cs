@@ -32,6 +32,15 @@ namespace Ryujinx.Graphics.Shader.Translation.Transforms
 
             int functionId = context.Hfm.GetOrCreateFunctionId(HelperFunctionName.Hmma16816F16, memoryId.Value);
 
+            // oot2-native: with the host's cooperative HMMA (the job option `hmma`, default "coop"), a SPIR-V compute program calls the native function
+            // instead, with the same arguments. The helper stays in the module, uncalled: the runtime turns the calls back into calls of the helper by
+            // name where the device cannot run the native one (runtime/gpu/spirv.c, spv_hmma_fallback), and the SPIR-V generator does the same where
+            // the module cannot take the Vulkan memory model the native one needs (CodeGen/Spirv/CoopHmma.cs). A task or mesh program keeps the helper
+            if (context.TargetLanguage == TargetLanguage.Spirv && context.Definitions.MeshStage == null && context.GpuAccessor.QueryHostCooperativeHmma())
+            {
+                functionId = context.Hfm.GetOrCreateFunctionId(HelperFunctionName.Hmma16816F16Coop, memoryId.Value);
+            }
+
             Operand d0 = operation.GetDest(0);
             Operand d1 = operation.GetDest(1);
 

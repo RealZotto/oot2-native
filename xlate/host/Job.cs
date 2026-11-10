@@ -92,6 +92,14 @@ internal sealed class JobOptions
 
     // The limits a task or mesh program is checked against (the RTX 3060 Ti's unless prepare reads the device)
     public MeshLimits MeshLimits { get; init; } = MeshLimits.Default;
+
+    // How HMMA.16816 with an f16 accumulator is translated in a compute program. "coop" (the default): a call of a function that runs it on
+    // VK_KHR_cooperative_matrix, with the scratch-memory helper kept in the module, uncalled, for the runtime to fall back to by name on a
+    // device whose probe refuses the native form (runtime/gpu/vk_hmma.c). "helper": the helper alone, the form every module had before (A/B
+    // work and picture checks). The default is part of the executable, so changing it changes the translator identity
+    public const string HmmaCoop = "coop";
+    public const string HmmaHelper = "helper";
+    public string Hmma { get; init; } = HmmaCoop;
 }
 
 /// <summary>
@@ -119,7 +127,7 @@ internal sealed class Job
 
     private static readonly HashSet<string> KnownOptions = new(StringComparer.Ordinal)
     {
-        "debug", "reduced", "float64", "nonuniform_indexing", "capability_fixup", "variant", "mesh_limits",
+        "debug", "reduced", "float64", "nonuniform_indexing", "capability_fixup", "variant", "mesh_limits", "hmma",
     };
 
     public string Key { get; private set; }
@@ -546,7 +554,7 @@ internal sealed class Job
         }
 
         bool debug = false, reduced = false, float64 = true, nonUniform = true, fixup = true;
-        string variant = "";
+        string variant = "", hmma = JobOptions.HmmaCoop;
         MeshLimits limits = MeshLimits.Default;
 
         foreach (JsonProperty p in opt.EnumerateObject())
@@ -567,6 +575,14 @@ internal sealed class Job
                 case "capability_fixup": fixup = ReadBool(p.Value, where); break;
                 case "variant": variant = ReadString(p.Value, where); break;
                 case "mesh_limits": limits = ReadMeshLimits(p.Value, where); break;
+                case "hmma":
+                    hmma = ReadString(p.Value, where);
+                    if (hmma != JobOptions.HmmaCoop && hmma != JobOptions.HmmaHelper)
+                    {
+                        throw Bad($"{where} is '{Clip(hmma)}'; the values are '{JobOptions.HmmaCoop}' and '{JobOptions.HmmaHelper}'");
+                    }
+
+                    break;
             }
         }
 
@@ -579,6 +595,7 @@ internal sealed class Job
             CapabilityFixup = fixup,
             Variant = variant,
             MeshLimits = limits,
+            Hmma = hmma,
         };
     }
 

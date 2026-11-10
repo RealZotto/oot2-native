@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The oot2-native contributors
+//
+// The start-up probe of HMMA on VK_KHR_cooperative_matrix (oot2/vk_hmma.h, runtime/gpu/vk_hmma.c): one subgroup of 32 lanes,
+// one buffer of words at the device address in the push constants.
+//
+// 1. The order. A (16 x 16), B (16 x 8) and C (16 x 8) of halves are loaded row-major from words 0, 128 and 192, each
+//    component's value its position (row times columns plus column); every lane writes its components in index order and
+//    the matrices' per-lane lengths, so the CPU finds which component holds which position.
+// 2. The native multiply. Lane t's eight words at 256 + 8t are the console's fragments of A (4), B (2) and C (2); they
+//    go into cooperative matrices component by component as the translator's function does (the console element of each
+//    component is the inverse of the translator's order, from the push constants), one multiply-add, and D's console
+//    elements come out at the components the order names.
+// 3. The helper's multiply, on the same words: the scratch-memory helper's algorithm (A row-major, B transposed and C in
+//    a block of workgroup memory, a barrier, then each lane's two D words from 64 fused multiply-adds in k order, rounded
+//    to halves once), as the translator's dmsh_hmma16816_f16 computes it.
+//
+// Out: 512 + 8t lane t's A, B and C components (4, 2 and 2 words); 768 + 2t the native D; 832 + 2t the helper's D; 896
+// the lengths of A, B and C.
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 32) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint w[];
+};
+
+layout(push_constant) uniform Probe {
+    uvec2 words;
+    uint inv_a[8];   // the console element that component j of A holds
+    uint inv_b[4];
+    uint inv_c[4];
+    uint ord_c[4];   // the component that holds console element e of C and D
+} probe;
+
+shared uint block[256];
+
+#define MA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MB coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB>
+#define MC coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>
+
+uint pack2(float16_t lo, float16_t hi) {
+    return packFloat2x16(f16vec2(lo, hi));
+}
+
+void main() {
+    Words b = Words(probe.words);
+    uint t = gl_LocalInvocationID.x;
+
+    // 1. the order
+    MA pa;
+    MB pb;
+    MC pc;
+    coopMatLoad(pa, b.w, 0, 8, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(pb, b.w, 128, 4, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(pc, b.w, 192, 4, gl_CooperativeMatrixLayoutRowMajor);
+    uint o = 512 + 8 * t;
+    b.w[o + 0] = pack2(pa[0], pa[1]);
+    b.w[o + 1] = pack2(pa[2], pa[3]);
+    b.w[o + 2] = pack2(pa[4], pa[5]);
+    b.w[o + 3] = pack2(pa[6], pa[7]);
+    b.w[o + 4] = pack2(pb[0], pb[1]);
+    b.w[o + 5] = pack2(pb[2], pb[3]);
+    b.w[o + 6] = pack2(pc[0], pc[1]);
+    b.w[o + 7] = pack2(pc[2], pc[3]);
+    if (t == 0) {
+        b.w[896] = pa.length();
+        b.w[897] = pb.length();
+        b.w[898] = pc.length();
+    }
+
+    // 2. the native multiply
+    uint i = 256 + 8 * t;
+    float16_t ea[8], eb[4], ec[4];
+    for (int r = 0; r < 4; r++) {
+        f16vec2 h = unpackFloat2x16(b.w[i + r]);
+        ea[2 * r] = h.x;
+        ea[2 * r + 1] = h.y;
+    }
+    for (int r = 0; r < 2; r++) {
+        f16vec2 hb = unpackFloat2x16(b.w[i + 4 + r]);
+        f16vec2 hc = unpackFloat2x16(b.w[i + 6 + r]);
+        eb[2 * r] = hb.x;
+        eb[2 * r + 1] = hb.y;
+        ec[2 * r] = hc.x;
+        ec[2 * r + 1] = hc.y;
+    }
+    MA ma = MA(float16_t(0.0));
+    MB mb = MB(float16_t(0.0));
+    MC mc = MC(float16_t(0.0));
+    ma[0] = ea[probe.inv_a[0]];
+    ma[1] = ea[probe.inv_a[1]];
+    ma[2] = ea[probe.inv_a[2]];
+    ma[3] = ea[probe.inv_a[3]];
+    ma[4] = ea[probe.inv_a[4]];
+    ma[5] = ea[probe.inv_a[5]];
+    ma[6] = ea[probe.inv_a[6]];
+    ma[7] = ea[probe.inv_a[7]];
+    mb[0] = eb[probe.inv_b[0]];
+    mb[1] = eb[probe.inv_b[1]];
+    mb[2] = eb[probe.inv_b[2]];
+    mb[3] = eb[probe.inv_b[3]];
+    mc[0] = ec[probe.inv_c[0]];
+    mc[1] = ec[probe.inv_c[1]];
+    mc[2] = ec[probe.inv_c[2]];
+    mc[3] = ec[probe.inv_c[3]];
+    MC md = coopMatMulAdd(ma, mb, mc);
+    float16_t ed[4];
+    ed[0] = md[0];
+    ed[1] = md[1];
+    ed[2] = md[2];
+    ed[3] = md[3];
+    b.w[768 + 2 * t] = pack2(ed[probe.ord_c[0]], ed[probe.ord_c[1]]);
+    b.w[768 + 2 * t + 1] = pack2(ed[probe.ord_c[2]], ed[probe.ord_c[3]]);
+
+    // 3. the helper's multiply: lane L, g = L / 4, q = L % 4 (the translator's t)
+    uint g = t >> 2, q = t & 3;
+    block[g * 8 + q] = b.w[i + 0];
+    block[(g + 8) * 8 + q] = b.w[i + 1];
+    block[g * 8 + q + 4] = b.w[i + 2];
+    block[(g + 8) * 8 + q + 4] = b.w[i + 3];
+    block[128 + g * 8 + q] = b.w[i + 4];
+    block[128 + g * 8 + q + 4] = b.w[i + 5];
+    block[192 + g * 4 + q] = b.w[i + 6];
+    block[192 + (g + 8) * 4 + q] = b.w[i + 7];
+    barrier();
+    for (uint half_row = 0; half_row < 2; half_row++) {
+        uint row = g + 8 * half_row;
+        vec2 cw = unpackHalf2x16(b.w[i + 6 + half_row]);
+        float acc[2] = float[2](cw.x, cw.y);
+        for (uint j = 0; j < 2; j++) {
+            uint col = 2 * q + j;
+            for (uint kw = 0; kw < 8; kw++) {
+                vec2 aw = unpackHalf2x16(block[row * 8 + kw]);
+                vec2 bw = unpackHalf2x16(block[128 + col * 8 + kw]);
+                acc[j] = fma(aw.x, bw.x, acc[j]);
+                acc[j] = fma(aw.y, bw.y, acc[j]);
+            }
+        }
+        b.w[832 + 2 * t + half_row] = packHalf2x16(vec2(acc[0], acc[1]));
+    }
+}

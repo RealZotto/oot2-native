@@ -280,6 +280,7 @@ internal sealed class Host
             w.WriteBoolean("nonuniform_indexing", d.NonUniformIndexing);
             w.WriteBoolean("capability_fixup", d.CapabilityFixup);
             w.WriteString("variant", d.Variant);
+            w.WriteString("hmma", d.Hmma);
             w.WriteNumber("heap_images", Job.DefaultHeapImages);
             w.WriteNumber("heap_samplers", Job.DefaultHeapSamplers);
             w.WriteEndObject();
