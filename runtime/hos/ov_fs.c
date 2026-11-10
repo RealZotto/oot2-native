@@ -4,8 +4,10 @@
 // nn::fs as the host answers it. A path is "<mount>:/<path>" and a mount name maps to: the RomFS pack (romfs.c,
 // read-only); save data in <game folder>/save/<user>/, created on first use; temporary storage in <game folder>/temp/,
 // emptied the first time it is mounted in a run; cache storage in <game folder>/cache/<index>/. Files and directories
-// of the host mounts are host files (hostfile.c), written in place; Commit flushes the open files of its mount. The
-// SDK's own nn::fs code is bypassed for every function here: its handles would name service objects that do not exist.
+// of the host mounts are host files (hostfile.c). Temporary and cache storage are written in place; save data is written
+// to a shadow of each changed file and Commit publishes the shadows (savetxn.h), so a run that stops between two writes
+// leaves the old save, never half of a new one; shadows not committed are dropped at Unmount, as the console drops
+// uncommitted data. The SDK's own nn::fs code is bypassed for every function here: its handles would name service objects that do not exist.
 //
 // Handles are 64-bit values the guest keeps in its FileHandle and DirectoryHandle: RomFS files ROMFS_HANDLE_BASE +
 // slot (fs.h), host files FILE_BASE + slot, directories DIR_BASE + slot, cache storage lists LIST_BASE + slot.
@@ -16,7 +18,8 @@
 // table, the path to host path rule, the handle tables, the result of each call, the directory listing snapshot, the
 // override thunks and their signatures, the cache storage calls. Changed here: the host layer is hostfile.c; the RomFS
 // is a mount kind of the one table (several names may mount it, and the same name again answers success); save data
-// is written in place, with none of the donor's working copy, atomic Commit or backups; the save folder is keyed by
+// is written to shadows that Commit publishes under a marker (savetxn.c), in place of the donor's working copy, atomic
+// Commit and backups; the save folder is keyed by
 // the user id the guest presents; DeleteDirectory, GetDirectoryEntryCount, CreateFile with an option, Commit with an
 // option and MountSaveData with a user id are added; the forms that name another application are named fatals; a
 // handle table that is full or a handle that is not open is a named fatal of kind fs; no trace, repeat-open note,
@@ -27,6 +30,7 @@
 
 #include "fs.h"
 #include "plat.h"
+#include "savetxn.h"
 
 #define FILE_BASE 0x200000000ull
 #define DIR_BASE 0x300000000ull
@@ -43,7 +47,9 @@
 enum { M_FREE, M_ROM, M_SAVE, M_TEMP, M_CACHE };
 
 typedef struct Mount { int kind; uint32_t id; char name[32]; char root[ROOT_PATH]; } Mount;
-typedef struct File { HostFile *h; int mode; uint32_t mount; } File;       // h NULL: free
+// h NULL: free. A save handle also keeps its file's host path (real) and the serial of the shadow it is open on (bound; 0:
+// the file itself), and follows the shadow when the file gains or loses one (file_bound).
+typedef struct File { HostFile *h; int mode; uint32_t mount; char *real; uint64_t bound; } File;
 typedef struct Listed { char *name; int kind; uint64_t size; } Listed;
 typedef struct Listing { Listed *e; int n, cap; } Listing;
 typedef struct Dir { Listed *e; int n, next, mode, used; } Dir;           // the entries as they were at open; used 0: free
@@ -187,8 +193,12 @@ static void unmount(Cpu *c, const char *name) {
     plat_mutex_lock(&fs_lock);
     for (int i = 0; i < NMOUNTS; i++)
         if (mounts[i].kind && !strcmp(mounts[i].name, name)) {
+            int save = mounts[i].kind == M_SAVE;
+            char root[ROOT_PATH];
+            snprintf(root, sizeof root, "%s", mounts[i].root);
             mounts[i].kind = M_FREE;
             plat_mutex_unlock(&fs_lock);
+            if (save) st_discard_prefix(root);   // changes never committed
             rt_log("fs unmount %s", name);
             return;
         }
@@ -224,12 +234,13 @@ static uint32_t host_path(const Mount *m, const char *rest, char *out, size_t ca
 }
 
 // The host path of a path in a mount that can change: FS_R_UNSUPPORTED_OPEN on the RomFS.
-static uint32_t change_path(const char *path, char *out, size_t cap, int *is_root) {
+static uint32_t change_path(const char *path, char *out, size_t cap, int *is_root, Mount *mo) {
     Mount m;
     const char *rest;
     uint32_t r = resolve(path, &m, &rest);
     if (r) return r;
     if (m.kind == M_ROM) return FS_R_UNSUPPORTED_OPEN;
+    if (mo) *mo = m;
     return host_path(&m, rest, out, cap, is_root);
 }
 
@@ -255,7 +266,10 @@ static uint32_t uid_root(Cpu *c, const uint64_t uid[2], char *out, size_t cap) {
 static uint32_t mount_save(Cpu *c, const char *name, const uint64_t uid[2]) {
     char root[ROOT_PATH];
     uint32_t r = uid_root(c, uid, root, sizeof root);
-    return r ? r : mount_add(c, name, M_SAVE, root);
+    if (r) return r;
+    int finished = st_recover(root);   // a commit or a write the last run was stopped in
+    if (finished != 0) rt_log("fs save recovery of %s: %d file(s) finished", root, finished);
+    return mount_add(c, name, M_SAVE, root);
 }
 
 static uint32_t mount_temp(Cpu *c, const char *name) {
@@ -357,33 +371,42 @@ static void close_cache_list(Cpu *c, uint64_t h) {
     plat_mutex_unlock(&fs_lock);
 }
 
-// nn::Result nn::fs::Commit(const char *name): the data of the mount's open files is on the disk at return. Files closed
+// nn::Result nn::fs::Commit(const char *name): the data of the mount's open files is on the disk at return; on save data
+// the changed files are published whole, all or none after a stop (savetxn.h). Files closed
 // concurrently with a Commit of their own mount are not something the game does.
 static uint32_t commit(const char *name) {
     uint32_t id = 0;
-    int found = 0, n = 0;
+    int found = 0, n = 0, save = 0;
+    char root[ROOT_PATH];
     HostFile *pending[NFILES];
     plat_mutex_lock(&fs_lock);
     for (int i = 0; i < NMOUNTS; i++)
-        if (mounts[i].kind && !strcmp(mounts[i].name, name)) found = 1, id = mounts[i].id;
+        if (mounts[i].kind && !strcmp(mounts[i].name, name)) {
+            found = 1, id = mounts[i].id, save = mounts[i].kind == M_SAVE;
+            snprintf(root, sizeof root, "%s", mounts[i].root);
+        }
     for (int i = 0; found && i < NFILES; i++)
         if (file_tab[i].h && (file_tab[i].mode & FS_OPEN_WRITE) && file_tab[i].mount == id) pending[n++] = file_tab[i].h;
     plat_mutex_unlock(&fs_lock);
     if (!found) return FS_R_PATH_NOT_FOUND;
+    if (save) return fs_result(st_commit(root));   // publishes the shadows, each synced first
     for (int i = 0; i < n; i++) hf_sync(pending[i]);
     return 0;
 }
 
 // ---- files
-static int file_slot(HostFile *f, int mode, uint32_t mount) {
+static int file_slot(HostFile *f, int mode, uint32_t mount, const char *real, uint64_t bound) {
+    char *copy = real ? strdup(real) : NULL;
+    if (real && !copy) rt_fatal("fs: out of memory for a save handle");
     int slot = -1;
     plat_mutex_lock(&fs_lock);
     for (int i = 0; i < NFILES && slot < 0; i++)
         if (!file_tab[i].h) {
-            file_tab[i] = (File){f, mode, mount};
+            file_tab[i] = (File){f, mode, mount, copy, bound};
             slot = i;
         }
     plat_mutex_unlock(&fs_lock);
+    if (slot < 0) free(copy);
     return slot;
 }
 
@@ -402,9 +425,48 @@ static HostFile *take_file(uint64_t h) {
     if (h < FILE_BASE || h >= FILE_BASE + NFILES) return NULL;
     plat_mutex_lock(&fs_lock);
     HostFile *f = file_tab[h - FILE_BASE].h;
+    char *real = file_tab[h - FILE_BASE].real;
     file_tab[h - FILE_BASE] = (File){0};
     plat_mutex_unlock(&fs_lock);
+    free(real);
     return f;
+}
+
+// The host file to use for handle h (NULL when h is not an open host file). A save handle first follows its file: when the
+// file has a shadow the handle is not on (or no longer has the one it was on, after a Commit), it is reopened on the right
+// one; for_write on a handle open for writing starts the shadow, so the file itself is never written. *mode: the open mode.
+static HostFile *file_bound(uint64_t h, int *mode, int for_write) {
+    HostFile *f;
+    int md;
+    if (!file_get(h, &f, &md)) return NULL;
+    if (mode) *mode = md;
+    char real[HOST_PATH];
+    plat_mutex_lock(&fs_lock);
+    File *e = &file_tab[h - FILE_BASE];
+    int has = e->real && e->h == f && snprintf(real, sizeof real, "%s", e->real) < (int)sizeof real;
+    uint64_t bound = e->bound;
+    plat_mutex_unlock(&fs_lock);
+    if (!has) return f;
+    uint64_t want = st_serial(real);
+    if (!want && for_write && (md & FS_OPEN_WRITE) && st_begin(real, &want) != HF_OK)
+        rt_fatal("fs: cannot start the shadow of a save file");
+    if (want == bound) return f;
+    char target[HOST_PATH];
+    if (want) st_shadow_path(real, target, sizeof target);
+    else snprintf(target, sizeof target, "%s", real);
+    HostFile *nf = hf_open(target, (md & FS_OPEN_WRITE) != 0, NULL);
+    if (!nf) return f;   // the file is gone (deleted under the handle): keep what it has
+    plat_mutex_lock(&fs_lock);
+    e = &file_tab[h - FILE_BASE];
+    int same = e->h == f;
+    if (same) e->h = nf, e->bound = want;
+    plat_mutex_unlock(&fs_lock);
+    if (!same) {
+        hf_close(nf);
+        return f;
+    }
+    hf_close(f);
+    return nf;
 }
 
 // nn::Result nn::fs::OpenFile(FileHandle *out, const char *path, int mode)
@@ -429,11 +491,15 @@ static uint32_t open_file(Cpu *c, uint64_t out, const char *path, int mode) {
     char p[HOST_PATH];
     r = host_path(&m, rest, p, sizeof p, NULL);
     if (r) return r;
-    if (hf_kind(p) != HF_FILE) return FS_R_PATH_NOT_FOUND;
+    uint64_t shadow = m.kind == M_SAVE ? st_serial(p) : 0;   // a file with a shadow is opened on the shadow
+    char target[HOST_PATH];
+    if (shadow) st_shadow_path(p, target, sizeof target);
+    else snprintf(target, sizeof target, "%s", p);
+    if (hf_kind(target) != HF_FILE) return FS_R_PATH_NOT_FOUND;
     int err = 0;
-    HostFile *f = hf_open(p, (mode & FS_OPEN_WRITE) != 0, &err);
+    HostFile *f = hf_open(target, (mode & FS_OPEN_WRITE) != 0, &err);
     if (!f) return fs_result(err);
-    int slot = file_slot(f, mode, m.id);
+    int slot = file_slot(f, mode, m.id, m.kind == M_SAVE ? p : NULL, shadow);
     if (slot < 0) {
         hf_close(f);
         hos_gap(c, "fs", "the host file handle table is full (%d)", NFILES);
@@ -482,7 +548,7 @@ static uint32_t read_core(uint64_t h, int64_t offset, uint64_t buf, uint64_t siz
     }
     HostFile *f;
     int mode;
-    if (offset < 0 || (!buf && size) || !file_get(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
+    if (offset < 0 || (!buf && size) || !(f = file_bound(h, &mode, 0))) return FS_R_INVALID_ARGUMENT;
     if (!(mode & FS_OPEN_READ)) return FS_R_OPEN_MODE;
     return guest_read(buf, size, (uint64_t)offset, host_pread, f, 1, got, "host file");
 }
@@ -494,6 +560,8 @@ static uint32_t write_file(uint64_t h, int64_t offset, uint64_t buf, uint64_t si
     int mode;
     if (offset < 0 || (!buf && size) || !file_get(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
     if (!(mode & FS_OPEN_WRITE)) return FS_R_OPEN_MODE;
+    f = file_bound(h, NULL, 1);   // a save file's changes go to its shadow
+    if (!f) return FS_R_INVALID_ARGUMENT;
     uint32_t flags = 0;
     if (option && !hos_in(&flags, option, 4)) return FS_R_INVALID_ARGUMENT;
     uint64_t cur = 0;
@@ -520,7 +588,7 @@ static uint32_t file_size(uint64_t out, uint64_t h) {
     } else {
         HostFile *f;
         uint64_t size = 0;
-        if (!file_get(h, &f, NULL) || !hf_size(f, &size)) return FS_R_INVALID_ARGUMENT;
+        if (!(f = file_bound(h, NULL, 0)) || !hf_size(f, &size)) return FS_R_INVALID_ARGUMENT;
         v = (int64_t)size;
     }
     return hos_out(out, &v, 8) ? 0 : FS_R_INVALID_ARGUMENT;
@@ -532,6 +600,7 @@ static uint32_t set_file_size(uint64_t h, int64_t size) {
     int mode;
     if (size < 0 || !file_get(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
     if (!(mode & FS_OPEN_WRITE)) return FS_R_OPEN_MODE;
+    if (!(f = file_bound(h, NULL, 1))) return FS_R_INVALID_ARGUMENT;
     return fs_result(hf_set_size(f, (uint64_t)size));
 }
 
@@ -539,7 +608,7 @@ static uint32_t flush_file(uint64_t h) {
     if (romfs_handle(h)) return 0;   // nothing was written
     HostFile *f;
     int mode;
-    if (!file_get(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
+    if (!(f = file_bound(h, &mode, 0))) return FS_R_INVALID_ARGUMENT;
     if (mode & FS_OPEN_WRITE) hf_sync(f);
     return 0;
 }
@@ -553,9 +622,14 @@ static void close_file(Cpu *c, uint64_t h) {
 
 static uint32_t create_file(const char *path, int64_t size) {
     char p[HOST_PATH];
-    uint32_t r = change_path(path, p, sizeof p, NULL);
+    Mount m;
+    uint32_t r = change_path(path, p, sizeof p, NULL, &m);
     if (r) return r;
     if (size < 0) return FS_R_INVALID_ARGUMENT;
+    if (m.kind == M_SAVE) {   // the new file appears when it is committed
+        uint64_t serial;
+        return fs_result(st_begin_create(p, (uint64_t)size, &serial));
+    }
     int err = 0;
     HostFile *f = hf_create(p, &err);
     if (!f) return fs_result(err);
@@ -566,21 +640,29 @@ static uint32_t create_file(const char *path, int64_t size) {
 
 static uint32_t delete_file(const char *path) {
     char p[HOST_PATH];
-    uint32_t r = change_path(path, p, sizeof p, NULL);
+    Mount m;
+    uint32_t r = change_path(path, p, sizeof p, NULL, &m);
     if (r) return r;
     if (hf_kind(p) == HF_DIR) return FS_R_INVALID_ARGUMENT;   // DeleteFile on a directory
+    if (m.kind == M_SAVE && st_serial(p)) {   // the shadow goes with the file; a file only made since the last commit is gone
+        st_discard_prefix(p);
+        if (hf_kind(p) == HF_MISSING) return 0;
+    }
     return fs_result(hf_unlink(p));
 }
 
 static uint32_t rename_file(const char *from, const char *to) {
     char a[HOST_PATH], b[HOST_PATH];
     int root = 0;
-    uint32_t r = change_path(from, a, sizeof a, &root);
-    if (!r) r = change_path(to, b, sizeof b, NULL);
+    Mount m;
+    uint32_t r = change_path(from, a, sizeof a, &root, &m);
+    if (!r) r = change_path(to, b, sizeof b, NULL, NULL);
     if (r) return r;
     size_t n = strcspn(from, ":");
     if (root || strcspn(to, ":") != n || strncmp(from, to, n)) return FS_R_INVALID_PATH;   // a root, or across mounts
-    if (hf_kind(b) != HF_MISSING) return FS_R_ALREADY_EXISTS;
+    if (hf_kind(b) != HF_MISSING || (m.kind == M_SAVE && st_serial(b))) return FS_R_ALREADY_EXISTS;
+    // What moves is published first, by itself: the move is one rename, and a shadow must not stay behind under the old name.
+    if (m.kind == M_SAVE && st_publish_prefix(a) != HF_OK) return FS_R_INVALID_ARGUMENT;
     return fs_result(hf_rename(a, b));
 }
 
@@ -598,6 +680,7 @@ static uint32_t entry_type(uint64_t out, const char *path) {
         r = host_path(&m, rest, p, sizeof p, NULL);
         if (r) return r;
         int kind = hf_kind(p);
+        if (kind == HF_MISSING && m.kind == M_SAVE && st_serial(p)) kind = HF_FILE;   // made since the last commit
         if (kind == HF_MISSING) return FS_R_PATH_NOT_FOUND;
         type = kind == HF_DIR ? FS_ENTRY_DIRECTORY : FS_ENTRY_FILE;
     }
@@ -606,9 +689,30 @@ static uint32_t entry_type(uint64_t out, const char *path) {
 }
 
 // ---- directories
+// A save folder's listing as the guest sees it: a shadow shows under its file's name (replacing the file's own row, and
+// standing for a file not committed yet), and the shadows nobody owns and the commit marker are not shown.
+static void save_listing(Listing *l, const char *dir) {
+    int out = 0;
+    for (int i = 0; i < l->n; i++) {
+        Listed e = l->e[i];
+        size_t len = strlen(e.name), sl = strlen(ST_SUFFIX);
+        char real[HOST_PATH];
+        int drop = !strcmp(e.name, ST_MARKER) || !strcmp(e.name, ST_MARKER_TMP);
+        if (!drop && len > sl && !strcmp(e.name + len - sl, ST_SUFFIX)) {
+            drop = snprintf(real, sizeof real, "%s/%.*s", dir, (int)(len - sl), e.name) >= (int)sizeof real || !st_serial(real);
+            if (!drop) e.name[len - sl] = 0;
+        } else if (!drop && e.kind == HF_FILE) {   // a file that has a shadow is listed once, by its shadow
+            drop = snprintf(real, sizeof real, "%s/%s", dir, e.name) < (int)sizeof real && st_serial(real);
+        }
+        if (drop) free(e.name);
+        else l->e[out++] = e;
+    }
+    l->n = out;
+}
+
 static uint32_t create_directory(const char *path) {
     char p[HOST_PATH];
-    uint32_t r = change_path(path, p, sizeof p, NULL);
+    uint32_t r = change_path(path, p, sizeof p, NULL, NULL);
     return r ? r : fs_result(hf_mkdir(p));
 }
 
@@ -616,10 +720,12 @@ static uint32_t create_directory(const char *path) {
 static uint32_t delete_directory(const char *path, int recursive) {
     char p[HOST_PATH];
     int root = 0;
-    uint32_t r = change_path(path, p, sizeof p, &root);
+    Mount m;
+    uint32_t r = change_path(path, p, sizeof p, &root, &m);
     if (r) return r;
     if (root) return FS_R_INVALID_PATH;
     if (hf_kind(p) != HF_DIR) return FS_R_PATH_NOT_FOUND;
+    if (recursive && m.kind == M_SAVE) st_discard_prefix(p);
     if (!recursive) return fs_result(hf_rmdir(p));
     return remove_tree(p) ? FS_R_INVALID_ARGUMENT : 0;
 }
@@ -639,6 +745,7 @@ static uint32_t open_directory(Cpu *c, uint64_t out, const char *path, int mode)
         r = host_path(&m, rest, p, sizeof p, NULL);
         if (!r && hf_kind(p) != HF_DIR) r = FS_R_PATH_NOT_FOUND;
         if (!r) r = fs_result(hf_list(p, listing_add, &l));
+        if (!r && m.kind == M_SAVE) save_listing(&l, p);
         if (!r && l.n > 1) qsort(l.e, (size_t)l.n, sizeof *l.e, listed_cmp);
     }
     if (r) {

@@ -84,6 +84,7 @@ int hf_mkdir(const char *path);                             // HF_EXISTS when so
 int hf_rmdir(const char *path);
 int hf_unlink(const char *path);
 int hf_rename(const char *from, const char *to);            // never replaces: HF_EXISTS
+int hf_replace(const char *from, const char *to);           // replaces an existing file, atomically and durably (savetxn.c)
 // add(name, kind, size, ctx) for every entry of dir but "." and ".."; it returns 0 to stop. HF_OK or an HF_ error.
 int hf_list(const char *dir, int (*add)(const char *name, int kind, uint64_t size, void *ctx), void *ctx);
 

@@ -151,6 +151,37 @@ static int os_rename(const char *from, const char *to) {
     return MoveFileExW(a, b, 0) ? HF_OK : os_err(GetLastError());
 }
 
+// A file moved over another one in one step: a reader sees the old file or the new one, never neither. The rename carries
+// POSIX semantics (Windows 10 1709 and later), so it also replaces a file some handle still has open (every handle here is
+// opened with FILE_SHARE_DELETE); where the system does not know the call, MoveFileEx replaces a file nobody has open. The
+// new file's buffers are flushed before it returns.
+static int os_replace(const char *from, const char *to) {
+    wchar_t a[WPATH], b[WPATH], full[WPATH];
+    if (!widen(from, a) || !widen(to, b)) return HF_ERROR;
+    DWORD n = GetFullPathNameW(b, WPATH, full, NULL);
+    if (!n || n >= WPATH) return HF_ERROR;
+    HANDLE h = CreateFileW(a, DELETE | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return os_err(GetLastError());
+    _Alignas(8) char buf[sizeof(FILE_RENAME_INFO) + WPATH * sizeof(wchar_t)];
+    FILE_RENAME_INFO *ri = (FILE_RENAME_INFO *)buf;
+    memset(ri, 0, sizeof *ri);
+    ri->Flags = 0x1 | 0x2;   // FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS
+    ri->FileNameLength = n * sizeof(wchar_t);
+    memcpy(ri->FileName, full, (n + 1) * sizeof(wchar_t));
+    int err = HF_OK;
+    if (!SetFileInformationByHandle(h, (FILE_INFO_BY_HANDLE_CLASS)22 /* FileRenameInfoEx */, ri,
+                                    (DWORD)(sizeof *ri + n * sizeof(wchar_t)))) {
+        DWORD e = GetLastError();
+        err = os_err(e);
+        if (e == ERROR_INVALID_PARAMETER || e == ERROR_INVALID_FUNCTION || e == ERROR_NOT_SUPPORTED) err = -1;
+    }
+    if (!err) FlushFileBuffers(h);
+    CloseHandle(h);
+    if (err != -1) return err;
+    return MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? HF_OK : os_err(GetLastError());
+}
+
 static int os_list(const char *dir, int (*add)(const char *name, int kind, uint64_t size, void *ctx), void *ctx) {
     wchar_t wd[WPATH], pat[WPATH + 4];
     if (!widen(dir, wd)) return HF_ERROR;
@@ -259,6 +290,23 @@ static int os_rename(const char *from, const char *to) {
     return rename(from, to) ? os_err(errno) : HF_OK;
 }
 
+// rename(2) replaces the target in one step; the folder is then synced so the new name is on the disk too.
+static int os_replace(const char *from, const char *to) {
+    if (rename(from, to)) return os_err(errno);
+    char dir[4096];
+    if (snprintf(dir, sizeof dir, "%s", to) >= (int)sizeof dir) return HF_OK;
+    char *slash = strrchr(dir, '/');
+    if (!slash) snprintf(dir, sizeof dir, ".");
+    else if (slash == dir) dir[1] = 0;
+    else *slash = 0;
+    int fd = open(dir, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+    }
+    return HF_OK;
+}
+
 static int os_list(const char *dir, int (*add)(const char *name, int kind, uint64_t size, void *ctx), void *ctx) {
     DIR *d = opendir(dir);
     if (!d) return os_err(errno);
@@ -295,6 +343,7 @@ int hf_mkdir(const char *path) { return BLOCKING(int, os_mkdir(path)); }
 int hf_rmdir(const char *path) { return BLOCKING(int, os_rmdir(path)); }
 int hf_unlink(const char *path) { return BLOCKING(int, os_unlink(path)); }
 int hf_rename(const char *from, const char *to) { return BLOCKING(int, os_rename(from, to)); }
+int hf_replace(const char *from, const char *to) { return BLOCKING(int, os_replace(from, to)); }
 
 int hf_list(const char *dir, int (*add)(const char *name, int kind, uint64_t size, void *ctx), void *ctx) {
     return BLOCKING(int, os_list(dir, add, ctx));
