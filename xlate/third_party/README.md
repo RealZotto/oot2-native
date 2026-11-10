@@ -206,7 +206,9 @@ Changes of this project:
   `NClamp` (`GLSL.std.450`, no capability), and the constant folder follows the
   same rule instead of .NET's NaN-propagating `Math.Clamp`. F2I of a NaN is 0
   for an integer of 32 bits or less (`OpConvertFToS` and `OpConvertFToU` leave
-  it undefined): `EmitF2I` selects 0 for a NaN source; the 64-bit form takes
+  it undefined): `EmitF2I` gives 0 for a NaN source, by a select after the
+  conversion when the count below was made and by the bounded sequence of the
+  entry on `FP32ToIntSaturated` since; the 64-bit form takes
   the integer's top bit, as NVIDIA's documentation gives. The `.RELU` of HFMA2
   and HMUL2 keeps a NaN a NaN, which `NMax` against 0 would turn into 0. Over
   the 56,381 programs of the corpus, 50,926 modules change and nothing else:
@@ -222,7 +224,7 @@ Changes of this project:
   80, `.FTZ`, is on every FMNMX word of the corpus and stays dropped; none of
   those words has a refused bit.
 - `Instructions/InstEmitConversion.cs`, `FP32ToS32Bounded` (new, beside
-  `EmitF2I`, which is unchanged); `Instructions/InstEmitAmpereMem.cs`, `ATmml`;
+  `EmitF2I`); `Instructions/InstEmitAmpereMem.cs`, `ATmml`;
   `Instructions/InstEmitAmpereAlu.cs`, `AF2i64`;
   `Translation/HelperFunctionManager.cs`, `GenerateTexelFetchScaleFunction`,
   `GenerateTextureSizeUnscaleFunction`; `Translation/Transforms/TexturePass.cs`,
@@ -237,7 +239,8 @@ Changes of this project:
   by a select otherwise. The 64-bit conversion clamps from 0 to the largest
   float below 2^64 and saturates as the console's does: 0 for a negative value,
   all ones from 2^64 up, the top bit for a NaN. A value in range converts as
-  before. F2I's own sequence (`EmitF2I`) is not part of this change.
+  before. F2I's own sequence (`EmitF2I`) is not part of this change; it is the
+  next entry.
 - `Instructions/InstEmitConversion.cs`, `EmitF2I` and `FP32ToIntSaturated`
   (new); `Instructions/InstEmitAmpereAlu.cs`, `AF2i`: F2I of a single or of a
   half bounds its float before it converts it. Its select of 0 for a NaN came
@@ -264,8 +267,20 @@ Changes of this project:
   for an unsigned 32-bit and for a signed 16-bit one, 1 fewer for a signed
   8-bit one, 9 fewer for an unsigned 16-bit one and 10 fewer for an unsigned
   8-bit one; toward zero each has 1 fewer than that, so 3 more for a signed
-  32-bit integer and 1 fewer than before for an unsigned one. No pass over the
-  corpus was made with this change. What the sequence gives for a NaN or an
+  32-bit integer and 1 fewer than before for an unsigned one. A signed 32-bit
+  site also has one more `NoContraction` decoration, on the clamp. Over the
+  56,381 programs of the corpus, which all translate with and without this
+  change, 42,885 modules change, the 42,885 that hold a F2I word, and nothing
+  else; all of them pass spirv-val and none of their descriptions changes but
+  the module's hash and size. 38,533 grow, 4,322 shrink and 30 keep their
+  size; together they have 0.22 percent more words. The corpus converts to a
+  signed or unsigned 32-bit integer and to an unsigned 16-bit one, from a
+  single; the other forms (a signed 16-bit integer, either 8-bit one, a half
+  source) have the synthetic tests only. Four pixel programs of the corpus
+  convert the constant 0x7FFFFFFF, a NaN, to an unsigned 32-bit integer and
+  give the result to an atomic minimum and maximum: the clamp folds to 0
+  there, where the module held `OpConvertFToU` of the NaN before. What the
+  sequence gives for a NaN or an
   infinity, here and in the conversions of the entry above, is what SPIR-V
   says, and Vulkan does not hold a driver to it: the modules do not declare
   `SignedZeroInfNanPreserve`, and without it a driver may assume that no
