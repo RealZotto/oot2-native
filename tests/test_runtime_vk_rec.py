@@ -137,6 +137,44 @@ class RingAndPacketTest(RecorderBase):
     def test_frames_from_two_threads_come_out_in_value_order_and_whole(self) -> None:
         self.passes("frame_order")
 
+    def test_the_replay_counters_split_the_frame_time_and_the_waits(self) -> None:
+        """OOT2_REPLAY_COUNTERS: the recorder's per-frame numbers as count, sum, median, p90 and largest; the completion
+        thread's effect time; the time the game's fence wait and finish took, which is the device's lateness."""
+        done = self.run_case(self.levels[0], "counted_waits", env={"OOT2_REPLAY_COUNTERS": "1"})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        line = [x for x in done.stdout.splitlines() if x.startswith("ok counted_waits")][0]
+        fn, fns, kn, kns, sn, sns = (int(x) for x in re.search(r"fence (\d+) (\d+) finish (\d+) (\d+) sync (\d+) (\d+)", line).groups())
+        self.assertEqual((fn, kn), (1, 1))
+        self.assertGreaterEqual(fns, 50_000_000)    # the device was 60 ms late, minus the time the case itself took
+        self.assertLess(fns, 5_000_000_000)
+        self.assertGreaterEqual(kns, 25_000_000)    # 45 ms late, less the effect's 25 ms already spent
+        self.assertGreaterEqual(sn, 1)               # the fence wait blocked on the timeline (the finish waits on its own)
+        self.assertGreaterEqual(sns, fns - 5_000_000)   # the sync wait contains the fence wait
+        groups = {}
+        for x in done.stderr.splitlines():
+            m = re.match(r"\[rt\] rc kind=exit group=(\w+) .*", x)
+            if m:
+                groups.setdefault(m.group(1), {}).update({k: int(v) for k, v in re.findall(r" (\w+)=(\d+)", x)})
+        ft, comp = groups["frametime"], groups["completion"]
+        for name in ("gate_wait", "slot_wait", "ring_wait", "replay", "replay_cpu", "record", "record_cpu"):
+            key = f"tm_{name}_ns"
+            self.assertEqual(ft[key + "_n"], 2, key)                       # two frames
+            self.assertLessEqual(ft[key + "_p50"], ft[key + "_p90"], key)
+            self.assertLessEqual(ft[key + "_p90"], ft[key + "_max"], key)
+            self.assertLessEqual(ft[key + "_max"], ft[key + "_sum"], key)
+        self.assertGreater(ft["tm_replay_ns_sum"], 0)
+        self.assertGreater(ft["tm_record_ns_sum"], 0)
+        self.assertEqual(comp["tm_effect_ns_n"], 2)                         # one value, one measure
+        self.assertGreaterEqual(comp["tm_effect_ns_max"], 25_000_000)       # the slow effect
+        self.assertGreaterEqual(comp["tm_effect_ns_sum"], 25_000_000)
+        self.assertEqual(groups["time"]["t_fence_wait_n"], 1)
+        self.assertEqual(groups["time"]["t_finish_n"], 1)
+
+    def test_the_replay_counters_off_leave_the_frames_alone(self) -> None:
+        done = self.run_case(self.levels[0], "frame_order", env={"OOT2_REPLAY_COUNTERS": "0"})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertNotIn("[rt] rc ", done.stderr)
+
     def test_a_third_frame_waits_for_the_first(self) -> None:
         self.passes("frame_limit")
 

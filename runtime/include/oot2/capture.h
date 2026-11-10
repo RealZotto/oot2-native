@@ -54,6 +54,11 @@
 //   count   seq t skipped shader pipeline raw faults
 //                                      once a second: skipped draws, shader misses, pipeline misses, raw-access misses
 //                                      and device faults so far
+//   off     seq t enable cond          once a second, and once before the closing record: the draws, mesh draws and dispatches
+//                                      the replay did not make because rendering was off, by cause: the game's RenderEnable
+//                                      of 0 (enable) and a conditional rendering that decided against drawing (cond). They
+//                                      are not in "skipped draws" (the draws skipped for a pipeline not ready), and a run
+//                                      with a picture that lacks elements and no stop reads this before anything else.
 //   cost    seq t presents sum_ns max_ns sampler_ns
 //                                      once a second: the CPU time the capture took on the presenting thread over the
 //                                      presents so far (sum and the largest one) and on its own sampling thread
@@ -99,6 +104,7 @@ int capture_on(void);   // 1 once capture_start opened a file, until the closing
 void capture_note(const char *key, const char *value);
 void capture_count(int counter, uint64_t n);                  // any thread; counted whether or not a capture runs
 uint64_t capture_counter(int counter);                        // a counter's value now (the tests', and any reader of the run's numbers)
+void capture_render_off(int cond);                            // a draw or dispatch kept from being made by rendering off (cond: by a condition)
 void capture_gpu_pass(uint64_t seq, int pass, uint64_t ns);   // a GPU timestamp of a pass of present seq's frame
 
 // From the front end: nvnQueuePresentTexture after present seq was made, nvnQueueSubmitCommands after a submission.

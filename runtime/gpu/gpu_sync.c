@@ -27,6 +27,7 @@
 
 #include "oot2/gpu.h"
 #include "oot2/kernel.h"
+#include "oot2/replay_count.h"
 #include "oot2/runtime.h"
 #include "plat.h"
 
@@ -37,6 +38,14 @@ typedef struct {
     GpuEffect fn;
     void *arg;
 } Effect;
+
+// The replay counters (OOT2_REPLAY_COUNTERS): the completion thread's time running one value's effects, a value at a
+// time. It is the only writer of the series. Counted behind the counters' own test of rc_on.
+RC_SERIES(s_effect, "tm_effect_ns");
+static void effect_report(RcLine *l) {
+    rc_group(l, "completion");
+    rc_series_put(l, &s_effect);
+}
 
 typedef struct Sub {
     struct Sub *next;
@@ -74,7 +83,12 @@ static void completion(void *arg) {
             g_head = s->next;
             if (!g_head) g_tail = &g_head;
             plat_mutex_unlock(&g_lock);
+            uint64_t effect_t0 = RC_ON() ? plat_now_ns() : 0;
             for (int i = 0; i < s->n; i++) s->effects[i].fn(s->effects[i].arg, s->value);
+            if (effect_t0) {
+                rc_hook(effect_report);
+                rc_series_add(&s_effect, plat_now_ns() - effect_t0);
+            }
             plat_mutex_lock(&g_lock);
             __atomic_store_n(&g_done, s->value, __ATOMIC_RELEASE);
             plat_cond_broadcast(&g_changed);
@@ -181,7 +195,7 @@ void gpu_sync_end(void) {
 int gpu_sync_wait(uint64_t value, uint64_t timeout_ns) {
     if (value <= __atomic_load_n(&g_done, __ATOMIC_ACQUIRE)) return 1;
     plat_mutex_lock(&g_lock);
-    uint64_t start = plat_now_ns();
+    uint64_t start = plat_now_ns();   // the replay counters' t_sync_wait reads the same stamp
     while (value <= g_handed && g_done < value) {
         if (timeout_ns == UINT64_MAX) {
             plat_cond_wait(&g_changed, &g_lock);
@@ -193,6 +207,10 @@ int gpu_sync_wait(uint64_t value, uint64_t timeout_ns) {
     }
     int ok = g_done >= value;
     plat_mutex_unlock(&g_lock);
+    if (RC_ON()) {   // a wait that had to block, by whoever asked
+        RC_ADD(RC_T_SYNC_N, 1);
+        RC_ADD(RC_T_SYNC_NS, plat_now_ns() - start);
+    }
     return ok;
 }
 

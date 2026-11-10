@@ -309,6 +309,8 @@ class ReplayBase(unittest.TestCase):
     def setUpClass(cls) -> None:
         if "error" in _BUILT:
             raise RuntimeError("vk_replay_test did not build (see the first class's error)")
+        if "exe" in _BUILT and not Path(_BUILT["exe"]).exists():   # a module's teardown freed it: the next module builds again
+            _BUILT.pop("exe")
         if "exe" not in _BUILT:
             cc = clang_or_skip()
             include, glslang = vulkan_or_skip()

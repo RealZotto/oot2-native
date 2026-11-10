@@ -145,6 +145,28 @@ class CountersTest(unittest.TestCase):
         self.assertIn("OOT2_REPLAY_COUNTERS", done.stderr)
         self.assertIn("sometimes", done.stderr)
 
+    def test_a_series_prints_its_count_sum_median_p90_and_largest_for_each_window(self) -> None:
+        series = [x for x in rc_lines(self.passing("series").stderr) if x["group"] == "series"]
+        self.assertEqual([(x["kind"], x["present"]) for x in series], [("window", "10"), ("window", "20"), ("window", "30"),
+                                                                       ("exit", "33")])
+
+        def stats(x: dict) -> tuple:
+            return tuple(int(x[f"sample_{k}"]) for k in ("n", "sum", "p50", "p90", "max"))
+        self.assertEqual(stats(series[0]), (10, 55, 5, 9, 10))          # the median of 1..10 is the 5th, the 90th the 9th
+        self.assertEqual(stats(series[1]), (3, 600, 200, 300, 300))
+        cap = 16384
+        newest = range(6, cap + 6)                                       # 5 of the cap + 5 values fell out of the window
+        self.assertEqual(stats(series[2]), (cap, sum(newest), 6 + (cap - 1) // 2, 6 + (cap * 9 + 9) // 10 - 1, cap + 5))
+        self.assertEqual(series[2]["sample_dropped"], "5")
+        self.assertNotIn("sample_dropped", series[0])
+        self.assertEqual(stats(series[3]), (1, 4, 4, 4, 4))              # the exit: since the last window line
+        for x in series:                                                 # a series with no value prints zeros
+            self.assertEqual([x[f"none_{k}"] for k in ("n", "sum", "p50", "p90", "max")], ["0"] * 5)
+            self.assertEqual(x["raw_value"], "77")                       # a raw value is printed as it is, never as a change
+
+    def test_the_present_hook_is_called_at_every_present_with_the_counters_off(self) -> None:
+        self.assertIn("hook calls 5", self.passing("hook").stdout)
+
     def test_a_stop_prints_the_exit_line(self) -> None:
         done = self.run_case("stop")
         self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)

@@ -49,6 +49,7 @@
 #include "oot2/gfx.h"
 #include "oot2/gpu.h"
 #include "oot2/pagegen.h"
+#include "oot2/replay_count.h"
 #include "oot2/runtime.h"
 #include "oot2/vk_rec.h"
 #include "oot2/vk_replay.h"
@@ -72,6 +73,7 @@ typedef struct {
     const VkReplayOps *ops;
     VkQueryPool pools[VKR_QUERY_POOLS];   // query q is query q % VKR_QUERIES of pools[q / VKR_QUERIES]
     uint32_t np, nq, n;                   // pools taken, queries used, entries
+    void *trace;                          // the trace's note of each query (vkrt_queries_take), NULL with the trace off
     Entry e[];
 } Done;
 
@@ -101,6 +103,10 @@ static VkrReportStats g_st;
 #define WAIT_SITES 64
 static struct { uint64_t caller; int unsatisfied_logged; } g_sites[WAIT_SITES];
 static int g_nsites;
+// The call sites whose WaitEvent was unsatisfied in the frame being completed (g_lock): the counters' "first per site per
+// frame" (waits_unsat_first). Counted only with the replay counters on.
+static uint64_t g_frame_unsat[WAIT_SITES];
+static int g_frame_nunsat;
 
 void vkr_report_reset(void) {
     g_counting = 0, g_pending_n = 0, R.n = 0, R.np = 0, R.nq = 0, R.open = -1;
@@ -162,6 +168,7 @@ void vkr_report_draw(void) {
     }
     vkrec_BeginQuery(R.pools[R.nq / VKR_QUERIES], R.nq % VKR_QUERIES, 0);
     R.open = (int)R.nq++;
+    if (vkrt_on) vkrt_query((uint32_t)R.open);
 }
 
 // The pass ends, or a samples-passed report or reset closes the segment: the open query ends.
@@ -272,6 +279,14 @@ static void wait_event(const p_wait_event *p) {
     int ok = wait_ok(p, &w);
     g_st.waits++;
     if (!ok) g_st.waits_unsatisfied++;
+    if (!ok && RC_ON()) {
+        int seen = 0;
+        for (int i = 0; i < g_frame_nunsat && !seen; i++) seen = g_frame_unsat[i] == p->caller;
+        if (!seen) {
+            if (g_frame_nunsat < WAIT_SITES) g_frame_unsat[g_frame_nunsat++] = p->caller;
+            g_st.waits_unsat_first++;
+        }
+    }
     int s = 0;
     while (s < g_nsites && g_sites[s].caller != p->caller) s++;
     int first = s == g_nsites;
@@ -293,8 +308,10 @@ static void complete(void *arg, uint64_t value) {
         uint32_t n = d->nq - i * VKR_QUERIES;
         d->ops->query_results(d->pools[i], n < VKR_QUERIES ? n : VKR_QUERIES, res + i * VKR_QUERIES);
     }
+    if (d->trace) vkrt_queries_done(d->trace, d->nq, res);
     uint32_t next = 0;
     plat_mutex_lock(&g_lock);
+    g_frame_nunsat = 0;
     for (uint32_t k = 0; k < d->n; k++) {
         const Entry *e = &d->e[vkr_reverse_results ? d->n - 1 - k : k];
         switch (e->kind) {
@@ -338,6 +355,7 @@ void vkr_report_frame_end(void) {
     Done *d = malloc(sizeof *d + sizeof d->e[0] * R.n);
     if (!d) rt_fatal("gfx: vulkan: out of memory for a frame's reports and events");
     d->ops = vkr_frame_ops(), d->np = R.np, d->nq = R.nq, d->n = R.n;
+    d->trace = vkrt_on ? vkrt_queries_take(R.nq) : NULL;
     memcpy(d->pools, R.pools, sizeof d->pools);
     if (R.n) memcpy(d->e, R.e, sizeof d->e[0] * R.n);
     vkrec_effect(complete, d);

@@ -31,6 +31,7 @@
 #include "oot2/gpu_vk.h"
 #include "oot2/kernel.h"
 #include "oot2/nvn_program.h"
+#include "oot2/replay_count.h"
 #include "oot2/runtime.h"
 #include "oot2/settings.h"
 #include "oot2/vk_rec.h"
@@ -196,6 +197,7 @@ static void recorder_main(void *arg) {
             VkRecFrame *row = &G.log[seq % VKREC_LOG];
             row->record_ns = plat_now_ns() - t0;
             row->record_cpu_ns = plat_thread_cpu_ns(NULL) - cpu0;
+            if (RC_ON()) vkrec_count_record(row->record_ns, row->record_cpu_ns);
             x.cb = VK_NULL_HANDLE;
         } else {
             vkrec_exec(&x, op, p);
@@ -334,6 +336,7 @@ uint64_t vkrec_end(const VkSemaphoreSubmitInfo *waits, uint32_t nwaits) {
     row->draws = G.draws;
     row->packets = (uint32_t)(st.packets - G.packets_begin);
     row->bytes = (st.words - G.words_begin) * 8;
+    if (RC_ON()) vkrec_count_replay(row);
     gpu_ring_publish(G.ring);
     return value;
 }

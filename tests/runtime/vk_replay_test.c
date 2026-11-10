@@ -351,6 +351,13 @@ static void op_query_results(VkQueryPool pool, uint32_t n, uint64_t *out) {
     printf("query results pool 0x%llx n %u\n", (ull)(uintptr_t)pool, n);
 }
 
+// The trace's view of a texture ID (OOT2_REPLAY_TRACE): an entry for the IDs below 100, with an invented format, none above.
+static int op_trace_tex(uint32_t id, uint32_t *format, int *astc) {
+    if (id >= 100) return 0;
+    *format = 0x25 + id, *astc = id == 9;
+    return 1;
+}
+
 static const VkReplayOps g_fake_ops = {
     .graphics = op_graphics, .compute = op_compute,
     .graphics_layout = (VkPipelineLayout)(uintptr_t)0x6100, .compute_layout = (VkPipelineLayout)(uintptr_t)0x6200,
@@ -359,7 +366,8 @@ static const VkReplayOps g_fake_ops = {
     .image_slot = op_image_slot, .storage_image = op_storage_image, .image_by_id = op_image_by_id, .scratch = op_scratch,
     .buffer_address = op_buffer_address, .task_set = op_task_set, .raw = op_raw,
     .frame_begin = op_frame_begin,
-    .frame_end = op_frame_end, .queries = op_queries, .query_results = op_query_results, .cpu_reads = op_cpu_reads};
+    .frame_end = op_frame_end, .queries = op_queries, .query_results = op_query_results, .cpu_reads = op_cpu_reads,
+    .trace_tex = op_trace_tex};
 
 // ---------- the stand-in recorder calls: one line per call
 #define FAKE_CB ((VkCommandBuffer)(uintptr_t)0xC0FFEE00u)
@@ -836,6 +844,7 @@ static void case_graphics(void) {
     printf("stats frames %llu draws %llu clears %llu passes %llu snapshots %llu live %llu writes %llu\n", (ull)st.frames,
            (ull)st.draws, (ull)st.clears, (ull)st.passes, (ull)st.snapshots, (ull)st.live_uniforms,
            (ull)st.storage_writes);
+    rc_present(1);   // a present of the front end (the replay's trace writes its summary line at it)
     close_fakes();
     printf("ok graphics\n");
 }
@@ -858,8 +867,28 @@ static void case_skip(int silent) {
     vkr_stats(&st);
     printf("stats draw_ops %llu draws %llu skipped %llu render_off %llu lost %llu\n", (ull)st.draw_ops, (ull)st.draws,
            (ull)st.skipped, (ull)st.render_off, (ull)st.lost);
+    rc_present(1);
     close_fakes();
     printf("ok %s\n", silent ? "skip_render_off" : "skip");
+}
+
+// The trace's line for raw-access misses (OOT2_REPLAY_TRACE; vk_replay_trace.c), fed what the device would report. The
+// declaration is the file's own: the function is private to runtime/gpu.
+void vkrt_raw_misses(const GpuVkRawStats *r, uint64_t seq);
+static void case_trace_misses(void) {
+    GpuVkRawStats r;
+    memset(&r, 0, sizeof r);
+    r.miss_submissions = 3, r.misses = 130, r.last_miss_value = 77, r.last_misses = 5;
+    const uint32_t kinds[5] = {RAW_MISS_KIND_LOAD, RAW_MISS_KIND_LOAD, RAW_MISS_KIND_STORE, RAW_MISS_KIND_ATOMIC,
+                               RAW_MISS_KIND_ATOMIC};
+    const uint32_t reasons[5] = {RAW_MISS_REASON_OUTSIDE_SPAN, RAW_MISS_REASON_NO_CHUNK, RAW_MISS_REASON_NO_PAGE,
+                                 RAW_MISS_REASON_NO_PAGE, RAW_MISS_REASON_NO_PAGE};
+    for (int i = 0; i < 5; i++) r.last_miss[i] = (RawMiss){0x1000u + 8u * (uint64_t)i, kinds[i], reasons[i]};
+    vkrt_raw_misses(&r, 9);    // two earlier submissions with misses are not shown
+    vkrt_raw_misses(&r, 10);   // nothing new: no line
+    r.miss_submissions = 4, r.misses = 131, r.last_miss_value = 90, r.last_misses = 1;
+    vkrt_raw_misses(&r, 11);
+    printf("ok trace_misses\n");
 }
 
 static void case_depth(void) {
@@ -1489,6 +1518,8 @@ static void case_reports(void) {
     VkrStats st;
     vkr_stats(&st);
     printf("draws %llu\n", (ull)st.draws);
+    printf("render_off_by_cause %llu %llu\n", (ull)st.render_off_enable, (ull)st.render_off_cond);
+    rc_present(1);
     close_fakes();
     printf("ok reports\n");
 }
@@ -1852,6 +1883,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "attr_collect") && argc >= 3) case_attr_collect(argv[2]);
     else if (!strcmp(cs, "collect_other_stop") && argc >= 3) case_collect_other_stop(argv[2]);
     else if (!strcmp(cs, "skip_render_off")) case_skip(1);
+    else if (!strcmp(cs, "trace_misses")) case_trace_misses();
     else if (!strcmp(cs, "depth")) case_depth();
     else if (!strcmp(cs, "compute")) case_compute();
     else if (!strcmp(cs, "raw_first")) case_raw_first();

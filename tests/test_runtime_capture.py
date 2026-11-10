@@ -237,8 +237,15 @@ class CaptureTest(unittest.TestCase):
                     self.assertGreater(private, 0)
                     self.assertGreater(available, 0)
                     self.assertTrue(pages >= 0 or "pages_output_counter_state" in cap.header, m)
-                self.assertEqual(cap.end.counters, (0, 0, 1, 0, 0))
+                self.assertEqual(cap.end.counters, (0, 0, 1, 0, 0))   # the draws rendering off kept from being made are not in them
                 self.assertEqual(cap.gpu, [(5, 0, 1234)])
+                lines = path.read_text(encoding="utf-8").splitlines()
+                off = [x.split("\t") for x in lines if x.startswith("off\t")]
+                self.assertGreaterEqual(len(off), 2)                  # once a second, and once before the closing record
+                self.assertEqual(off[-1][-2:], ["2", "3"])            # enable, cond
+                self.assertLess(max(i for i, x in enumerate(lines) if x.startswith("off\t")),
+                                next(i for i, x in enumerate(lines) if x.startswith("end\t")))
+                self.assertTrue(lines[-1].startswith("end\t"))
                 self.assertGreater(cap.end.working_set, 0)
                 self.assertEqual(cap.end.cost_presents, len(cap.presents))
                 v = cc.check(cap)

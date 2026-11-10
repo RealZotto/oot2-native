@@ -54,7 +54,11 @@
     X(DG_VALSAME_VS, "digest_vs_value_same") X(DG_VALSAME_PS, "digest_ps_value_same")                                   \
     X(DG_VALSAME_OTHER, "digest_other_value_same")                                                                      \
     X(TEX_OPS, "tex_bind_ops") X(TEX_OPS_SAME_TYPE, "tex_bind_ops_same_type") X(TEX_BINDS, "tex_binds")                 \
-    X(TEX_SAME_HANDLE, "tex_same_handle") X(TEX_SAME_TYPE, "tex_same_type")
+    X(TEX_SAME_HANDLE, "tex_same_handle") X(TEX_SAME_TYPE, "tex_same_type")                                             \
+    /* time the game's threads spend waiting for the device's published value (nanoseconds): the NVN fence wait, */     \
+    /* the queue finish, and every wait on the timeline that had to block, whoever asked */                             \
+    X(T_FENCE_N, "t_fence_wait_n") X(T_FENCE_NS, "t_fence_wait_ns") X(T_FINISH_N, "t_finish_n")                         \
+    X(T_FINISH_NS, "t_finish_ns") X(T_SYNC_N, "t_sync_wait_n") X(T_SYNC_NS, "t_sync_wait_ns")
 
 enum RcId {
 #define RC_ENUM(id, name) RC_##id,
@@ -67,6 +71,7 @@ typedef struct RcBlock {
     uint64_t c[RC_N];
 } RcBlock;
 
+typedef struct RcLine RcLine;
 extern int rc_on;
 extern _Thread_local RcBlock *rc_tl;
 RcBlock *rc_claim(void);
@@ -91,13 +96,35 @@ const char *rc_name(int id);
 
 // A line group. A hook adds its own values to a line; each value is a cumulative count, the line prints its change over
 // the window or the whole value at the exit.
-typedef struct RcLine RcLine;
 typedef void (*RcHook)(RcLine *l);
 void rc_hook(RcHook h);   // once per function
 void rc_group(RcLine *l, const char *name);
 void rc_put(RcLine *l, const char *key, uint64_t cumulative);
 
+// A series of times (or any other numbers) with one writer: the values of a window as their sum, median, 90th percentile
+// and largest. The writer adds with rc_series_add (a plain store and a release of the count; the values of a window are
+// kept up to RC_SERIES_CAP, a window with more prints the newest and says how many it dropped), the line group's hook
+// prints with rc_series_put and starts the next window. A value is printed as it is (not as a change over cumulative
+// values): <name>_n, _sum, _p50, _p90, _max and, only when a window overflowed, _dropped. A line printed at the exit
+// shows the values since the last window line.
+#define RC_SERIES_CAP 16384u
+typedef struct RcSeries {
+    const char *name;
+    uint64_t *v;        // RC_SERIES_CAP slots, made by the first rc_series_add
+    uint64_t n;         // values added so far (atomic), the next one goes to slot n % RC_SERIES_CAP
+    uint64_t read;      // values taken by lines so far (the printing thread's)
+    uint64_t dropped;   // values that fell out of a window unread (the printing thread's)
+} RcSeries;
+#define RC_SERIES(var, label) static RcSeries var = {.name = (label)}
+void rc_series_add(RcSeries *s, uint64_t v);
+void rc_series_put(RcLine *l, RcSeries *s);
+// A value printed as it is (a hook's own number, not a cumulative count).
+void rc_put_raw(RcLine *l, const char *key, uint64_t v);
+
 // A present of the front end (nvn_census_present): the window's line group when the window is full.
 void rc_present(uint64_t seq);
+// A function called at every present of the front end, whatever the counters' state (the replay's trace registers one at
+// start-up). One hook; NULL removes it.
+void rc_set_present_hook(void (*fn)(uint64_t seq));
 // The lines now (a test; the exit does it by itself).
 void rc_print(const char *kind, uint64_t present);

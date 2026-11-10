@@ -76,6 +76,7 @@ static uint64_t g_shown_slot[SHOWN_LAG];          // g_frame: slot seq % SHOWN_L
 static Submitter g_subs[SUBMITTERS];              // g_sub
 static int g_nsubs;
 static uint64_t g_counters[CAPTURE_COUNTERS];     // atomic
+static uint64_t g_render_off[2];                  // atomic: draws and dispatches rendering off kept from being made, by cause
 static uint64_t g_cost_n, g_cost_sum, g_cost_max, g_sampler_cpu;   // atomic
 
 // ---------- lines and the buffer
@@ -233,6 +234,9 @@ static void sampler_main(void *arg) {
             append(&g_l);
             l_str(&g_l, "count"), l_t(&g_l, g_last_seq), l_t(&g_l, t), l_counters(&g_l, c);
             append(&g_l);
+            l_str(&g_l, "off"), l_t(&g_l, g_last_seq), l_t(&g_l, t), l_t(&g_l, __atomic_load_n(&g_render_off[0], __ATOMIC_RELAXED)),
+                l_t(&g_l, __atomic_load_n(&g_render_off[1], __ATOMIC_RELAXED));
+            append(&g_l);
             l_str(&g_l, "cost"), l_t(&g_l, g_last_seq), l_t(&g_l, t), l_cost(&g_l);
             append(&g_l);
         }
@@ -273,6 +277,9 @@ void capture_end(int code) {
             l_t(&g_l, g_gap[i].frames), l_t(&g_l, g_gap[i].sum_ns), l_t(&g_l, g_gap[i].max_ns);
         append(&g_l);
     }
+    l_str(&g_l, "off"), l_t(&g_l, g_last_seq), l_t(&g_l, since(now)),   // before the end, which stays the last line
+        l_t(&g_l, __atomic_load_n(&g_render_off[0], __ATOMIC_RELAXED)), l_t(&g_l, __atomic_load_n(&g_render_off[1], __ATOMIC_RELAXED));
+    append(&g_l);
     l_str(&g_l, "end"), l_tab(&g_l), l_i(&g_l, code), l_tab(&g_l), l_str(&g_l, reason(code)), l_t(&g_l, g_last_seq),
         l_t(&g_l, since(now)), l_t(&g_l, (uint64_t)fatal), l_counters(&g_l, c), l_mem(&g_l, &m), l_cost(&g_l);
     append(&g_l);
@@ -376,6 +383,10 @@ void capture_note(const char *key, const char *value) {
 void capture_count(int counter, uint64_t n) {
     if (counter < 0 || counter >= CAPTURE_COUNTERS) rt_fatal("capture_count: counter %d", counter);
     __atomic_fetch_add(&g_counters[counter], n, __ATOMIC_RELAXED);
+}
+
+void capture_render_off(int cond) {
+    if (capture_on()) __atomic_fetch_add(&g_render_off[cond != 0], 1, __ATOMIC_RELAXED);
 }
 
 uint64_t capture_counter(int counter) {

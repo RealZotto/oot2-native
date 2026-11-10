@@ -881,7 +881,8 @@ class SmokeTest(unittest.TestCase):
             lines = [x for x in run["rc"] if x["kind"] == "exit"]
             what = f"{pattern} {kind}"
             self.assertEqual({x["group"] for x in lines},
-                             {"sub", "draw", "bank", "uniform", "ledger", "threads", "vkr", "backing"}, what)
+                             {"sub", "draw", "bank", "uniform", "ledger", "time", "threads", "vkr", "backing", "silent",
+                              "frametime", "completion"}, what)
             flat: dict[str, int] = {}
             for x in lines:
                 for k, v in x.items():

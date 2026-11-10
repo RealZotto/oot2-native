@@ -9,8 +9,12 @@
 
 #include "oot2/backing.h"
 #include "oot2/replay_count.h"
+#include "oot2/texsync.h"
+#include "oot2/vk_bindless.h"
+#include "oot2/vk_image.h"
 #include "oot2/vk_pipeline.h"
 #include "oot2/vk_replay.h"
+#include "oot2/vk_texture.h"
 #include "vk_replay_int.h"
 
 #define SEEN_SLOTS 4096     // distinct tuples a submission remembers (a power of two); past 2,048 a tuple counts as new
@@ -171,4 +175,28 @@ static void report(RcLine *l) {
     backing_stats(&b);
     rc_group(l, "backing");
     rc_put(l, "backing_resolves", b.resolves), rc_put(l, "backing_resolve_misses", b.resolve_misses);
+    // The counters of work the replay drops, approximates or reads as nothing without a stop, which nothing printed before
+    // (vkr_unregistered_textures, above, was printed already): what rendering off turned off by cause, the conditions that
+    // decided against drawing, the waits the work before them did not satisfy (all, and the first of each call site in
+    // each frame), the reports into memory the CPU cannot see, the sampler approximations, the texture regions uploaded as
+    // zeros, and the textures that got no image.
+    VkrReportStats r;
+    vkr_report_stats(&r);
+    VkbStats bs;
+    vkb_stats(&bs);
+    VktStats ts;
+    vkt_stats(&ts);
+    TexSyncStats xs;
+    texsync_stats(&xs);
+    VkbImageStats is;
+    vkb_image_stats(&is);
+    rc_group(l, "silent");
+    rc_put(l, "vkr_render_off_enable", s.render_off_enable), rc_put(l, "vkr_render_off_cond", s.render_off_cond);
+    rc_put(l, "vkr_clears_off", s.clears_off);
+    rc_put(l, "rep_conditions", r.conditions), rc_put(l, "rep_conditions_false", r.conditions_false);
+    rc_put(l, "rep_waits", r.waits), rc_put(l, "rep_waits_unsatisfied", r.waits_unsatisfied);
+    rc_put(l, "rep_waits_unsat_first_per_site_frame", r.waits_unsat_first), rc_put(l, "rep_reports_dropped", r.dropped);
+    rc_put(l, "bind_wrap_approx", bs.wrap_approx), rc_put(l, "bind_border_approx", bs.border_approx);
+    rc_put(l, "tex_zero_regions_uploaded", ts.zero_regions), rc_put(l, "texsync_zero_regions", xs.zero_regions);
+    rc_put(l, "img_skipped_cpu", is.skipped_cpu), rc_put(l, "img_skipped_format", is.skipped_format);
 }

@@ -51,6 +51,7 @@
 #include "oot2/kernel.h"
 #include "oot2/memory.h"
 #include "oot2/nvn_program.h"
+#include "oot2/replay_count.h"
 #include "oot2/runtime.h"
 #include "oot2/settings.h"
 #include "oot2/vk_pipeline.h"
@@ -851,6 +852,52 @@ static void case_frame_limit(void) {
     join(1);
     close_fake();
     printf("ok frame_limit\n");
+}
+
+// ---------- where the frame time goes (OOT2_REPLAY_COUNTERS: vk_replay_time.c, gpu_sync.c, vk_submit.c)
+// Two frames; the second frame's effect takes 25 ms on the completion thread; the game waits for the first value through the
+// back end's fence wait (the device is late by 60 ms) and finishes the queue (late by 45 ms). The case prints the exit line group
+// of the counters itself, so the driver reads exact counts (frames 2, effects 2, one fence wait, one finish) and times (the
+// waits at least as long as the lateness, the effect at least 25 ms).
+static void counted_effect(void *arg, uint64_t value) {
+    (void)value;
+    if (arg) plat_sleep_ns(25000000ull);
+}
+static uint64_t g_late_value, g_late_ns;
+static void late_device(void *arg) {
+    (void)arg;
+    plat_sleep_ns(g_late_ns);
+    counter_raise(g_late_value);
+    ended();
+}
+static void case_counted_waits(void) {
+    rc_enable(600);
+    open_fake(1u << 20, 4, 0);
+    uint64_t v1 = vkrec_begin(GPU_VK_REPLAY);
+    vkrec_effect(counted_effect, NULL);
+    vkrec_Draw(3, 1, 0, 0);
+    vkrec_end(NULL, 0);
+    uint64_t v2 = vkrec_begin(GPU_VK_REPLAY);
+    vkrec_effect(counted_effect, (void *)1);
+    vkrec_Draw(3, 1, 0, 0);
+    vkrec_end(NULL, 0);
+    vkrec_idle();
+    g_late_value = v1, g_late_ns = 60000000ull;
+    CHECK(plat_thread_start(late_device, NULL, 1 << 20));
+    CHECK(gfx_vulkan_backend.fence_wait(v1, UINT64_MAX));
+    join(1);
+    g_late_value = v2, g_late_ns = 45000000ull;
+    CHECK(plat_thread_start(late_device, NULL, 1 << 20));
+    gfx_vulkan_backend.finish(0);
+    join(2);
+    close_fake();
+    uint64_t sum[RC_N];
+    rc_sum(sum);
+    printf("ok counted_waits fence %llu %llu finish %llu %llu sync %llu %llu\n", (unsigned long long)sum[RC_T_FENCE_N],
+           (unsigned long long)sum[RC_T_FENCE_NS], (unsigned long long)sum[RC_T_FINISH_N],
+           (unsigned long long)sum[RC_T_FINISH_NS], (unsigned long long)sum[RC_T_SYNC_N],
+           (unsigned long long)sum[RC_T_SYNC_NS]);
+    rc_print("exit", 0);
 }
 
 // ---------- breadcrumbs
@@ -2022,6 +2069,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "pack_pnext")) case_pack_pnext();
     else if (!strcmp(cs, "frame_order")) case_frame_order();
     else if (!strcmp(cs, "frame_limit")) case_frame_limit();
+    else if (!strcmp(cs, "counted_waits")) case_counted_waits();
     else if (!strcmp(cs, "window") && args >= 3) case_window(argv[2]);
     else if (!strcmp(cs, "frames_over")) case_frames_over();
     else if (!strcmp(cs, "frames_range")) case_frames_range();

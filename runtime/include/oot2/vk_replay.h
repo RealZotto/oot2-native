@@ -174,6 +174,10 @@ typedef struct VkReplayOps {
     // 1 when the CPU may read [addr, addr + size) now (a memory pool it sees holds it): the words of a conditional
     // rendering condition. NULL: never (the condition renders).
     int (*cpu_reads)(uint64_t addr, uint64_t size);
+    // The trace (OOT2_REPLAY_TRACE, vk_replay_trace.c): what the bindless tables hold at texture pool ID `id`, read without
+    // changing anything: 1 when an entry is registered (*format its NVN format, *astc 1 when the format is ASTC), else 0.
+    // May be NULL (the trace then says "unknown").
+    int (*trace_tex)(uint32_t id, uint32_t *format, int *astc);
 } VkReplayOps;
 #define VKR_QUERIES 512u       // occlusion queries in one pool
 #define VKR_QUERY_POOLS 8u     // pools a frame may take (one query per pass while counting, one more per report)
@@ -233,6 +237,9 @@ typedef struct VkrStats {
     // lost is what none of those accounts for: draw_ops less draws, dispatches, render_off, skipped and collected (in either
     // direction), 0 by contract; read it before judging a picture.
     uint64_t draw_ops, render_off, skipped, lost;
+    // render_off split by its cause (the game's RenderEnable of 0, or a conditional rendering that decided against drawing:
+    // render_off_enable + render_off_cond == render_off), and the clears (not draw ops) that rendering off dropped.
+    uint64_t render_off_enable, render_off_cond, clears_off;
     uint64_t collected;                             // draws skipped for collection (settings.h collect_variants): in the
                                                     // accounting above, never drawn, 0 in every run but a development one
     uint64_t raw_binds;                            // draws and dispatches with a raw-access stage (D15)
@@ -251,5 +258,7 @@ typedef struct VkrReportStats {
     uint64_t resets, events, queries;       // samples-passed resets, event signals, occlusion queries read back
     uint64_t waits, waits_unsatisfied;      // WaitEvents checked, and those the work before them did not satisfy
     uint64_t conditions, conditions_false;  // SetRenderEnableConditional decided, and those that disabled rendering
+    uint64_t waits_unsat_first;             // the first unsatisfied WaitEvent of each call site in each frame (waits_unsatisfied
+                                            // counts every one; only the first of each site is ever logged)
 } VkrReportStats;
 void vkr_report_stats(VkrReportStats *out);

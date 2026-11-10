@@ -121,6 +121,47 @@ void rc_put(RcLine *l, const char *key, uint64_t cumulative) {
     put_value(l, key, cumulative >= prev ? cumulative - prev : 0);
 }
 
+void rc_put_raw(RcLine *l, const char *key, uint64_t v) { put_value(l, key, v); }
+
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+void rc_series_add(RcSeries *s, uint64_t v) {
+    if (!s->v) {
+        s->v = calloc(RC_SERIES_CAP, sizeof *s->v);
+        if (!s->v) return;   // out of memory: the series stays empty
+    }
+    uint64_t n = __atomic_load_n(&s->n, __ATOMIC_RELAXED);
+    s->v[n % RC_SERIES_CAP] = v;
+    __atomic_store_n(&s->n, n + 1, __ATOMIC_RELEASE);
+}
+
+void rc_series_put(RcLine *l, RcSeries *s) {
+    uint64_t end = __atomic_load_n(&s->n, __ATOMIC_ACQUIRE), from = s->read;
+    if (end - from > RC_SERIES_CAP) {
+        s->dropped += end - from - RC_SERIES_CAP;
+        from = end - RC_SERIES_CAP;
+    }
+    uint64_t count = end - from, sum = 0, p50 = 0, p90 = 0, max = 0, dropped = s->dropped;
+    uint64_t *copy = count ? malloc(count * sizeof *copy) : NULL;
+    if (count && copy) {
+        for (uint64_t i = 0; i < count; i++) sum += copy[i] = s->v[(from + i) % RC_SERIES_CAP];
+        qsort(copy, count, sizeof *copy, cmp_u64);
+        p50 = copy[(count - 1) / 2], p90 = copy[(count * 9 + 9) / 10 - 1], max = copy[count - 1];
+    }
+    free(copy);
+    s->read = end, s->dropped = 0;
+    char key[64];
+    snprintf(key, sizeof key, "%s_n", s->name), put_value(l, key, count);
+    snprintf(key, sizeof key, "%s_sum", s->name), put_value(l, key, sum);
+    snprintf(key, sizeof key, "%s_p50", s->name), put_value(l, key, p50);
+    snprintf(key, sizeof key, "%s_p90", s->name), put_value(l, key, p90);
+    snprintf(key, sizeof key, "%s_max", s->name), put_value(l, key, max);
+    if (dropped) snprintf(key, sizeof key, "%s_dropped", s->name), put_value(l, key, dropped);
+}
+
 void rc_hook(RcHook h) {
     for (int i = 0; i < g_nhooks; i++)
         if (g_hooks[i] == h) return;
@@ -132,6 +173,7 @@ static const char *group_of(int id) {
     if (id < RC_BANK_CALLS_C0) return "draw";
     if (id < RC_UNI_CALLS) return "bank";
     if (id < RC_DG_CALLS_VS) return "uniform";
+    if (id >= RC_T_FENCE_N) return "time";
     return "ledger";
 }
 
@@ -175,7 +217,11 @@ void rc_print(const char *kind, uint64_t present) {
     plat_mutex_unlock(&lock);
 }
 
+static void (*g_present_hook)(uint64_t);
+void rc_set_present_hook(void (*fn)(uint64_t seq)) { g_present_hook = fn; }
+
 void rc_present(uint64_t seq) {
+    if (g_present_hook) g_present_hook(seq);
     if (!rc_on) return;
     g_last_present = seq;
     if (g_window && seq % g_window == 0) rc_print("window", seq);

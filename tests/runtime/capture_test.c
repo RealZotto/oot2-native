@@ -176,6 +176,8 @@ static void g_game_stop(Cpu *t) {
         if (k == 5 && !g_stop) {   // the length case's counters
             capture_count(CAPTURE_PIPELINE_MISSES, 1);
             capture_gpu_pass(5, 0, 1234);
+            for (int i = 0; i < 2; i++) capture_render_off(0);   // draws rendering off kept from being made: 2 by RenderEnable,
+            for (int i = 0; i < 3; i++) capture_render_off(1);   // 3 by a condition (their own record, not the skipped draws)
         }
         frame(t, k);
         CHECK(k < 100000);

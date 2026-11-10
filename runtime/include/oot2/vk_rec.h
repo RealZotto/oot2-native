@@ -241,6 +241,10 @@ typedef struct VkRecFrame {
 // next vkrec_open. Call after vkrec_idle.
 #define VKREC_LOG 4096u
 const VkRecFrame *vkrec_frames(uint32_t *n);
+// The replay counters' feeds (OOT2_REPLAY_COUNTERS, vk_replay_time.c), called only with the counters on: a frame's values
+// as the replaying thread leaves them at vkrec_end, and the recorder's once it has submitted the frame.
+void vkrec_count_replay(const VkRecFrame *row);
+void vkrec_count_record(uint64_t ns, uint64_t cpu_ns);
 void vkrec_ring_stats(GpuRingStats *out);
 
 // ---- inside the recorder (vk_rec.c, vk_rec_pack.c)

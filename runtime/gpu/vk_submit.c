@@ -28,6 +28,7 @@
 
 #include "oot2/bindless.h"
 #include "oot2/gpu_vk.h"
+#include "oot2/replay_count.h"
 #include "oot2/runtime.h"
 #include "oot2/vk_capture.h"
 #include "oot2/vk_image.h"
@@ -238,11 +239,26 @@ static uint64_t vk_submit(uint64_t queue, const uint64_t *handles, int n) {
     return vkr_submit(handles, n);
 }
 
-static int vk_fence_wait(uint64_t value, uint64_t timeout_ns) { return gpu_sync_wait(value, timeout_ns); }
+// The game's wait for a fence value: with the replay counters on, the time it takes (the published value is the device's
+// progress, run through the completion thread's effects first) is counted as t_fence_wait, and the queue finish below as t_finish.
+static int vk_fence_wait(uint64_t value, uint64_t timeout_ns) {
+    uint64_t t0 = RC_ON() ? plat_now_ns() : 0;
+    int ok = gpu_sync_wait(value, timeout_ns);
+    if (t0) {
+        RC_ADD(RC_T_FENCE_N, 1);
+        RC_ADD(RC_T_FENCE_NS, plat_now_ns() - t0);
+    }
+    return ok;
+}
 static uint64_t vk_fence_done(void) { return gpu_sync_done(); }
 static void vk_finish(uint64_t queue) {   // one timeline: every queue's work is finished, which covers the queue's
     (void)queue;
+    uint64_t t0 = RC_ON() ? plat_now_ns() : 0;
     gpu_sync_finish();
+    if (t0) {
+        RC_ADD(RC_T_FINISH_N, 1);
+        RC_ADD(RC_T_FINISH_NS, plat_now_ns() - t0);
+    }
 }
 
 // The bindless tables (oot2/bindless.h): a registration changes one entry of its pool's shadow table and appends one

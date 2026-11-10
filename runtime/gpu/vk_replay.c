@@ -106,6 +106,7 @@ static struct {
     float bias[3];                            // factor, units, clamp
     float blend_color[4];
     int depth_clamp, raster_discard, restart_en, render, bounds_en, conservative;
+    int render_cause;                         // why render is 0: 1 the game's RenderEnable, 2 a conditional rendering
     uint32_t restart_index, sample_mask;
     float bounds[2];
     uint32_t vattr[NVN_VERTEX_BINDINGS];
@@ -236,6 +237,16 @@ void vkr_reset(void) {
 }
 
 __attribute__((constructor)) static void replay_init(void) { vkr_reset(); }
+
+// A draw, mesh draw or dispatch the replay does not make because rendering is off, by the cause (S.render_cause): counted
+// for the statistics (VkrStats render_off, split by cause) and for the capture, whose own count of them is kept apart from
+// the draws skipped for a pipeline not ready (oot2/capture.h, the "off" record).
+static void render_off(void) {
+    g_stats.render_off++;
+    if (S.render_cause == 2) g_stats.render_off_cond++;
+    else g_stats.render_off_enable++;
+    capture_render_off(S.render_cause == 2);
+}
 
 // ---------- stops
 #define stop(...) vkr_stop(__VA_ARGS__)
@@ -481,6 +492,7 @@ static Bound uniform(VknBuf b) {
     RC_ADD(RC_UNI_CALLS, 1);
     if (!b.addr || !b.size) {
         RC_ADD(RC_UNI_ZERO, 1);
+        if (vkrt_on) vkrt_unbound('u');
         return zero_block();
     }
     uint64_t size = b.size < UNIFORM_MAX ? b.size : UNIFORM_MAX;
@@ -542,6 +554,7 @@ static void raw_diag_flush(int kind, const char *const *keys, int nkeys, uint32_
 
 static void pass_end(void) {
     if (!F.in_pass) return;
+    if (vkrt_on) vkrt_pass_end(F.pass_draws);
     vkr_report_pass_end();   // a samples-passed query begun in the pass ends in it
     vkrec_EndRendering();
     F.in_pass = 0;
@@ -631,6 +644,7 @@ static void pass_begin(void) {
     F.pass_draws = 0, F.pass_vs = F.pass_fs = NULL;
     F.dyn_valid = 0;   // the viewport's flip and the scissor clip depend on the pass's height
     g_stats.passes++;
+    if (vkrt_on) vkrt_pass_begin(w, h, F.ncolor, F.formats.color, F.formats.depth, F.formats.stencil);
 }
 
 // ---------- dynamic state
@@ -951,6 +965,7 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
                 range = c1_end - c1_at < UNIFORM_MAX ? c1_end - c1_at : UNIFORM_MAX;
             } else {
                 at = zero_block();
+                if (vkrt_on) vkrt_unbound('c');
             }
         } else if (cb->slot == 2) {
             static const uint64_t none[128];
@@ -979,6 +994,7 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
         uint64_t addr = bank_word(st, c0, sb->cb_slot, sb->address_byte_offset, 8);
         uint64_t size = bank_word(st, c0, sb->cb_slot, sb->address_byte_offset + 8u, 4);
         if (!addr || !size) {   // unbound: zeros; one the module writes gets its own, so the shared zeros stay zero
+            if (vkrt_on) vkrt_unbound('s');
             Bound at = zero_block();
             if (sb->write) {
                 void *p;
@@ -1028,7 +1044,9 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
             stop("stage %s's texture slot at push constant byte %d", stage->key, t->push_offset);
         uint64_t h = S.tex[st][t->c2_slot];
         uint32_t id = nvn_handle_texture_id(h), sampler = nvn_handle_sampler_id(h);
+        if (vkrt_on) vkrt_tex_mark();
         uint32_t slot = F.ops->image_slot(id, t->view);
+        if (vkrt_on) vkrt_tex(st, (uint32_t)t->c2_slot, id, sampler, slot, F.ops);
         if (slot == UINT32_MAX) slot = id, g_stats.unregistered_textures++;
         s->push[t->push_offset / 4] = slot | sampler << 20;
     }
@@ -1243,8 +1261,9 @@ static int draw_prepare_body(int prim, uint32_t base_instance, VkBool32 *restart
 static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out) {
 #endif
     g_stats.draw_ops++;
+    if (vkrt_on) vkrt_begin(S.render ? 0 : S.render_cause);
     if (!S.render) {
-        g_stats.render_off++;
+        render_off();
         return 0;
     }
     if (P.id[ST_TS] || P.id[ST_MS]) stop("a vertex draw with task or mesh stages bound (the mesh draws)");
@@ -1253,6 +1272,13 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
     if (!fs) stop("a draw with no pixel stage bound (stage %s)", vs->key);
     VkpStage vst = replay_stage(vs), fst = replay_stage(fs);
     const ShaderBinds *vb = binds_of(&vst, SHD_VS), *fb = binds_of(&fst, SHD_PS);
+    if (vkrt_on) {
+        const nvn_stage *raw[2];
+        int nraw = 0;
+        if (vb->raw) raw[nraw++] = vs;
+        if (fb->raw) raw[nraw++] = fs;
+        vkrt_stages(vs->key, fs->key, NULL, raw, nraw);
+    }
     if (S.conservative) stop("conservative rasterization is not replayed yet");
     if (S.sample_mask != ~0u && (S.sample_mask & 1) != 1) stop("sample mask %#x is not replayed yet", S.sample_mask);
     pass_begin();
@@ -1272,6 +1298,7 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
 #endif
     if (!pipe) {
         g_stats.skipped++;
+        if (vkrt_on) vkrt_skip();
         return 0;
     }
     if (RC_ON()) vkrc_draw(0, NULL, &vst, &fst, &F.formats, pipe);
@@ -1310,8 +1337,12 @@ static uint32_t instances(int32_t n) { return n > 0 ? (uint32_t)n : 1u; }
 static void op_draw(const p_draw *d) {
     VkBool32 restart;
     g_reach_below = 0;   // a walk that left an indexed draw by the collection way-out may have left it set
+    if (vkrt_on) vkrt_kind('d');
     if (!draw_prepare(d->prim, (uint32_t)d->base_instance, &restart)) return;
     vkrec_Draw((uint32_t)d->count, instances(d->instances), (uint32_t)d->first, (uint32_t)d->base_instance);
+    if (vkrt_on)
+        vkrt_end(&(VkrtEnd){.count = (uint32_t)d->count, .first = d->first, .inst_rec = d->instances,
+                            .inst_run = instances(d->instances), .prim = d->prim});
 }
 
 static void index_buffer(int itype, uint64_t ibuf, uint64_t count) {
@@ -1331,11 +1362,15 @@ static void index_buffer(int itype, uint64_t ibuf, uint64_t count) {
 static void op_draw_idx(const p_draw_idx *d) {
     VkBool32 restart;
     g_reach_below = d->base_vertex < 0;
+    if (vkrt_on) vkrt_kind('i');
     const int prepared = draw_prepare(d->prim, (uint32_t)d->base_instance, &restart);
     g_reach_below = 0;
     if (!prepared) return;
     index_buffer(d->itype, d->ibuf, (uint64_t)(uint32_t)d->count);
     vkrec_DrawIndexed((uint32_t)d->count, instances(d->instances), 0, d->base_vertex, (uint32_t)d->base_instance);
+    if (vkrt_on)
+        vkrt_end(&(VkrtEnd){.count = (uint32_t)d->count, .first = d->base_vertex, .inst_rec = d->instances,
+                            .inst_run = instances(d->instances), .prim = d->prim});
 }
 
 static void op_draw_idx_ind(const p_draw_idx_ind *d) {
@@ -1356,11 +1391,20 @@ static void op_draw_idx_ind(const p_draw_idx_ind *d) {
     RC_ADD(RC_IND_SCAN_STEPS, scanned);
     if (readable) memcpy(&base_instance, (const uint8_t *)(uintptr_t)d->ind + 16, 4);
     g_reach_below = 1;
+    if (vkrt_on) vkrt_kind('I');
     const int prepared = draw_prepare(d->prim, base_instance, &restart);
     g_reach_below = 0;
     if (!prepared) return;
     index_buffer(d->itype, d->ibuf, 0);
     vkrec_DrawIndexedIndirect((VkBuffer)(uintptr_t)ref.buffer, ref.offset, 1, 20);
+    if (vkrt_on) {   // the record's count and instance words, read where the draw's base instance was read (the CPU's view)
+        VkrtEnd e = {.prim = d->prim, .have_ind = readable};
+        if (readable) {
+            memcpy(&e.ind_count, (const uint8_t *)(uintptr_t)d->ind, 4);
+            memcpy(&e.ind_inst, (const uint8_t *)(uintptr_t)d->ind + 4, 4);
+        }
+        vkrt_end(&e);
+    }
 }
 
 static void mesh_first_task_push(Set1 *s, VkDeviceAddress address) {
@@ -1394,8 +1438,9 @@ static Bound mesh_indirect_record(uint64_t indirect) {
 
 static void op_draw_mesh(const p_draw_mesh *d, uint64_t indirect) {
     g_stats.draw_ops++;
+    if (vkrt_on) vkrt_begin_kind(indirect ? 'M' : 'm', S.render ? 0 : S.render_cause);
     if (!S.render) {
-        g_stats.render_off++;
+        render_off();
         return;
     }
     if (P.id[ST_VS]) stop("a mesh draw with a vertex stage bound");
@@ -1411,6 +1456,14 @@ static void op_draw_mesh(const p_draw_mesh *d, uint64_t indirect) {
     VkpStage mesh = replay_stage(ms), pixel = replay_stage(fs);
     const ShaderBinds *tb = ts ? binds_of(&task, SHD_TS) : NULL;
     const ShaderBinds *mb = binds_of(&mesh, SHD_MS), *fb = binds_of(&pixel, SHD_PS);
+    if (vkrt_on) {
+        const nvn_stage *raw[3];
+        int nraw = 0;
+        if (ts && tb->raw) raw[nraw++] = ts;
+        if (mb->raw) raw[nraw++] = ms;
+        if (fb->raw) raw[nraw++] = fs;
+        vkrt_stages(ms->key, fs->key, ts ? ts->key : NULL, raw, nraw);
+    }
     if (S.conservative) stop("conservative rasterization is not replayed yet");
     if (S.sample_mask != ~0u && (S.sample_mask & 1) != 1)
         stop("sample mask %#x is not replayed yet", S.sample_mask);
@@ -1419,6 +1472,7 @@ static void op_draw_mesh(const p_draw_mesh *d, uint64_t indirect) {
     VkPipeline pipe = F.ops->graphics(&mesh, ts ? &task : NULL, &pixel, &F.formats, targets_hold_earlier_picture());
     if (!pipe) {
         g_stats.skipped++;
+        if (vkrt_on) vkrt_skip();
         return;
     }
     if (!F.ops->buffer_address) stop("mesh draws need replay scratch with buffer device addresses");
@@ -1485,6 +1539,7 @@ static void op_draw_mesh(const p_draw_mesh *d, uint64_t indirect) {
         vkrec_DrawMeshTasksIndirectEXT(record.buf, record.off, 1, MESH_INDIRECT_RECORD_BYTES);
     else
         vkrec_DrawMeshTasksEXT((uint32_t)d->count, 1, 1);
+    if (vkrt_on) vkrt_end(&(VkrtEnd){.count = indirect ? 0 : (uint32_t)d->count, .first = indirect ? 0 : d->first, .prim = -1});
 }
 
 // ---------- the movie chain's stand-in (settings.h test_movie_blit, oot2/vk_movie_blit.h)
@@ -1599,8 +1654,9 @@ static int movie_replaces(const nvn_stage *cs) {
 // buffer into the bank, which the dispatch has to itself, right before it runs.
 static void dispatch(const uint32_t groups[3], uint64_t ind) {
     g_stats.draw_ops++;
+    if (vkrt_on) vkrt_begin_kind(ind ? 'C' : 'c', S.render ? 0 : S.render_cause);
     if (!S.render) {
-        g_stats.render_off++;
+        render_off();
         return;
     }
     const nvn_stage *cs = P.id[ST_CS];
@@ -1608,6 +1664,7 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     if (movie_replaces(cs)) return;   // the movie chain's stand-in, a test switch: 0 at once when the setting is off
     VkpStage cst = replay_stage(cs);
     const ShaderBinds *b = binds_of(&cst, SHD_CS);
+    if (vkrt_on) vkrt_stages(cs->key, NULL, NULL, &cs, b->raw ? 1 : 0);
     pass_end();
     F.noting = vkgt_enabled;   // the pass's mark is made; the buffers from here on are this dispatch's
     if (F.after_xfer) full_barrier();
@@ -1635,6 +1692,7 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     F.draws++, g_stats.dispatches++;
     if (!ind) {
         vkrec_Dispatch(groups[0], groups[1], groups[2]);
+        if (vkrt_on) vkrt_end(&(VkrtEnd){.groups = {groups[0], groups[1], groups[2]}, .prim = -1});
         if (vkgt_enabled) vkgt_mark(VKGT_DISPATCH, cs->key, groups[0], groups[1], groups[2]);
         if (b->raw) raw_diag_flush('c', (const char *const[]){cs->key}, 1, 0);
         F.noting = 0;
@@ -1646,6 +1704,7 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     vkrec_CopyBuffer(buf, patch.buf, &counts);
     full_barrier();
     vkrec_DispatchIndirect(buf, ref.offset);
+    if (vkrt_on) vkrt_end(&(VkrtEnd){.prim = -1});
     F.c0[ST_CS].valid = 0;   // the bank holds the GPU's counts now, not the CPU's bytes
     if (vkgt_enabled) vkgt_mark(VKGT_DISPATCH, cs->key, 0, 0, 0);   // the counts are the GPU's: unknown here
     if (b->raw) raw_diag_flush('c', (const char *const[]){cs->key}, 1, 0);
@@ -1673,7 +1732,11 @@ static VkRect2D clear_rect(void) {
 }
 
 static void op_clear_color(const p_clear_color *c) {
-    if (!S.render) return;
+    if (!S.render) {
+        g_stats.clears_off++;
+        if (vkrt_on) vkrt_clear_off();
+        return;
+    }
     if (c->index < 0 || c->index >= 8) stop("a colour clear of target %d", c->index);
     pass_begin();
     if ((uint32_t)c->index >= F.ncolor || !S.rt.color[c->index].present) return;   // no target there: nothing to clear
@@ -1687,7 +1750,11 @@ static void op_clear_color(const p_clear_color *c) {
 }
 
 static void op_clear_ds(const p_clear_ds *c) {
-    if (!S.render) return;
+    if (!S.render) {
+        g_stats.clears_off++;
+        if (vkrt_on) vkrt_clear_off();
+        return;
+    }
     pass_begin();
     if (!F.has_depth) return;
     VkClearAttachment a = {.clearValue.depthStencil = {c->depth, (uint32_t)c->stencil}};
@@ -1894,8 +1961,8 @@ static void record_op(const op_hdr *r) {
     }
     case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, sizeof S.blend_color); break;
     case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_flag *)a)->value != 0; break;
-    case OP_RENDER_ENABLE: S.render = ((const p_flag *)a)->value != 0; break;
-    case OP_RENDER_COND: S.render = vkr_condition(a); break;
+    case OP_RENDER_ENABLE: S.render = ((const p_flag *)a)->value != 0, S.render_cause = S.render ? 0 : 1; break;
+    case OP_RENDER_COND: S.render = vkr_condition(a), S.render_cause = S.render ? 0 : 2; break;
     case OP_RASTER_DISCARD: S.raster_discard = ((const p_flag *)a)->value != 0; break;
     case OP_PRIM_RESTART: {
         const p_prim_restart *p = a;
@@ -1977,6 +2044,7 @@ uint64_t vkr_submit(const uint64_t *handles, int n) {
     memset(&F, 0, sizeof F);
     F.ops = ops, F.value = value;
     if (RC_ON()) vkrc_submit_begin();
+    if (vkrt_on) vkrt_submit_begin(value);
     if (vkgt_enabled) vkgt_frame_begin(value);
     static uint64_t frames;
     int k = (int)(frames++ % FRAMES_KEPT);
@@ -1990,6 +2058,7 @@ uint64_t vkr_submit(const uint64_t *handles, int n) {
     if (ops->frame_end) ops->frame_end(value);
     vkr_report_frame_end();   // after the frame's end: its events and reports follow the backing map's write-backs
     if (RC_ON()) vkrc_submit_end(F.draws);
+    if (vkrt_on) vkrt_submit_end();
     g_stats.frames++;
     if (vkgt_enabled) vkgt_frame_end();   // the last timestamps, and the effect that reads them
     return vkrec_end(NULL, 0);

@@ -390,6 +390,17 @@ static int dev_cpu_reads(uint64_t addr, uint64_t size) {
     return p && !(p->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS);
 }
 
+// The trace (OOT2_REPLAY_TRACE) asks what the bindless tables hold at a texture ID: the entry and its format, nothing made.
+static int dev_trace_tex(uint32_t id, uint32_t *format, int *astc) {
+    tex_t t;
+    view_t v;
+    if (!bindless_texture_entry(id, &t, &v)) return 0;
+    *format = v.set_format ? v.format : t.d.format;
+    const VkfRow *row = vkf_row((int)*format);
+    *astc = row && (row->flags & VKF_ASTC) != 0;
+    return 1;
+}
+
 const VkReplayOps *vkr_device_ops(void) {
     static VkReplayOps ops = {.graphics = vkm_graphics, .compute = vkm_compute, .program_bound = vkm_program_bound,
                               .binds = dev_binds,
@@ -399,7 +410,8 @@ const VkReplayOps *vkr_device_ops(void) {
                               .storage_image = dev_storage_image, .image_by_id = dev_image_by_id, .scratch = dev_scratch,
                               .buffer_address = dev_buffer_address, .task_set = dev_task_set,
                               .raw = gpu_vk_raw_begin, .frame_begin = dev_frame_begin, .frame_end = dev_frame_end,
-                              .queries = dev_queries, .query_results = dev_query_results, .cpu_reads = dev_cpu_reads};
+                              .queries = dev_queries, .query_results = dev_query_results, .cpu_reads = dev_cpu_reads,
+                              .trace_tex = dev_trace_tex};
     const VkpLayouts *l = vkp_layouts();   // read at every call: the pipeline builder may open after the first frame
     ops.graphics_layout = l->graphics, ops.compute_layout = l->compute;
     ops.raw_snap = gpu_vk_raw_diag() ? gpu_vk_raw_snap : NULL;   // settings.h raw_diag: off, no snapshot packets
