@@ -10,14 +10,21 @@
 //   hos_test CASE DIR   runs one case with DIR as the game folder (census.tsv goes there); prints "ok CASE" and exits
 //                       0, or exits 1 with a FAIL line. The cases that end in a named fatal exit with the runtime's
 //                       code (tests/test_runtime_hos.py).
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #include "layout.h"
 #include "endmark.h"
 #include "oot2/boot.h"
 #include "oot2/gfx.h"
+#include "oot2/hid_motion.h"
 #include "oot2/kernel.h"
 #include "oot2/ledger.h"
 #include "oot2/memory.h"
@@ -131,6 +138,250 @@ static uint64_t nvn(Cpu *a, const char *name, uint64_t x0, uint64_t x1, uint64_t
     return a->x[0];
 }
 
+
+// The nn::hid six-axis overrides, the nn::pl and nn::pctl overrides: bound as the loader binds an import.
+static const char *const HID_SYMBOLS[] = {
+    "_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE",
+    "_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE",
+    "_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE",
+    "_ZN2nn3hid6detail22GetSixAxisSensorStatesEPiPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE",
+    "_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE",
+};
+enum { H_START, H_STOP, H_STATES, H_DSTATES, H_STATE, H_COUNT };
+static uint64_t g_hid[H_COUNT];
+static const char *const PL_SYMBOLS[] = {
+    "_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE",
+    "_ZN2nn2pl20GetSharedFontAddressENS0_14SharedFontTypeE",
+    "_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE",
+    "_ZN2nn2pl17RequestLoadNxFontEPvm",
+    "_ZN2nn4pctl33CheckAgcPermissionUnderMinimumAgeERKNS_7account3UidE",
+};
+enum { P_STATE, P_ADDR, P_SIZE, P_REQ, P_PCTL, P_COUNT };
+static uint64_t g_pl[P_COUNT];
+
+static int case_is(const char *prefix) { return !strncmp(g_case, prefix, strlen(prefix)); }
+
+static void set_env(const char *name, const char *value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
+
+static void make_dir(const char *path) {
+#ifdef _WIN32
+    _mkdir(path);
+#else
+    mkdir(path, 0777);
+#endif
+}
+
+// A made-up font file: an sfnt magic and then a pattern that depends on the seed, nothing of any real font.
+static size_t write_blob(const char *path, size_t size, uint8_t seed, const char *magic4) {
+    uint8_t *b = malloc(size);
+    CHECK(b != NULL);
+    for (size_t i = 0; i < size; i++) b[i] = (uint8_t)(seed + i * 7 + (i >> 8));
+    if (magic4) memcpy(b, magic4, 4);
+    else memcpy(b, "\0\1\0\0", 4);
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL);
+    CHECK(fwrite(b, 1, size, f) == size);
+    fclose(f);
+    free(b);
+    return size;
+}
+static void expect_blob(uint64_t addr, size_t size, uint8_t seed) {
+    const uint8_t *g = (const uint8_t *)(uintptr_t)addr;
+    CHECK(g[0] == 0 && g[1] == 1 && g[2] == 0 && g[3] == 0);
+    for (size_t i = 4; i < size; i++) CHECK(g[i] == (uint8_t)(seed + i * 7 + (i >> 8)));
+}
+
+// ---- the six-axis state as the guest reads it
+typedef struct {
+    int64_t delta_ns, sampling;
+    float acc[3], gyro[3], angle[3], dir[9];
+    uint32_t attributes, reserved;
+} SixState;
+_Static_assert(sizeof(SixState) == 0x60, "six-axis state layout");
+#define SIX_OUT (HEAP + 0x1000)
+#define SIX_HANDLE (HEAP + 0x100)
+
+static uint64_t hcall(Cpu *a, int i, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3) {
+    a->x[0] = x0, a->x[1] = x1, a->x[2] = x2, a->x[3] = x3;
+    rt_call(a, g_hid[i]);
+    return a->x[0];
+}
+static void six_copy(SixState *out, int n) { memcpy(out, (const void *)(uintptr_t)SIX_OUT, (size_t)n * sizeof *out); }
+// GetSixAxisSensorStates(out, n, &handle): the count it gives back, the states in out
+static int six_read(Cpu *a, int n, SixState *out) {
+    memset((void *)(uintptr_t)SIX_OUT, 0xcc, (size_t)n * sizeof *out);
+    int got = (int)hcall(a, H_STATES, SIX_OUT, (uint64_t)n, SIX_HANDLE, 0);
+    six_copy(out, n);
+    return got;
+}
+static void six_feed(float gz, uint64_t dt) {
+    const float flat[3] = {0, 0, -1}, gyro[3] = {0, 0, gz};
+    hid_motion_feed(flat, gyro, dt, plat_now_ns());
+}
+static int is_rest(const SixState *s) {
+    return s->attributes == 0 && s->delta_ns == 0 && s->acc[0] == 0 && s->acc[1] == 0 && s->acc[2] == -1 &&
+           s->gyro[0] == 0 && s->gyro[1] == 0 && s->gyro[2] == 0 && s->angle[2] == 0 && s->dir[0] == 1 &&
+           s->dir[4] == 1 && s->dir[8] == 1 && s->dir[1] == 0;
+}
+#define NEARF(a, b, eps) (fabs((double)(a) - (double)(b)) <= (eps))
+
+// The case hid_motion: a synthetic sensor stream through the host motion layer, read through the nn::hid overrides.
+// With replay set (hid_motion_replay) an input file is being replayed: the pad's motion must not reach the game.
+static void hid_motion_case(int replay) {
+    Cpu a;
+    memset(&a, 0, sizeof a);
+    a.excl_addr = ~0ull;
+    uint32_t handle = 0x20003;
+    memcpy((void *)(uintptr_t)SIX_HANDLE, &handle, sizeof handle);
+    SixState s[16];
+    // not started: samples fed are not read, every state is a controller at rest and the sampling numbers grow
+    for (int i = 0; i < 3; i++) six_feed(0.5f, 4000000);
+    CHECK(six_read(&a, 16, s) == 16);
+    for (int i = 0; i < 16; i++) CHECK(is_rest(&s[i]));
+    for (int i = 1; i < 16; i++) CHECK(s[i].sampling == s[0].sampling - i);
+    int64_t last_rest = s[0].sampling;
+    CHECK(!hid_motion_wanted());
+    CHECK(hcall(&a, H_START, SIX_HANDLE, 0, 0, 0) == 0);
+    CHECK(hid_motion_wanted());   // the window thread now turns the pad's sensors on
+    // started, nothing fed since the start: still at rest, and the numbers still grow
+    CHECK(six_read(&a, 16, s) == 16);
+    for (int i = 0; i < 16; i++) CHECK(is_rest(&s[i]));
+    CHECK(s[0].sampling > last_rest);
+    last_rest = s[0].sampling;
+    // five samples of a quarter-turn-a-second-per-ten-ticks ramp about the face's normal, 4 ms apart
+    for (int k = 1; k <= 5; k++) six_feed(0.1f * (float)k, 4000000);
+    CHECK(six_read(&a, 16, s) == 16);
+    if (replay) {
+        for (int i = 0; i < 16; i++) CHECK(is_rest(&s[i]));   // the replayed input replaces the pad's motion too
+        CHECK(hcall(&a, H_STOP, SIX_HANDLE, 0, 0, 0) == 0);
+        CHECK(!hid_motion_wanted());
+        return;
+    }
+    for (int i = 0; i < 5; i++) {
+        CHECK(s[i].attributes == 1);
+        CHECK(s[i].delta_ns == 4000000);
+        CHECK(NEARF(s[i].gyro[2], 0.1 * (5 - i), 1e-6) && s[i].gyro[0] == 0 && s[i].gyro[1] == 0);
+        CHECK(NEARF(s[i].acc[2], -1, 1e-6));
+    }
+    CHECK(NEARF(s[0].angle[2], 0.1 * 15 * 0.004, 1e-6));   // the sum of the ramp over the ticks, in revolutions
+    CHECK(s[0].sampling > last_rest);                       // above every number given at rest
+    for (int i = 1; i < 16; i++) CHECK(s[i].sampling == s[0].sampling - i);
+    // the states the pad has not sent yet repeat the oldest sample's pose and move nothing
+    for (int i = 5; i < 16; i++) {
+        CHECK(s[i].attributes == 1 && s[i].delta_ns == 0);
+        CHECK(s[i].gyro[0] == 0 && s[i].gyro[1] == 0 && s[i].gyro[2] == 0);
+        CHECK(NEARF(s[i].angle[2], s[4].angle[2], 1e-9) && NEARF(s[i].dir[0], s[4].dir[0], 1e-9));
+    }
+    // the same samples read again are the same states with the same numbers
+    SixState again[16];
+    CHECK(six_read(&a, 16, again) == 16);
+    CHECK(!memcmp(s, again, sizeof s));
+    // the other forms: the detail count form, and the single state form
+    int32_t count = -1;
+    memset((void *)(uintptr_t)SIX_OUT, 0xcc, sizeof s);
+    CHECK(hcall(&a, H_DSTATES, HEAP + 0x200, SIX_OUT, 16, SIX_HANDLE) == 0);
+    memcpy(&count, (const void *)(uintptr_t)(HEAP + 0x200), sizeof count);
+    CHECK(count == 16);
+    six_copy(again, 16);
+    CHECK(!memcmp(s, again, sizeof s));
+    memset((void *)(uintptr_t)SIX_OUT, 0xcc, sizeof s);
+    CHECK(hcall(&a, H_STATE, SIX_OUT, SIX_HANDLE, 0, 0) == 0);
+    six_copy(again, 1);
+    CHECK(!memcmp(&s[0], &again[0], sizeof s[0]));
+    // one more sample moves the newest number by one
+    six_feed(0.6f, 4000000);
+    CHECK(six_read(&a, 16, again) == 16);
+    CHECK(again[0].sampling == s[0].sampling + 1 && NEARF(again[0].gyro[2], 0.6, 1e-6));
+    // the pad stops sending (a sample from long ago): at rest again, numbers still above the live ones
+    int64_t last_live = again[0].sampling;
+    hid_motion_clear();
+    six_feed(0.5f, 4000000);
+    {
+        const float flat[3] = {0, 0, -1}, gyro[3] = {0, 0, 0.5f};
+        hid_motion_feed(flat, gyro, 4000000, plat_now_ns() - 1000000000ull);   // a second old
+    }
+    CHECK(six_read(&a, 16, s) == 16);
+    for (int i = 0; i < 16; i++) CHECK(is_rest(&s[i]));
+    CHECK(s[0].sampling > last_live);
+    // the menu's swallow
+    hid_motion_clear();
+    six_feed(0.5f, 4000000);
+    hid_motion_suppress(1);
+    CHECK(six_read(&a, 16, s) == 16 && is_rest(&s[0]));
+    hid_motion_suppress(0);
+    CHECK(six_read(&a, 16, s) == 16 && s[0].attributes == 1);
+    // stopped: at rest and the pad's sensors may go off
+    CHECK(hcall(&a, H_STOP, SIX_HANDLE, 0, 0, 0) == 0);
+    CHECK(!hid_motion_wanted());
+    int64_t before = s[0].sampling;
+    CHECK(six_read(&a, 16, s) == 16);
+    for (int i = 0; i < 16; i++) CHECK(is_rest(&s[i]));
+    CHECK(s[0].sampling > before);
+    for (int i = 0; i < H_COUNT; i++) {
+        const HosNote *n = hos_note(HID_SYMBOLS[i]);
+        CHECK(n && !strcmp(n->status, HOS_IMPLEMENTED) && n->why[0]);
+    }
+}
+
+// The cases pl_font and pl_font_env: the shared font calls, with a made-up font file in the game folder (and, for the
+// second, another that OOT2_SHARED_FONT names and that wins).
+static void pl_font_case(int env) {
+    Cpu a;
+    memset(&a, 0, sizeof a);
+    a.excl_addr = ~0ull;
+    for (int t = 0; t < 6; t++) {   // the load state is Loaded for every type the console has
+        a.x[0] = (uint64_t)t;
+        rt_call(&a, g_pl[P_STATE]);
+        CHECK((uint32_t)a.x[0] == 1);
+    }
+    const size_t want = env ? 2222 : 3001;
+    const uint8_t seed = env ? 90 : 17;
+    uint64_t first = 0;
+    for (int t = 0; t < 6; t++) {
+        a.x[0] = (uint64_t)t;
+        rt_call(&a, g_pl[P_ADDR]);
+        uint64_t addr = a.x[0];
+        CHECK(addr != 0);
+        if (!t) first = addr;
+        CHECK(addr == first);   // one font serves every type
+        a.x[0] = (uint64_t)t;
+        rt_call(&a, g_pl[P_SIZE]);
+        CHECK(a.x[0] == want);
+        expect_blob(addr, want, seed);
+    }
+    // RequestLoadNxFont: a buffer of guest memory is accepted and left as it is
+    memset((void *)(uintptr_t)(HEAP + 0x4000), 0x5a, 0x1000);
+    a.x[0] = HEAP + 0x4000, a.x[1] = 0x1000;
+    rt_call(&a, g_pl[P_REQ]);
+    const uint8_t *buf = (const uint8_t *)(uintptr_t)(HEAP + 0x4000);
+    for (int i = 0; i < 0x1000; i++) CHECK(buf[i] == 0x5a);
+    for (int i = P_STATE; i <= P_REQ; i++) {   // every override of the group is in the census, with its reason
+        const HosNote *n = hos_note(PL_SYMBOLS[i]);
+        CHECK(n && n->why[0] && strcmp(n->status, HOS_GAP));   // answers: no longer a named fatal
+    }
+}
+
+// The case pctl: the parental-control age check answers without a stop
+static void pctl_case(void) {
+    Cpu a;
+    memset(&a, 0, sizeof a);
+    a.excl_addr = ~0ull;
+    memset((void *)(uintptr_t)(HEAP + 0x300), 0x11, 16);   // a Uid
+    a.x[0] = HEAP + 0x300;
+    a.x[1] = 0xdead;
+    rt_call(&a, g_pl[P_PCTL]);
+    CHECK((a.x[0] & 0xff) == 0);
+    const HosNote *n = hos_note(PL_SYMBOLS[P_PCTL]);
+    CHECK(n && n->why[0] && strcmp(n->status, HOS_GAP));
+}
+
 // ---- guest programs (each ends its thread)
 static void g_sm(Cpu *c) {
     uint32_t h = open_port(c, "sm:");
@@ -196,6 +447,17 @@ static void g_fatal(Cpu *c) {
         c->x[30] = G(2) + 0x54;
         c->pc = g_movie;
         rt_dispatch(c);
+    } else if (case_is("pl_")) {
+        // the shared font calls that stop by name, called from main+0x250 as the game calls its table
+        int which = !strcmp(g_case, "pl_font_missing") || !strcmp(g_case, "pl_font_not_sfnt") ? P_ADDR
+                    : !strcmp(g_case, "pl_font_type") ? P_STATE : P_REQ;
+        c->x[0] = !strcmp(g_case, "pl_font_missing") ? 2 : !strcmp(g_case, "pl_font_type") ? 9 : 0;
+        c->x[1] = 0x1000;   // pl_nx_buffer: a null buffer
+        if (!strcmp(g_case, "pl_nx_size")) c->x[0] = HEAP + 0x4000, c->x[1] = 0;            // no bytes
+        if (!strcmp(g_case, "pl_nx_range")) c->x[0] = HEAP + 0x4000, c->x[1] = 1ull << 32;   // runs out of guest memory
+        c->x[30] = G(2) + 0x54;
+        c->pc = g_pl[which];
+        rt_dispatch(c);
     } else if (!strcmp(g_case, "fault")) {
         // a read of unmapped memory by guest code, with a frame record the fault names: x30 and the x29 chain
         uint64_t frame[2] = {0, G(1) + 0x44};
@@ -240,6 +502,35 @@ static void boot(const char *folder) {
     if (!strcmp(g_case, "nvn") || !strcmp(g_case, "nvn_census") || !strcmp(g_case, "census_files") ||
         !strcmp(g_case, "collect_note") || !strcmp(g_case, "collect_none"))
         nvn_procs_register();   // as main.c does, before the layer
+    if (case_is("hid_motion"))
+        for (int i = 0; i < H_COUNT; i++) CHECK((g_hid[i] = rt_hostfn_bind(HID_SYMBOLS[i])) != 0);
+    if (case_is("pl_") || !strcmp(g_case, "pctl"))
+        for (int i = 0; i < P_COUNT; i++) CHECK((g_pl[i] = rt_hostfn_bind(PL_SYMBOLS[i])) != 0);
+    set_env("OOT2_SHARED_FONT", NULL);
+    if (case_is("pl_font") || case_is("pl_nx")) {
+        char path[1200];
+        snprintf(path, sizeof path, "%s/fonts", folder);
+        make_dir(path);
+        snprintf(path, sizeof path, "%s/fonts/shared-font.ttf", folder);
+        if (!strcmp(g_case, "pl_font_not_sfnt")) write_blob(path, 500, 3, "BFTT");
+        else if (strcmp(g_case, "pl_font_missing") && strcmp(g_case, "pl_font_type")) write_blob(path, 3001, 17, NULL);
+        if (!strcmp(g_case, "pl_font_env")) {
+            snprintf(path, sizeof path, "%s/elsewhere.ttf", folder);
+            write_blob(path, 2222, 90, NULL);
+            set_env("OOT2_SHARED_FONT", path);
+        }
+    }
+    if (!strcmp(g_case, "hid_motion_replay")) {   // an input file is replayed: the real input, and the pad's motion, are off
+        char path[1200];
+        snprintf(path, sizeof path, "%s/replay.txt", folder);
+        FILE *f = fopen(path, "wb");
+        CHECK(f != NULL);
+        fputs("at 0 for 1 a\n", f);
+        fclose(f);
+        set_env("OOT2_INPUT_FILE", path);
+    } else {
+        set_env("OOT2_INPUT_FILE", NULL);
+    }
     hos_init(folder, NULL, 0);
     static const uint64_t addrs[] = {G(1), G(2), G(3), G(4)};
     static const GuestFn fns[] = {g_sm, g_fatal, guest_end, guest_end};
@@ -540,9 +831,19 @@ int main(int argc, char **argv) {
         // a census-mode run ends with its own exit code after the census has its stop row
         boot(dir);
         rt_census_end(RT_EXIT_CENSUS, "[census mode] the case ended at its frame limit");
+    } else if (case_is("hid_motion")) {
+        boot(dir);
+        hid_motion_case(!strcmp(g_case, "hid_motion_replay"));
+    } else if (!strcmp(g_case, "pl_font") || !strcmp(g_case, "pl_font_env")) {
+        boot(dir);
+        pl_font_case(!strcmp(g_case, "pl_font_env"));
+    } else if (!strcmp(g_case, "pctl")) {
+        boot(dir);
+        pctl_case();
     } else if (!strcmp(g_case, "service") || !strcmp(g_case, "port") || !strcmp(g_case, "command") ||
+
                !strcmp(g_case, "nvn") || !strcmp(g_case, "movie") ||
-               !strcmp(g_case, "fault") || !strcmp(g_case, "fault_chain")) {
+               !strcmp(g_case, "fault") || !strcmp(g_case, "fault_chain") || case_is("pl_")) {
         boot(dir);
         rt_kernel_run(G(2), 0);
     } else if (!strcmp(g_case, "boot")) {

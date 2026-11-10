@@ -3,8 +3,9 @@
 //
 // The window (oot2/window.h): SDL3, one thread that makes the window and pumps its events, the Vulkan surface calls, the
 // menu's keys and pad buttons, the pointer, and the host input layer's producer: it reads the gamepad (or, with none, the
-// keyboard), applies the mapping and dead zone, publishes the snapshot (oot2/hid_input.h), and plays the vibration
-// requests it is given. Compiled without SDL3 (OOT2_WITH_SDL3 unset: no kit, tools/fetch_sdl3.py) to refusals, so a
+// keyboard), applies the mapping and dead zone, publishes the snapshot (oot2/hid_input.h), feeds the pad's gyroscope and
+// accelerometer to the motion layer (oot2/hid_motion.h) while the game has the six-axis sensor started, and plays the
+// vibration requests it is given. Compiled without SDL3 (OOT2_WITH_SDL3 unset: no kit, tools/fetch_sdl3.py) to refusals, so a
 // program built that way starts and presents to the offscreen capture.
 //
 // Why a thread of our own: SDL wants every video call on the thread that initialised it, the game's main thread waits
@@ -18,6 +19,7 @@
 
 #include "oot2/window.h"
 #include "oot2/hid_input.h"
+#include "oot2/hid_motion.h"
 #include "oot2/settings.h"
 
 #ifndef OOT2_WITH_SDL3
@@ -175,6 +177,32 @@ static void note_close(void) {
     if (in.closed) in.closed();
 }
 
+// ---------- the pad's motion
+// The first pad's gyroscope and accelerometer, while the game has started the six-axis sensor (hid_motion_wanted). SDL
+// sends each sensor as an event at the pad's own rate, and those events wake the loop, so the samples are neither polled
+// at the loop's idle rate nor read twice. A gyroscope sample is paired with the newest accelerometer sample and fed with
+// the time since the last gyroscope sample on the pad's own clock. A pad without both sensors keeps the six-axis states at
+// rest (the motion layer has no samples). All of this runs on the window thread.
+static SDL_JoystickID s_motion_pad;   // the gamepad whose sensors are on, 0 none
+static int s_motion_ok;               // ... and it has both, enabled
+static float s_accel[3];
+static int s_have_accel;
+static uint64_t s_last_gyro_ns;
+
+static void motion_event(const SDL_GamepadSensorEvent *s) {
+    if (!s_motion_ok || s->which != s_motion_pad) return;
+    if (s->sensor == SDL_SENSOR_ACCEL) {
+        memcpy(s_accel, s->data, sizeof s_accel);
+        s_have_accel = 1;
+    } else if (s->sensor == SDL_SENSOR_GYRO && s_have_accel) {
+        float acc[3], gyro[3];
+        hid_motion_from_sdl(s_accel, s->data, acc, gyro);
+        uint64_t dt = s_last_gyro_ns && s->sensor_timestamp > s_last_gyro_ns ? s->sensor_timestamp - s_last_gyro_ns : 0;
+        s_last_gyro_ns = s->sensor_timestamp;
+        hid_motion_feed(acc, gyro, dt, plat_now_ns());
+    }
+}
+
 static void handle(const SDL_Event *e, SDL_Gamepad **pads, float *px, float *py, int *down) {
     WinInput in = input_copy();
     if (e->type == g_ev_job) {
@@ -231,6 +259,7 @@ static void handle(const SDL_Event *e, SDL_Gamepad **pads, float *px, float *py,
     }
     case SDL_EVENT_GAMEPAD_ADDED: open_pad(e->gdevice.which, pads); break;
     case SDL_EVENT_GAMEPAD_REMOVED: close_pad(e->gdevice.which, pads); break;
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: motion_event(&e->gsensor); break;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP: {
         int b = e->gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE ? BTN_GUIDE
@@ -351,6 +380,7 @@ static void publish_input(SDL_Gamepad **pads) {
     WinInput wi = input_copy();
     int suppressed = wi.menu_open && wi.menu_open();
     hid_host_input_suppress(suppressed);
+    hid_motion_suppress(suppressed);
     if (suppressed) return;   // the menu is open: read returns a zeroed snapshot, publish nothing new
     HidHostInput in = {0};
     int64_t dead = rt_setting(RT_SET_input_dead_zone);
@@ -375,6 +405,39 @@ static void publish_input(SDL_Gamepad **pads) {
         }
     }
     hid_host_input_publish(&in);
+}
+
+// Turn the first pad's sensors on while the game wants motion and the pad has both, and off again when it stops or the
+// pad changes; the motion layer is cleared whenever the source changes, so no sample of another pad is read.
+static void service_motion(SDL_Gamepad **pads) {
+    SDL_Gamepad *g = first_pad(pads);
+    SDL_JoystickID id = g ? SDL_GetGamepadID(g) : 0;
+    if (!g || !hid_motion_wanted()) {
+        if (s_motion_pad) {
+            SDL_Gamepad *old = SDL_GetGamepadFromID(s_motion_pad);
+            if (old && s_motion_ok) {
+                SDL_SetGamepadSensorEnabled(old, SDL_SENSOR_GYRO, false);
+                SDL_SetGamepadSensorEnabled(old, SDL_SENSOR_ACCEL, false);
+            }
+            SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_SENSOR_UPDATE, false);
+            s_motion_pad = 0, s_motion_ok = 0, s_have_accel = 0, s_last_gyro_ns = 0;
+            hid_motion_clear();
+        }
+        return;
+    }
+    if (id == s_motion_pad) return;
+    s_motion_pad = id, s_have_accel = 0, s_last_gyro_ns = 0;
+    hid_motion_clear();
+    s_motion_ok = SDL_GamepadHasSensor(g, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(g, SDL_SENSOR_ACCEL) &&
+                  SDL_SetGamepadSensorEnabled(g, SDL_SENSOR_GYRO, true) &&
+                  SDL_SetGamepadSensorEnabled(g, SDL_SENSOR_ACCEL, true);
+    SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_SENSOR_UPDATE, s_motion_ok);
+    if (s_motion_ok)
+        fprintf(stderr, "[rt] input: motion sensors on (gyro %.0f Hz, accelerometer %.0f Hz)\n",
+                (double)SDL_GetGamepadSensorDataRate(g, SDL_SENSOR_GYRO),
+                (double)SDL_GetGamepadSensorDataRate(g, SDL_SENSOR_ACCEL));
+    else
+        fprintf(stderr, "[rt] input: this gamepad has no gyroscope and accelerometer: the six-axis sensor reads at rest\n");
 }
 
 // The vibration requests nn::hid made (oot2/hid_input.h), played on the open gamepad; with no gamepad the requests are
@@ -468,6 +531,7 @@ static void thread_main(void *arg) {
         }
         apply_rumble(pads);
         publish_input(pads);
+        service_motion(pads);
     }
     {   // a job queued as the loop ended still runs: its caller waits for it
         SDL_Event e;

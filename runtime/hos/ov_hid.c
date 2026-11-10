@@ -4,9 +4,9 @@
 // nn::hid, answered as a docked console with one full-key controller (player 1) and nothing pressed would answer it.
 // This runtime has no host input layer yet: every state read is well-formed (a sampling number that grows with each
 // read, buttons and sticks at zero, the controller marked connected, mouse, keyboard and touch screen with no input),
-// the controller's two vibration devices and its six-axis sensor exist, but nothing plays and the sensor lies at rest.
-// A host input layer replaces the stubs: the full-key GetNpadStates form, the mouse, keyboard and touch reads,
-// SendVibrationValue(s) and the six-axis reads. Docked only: the handheld controller (id 0x20, style bit 1) is never
+// the controller's two vibration devices and its six-axis sensor exist. The six-axis states are the host pad's gyroscope
+// and accelerometer (oot2/hid_motion.h) while the game has started the sensor and the pad has them, and a controller
+// lying still otherwise; the touch screen has no touches. Docked only: the handheld controller (id 0x20, style bit 1) is never
 // connected here.
 //
 // Handles are the SDK's (nn::hid utility functions): byte 0 the style index (3 full-key, 4 handheld), byte 1 the
@@ -20,9 +20,10 @@
 // Switch 2 and SDK 22 sections have no header of their own: the repository's GPL-3.0-or-later). Changed here: host
 // functions follow runtime.h and carry a HOS_OVERRIDE note; guest memory is read with hos_in and written with hos_out,
 // and a pointer the guest may not use is a guest stop naming the call; there is no gamepad, keyboard, rumble or motion
-// code (the host calls and the TOTK_* settings are gone), so the full-key state is a connected controller with nothing
-// pressed, a vibration value is remembered and not played, and the six-axis sensor reads at rest with sampling numbers
-// that grow, newest first; the handheld mode is not carried; IsVibrationPermitted answers the PermitVibration state.
+// code of the donor's (the host calls and the TOTK_* settings are gone; the full-key state and the six-axis states come
+// from the host layers, oot2/hid_input.h and oot2/hid_motion.h, written here), a vibration value is remembered, and a
+// six-axis read without host motion is a controller at rest with sampling numbers that grow, newest first; the
+// handheld mode is not carried; IsVibrationPermitted answers the PermitVibration state.
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
@@ -31,6 +32,7 @@
 #include "plat.h"
 
 #include "oot2/hid_input.h"
+#include "oot2/hid_motion.h"
 #include "oot2/hid_replay.h"
 
 typedef struct {
@@ -74,6 +76,8 @@ static int64_t sample;                                                          
 static const HidVibrationValue vib_neutral = {0, 160, 0, 320};
 static HidVibrationValue vib_last[VIBRATION_SIDES] = {{0, 160, 0, 320}, {0, 160, 0, 320}};   // lock
 static int vib_allowed = 1;                                                     // lock: PermitVibration
+static int six_started, six_live;                                               // lock: Start..Stop; the last read was live
+static int64_t motion_offset;                                                   // lock: live sampling numbers = producer's + this
 
 // Hand out n sampling numbers; returns the newest.
 static int64_t take_samples(int64_t n) {
@@ -415,7 +419,7 @@ static void ov_vib_permit(Cpu *c) {
     ret_x(c, HOS_R_OK);
 }
 
-// ---- six-axis sensor: lies at rest
+// ---- six-axis sensor: the host pad's motion, or at rest
 // int GetSixAxisSensorHandles(SixAxisSensorHandle *out, int count, const NpadIdType &id, NpadStyleSet style): the SDK's
 // order (one sensor per style, two for the Joy-Con pair).
 static void ov_six_axis_handles(Cpu *c) {
@@ -441,30 +445,71 @@ static void ov_six_axis_handles(Cpu *c) {
     ret_x(c, n);
 }
 
-// Write max states newest first, all at rest and not marked connected: a controller lying still. The game reads every
-// state it asks for and ignores the count, so all max are filled; their sampling numbers grow with each read.
+// Write max states newest first. While the game has started the sensor and the host pad has a gyroscope and an
+// accelerometer (oot2/hid_motion.h), the newest states are the pad's; a read that has fewer samples than states asked
+// for is padded with the oldest sample's pose and no motion (zero angular velocity and zero delta), so a state the pad
+// did not send adds no rotation. Otherwise every state is at rest, not marked connected: a controller lying still. The
+// game reads every state it asks for and ignores the count, so all max are filled. Sampling numbers only ever grow: a
+// live read takes the producer's numbers (stable while the samples are the same ones) shifted above every number given
+// before, and a read at rest numbers its states from the last number given.
 static void six_fill(Cpu *c, uint64_t out, int max, const char *fn) {
     static const HidSixAxisState rest = {.acc = {0, 0, -1}, .dir = {1, 0, 0, 0, 1, 0, 0, 0, 1}};
-    int64_t newest = take_samples(max);
+    HidMotionState live[HID_MOTION_RING];
+    int want = max < HID_MOTION_RING ? max : HID_MOTION_RING, n = 0;
+    int64_t newest;
+    plat_mutex_lock(&lock);
+    if (six_started && !hid_replay_replaying()) n = hid_motion_read(live, want, plat_now_ns());
+    if (n > 0) {
+        if (!six_live) {
+            motion_offset = sample + max - live[0].sampling + 1;
+            six_live = 1;
+        }
+        newest = live[0].sampling + motion_offset;
+        if (newest > sample) sample = newest;
+    } else {
+        six_live = 0;
+        newest = sample += max;
+    }
+    plat_mutex_unlock(&lock);
     for (int i = 0; i < max; i++) {
         HidSixAxisState s = rest;
+        if (n > 0) {
+            const HidMotionState *m = &live[i < n ? i : n - 1];
+            s.delta_ns = i < n ? m->delta_ns : 0;
+            memcpy(s.acc, m->acc, sizeof s.acc);
+            if (i < n) memcpy(s.gyro, m->gyro, sizeof s.gyro);
+            memcpy(s.angle, m->angle, sizeof s.angle);
+            memcpy(s.dir, m->dir, sizeof s.dir);
+            s.attributes = ATTR_CONNECTED;
+        }
         s.sampling = newest - i;
         if (!hos_out(out + (uint64_t)i * sizeof s, &s, sizeof s))
             rt_guest_stop(c, "nn::hid::%s: state %d is not writable guest memory", fn, i);
     }
-    ONCE("hid: six-axis read: at rest, no host motion (%u states)", (uint32_t)max);
+    if (n > 0) ONCE("hid: six-axis read: live motion from the host pad (%d of %d states)", n, max);
+    else ONCE("hid: six-axis read: at rest, no host motion (%u states)", (uint32_t)max);
 }
 
-// Result StartSixAxisSensor(const SixAxisSensorHandle &), also detail::
+// Result StartSixAxisSensor(const SixAxisSensorHandle &), also detail::: the host pad's sensors are turned on, and the
+// angle and direction start over.
 static void ov_six_start(Cpu *c) {
     uint32_t h = ref32(c, 0, "StartSixAxisSensor");
     ONCE("hid: the game started the six-axis sensor (handle %#x)", h);
+    plat_mutex_lock(&lock);
+    six_started = 1;
+    plat_mutex_unlock(&lock);
+    hid_motion_restart();
+    hid_motion_set_wanted(1);
     ret_x(c, HOS_R_OK);
 }
 
 // Result StopSixAxisSensor(const SixAxisSensorHandle &), also detail::
 static void ov_six_stop(Cpu *c) {
     (void)ref32(c, 0, "StopSixAxisSensor");
+    plat_mutex_lock(&lock);
+    six_started = 0;
+    plat_mutex_unlock(&lock);
+    hid_motion_set_wanted(0);
     ret_x(c, HOS_R_OK);
 }
 
@@ -627,26 +672,28 @@ HOS_OVERRIDE("_ZN2nn3hid31EnableVibrationNxCompatibleModeEv", ov_hid_ok, HOS_STU
              "accepted, no vibration plays; donor ov_input.c:656");
 HOS_OVERRIDE("_ZN2nn3hid32DisableVibrationNxCompatibleModeEv", ov_hid_ok, HOS_STUB,
              "accepted, no vibration plays; donor ov_input.c:657");
-HOS_OVERRIDE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_start, HOS_STUB,
-             "accepted, no host motion layer yet; donor ov_input.c:467-477");
-HOS_OVERRIDE("_ZN2nn3hid6detail18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_start, HOS_STUB,
-             "accepted, no host motion layer yet; donor ov_input.c:467-477");
-HOS_OVERRIDE("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_stop, HOS_STUB,
-             "accepted, no host motion layer yet; donor ov_input.c:480-483");
-HOS_OVERRIDE("_ZN2nn3hid6detail17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_stop, HOS_STUB,
-             "accepted, no host motion layer yet; donor ov_input.c:480-483");
+HOS_OVERRIDE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_start, HOS_IMPLEMENTED,
+             "accepted: the host pad's sensors are turned on and the angle starts over; donor ov_input.c:467-477");
+HOS_OVERRIDE("_ZN2nn3hid6detail18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_start, HOS_IMPLEMENTED,
+             "accepted: the host pad's sensors are turned on and the angle starts over; donor ov_input.c:467-477");
+HOS_OVERRIDE("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_stop, HOS_IMPLEMENTED,
+             "accepted: the host pad's sensors are turned off; donor ov_input.c:480-483");
+HOS_OVERRIDE("_ZN2nn3hid6detail17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_stop, HOS_IMPLEMENTED,
+             "accepted: the host pad's sensors are turned off; donor ov_input.c:480-483");
 HOS_OVERRIDE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE",
-             ov_six_states_public, HOS_STUB,
-             "all requested states at rest, newest first, sampling numbers growing: no host motion layer yet; donor "
-             "ov_input.c:488-502, 522-524");
+             ov_six_states_public, HOS_IMPLEMENTED,
+             "the host pad's gyroscope and accelerometer while the sensor is started, else all states at rest; newest "
+             "first, sampling numbers growing; donor ov_input.c:488-502, 522-524");
 HOS_OVERRIDE("_ZN2nn3hid6detail22GetSixAxisSensorStatesEPiPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE",
-             ov_six_states, HOS_STUB,
-             "all requested states at rest, newest first, sampling numbers growing: no host motion layer yet; donor "
-             "ov_input.c:488-510");
+             ov_six_states, HOS_IMPLEMENTED,
+             "the host pad's gyroscope and accelerometer while the sensor is started, else all states at rest; newest "
+             "first, sampling numbers growing; donor ov_input.c:488-510");
 HOS_OVERRIDE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", ov_six_state,
-             HOS_STUB, "one state at rest: no host motion layer yet; donor ov_input.c:513-516");
+             HOS_IMPLEMENTED, "one state from the host pad's motion while the sensor is started, else at rest; donor "
+             "ov_input.c:513-516");
 HOS_OVERRIDE("_ZN2nn3hid6detail21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE",
-             ov_six_state, HOS_STUB, "one state at rest: no host motion layer yet; donor ov_input.c:513-516");
+             ov_six_state, HOS_IMPLEMENTED, "one state from the host pad's motion while the sensor is started, else at "
+             "rest; donor ov_input.c:513-516");
 HOS_OVERRIDE("_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE",
              ov_hid_ok, HOS_STUB,
              "accepted without effect: the sensor has one fixed behaviour; donor ov_input.c:529, 631");

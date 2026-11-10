@@ -21,11 +21,12 @@
 // runtime does not have, the second are the network file). Every override is a HOS_OVERRIDE with its status and a one
 // line why. Out parameters and by-reference inputs go through hos_out and hos_in: an address that is not guest memory
 // stops the guest, as the fault would on a console. A value the runtime has no answer for is a named gap (hos_gap)
-// instead of a made-up success: the shared fonts (no font files are prepared yet), the parental-control age check, an
-// unknown font type or mode. Added to the donor's set: the network clock task, the network service accounts and the
+// instead of a made-up success: a shared font when no open-licence font file is placed (the console's own fonts are never
+// read), an unknown font type or mode. Added to the donor's set: the network clock task, the network service accounts and the
 // account AsyncContext, the prepo over-frequency event, the nfp device calls the game imports, and
 // StandardNetworkSystemClock::now.
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -618,15 +619,16 @@ static void ov_pctl_initialize(Cpu *c) {
 HOS_OVERRIDE("_ZN2nn4pctl10InitializeEv", ov_pctl_initialize, HOS_STUB,
              "logged, no parental control service to open; donor ov_system.c:382");
 
-// ? CheckAgcPermissionUnderMinimumAge(const account::Uid &): no donor, and what a console without parental controls
-// answers is not recorded, so this is a gap and not a guess.
-static void ov_pctl_agc(Cpu *c) {
-    char at[96];
-    hos_gap(c, "pctl", "nn::pctl::CheckAgcPermissionUnderMinimumAge from %s: the answer of a console without parental "
-            "controls is not recorded", hos_caller(c, at, (int)sizeof at));
-}
-HOS_OVERRIDE("_ZN2nn4pctl33CheckAgcPermissionUnderMinimumAgeERKNS_7account3UidE", ov_pctl_agc, HOS_GAP,
-             "named gap, not an answer: no donor and no recorded answer; the services study");
+// u8 CheckAgcPermissionUnderMinimumAge(const account::Uid &): the SDK's own function asks the parental control service
+// and returns one byte; the game branches on it as a small enumeration (0 and 1 among others), not as a Result. Without
+// parental controls the answer is 0. Two other runtimes answer 0 for this function: the jaigner-oot runtime, which runs
+// this same game's SDK function (its comment reads "no parental controls ... permitted"), and nxnative, for other games'
+// builds of it ("never"). The two disagree on what to call the value and neither documents what 1, 2 and 3 mean, so the
+// value is the donors' and its meaning is not settled here.
+static void ov_pctl_agc(Cpu *c) { ret_x(c, 0); }
+HOS_OVERRIDE("_ZN2nn4pctl33CheckAgcPermissionUnderMinimumAgeERKNS_7account3UidE", ov_pctl_agc, HOS_ABSENT,
+             "0, as a console with no parental controls set and both donors that answer it (jaigner-oot, nxnative); "
+             "the meaning of the other values is not recorded");
 
 // ==== nn::account: one offline local user with a constant Uid. A console's own user would differ; the game only needs
 // one stable Uid, which the donor kept in a file.
@@ -1217,14 +1219,71 @@ static void ov_netclock_destroy(Cpu *c) {
 HOS_OVERRIDE("_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTaskD1Ev", ov_netclock_destroy, HOS_OFFLINE,
              "frees the task's slot, no session to close");
 
-// ==== nn::pl shared fonts. No font files are prepared yet (the services study), so what the donor does without its
-// files is done here: the load state is Loaded, since the game spins until it is, and the address, the size and the
-// request for the NX font are named gaps, so a font the game needs stops the run at the call that wants it and not in
-// a wait. The donor read the six BFTTF files of the console's shared fonts from a folder; that comes when the files do.
+// ==== nn::pl shared fonts. The console's system fonts are never shipped and never read from a dump. The runtime serves
+// one open-licence TrueType or OpenType font that the player's game folder holds (fonts/shared-font.ttf, which oot2
+// prepare is to place there) or that OOT2_SHARED_FONT names, for every shared font type, as the console serves its
+// standard font when a language's own font is missing. The game hands the address and size it gets to a font loader
+// that recognises a plain sfnt (TrueType, OpenType or collection) by its first four bytes, so the file is served as it
+// is. The load state is Loaded though no file may be there: the game spins until it is, so a missing file stops by name at
+// the call that asks for the font, with what to place and where, and not in a wait. The SDK function returns a font's
+// address and size only for a loaded font, so a font that is not there is a stop and never a null answer.
+enum { FONT_TYPES = 6, FONT_MAX_SIZE = 16 << 20 };   // 0 standard .. 5 the button glyphs; the kernel region is 64 MiB
+static struct { int loaded; uint64_t addr, size; } shared_font;   // sys_lock
+
 static int32_t font_type(Cpu *c, const char *fn) {
     int32_t t = (int32_t)arg_x(c, 0);
-    if (t < 0 || t > 5) hos_gap(c, "pl", "nn::pl::%s: shared font type %d is not one this runtime knows", fn, t);
+    if (t < 0 || t >= FONT_TYPES) hos_gap(c, "pl", "nn::pl::%s: shared font type %d is not one this runtime knows", fn, t);
     return t;
+}
+
+// The first four bytes of an sfnt font: TrueType 0x00010000, 'OTTO', 'true' and a collection 'ttcf'.
+static int font_is_sfnt(const uint8_t *b) {
+    return !memcmp(b, "\0\1\0\0", 4) || !memcmp(b, "OTTO", 4) || !memcmp(b, "true", 4) || !memcmp(b, "ttcf", 4);
+}
+
+// The font file's path: OOT2_SHARED_FONT when set, else fonts/shared-font.ttf in the game folder.
+static const char *font_path(char *buf, size_t n) {
+    const char *e = getenv("OOT2_SHARED_FONT");
+    if (e && *e) snprintf(buf, n, "%s", e);
+    else snprintf(buf, n, "%s/fonts/shared-font.ttf", hos_game_folder());
+    return buf;
+}
+
+// Read the font into guest memory once; a named stop when it is missing, too large or not an sfnt. Holding sys_lock.
+static void font_load(Cpu *c, const char *fn, int32_t t) {
+    if (shared_font.loaded) return;
+    char path[1100], at[96];
+    font_path(path, sizeof path);
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        hos_gap(c, "pl", "nn::pl::%s(%d) from %s: no shared font file at %s. The console's fonts are not part of this "
+                "program: place an open-licence TrueType or OpenType font there, or name one with OOT2_SHARED_FONT",
+                fn, t, hos_caller(c, at, (int)sizeof at), path);
+    uint8_t *data = NULL;
+    size_t len = 0;
+    if (!fseek(f, 0, SEEK_END)) {
+        long end = ftell(f);
+        if (end > 0 && end <= FONT_MAX_SIZE && !fseek(f, 0, SEEK_SET)) {
+            data = malloc((size_t)end);
+            if (data && fread(data, 1, (size_t)end, f) == (size_t)end) len = (size_t)end;
+        }
+    }
+    fclose(f);
+    if (!len) {
+        free(data);
+        hos_gap(c, "pl", "nn::pl::%s(%d) from %s: the shared font file %s is empty, unreadable or larger than %d MiB", fn,
+                t, hos_caller(c, at, (int)sizeof at), path, FONT_MAX_SIZE >> 20);
+    }
+    if (len < 12 || !font_is_sfnt(data)) {
+        free(data);
+        hos_gap(c, "pl", "nn::pl::%s(%d) from %s: the shared font file %s is not a TrueType or OpenType font", fn, t,
+                hos_caller(c, at, (int)sizeof at), path);
+    }
+    uint64_t addr = mem_kernel_alloc(len);
+    if (!hos_out(addr, data, len)) rt_fatal("nn::pl::%s: the kernel region block for the shared font is not writable", fn);
+    free(data);
+    shared_font.addr = addr, shared_font.size = len, shared_font.loaded = 1;
+    rt_log("pl: shared font served to every font type: %zu bytes from %s", len, path);
 }
 
 // SharedFontLoadState GetSharedFontLoadState(SharedFontType)
@@ -1233,32 +1292,43 @@ static void ov_font_state(Cpu *c) {
     ret_x(c, 1);
 }
 HOS_OVERRIDE("_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE", ov_font_state, HOS_ABSENT,
-             "Loaded though no font file is prepared: a missing font stops at Address or Size, not in a spin; "
-             "donor ov_system.c:828");
+             "Loaded though a font file may not be placed: a missing font stops by name at Address or Size, not in a "
+             "spin; donor ov_system.c:828");
 
 // const void *GetSharedFontAddress(SharedFontType) and size_t GetSharedFontSize(SharedFontType)
 static void ov_font_address(Cpu *c) {
     int32_t t = font_type(c, "GetSharedFontAddress");
-    char at[96];
-    hos_gap(c, "pl", "nn::pl::GetSharedFontAddress(%d) from %s: no shared font file is prepared yet", t,
-            hos_caller(c, at, (int)sizeof at));
+    plat_mutex_lock(&sys_lock);
+    font_load(c, "GetSharedFontAddress", t);
+    uint64_t addr = shared_font.addr;
+    plat_mutex_unlock(&sys_lock);
+    ret_x(c, addr);
 }
 static void ov_font_size(Cpu *c) {
     int32_t t = font_type(c, "GetSharedFontSize");
-    char at[96];
-    hos_gap(c, "pl", "nn::pl::GetSharedFontSize(%d) from %s: no shared font file is prepared yet", t,
-            hos_caller(c, at, (int)sizeof at));
+    plat_mutex_lock(&sys_lock);
+    font_load(c, "GetSharedFontSize", t);
+    uint64_t size = shared_font.size;
+    plat_mutex_unlock(&sys_lock);
+    ret_x(c, size);
 }
-HOS_OVERRIDE("_ZN2nn2pl20GetSharedFontAddressENS0_14SharedFontTypeE", ov_font_address, HOS_GAP,
-             "named gap, not an answer: no font file is prepared, as in the donor; donor ov_system.c:859");
-HOS_OVERRIDE("_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE", ov_font_size, HOS_GAP,
-             "named gap, not an answer: no font file is prepared, as in the donor; donor ov_system.c:863");
+HOS_OVERRIDE("_ZN2nn2pl20GetSharedFontAddressENS0_14SharedFontTypeE", ov_font_address, HOS_IMPLEMENTED,
+             "the open-licence font file placed in the game folder (or OOT2_SHARED_FONT), in guest memory, the same for "
+             "every type; a named stop when there is none");
+HOS_OVERRIDE("_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE", ov_font_size, HOS_IMPLEMENTED,
+             "the size of that file; a named stop when there is none");
 
-// ? RequestLoadNxFont(void *buffer, size_t size): no donor, and what it loads is not recorded, so this is a gap.
+// RequestLoadNxFont(void *buffer, size_t size): the console's service loads its Switch 1 fonts into the buffer the game
+// offers (the SDK builds a transfer memory over it). The fonts the game then reads come from GetSharedFontAddress and
+// GetSharedFontSize, which this runtime serves from its own memory, so the request needs no copy: it checks that the
+// buffer is guest memory, as the transfer memory creation would, and returns. Nothing else of it is observable: the SDK's
+// function ignores the size it is given and returns no value.
 static void ov_font_request(Cpu *c) {
-    char at[96];
-    hos_gap(c, "pl", "nn::pl::RequestLoadNxFont from %s: no donor hooks it and no font file is prepared yet",
-            hos_caller(c, at, (int)sizeof at));
+    uint64_t buf = arg_x(c, 0), size = arg_x(c, 1);
+    uint8_t probe;
+    if (!size || size > RT_ADDRESS_LIMIT - buf || !hos_in(&probe, buf, 1) || !hos_in(&probe, buf + size - 1, 1))
+        rt_guest_stop(c, "nn::pl::RequestLoadNxFont: the buffer 0x%llx of %llu bytes is not guest memory",
+                      (unsigned long long)buf, (unsigned long long)size);
 }
-HOS_OVERRIDE("_ZN2nn2pl17RequestLoadNxFontEPvm", ov_font_request, HOS_GAP,
-             "named gap, not an answer: no donor and no font file is prepared; the services study");
+HOS_OVERRIDE("_ZN2nn2pl17RequestLoadNxFontEPvm", ov_font_request, HOS_IMPLEMENTED,
+             "buffer checked, nothing copied: the fonts are served from the runtime's own memory by Address and Size");

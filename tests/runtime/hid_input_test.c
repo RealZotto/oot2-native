@@ -6,7 +6,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <math.h>
+
 #include "oot2/hid_input.h"
+#include "oot2/hid_motion.h"
 
 #define CHECK(x)                                        \
     do {                                                \
@@ -145,6 +148,135 @@ static int case_keyboard_sticks(void) {
     return 0;
 }
 
+// ---- the motion layer, driven by synthetic sensor samples (no pad, no SDL)
+#define NEAR(a, b, eps) (fabs((double)(a) - (double)(b)) <= (eps))
+#define TWO_PI 6.283185307179586
+#define G 9.80665f
+#define MS 1000000ull
+
+static int case_motion_convert(void) {
+    float acc[3], gyro[3];
+    const float still[3] = {0, 0, 0};
+    // a pad lying face up: SDL's accelerometer reads +1 g along its y; the console reads gravity, -1 g along its z
+    const float flat[3] = {0, G, 0};
+    hid_motion_from_sdl(flat, still, acc, gyro);
+    CHECK(NEAR(acc[0], 0, 1e-6) && NEAR(acc[1], 0, 1e-6) && NEAR(acc[2], -1, 1e-6));
+    // SDL x is the console's x with the sign of gravity, SDL z (toward the player) is the console's -y
+    const float on_x[3] = {G, 0, 0}, on_z[3] = {0, 0, G};
+    hid_motion_from_sdl(on_x, still, acc, gyro);
+    CHECK(NEAR(acc[0], -1, 1e-6) && NEAR(acc[1], 0, 1e-6) && NEAR(acc[2], 0, 1e-6));
+    hid_motion_from_sdl(on_z, still, acc, gyro);
+    CHECK(NEAR(acc[0], 0, 1e-6) && NEAR(acc[1], 1, 1e-6) && NEAR(acc[2], 0, 1e-6));
+    // one turn a second about each SDL axis (rad/s in) is one revolution a second about the console's axis (rev/s out)
+    const float turn_x[3] = {(float)TWO_PI, 0, 0}, turn_y[3] = {0, (float)TWO_PI, 0}, turn_z[3] = {0, 0, (float)TWO_PI};
+    hid_motion_from_sdl(flat, turn_x, acc, gyro);
+    CHECK(NEAR(gyro[0], 1, 1e-6) && NEAR(gyro[1], 0, 1e-6) && NEAR(gyro[2], 0, 1e-6));
+    hid_motion_from_sdl(flat, turn_y, acc, gyro);   // yaw of the pad flat on a table
+    CHECK(NEAR(gyro[0], 0, 1e-6) && NEAR(gyro[1], 0, 1e-6) && NEAR(gyro[2], 1, 1e-6));
+    hid_motion_from_sdl(flat, turn_z, acc, gyro);
+    CHECK(NEAR(gyro[0], 0, 1e-6) && NEAR(gyro[1], -1, 1e-6) && NEAR(gyro[2], 0, 1e-6));
+    printf("ok motion_convert\n");
+    return 0;
+}
+
+static int case_motion_fusion(void) {
+    HidMotionState s[HID_MOTION_RING + 8];
+    const float flat[3] = {0, 0, -1}, still[3] = {0, 0, 0}, yaw[3] = {0, 0, 0.25f};
+    uint64_t now = 1000 * MS;
+    CHECK(hid_motion_read(s, 4, now) == 0);   // nothing fed yet
+    hid_motion_feed(flat, still, 0, now);     // dt 0: the nominal 4 ms
+    CHECK(hid_motion_read(s, 4, now) == 1);
+    CHECK(s[0].sampling == 1 && s[0].delta_ns == 4 * (int64_t)MS);
+    CHECK(NEAR(s[0].acc[2], -1, 1e-6) && NEAR(s[0].gyro[2], 0, 1e-6) && NEAR(s[0].angle[2], 0, 1e-6));
+    for (int i = 0; i < 9; i++) CHECK(NEAR(s[0].dir[i], (i % 4 == 0) ? 1 : 0, 1e-5));   // identity: flat, facing the frame
+    // a quarter revolution a second about the face's normal for one second: angle 0.25 revolutions, the controller's x
+    // axis has swung from the reference x to the reference y
+    for (int i = 0; i < 250; i++) {
+        now += 4 * MS;
+        hid_motion_feed(flat, yaw, 4 * MS, now);
+    }
+    CHECK(hid_motion_read(s, 1, now) == 1);
+    CHECK(s[0].sampling == 251 && NEAR(s[0].gyro[2], 0.25, 1e-6));
+    CHECK(NEAR(s[0].angle[2], 0.25, 1e-4) && NEAR(s[0].angle[0], 0, 1e-6) && NEAR(s[0].angle[1], 0, 1e-6));
+    CHECK(NEAR(s[0].dir[0], 0, 2e-3) && NEAR(s[0].dir[1], 1, 2e-3) && NEAR(s[0].dir[2], 0, 2e-3));
+    CHECK(NEAR(s[0].dir[3], -1, 2e-3) && NEAR(s[0].dir[4], 0, 2e-3) && NEAR(s[0].dir[5], 0, 2e-3));
+    CHECK(NEAR(s[0].dir[6], 0, 2e-3) && NEAR(s[0].dir[7], 0, 2e-3) && NEAR(s[0].dir[8], 1, 2e-3));
+    // the ring: newest first, sampling numbers counting down by one, at most HID_MOTION_RING of them
+    int n = hid_motion_read(s, HID_MOTION_RING + 8, now);
+    CHECK(n == HID_MOTION_RING);
+    for (int i = 0; i < n; i++) CHECK(s[i].sampling == 251 - i);
+    // a restart: the states before it are not read, the next sample starts a fresh frame, the numbers go on
+    hid_motion_restart();
+    CHECK(hid_motion_read(s, 4, now) == 0);
+    const float tilted[3] = {0.5f, 0, -0.8660254f};
+    now += 4 * MS;
+    hid_motion_feed(tilted, still, 4 * MS, now);
+    CHECK(hid_motion_read(s, 4, now) == 1 && s[0].sampling == 252);
+    CHECK(NEAR(s[0].angle[2], 0, 1e-6));
+    // the fresh frame's up is the measured gravity's opposite: the controller's axes' reference z components are -acc
+    CHECK(NEAR(s[0].dir[2], -0.5, 1e-4) && NEAR(s[0].dir[5], 0, 1e-4) && NEAR(s[0].dir[8], 0.8660254, 1e-4));
+    // gravity pulls a drifted tilt back: flat again for twenty seconds with no rotation, the orientation follows
+    for (int i = 0; i < 5000; i++) {
+        now += 4 * MS;
+        hid_motion_feed(flat, still, 4 * MS, now);
+    }
+    CHECK(hid_motion_read(s, 1, now) == 1);
+    CHECK(NEAR(s[0].dir[2], 0, 2e-3) && NEAR(s[0].dir[5], 0, 2e-3) && NEAR(s[0].dir[8], 1, 2e-3));
+    printf("ok motion_fusion\n");
+    return 0;
+}
+
+static int case_motion_gates(void) {
+    HidMotionState s[4];
+    const float flat[3] = {0, 0, -1}, still[3] = {0, 0, 0};
+    uint64_t now = 5000 * MS;
+    hid_motion_feed(flat, still, 4 * MS, now);
+    CHECK(hid_motion_read(s, 4, now + 249 * MS) == 1);   // within 250 ms of the last sample
+    CHECK(hid_motion_read(s, 4, now + 250 * MS) == 0);   // the pad stopped sending: no motion
+    CHECK(hid_motion_read(s, 0, now) == 0);
+    CHECK(hid_motion_read(s, -1, now) == 0);
+    CHECK(hid_motion_read(s, 4, now - 1) == 1);          // a clock a little behind the producer's is not stale
+    hid_motion_suppress(1);                              // the menu's swallow
+    CHECK(hid_motion_read(s, 4, now) == 0);
+    hid_motion_suppress(0);
+    CHECK(hid_motion_read(s, 4, now) == 1);
+    hid_motion_clear();                                  // the pad went away
+    CHECK(hid_motion_read(s, 4, now) == 0);
+    hid_motion_feed(flat, still, 4 * MS, now + MS);      // a new pad: its samples only
+    CHECK(hid_motion_read(s, 4, now + MS) == 1 && s[0].sampling == 2);
+    CHECK(hid_motion_wanted() == 0);
+    hid_motion_set_wanted(1);
+    CHECK(hid_motion_wanted() == 1);
+    hid_motion_set_wanted(0);
+    CHECK(hid_motion_wanted() == 0);
+    printf("ok motion_gates\n");
+    return 0;
+}
+
+// Two turns in a row compose in the controller's own frame: a quarter turn about the controller's x axis, then a quarter
+// turn about its (new) z axis, leaves the controller's x axis pointing up. Free fall (no gravity reading) so that nothing
+// pulls the tilt back.
+static int case_motion_compose(void) {
+    HidMotionState s[1];
+    const float fall[3] = {0, 0, 0}, pitch[3] = {0.25f, 0, 0}, yaw[3] = {0, 0, 0.25f};
+    uint64_t now = 1000 * MS;
+    hid_motion_feed(fall, pitch, 4 * MS, now);   // the first sample starts the frame, flat
+    for (int i = 0; i < 250; i++) {
+        now += 4 * MS;
+        hid_motion_feed(fall, pitch, 4 * MS, now);
+    }
+    for (int i = 0; i < 250; i++) {
+        now += 4 * MS;
+        hid_motion_feed(fall, yaw, 4 * MS, now);
+    }
+    CHECK(hid_motion_read(s, 1, now) == 1);
+    CHECK(NEAR(s[0].dir[0], 0, 5e-3) && NEAR(s[0].dir[1], 0, 5e-3) && NEAR(s[0].dir[2], 1, 5e-3));    // x points up
+    CHECK(NEAR(s[0].dir[3], -1, 5e-3) && NEAR(s[0].dir[4], 0, 5e-3) && NEAR(s[0].dir[5], 0, 5e-3));   // y points to -x
+    CHECK(NEAR(s[0].dir[6], 0, 5e-3) && NEAR(s[0].dir[7], -1, 5e-3) && NEAR(s[0].dir[8], 0, 5e-3));   // z points to -y
+    printf("ok motion_compose\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc != 2) {
@@ -155,6 +287,8 @@ int main(int argc, char **argv) {
     static const struct { const char *name; int (*fn)(void); } cases[] = {
         {"deadzone", case_deadzone}, {"publish", case_publish}, {"bits", case_bits}, {"rumble", case_rumble},
         {"swallow", case_swallow}, {"remap", case_remap}, {"keyboard_sticks", case_keyboard_sticks},
+        {"motion_convert", case_motion_convert}, {"motion_fusion", case_motion_fusion},
+        {"motion_gates", case_motion_gates}, {"motion_compose", case_motion_compose},
     };
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++)
         if (!strcmp(argv[1], cases[i].name)) return cases[i].fn();

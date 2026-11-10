@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 The oot2-native contributors
 """Host tests of the input layer's pure pieces (no SDL, no GPU): compiles tests/runtime/hid_input_test.c with
-runtime/hos/hid_input.c (which has no runtime dependency) and runs each case. No Vulkan SDK, no game, no dump.
+runtime/hos/hid_input.c and runtime/hos/hid_motion.c (neither has a runtime dependency) and runs each case. No Vulkan SDK, no game, no dump.
 
 Run: python -m unittest discover -s tests -v
 """
@@ -31,7 +31,9 @@ class HidInputTest(unittest.TestCase):
         exe = Path(cls.tmp.name) / "hid_input_test.exe"
         cmd = [cc, "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
                "-I", str(RUNTIME / "include"), str(RUNTIME / "hos" / "hid_input.c"),
-               str(TEST_SOURCE), "-o", str(exe)]
+               str(RUNTIME / "hos" / "hid_motion.c"), str(TEST_SOURCE), "-o", str(exe)]
+        if os.name != "nt":
+            cmd.append("-lm")
         done = subprocess.run(cmd, capture_output=True, text=True)
         if done.returncode != 0:
             raise RuntimeError(f"build of hid_input_test failed:\n{done.stdout}{done.stderr}")
@@ -46,7 +48,8 @@ class HidInputTest(unittest.TestCase):
         return subprocess.run([str(self.exe), case], capture_output=True, text=True)
 
     def test_cases(self) -> None:
-        for case in ("deadzone", "publish", "bits", "rumble", "swallow", "remap", "keyboard_sticks"):
+        for case in ("deadzone", "publish", "bits", "rumble", "swallow", "remap", "keyboard_sticks", "motion_convert",
+                     "motion_fusion", "motion_gates", "motion_compose"):
             with self.subTest(case=case):
                 done = self.run_case(case)
                 self.assertEqual(done.returncode, 0, done.stderr)

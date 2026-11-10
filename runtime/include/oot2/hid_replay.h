@@ -91,6 +91,10 @@ void hid_replay_start(void);
 // is latched and given to every read of that tick. *in's sampling number is left alone. No-op with both options off.
 void hid_replay_filter(HidHostInput *in);
 
+// 1 while an input file is replayed. The real input is then replaced, and so is the pad's motion: the six-axis states
+// are at rest, so a run that is meant to be repeated does not depend on a pad being moved.
+int hid_replay_replaying(void);
+
 // The run stops: close the recorder's last run and its file. Safe to call again, and with the recorder off.
 void hid_replay_finish(void);
 

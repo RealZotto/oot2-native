@@ -48,7 +48,15 @@ EXIT_FATAL, EXIT_UNIMPLEMENTED, EXIT_GUEST_STOP, EXIT_CENSUS = 70, 71, 72, 73
 MOVIE = ("_ZN2nn5codec34InitializeAv1DecoderByRemoteMemoryEPNS0_14Av1DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24"
          "VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE")
 
-PASSING = ("sm", "notes", "opus")
+PL_STATE = "_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE"
+PL_ADDRESS = "_ZN2nn2pl20GetSharedFontAddressENS0_14SharedFontTypeE"
+PL_SIZE = "_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE"
+PL_REQUEST = "_ZN2nn2pl17RequestLoadNxFontEPvm"
+AT_250 = "0x7000000250 (main+0x250)"
+
+# the six-axis states from a synthetic sensor stream (also with an input file replayed: then at rest), the shared font
+# calls with a made-up font file, and the parental-control check: each answers, none stops by name
+PASSING = ("sm", "notes", "opus", "hid_motion", "hid_motion_replay", "pl_font", "pl_font_env", "pctl")
 
 # case: (exit code, text the FATAL line must contain, a row census.tsv must hold)
 FAILING = {
@@ -64,6 +72,19 @@ FAILING = {
     "movie": (EXIT_UNIMPLEMENTED, "FATAL: unimplemented movie: nn::codec::InitializeAv1Decoder: the host has no AV1 "
                                   "decoder (fake)",
               f"import\t{MOVIE}\timplemented\t1\t0x7000000250 (main+0x250)\t"),
+    # the shared font calls with no usable font: a stop that names the call, the file and what to place
+    "pl_font_missing": (EXIT_UNIMPLEMENTED, "FATAL: unimplemented pl: nn::pl::GetSharedFontAddress(2) from ",
+                        f"import\t{PL_ADDRESS}\timplemented\t1\t{AT_250}\t"),
+    "pl_font_not_sfnt": (EXIT_UNIMPLEMENTED, "is not a TrueType or OpenType font",
+                         f"import\t{PL_ADDRESS}\timplemented\t1\t{AT_250}\t"),
+    "pl_font_type": (EXIT_UNIMPLEMENTED, "FATAL: unimplemented pl: nn::pl::GetSharedFontLoadState: shared font type 9 is "
+                                         "not one this runtime knows", f"import\t{PL_STATE}\tabsent\t1\t{AT_250}\t"),
+    "pl_nx_buffer": (EXIT_GUEST_STOP, "nn::pl::RequestLoadNxFont: the buffer 0x0 of 4096 bytes is not guest memory",
+                     f"import\t{PL_REQUEST}\timplemented\t1\t{AT_250}\t"),
+    "pl_nx_size": (EXIT_GUEST_STOP, " of 0 bytes is not guest memory",
+                   f"import\t{PL_REQUEST}\timplemented\t1\t{AT_250}\t"),
+    "pl_nx_range": (EXIT_GUEST_STOP, " of 4294967296 bytes is not guest memory",
+                    f"import\t{PL_REQUEST}\timplemented\t1\t{AT_250}\t"),
 }
 
 
@@ -297,6 +318,30 @@ class HosTest(unittest.TestCase):
                     self.assertEqual(len(stop), 1, census)
                     self.assertTrue(stop[0].startswith(f"stop\texit {code}\tnamed-fatal\t1\t\t{fatal_lines[0]}"),
                                     stop[0])
+
+    def test_a_missing_shared_font_says_what_to_place_and_where(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, _ = self.run_case(level, "pl_font_missing")
+                self.assertEqual(done.returncode, EXIT_UNIMPLEMENTED, done.stdout + done.stderr)
+                fatal = [line for line in done.stderr.splitlines() if line.startswith("FATAL")]
+                self.assertEqual(len(fatal), 1, done.stderr)
+                self.assertIn("no shared font file at ", fatal[0])
+                self.assertIn("fonts/shared-font.ttf", fatal[0].replace("\\", "/"))
+                self.assertIn("OOT2_SHARED_FONT", fatal[0])
+                self.assertIn("open-licence", fatal[0])
+
+    def test_the_shared_font_is_served_as_the_file_it_is_and_the_log_says_where_it_came_from(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level, source="folder"):
+                done, _ = self.run_case(level, "pl_font")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual(done.stderr.count("pl: shared font served to every font type: 3001 bytes from "), 1,
+                                 done.stderr)
+            with self.subTest(level=level, source="OOT2_SHARED_FONT"):
+                done, _ = self.run_case(level, "pl_font_env")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("pl: shared font served to every font type: 2222 bytes from ", done.stderr)
 
     def test_an_unbodied_nvn_entry_point_is_a_named_fatal_in_the_census(self) -> None:
         done, folder = self.run_case(LEVELS[0], "nvn")
