@@ -316,8 +316,9 @@ static void setup(uint64_t heap, int real_watch) {
     backing_open(&k_ops);
     // The scenes of the stops below are the shape of a boundary an import and a mirror make at a raw-access begin, which the
     // union pass of that begin removes: they run with the pass off (the union_* cases turn it on), and keep pinning what the
-    // stops say for a boundary made inside a submission. COHERENCE_UNION=1 in the environment runs them with it on.
-    backing_set_union(getenv("COHERENCE_UNION") != NULL);
+    // stops say for a boundary made inside a submission. They are not run with it on: that pass removes the very boundary they
+    // build (measured: 37 of them no longer reach their stop or their counts), so such a run says nothing of them.
+    backing_set_union(0);
 }
 
 static int want_all(const BackingAsk *a) {
@@ -2170,6 +2171,20 @@ static void case_raw_dry_grow(void) {
     ev_finish(p, "raw_dry_grow");
 }
 
+// The same dry evaluation, then the run ends on a stop that is not the straddle stop: a plain named stop (exit 70, no dump
+// of the map) and the census frame limit (exit 73). Neither printed the dry evaluation, so the exit lines must.
+static void case_raw_dry_stop(void) {
+    uint64_t p, v0, v = ev_prefix(&p, &v0, 0);
+    CHECK(resolve(p - 0x800, 0x1000, v).kind == BACKING_IMPORT);
+    rt_fatal("coherence_test: a named stop that is not the straddle stop");
+}
+
+static void case_raw_dry_census(void) {
+    uint64_t p, v0, v = ev_prefix(&p, &v0, 0);
+    CHECK(resolve(p - 0x800, 0x1000, v).kind == BACKING_IMPORT);
+    rt_census_end(RT_EXIT_CENSUS, "coherence_test: the census frame limit");
+}
+
 // The import beside the mirror was used by the submission first: growing the mirror over it is the G4 refusal.
 static void case_raw_dry_g4(void) {
     uint64_t p, v0, v = ev_prefix(&p, &v0, 1);
@@ -3046,6 +3061,84 @@ static void case_union_hot_cap(void) { hot_chain(0), done("union_hot_cap"); }
 static void case_union_hot_rule(void) { hot_chain(1), done("union_hot_rule"); }
 static void case_union_hot_admit(void) { hot_chain(2), done("union_hot_admit"); }
 
+// ---------- the union together with what comes after it: the stamps, the hull, the growth and a GPU write
+// M = [p, p + 256 KiB) is a mirror (an earlier submission), I = [E, E + 256 KiB) an import above it, E = p + 256 KiB. The
+// submission v binds I BEFORE its first raw-access begin (a use stamp and a hull on I), then the begin joins M and I into U.
+// Mode 0: U is a mirror. Mode 1: the rule says import (the hook wants only asks of at most 256 KiB), so U is an import that
+// takes over I's hull (heir_take) while M, a mirror, gives nothing. Then v binds U, a bind across the old boundary, a tail
+// growth over pages committed after the begin, and a GPU write declared in U.
+static uint64_t g_grow_limit;
+static int small_asks_only(const BackingAsk *a) { return a->size <= 256 * KiB; }
+static int below_e_asks_only(const BackingAsk *a) { return a->size <= 256 * KiB && a->addr < g_grow_limit; }
+static BackingRef g_ug_u;
+static void gpu_ug(void) { *(uint32_t *)bytes(&g_ug_u) = 0xCCCCCCCCu; }
+
+static void union_grow_scene(const char *name, int mode) {
+    uint64_t p;
+    pool_t pp;
+    setup(64 * MiB, 0);
+    p = g_heap + 8 * MiB;
+    pp = pool(p - 1 * MiB, 16 * MiB);
+    const uint64_t E = p + 256 * KiB;
+    g_grow_limit = E;
+    backing_set_mirror_hook(below_e_asks_only);
+    cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(E, 256 * KiB, 0xBBBBBBBBu);   // committed since: I
+    uint64_t v1 = sub_begin();   // a begin with the pass off makes I (fill_pool) beside M and leaves the pair alone
+    backing_raw_begin(v1);
+    sub_end(v1);
+    gpu_run(v1, NULL);
+    CHECK(stats().mirrors == 1 && stats().imports == 1 && stats().raw_union_chains == 0);
+    union_on();
+    uint64_t v = sub_begin();
+    BackingRef pre = resolve(E + 0x1800, 0x2000, v);   // (1) a bind of the member that gets absorbed, before the begin
+    CHECK(pre.kind == BACKING_IMPORT);
+    CHECK(stats().mirrors == 1 && stats().imports == 1 && stats().raw_heirs == 0);
+    backing_set_mirror_hook(mode == 0 ? want_all : small_asks_only);
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    CHECK(s.raw_union_chains == 1 && s.raw_union_mirror == (uint64_t)(mode == 0) && s.raw_union_import == (uint64_t)(mode == 1));
+    CHECK(s.mirrors == (uint64_t)(mode == 0) && s.imports == (uint64_t)(mode == 1));
+    CHECK(mode == 0 ? s.mirror_bytes == 512 * KiB && s.raw_heirs == 0 : s.import_bytes == 512 * KiB && s.raw_heirs == 1);
+    CHECK(s.raw_heir_written == 0);   // a chain with a write of v on a member is left alone, so no written stamp is ever carried
+    CHECK(words_are(bytes(&pre), 0x2000, 0xBBBBBBBBu));   // what was recorded before the begin still reads I's bytes
+    uint64_t misses = s.resolve_misses;
+    g_ug_u = resolve(E + 0x100, 8, v);   // (2) a bind of U, and one across the old boundary
+    BackingRef across = resolve(E - 0x600, 0xe10, v);
+    s = stats();
+    CHECK(g_ug_u.kind == (mode == 0 ? BACKING_MIRROR : BACKING_IMPORT) && across.kind == g_ug_u.kind);
+    CHECK(s.resolve_misses == misses && s.raw_straddle_stops == 0 && s.raw_grows == 0);
+    cpu_fill(E + 256 * KiB, 256 * KiB, 0xDDDDDDDDu);   // committed after the begin, above U
+    CHECK(resolve(E + 256 * KiB - 0x600, 0x100, v).kind == g_ug_u.kind);   // v reached U's last page: a cut would split it
+    BackingRef i2 = resolve(E + 256 * KiB + 0x10000, 8, v);   // an import above U, used by v, its hull far above the growth
+    CHECK(i2.kind == BACKING_IMPORT);
+    BackingRef tail = resolve(E + 256 * KiB - 0x600, 0xe10, v);   // (3) a bind that runs out of U over its pages
+    s = stats();
+    CHECK(tail.kind == g_ug_u.kind);
+    if (mode == 0) {   // U, a mirror, grows over the one page, and I2 is trimmed in place
+        CHECK(s.raw_grows == 1 && s.raw_grow_bytes == 0x1000 && s.raw_grow_used == 1 && s.raw_grow_trims == 1);
+        CHECK(s.raw_refused[1] + s.raw_refused[2] + s.raw_refused[3] + s.raw_refused[4] + s.raw_refused[5] + s.raw_refused[6] == 0);
+        CHECK(s.mirrors == 1 && s.mirror_bytes == 512 * KiB + 0x1000 && s.imports == 1 && s.import_bytes == 256 * KiB - 0x1000);
+    } else {           // U is an import: nothing to grow, one import covers the run
+        CHECK(s.raw_grows == 0 && s.mirrors == 0 && s.raw_straddle_stops == 0);
+    }
+    backing_gpu_wrote(E + 0x100, 4, v);   // (4) a GPU write declared in U
+    sub_end(v);
+    gpu_run(v, gpu_ug);
+    CHECK(*(uint32_t *)(uintptr_t)(E + 0x100) == 0xCCCCCCCCu && *(uint32_t *)(uintptr_t)(E + 0x104) == 0xBBBBBBBBu);
+    printf("%s: union kind %s, bind before the begin and after, tail growth %llu, GPU write written back\n", name,
+           mode == 0 ? "mirror" : "import", (ull)s.raw_grows);
+    backing_pool_fini(&pp);
+    done(name);
+}
+
+static void case_union_grow_mirror(void) { union_grow_scene("union_grow_mirror", 0); }
+static void case_union_grow_import(void) { union_grow_scene("union_grow_import", 1); }
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc != 2) {
@@ -3081,7 +3174,7 @@ int main(int argc, char **argv) {
         {"raw_diag_birth", case_raw_diag_birth},
         {"raw_ev_miss", case_raw_ev_miss}, {"raw_ev_survives_hits", case_raw_ev_survives_hits},
         {"raw_ev_lost", case_raw_ev_lost}, {"raw_ev_origin", case_raw_ev_origin},
-        {"raw_dry_grow", case_raw_dry_grow}, {"raw_dry_g4", case_raw_dry_g4}, {"raw_dry_cap", case_raw_dry_cap},
+        {"raw_dry_grow", case_raw_dry_grow}, {"raw_dry_stop", case_raw_dry_stop}, {"raw_dry_census", case_raw_dry_census}, {"raw_dry_g4", case_raw_dry_g4}, {"raw_dry_cap", case_raw_dry_cap},
         {"raw_dry_kind", case_raw_dry_kind}, {"raw_dry_none", case_raw_dry_none}, {"raw_dry_g4_on", case_raw_dry_g4_on},
         {"raw_dry_g8", case_raw_dry_g8}, {"raw_dry_g5", case_raw_dry_g5}, {"raw_dry_g1", case_raw_dry_g1},
         {"raw_dry_g2", case_raw_dry_g2}, {"raw_ev_g4", case_raw_ev_g4}, {"raw_ev_g4_hull", case_raw_ev_g4_hull},
@@ -3091,7 +3184,8 @@ int main(int argc, char **argv) {
         {"union_promote_chain", case_union_promote_chain}, {"union_quiet", case_union_quiet},
         {"union_cap_stop", case_union_cap_stop}, {"union_admit_stop", case_union_admit_stop},
         {"union_rule_stop", case_union_rule_stop}, {"union_other_cell", case_union_other_cell},
-        {"union_left_hot", case_union_left_hot}, {"union_hot_cap", case_union_hot_cap},
+        {"union_left_hot", case_union_left_hot}, {"union_grow_mirror", case_union_grow_mirror}, {"union_grow_import", case_union_grow_import},
+        {"union_hot_cap", case_union_hot_cap},
         {"union_hot_rule", case_union_hot_rule}, {"union_hot_admit", case_union_hot_admit},
         {"raw_grow_used_import", case_raw_grow_used_import}, {"raw_grow_used_edge", case_raw_grow_used_edge},
         {"raw_grow_used_wait", case_raw_grow_used_wait}, {"raw_grow_used_written", case_raw_grow_used_written},

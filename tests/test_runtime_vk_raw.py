@@ -62,7 +62,7 @@ THREADS = 64
 BIG_THREADS = 1024   # raw_program_big: one group of the write-back cases
 TABLE = (1 << 39) + 0x4000_0000   # the pointer table: vk_raw_test.c, TABLE
 ENTRY = 32
-CASES = ("kinds", "keep", "miss", "commit", "reuse", "edges", "grow", "grow_taken", "grow_used", "grow_guarded_head",
+CASES = ("kinds", "keep", "miss", "commit", "reuse", "edges", "grow", "grow_taken", "grow_used", "grow_union", "grow_guarded_head",
          "grow_guarded_tail")
 # The write-back cases run the 1024-thread program (groups of 1024 threads, one entry each)
 BIG_CASES = ("wb", "wbcpu", "wbunmap", "wbflight", "wbremap", "wbremapflight", "wbnosink", "wbrefused", "wbreap")

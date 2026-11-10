@@ -40,6 +40,7 @@ from pathlib import Path
 from test_runtime_gpu import EXIT_FATAL, LEVELS, ROOT, build_program, case_env, clang_or_skip, fatal_lines, \
     vulkan_or_skip
 
+EXIT_CENSUS = 73   # RT_EXIT_CENSUS
 TEST_SOURCE = ROOT / "tests" / "runtime" / "coherence_test.c"
 
 PASSING = ("generations", "upload", "admission", "guarded_admission", "writeback", "writeback_no_reupload",
@@ -53,6 +54,7 @@ PASSING = ("generations", "upload", "admission", "guarded_admission", "writeback
            "raw_dry_g5", "raw_dry_g1", "raw_dry_g2",
            "raw_grow_used_import", "raw_grow_used_edge", "raw_grow_used_wait", "raw_grow_heir", "raw_grow_heir_old",
            "raw_grow_used_decommit",
+           "union_grow_mirror", "union_grow_import",
            "union_begin_straddle", "union_cap_demote", "union_cap_exempt", "union_exact_bytes", "union_order",
            "union_promote_chain", "union_quiet", "union_other_cell", "union_left_hot", "union_hot_cap", "union_hot_rule",
            "union_hot_admit")
@@ -618,6 +620,28 @@ class CoherenceTest(unittest.TestCase):
                                      f"1 raw-access submissions, 1 binds cut a mirror the submission had not resolved "
                                      f"there, {1 - refused} would have grown it, {refused} refused (refusals: {want}), "
                                      f"the evaluation changed the map 0 times")
+
+    def test_a_run_that_ends_on_a_stop_with_no_dump_or_on_the_census_limit_still_prints_the_dry_line(self) -> None:
+        # Only the straddle stop's dump holds the dry evaluation. A plain named stop (70) and the census limit (73) print it
+        # at exit, once, after the stop's own line, together with the mirror totals.
+        for case, code in (("raw_dry_stop", EXIT_FATAL), ("raw_dry_census", EXIT_CENSUS)):
+            for level in LEVELS:
+                with self.subTest(case=case, level=level):
+                    done = self.run_case(level, case)
+                    self.assertEqual(done.returncode, code, done.stdout + done.stderr)
+                    found = [line for line in done.stderr.splitlines() if line.startswith(EXIT_LINE)]
+                    self.assertEqual(len(found), 1, done.stderr)
+                    self.assertIn("1 raw-access submissions, 1 binds cut a mirror the submission had not resolved there, "
+                                  "1 would have grown it, 0 refused", found[0])
+                    self.assertEqual(done.stderr.count(TOTALS_LINE), 1, done.stderr)
+                    self.assertEqual(len([n for n, line in enumerate(done.stderr.splitlines()) if "straddle dump" in line]), 0)
+
+    def test_the_dry_line_is_printed_once_when_a_straddle_stop_dump_holds_it_or_not_at_all(self) -> None:
+        # The stop that has the dump prints the evaluation in it (the digest line); the exit lines must not add a second.
+        done = self.run_case(LEVELS[0], "raw_diag_hull")
+        self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+        self.assertEqual(done.stderr.count("the dry evaluation left the map "), 1, done.stderr)
+        self.assertEqual(done.stderr.count(EXIT_LINE), 0, done.stderr)
 
 
 if __name__ == "__main__":

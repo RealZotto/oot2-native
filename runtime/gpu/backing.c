@@ -1373,6 +1373,7 @@ static uint64_t g_ev_cur;     // the miss being served now (0: none)
 typedef struct EvCount { uint64_t value, n; } EvCount;
 static EvCount g_evc[EV_VAL];   // events written per submission, the lowest value dropped when full
 static struct { uint64_t evals, would, refused, mutated, g[DRY_N]; } g_dry;
+static int g_dump_dry_done;   // a straddle stop's dump printed the dry evaluation this run
 
 static void ev_imp_of(EvImp *o, const Backing *b) {
     *o = (EvImp){b->gpu_lo, b->gpu_hi, used_by(b), b->res_value, b->res_lo, b->res_hi, b->res_n, b->born_value,
@@ -1696,6 +1697,7 @@ static void diag_stop(const Cell *c, const Backing *m, uint64_t plo, uint64_t ph
     rt_log(DIAG "the dry evaluation left the map %s (digest %#llx before, %#llx after)",
            d0 == d1 ? "unchanged" : "CHANGED", (ull)d0, (ull)d1);
     g_st.raw_straddle_stops++;
+    __atomic_store_n(&g_dump_dry_done, 1, __ATOMIC_RELEASE);   // the dry evaluation is in the dump: the exit lines leave it out
     diag_ring(value);
     diag_events(value);
     rt_log(DIAG "stop %llu of this run follows", (ull)g_st.raw_straddle_stops);
@@ -2901,6 +2903,7 @@ void backing_open(const BackingOps *ops) {
     memset(g_ev, 0, sizeof g_ev);
     memset(g_evc, 0, sizeof g_evc);
     memset(&g_dry, 0, sizeof g_dry);
+    __atomic_store_n(&g_dump_dry_done, 0, __ATOMIC_RELEASE);
     g_ev_seq = g_ev_misses = g_ev_cur = 0;
     g_ring_seq = 0, g_ring_skip = 0, g_born_value = 0, g_grow_cap_logged = 0;
     const char *union_env = getenv("OOT2_BACKING_UNION");
@@ -2921,11 +2924,12 @@ int backing_is_open(void) { return g_open; }
 // first: backing_close, a stop of the run (rt_run_stop_hook: a named stop, a guest ExitProcess, the census limit) or the
 // process returning from main. The counters are read as they stand, with no lock: the stopping thread may hold g_lock (a
 // named stop is raised under it), and a line off by a count in flight is better than none. Once a run (g_exit_done). The
-// dry evaluation's line is left to the stop's dump, which holds it, and written by the runs that end on their own.
+// dry evaluation's line is left out only when a straddle stop's dump (diag_stop) printed it, which it flags in
+// g_dump_dry_done; every other end (a clean end, the census limit, any other named stop) writes it.
 
-static void exit_lines(int stop) {
+static void exit_lines(void) {
     if (__atomic_exchange_n(&g_exit_done, 1, __ATOMIC_ACQ_REL)) return;
-    if (g_st.raw_begins && !stop) {   // once per run that used the raw path, and ends on its own: what the candidate growth would have done (the dump of a stop holds it)
+    if (g_st.raw_begins && !__atomic_load_n(&g_dump_dry_done, __ATOMIC_ACQUIRE)) {   // once per run that used the raw path: what the candidate growth would have done (unless a straddle stop's dump printed it)
         char d[260];
         size_t at = 0;
         for (int i = 0; i < DRY_N; i++)
@@ -2948,15 +2952,15 @@ static void exit_lines(int stop) {
 }
 
 static void exit_writer(int code, const char *line) {
-    (void)line;
-    exit_lines(code != 0);   // a named stop is a nonzero code; a guest ExitProcess is 0
+    (void)code, (void)line;
+    exit_lines();
 }
 
-static void exit_atexit(void) { exit_lines(0); }
+static void exit_atexit(void) { exit_lines(); }
 
 void backing_close(void) {
     if (!g_open) return;
-    exit_lines(0);
+    exit_lines();
     plat_mutex_lock(&g_bt_lock);
     g_bt_stop = 1;
     plat_cond_signal(&g_bt_cond);
