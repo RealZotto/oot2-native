@@ -247,6 +247,12 @@ int vkn_vertex_format(int nvn_format, VkFormat *out, uint32_t *bytes, int *type)
 #define C0_BASE_INSTANCE 0x644u
 #define C0_SSBO_TS 0x670u
 #define C0_SSBO_MS 0x770u
+// The group counts are three words at 4, 8 and 0xc; the head's first word stays zero. The translator's modules settle
+// it. Of the 4128 compute programs of the prepared pack, 4110 read nothing under 0x10 of the driver bank (none uses a
+// NumWorkgroups builtin), 6 read the word at 4 only and 12 read the words at 4 and 8; none reads 0 or 0xc. Each of
+// those 18 scales the word at 4 by its local size's x extent and the word at 8 by the y extent (the 8x8, 16x16 and
+// 32x32 programs shift by 3, 4 and 5), so 4 is the x count and 8 the y count. Counts at 0, 4 and 8 would hand these
+// programs the y count where they read x. A back end that places x at 0 has another layout of the head.
 #define C0_DISPATCH_NVN2 4u
 #define C0_CS_UBO 0x210u
 #define C0_TABLE_BYTES (16u * C0_ROW)
