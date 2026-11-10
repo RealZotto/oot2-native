@@ -599,7 +599,7 @@ void hid_replay_filter(HidHostInput *in) {
     if (fatal[0]) rt_fatal("%s", fatal);   // after the lock: the stop hook closes the recorder under it
 }
 
-int hid_replay_replaying(void) { return g_replay_on; }
+int hid_replay_active(void) { return g_replay_on || g_rec_on; }
 
 void hid_replay_finish(void) {
     int held = g_inside;   // a stop raised under the lock by this thread: it already holds it

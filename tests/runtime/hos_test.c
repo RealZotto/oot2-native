@@ -233,7 +233,8 @@ static int is_rest(const SixState *s) {
 #define NEARF(a, b, eps) (fabs((double)(a) - (double)(b)) <= (eps))
 
 // The case hid_motion: a synthetic sensor stream through the host motion layer, read through the nn::hid overrides.
-// With replay set (hid_motion_replay) an input file is being replayed: the pad's motion must not reach the game.
+// With replay set (hid_motion_replay, hid_motion_record) an input file is being replayed or the recorder is on: the
+// pad's motion must not reach the game, since the file holds none.
 static void hid_motion_case(int replay) {
     Cpu a;
     memset(&a, 0, sizeof a);
@@ -259,7 +260,7 @@ static void hid_motion_case(int replay) {
     for (int k = 1; k <= 5; k++) six_feed(0.1f * (float)k, 4000000);
     CHECK(six_read(&a, 16, s) == 16);
     if (replay) {
-        for (int i = 0; i < 16; i++) CHECK(is_rest(&s[i]));   // the replayed input replaces the pad's motion too
+        for (int i = 0; i < 16; i++) CHECK(is_rest(&s[i]));   // the file holds no motion: none reaches the game
         CHECK(hcall(&a, H_STOP, SIX_HANDLE, 0, 0, 0) == 0);
         CHECK(!hid_motion_wanted());
         return;
@@ -530,6 +531,13 @@ static void boot(const char *folder) {
         set_env("OOT2_INPUT_FILE", path);
     } else {
         set_env("OOT2_INPUT_FILE", NULL);
+    }
+    if (!strcmp(g_case, "hid_motion_record")) {   // the recorder alone: the real input is recorded, without the motion
+        char path[1200];
+        snprintf(path, sizeof path, "%s/record.txt", folder);
+        set_env("OOT2_INPUT_RECORD", path);
+    } else {
+        set_env("OOT2_INPUT_RECORD", NULL);
     }
     hos_init(folder, NULL, 0);
     static const uint64_t addrs[] = {G(1), G(2), G(3), G(4)};
@@ -833,7 +841,7 @@ int main(int argc, char **argv) {
         rt_census_end(RT_EXIT_CENSUS, "[census mode] the case ended at its frame limit");
     } else if (case_is("hid_motion")) {
         boot(dir);
-        hid_motion_case(!strcmp(g_case, "hid_motion_replay"));
+        hid_motion_case(!strcmp(g_case, "hid_motion_replay") || !strcmp(g_case, "hid_motion_record"));
     } else if (!strcmp(g_case, "pl_font") || !strcmp(g_case, "pl_font_env")) {
         boot(dir);
         pl_font_case(!strcmp(g_case, "pl_font_env"));

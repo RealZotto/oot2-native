@@ -10,6 +10,10 @@
 // direction the controller's three axes in a reference frame whose z is up. The controller's axes are x to the right, y
 // toward the top edge (away from the player) and z out of the face.
 //
+// The layer is adapted from DKB Recomp's runtime/motion_fusion.c and the axis map of its runtime/input.c (MIT and
+// GPL-3.0-or-later; the origin is MacNativeGames): the header of runtime/hos/hid_motion.c names the commits and the
+// changes.
+//
 // The conversion from SDL's gamepad sensors follows the SDL documentation of the sensor axes (SDL_sensor.h: the
 // accelerometer reads m/s^2 including gravity, the gyroscope rad/s, counter-clockwise positive) and the axis map that two
 // donor runtimes use for the same console frame (dkb and jaigner-oot, both derived from MacNativeGames; nxnative states

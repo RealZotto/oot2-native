@@ -182,7 +182,10 @@ static void note_close(void) {
 // sends each sensor as an event at the pad's own rate, and those events wake the loop, so the samples are neither polled
 // at the loop's idle rate nor read twice. A gyroscope sample is paired with the newest accelerometer sample and fed with
 // the time since the last gyroscope sample on the pad's own clock. A pad without both sensors keeps the six-axis states at
-// rest (the motion layer has no samples). All of this runs on the window thread.
+// rest (the motion layer has no samples). All of this runs on the window thread. The check for both sensors, the calls
+// that turn them on and the two log lines of service_motion follow DKB Recomp runtime/input.c (sensors_ready; no licence
+// header: that repository's GPL-3.0-or-later) at c5d5e7c23d0a2c7f94a32a6ccfadda6b138b82ce; there a thread polls the
+// sensors every 4 ms, here SDL's events carry the samples.
 static SDL_JoystickID s_motion_pad;   // the gamepad whose sensors are on, 0 none
 static int s_motion_ok;               // ... and it has both, enabled
 static float s_accel[3];

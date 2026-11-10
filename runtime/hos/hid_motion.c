@@ -3,9 +3,17 @@
 //
 // The host motion layer (oot2/hid_motion.h): the conversion from SDL's gamepad sensors to the console's six-axis units,
 // the orientation the sensor fusion keeps, and the ring of states the window thread writes and nn::hid reads. The window
-// thread is the only producer; the readers are guest threads. The fusion is the usual complementary filter on a rotation
-// matrix (the gyroscope rotates it, the measured gravity pulls its tilt back), written from its definition; the donors
-// named in the header use the same idea.
+// thread is the only producer; the readers are guest threads. The fusion is a complementary filter on a rotation
+// matrix: the gyroscope rotates it, the measured gravity pulls its tilt back.
+//
+// Adapted from DKB Recomp runtime/motion_fusion.c at c5d5e7c23d0a2c7f94a32a6ccfadda6b138b82ce, whose header says it is
+// adapted from MacNativeGames games/totk/runtime/motion_fusion.c at b75be8cfa704df3701e86130c8ced268e79d6b11 (MIT,
+// Copyright (c) 2026 MacNativeGames contributors): the fusion (norm3, cross3, orthonormalize, align_to, integrate), the
+// feed, the read and the restart. The axis map of hid_motion_from_sdl is DKB Recomp's runtime/input.c
+// (input_motion_axes; no licence header: that repository's GPL-3.0-or-later) at the same commit. Changed here: one
+// layer instead of an instance per controller, under a spin lock instead of the donor's SRW lock; the conversion gives
+// revolutions per second itself; the reader takes the host time and answers nothing after 250 ms without a sample; a
+// clear, the game's wish (hid_motion_wanted) and the config menu's suppress are added; the names follow this runtime.
 #include <math.h>
 #include <stdatomic.h>
 #include <string.h>

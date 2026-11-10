@@ -54,9 +54,11 @@ PL_SIZE = "_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE"
 PL_REQUEST = "_ZN2nn2pl17RequestLoadNxFontEPvm"
 AT_250 = "0x7000000250 (main+0x250)"
 
-# the six-axis states from a synthetic sensor stream (also with an input file replayed: then at rest), the shared font
-# calls with a made-up font file, and the parental-control check: each answers, none stops by name
-PASSING = ("sm", "notes", "opus", "hid_motion", "hid_motion_replay", "pl_font", "pl_font_env", "pctl")
+# the six-axis states from a synthetic sensor stream (also with an input file replayed, and with the recorder on: then
+# at rest), the shared font calls with a made-up font file, and the parental-control check: each answers, none stops by
+# name
+PASSING = ("sm", "notes", "opus", "hid_motion", "hid_motion_replay", "hid_motion_record", "pl_font", "pl_font_env",
+           "pctl")
 
 # case: (exit code, text the FATAL line must contain, a row census.tsv must hold)
 FAILING = {

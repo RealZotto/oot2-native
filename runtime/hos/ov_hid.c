@@ -21,9 +21,9 @@
 // functions follow runtime.h and carry a HOS_OVERRIDE note; guest memory is read with hos_in and written with hos_out,
 // and a pointer the guest may not use is a guest stop naming the call; there is no gamepad, keyboard, rumble or motion
 // code of the donor's (the host calls and the TOTK_* settings are gone; the full-key state and the six-axis states come
-// from the host layers, oot2/hid_input.h and oot2/hid_motion.h, written here), a vibration value is remembered, and a
-// six-axis read without host motion is a controller at rest with sampling numbers that grow, newest first; the
-// handheld mode is not carried; IsVibrationPermitted answers the PermitVibration state.
+// from the host layers: oot2/hid_input.h, written here, and oot2/hid_motion.h, whose own header names its donor), a
+// vibration value is remembered, and a six-axis read without host motion is a controller at rest with sampling numbers
+// that grow, newest first; the handheld mode is not carried; IsVibrationPermitted answers the PermitVibration state.
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
@@ -448,17 +448,18 @@ static void ov_six_axis_handles(Cpu *c) {
 // Write max states newest first. While the game has started the sensor and the host pad has a gyroscope and an
 // accelerometer (oot2/hid_motion.h), the newest states are the pad's; a read that has fewer samples than states asked
 // for is padded with the oldest sample's pose and no motion (zero angular velocity and zero delta), so a state the pad
-// did not send adds no rotation. Otherwise every state is at rest, not marked connected: a controller lying still. The
-// game reads every state it asks for and ignores the count, so all max are filled. Sampling numbers only ever grow: a
-// live read takes the producer's numbers (stable while the samples are the same ones) shifted above every number given
-// before, and a read at rest numbers its states from the last number given.
+// did not send adds no rotation. Otherwise, and while an input file is replayed or the recorder is on (the file format
+// has no motion), every state is at rest, not marked connected: a controller lying still. The game reads every state
+// it asks for and ignores the count, so all max are filled. Sampling numbers only ever grow: a live read takes the
+// producer's numbers (stable while the samples are the same ones) shifted above every number given before, and a read
+// at rest numbers its states from the last number given.
 static void six_fill(Cpu *c, uint64_t out, int max, const char *fn) {
     static const HidSixAxisState rest = {.acc = {0, 0, -1}, .dir = {1, 0, 0, 0, 1, 0, 0, 0, 1}};
     HidMotionState live[HID_MOTION_RING];
     int want = max < HID_MOTION_RING ? max : HID_MOTION_RING, n = 0;
     int64_t newest;
     plat_mutex_lock(&lock);
-    if (six_started && !hid_replay_replaying()) n = hid_motion_read(live, want, plat_now_ns());
+    if (six_started && !hid_replay_active()) n = hid_motion_read(live, want, plat_now_ns());
     if (n > 0) {
         if (!six_live) {
             motion_offset = sample + max - live[0].sampling + 1;

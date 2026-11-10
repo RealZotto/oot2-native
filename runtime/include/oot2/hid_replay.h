@@ -16,6 +16,8 @@
 //                              replay it records the replayed input, which writes the same file again in canonical form.
 //                              The file is written as the run goes and its last run is closed when the run stops, so a
 //                              process killed from outside loses that last run.
+//   The pad's motion is not in the file. While either option is on, the six-axis sensor reads a controller at rest
+//   (hid_replay_active), so the file still holds everything the game was given.
 //   The two may not name the same file (the replay would be overwritten at start): two spellings of one file (./, upper
 //   case, a link) are caught by content, since an existing record file with the replay's exact bytes is refused too. Both
 //   are read once, at start-up (hos_init), and a file that cannot be read or has a malformed line stops the run there,
@@ -91,9 +93,10 @@ void hid_replay_start(void);
 // is latched and given to every read of that tick. *in's sampling number is left alone. No-op with both options off.
 void hid_replay_filter(HidHostInput *in);
 
-// 1 while an input file is replayed. The real input is then replaced, and so is the pad's motion: the six-axis states
-// are at rest, so a run that is meant to be repeated does not depend on a pad being moved.
-int hid_replay_replaying(void);
+// 1 while an input file is replayed or the recorder is on. The file format holds buttons and sticks and no motion, so
+// in both cases the pad's motion is kept from the game and the six-axis states are at rest: a replayed run does not
+// depend on a pad being moved, and a recorded run holds everything the game was given.
+int hid_replay_active(void);
 
 // The run stops: close the recorder's last run and its file. Safe to call again, and with the recorder off.
 void hid_replay_finish(void);
