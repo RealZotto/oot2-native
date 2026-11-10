@@ -1476,6 +1476,7 @@ static void case_attr_stop(const char *folder) {
     put(r, OP_BIND_VATTR, &va, sizeof va);
     PUT(r, OP_DRAW, (p_draw){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 3, .instances = 1});
     uint64_t h = rec_end(r);
+    ledger_frame_enter();   // as the command path does before a submission, so the stop writes from inside one
     vkr_submit(&h, 1);
     printf("submit returned\n");
 }
