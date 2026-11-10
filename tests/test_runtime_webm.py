@@ -69,7 +69,8 @@ def el(ident: int, payload: bytes, unknown: bool = False) -> bytes:
 
 def make_webm(units: list[bytes], w: int, h: int, *, video_codec: str = "V_AV1", audio: bool = True, per_cluster: int = 5,
               unknown_sizes: bool = False, unknown_segment: bool = False, groups: bool = False, duration_frames: float | None = None, lacing: int = 0,
-              replace: dict[int, bytes] | None = None, with_duration: bool = True) -> bytes:
+              replace: dict[int, bytes] | None = None, with_duration: bool = True, group_tail: bytes = b"",
+              info_size: int | None = None) -> bytes:
     """A WebM file holding the units as the blocks of track 1 (and, with audio, an A_OPUS track of small blocks)."""
     replace = replace or {}
     header = el(0x1A45DFA3, el(0x4286, b"\x01") + el(0x42F7, b"\x01") + el(0x42F2, b"\x04") + el(0x42F3, b"\x08")
@@ -94,11 +95,12 @@ def make_webm(units: list[bytes], w: int, h: int, *, video_codec: str = "V_AV1",
             key = 0x80 if units[i][:1] == b"\x0a" else 0   # a unit that opens with a sequence header is a key frame
             flags = key | (lacing << 1)
             block = b"\x81" + struct.pack(">h", rel) + bytes([flags]) + data
-            body += el(0xA0, el(0xA1, block) + (b"" if key else el(0xFB, b"\x7f"))) if groups else el(0xA3, block)
+            body += el(0xA0, el(0xA1, block) + (b"" if key else el(0xFB, b"\x7f")) + group_tail) if groups else el(0xA3, block)
             if audio:
                 body += el(0xA3, b"\x82" + struct.pack(">h", rel) + b"\x80" + bytes(20 + i))
         clusters.append(el(0x1F43B675, body, unknown=unknown_sizes))
-    segment = el(0x1549A966, info) + el(0x1654AE6B, tracks) + b"".join(clusters)
+    info_el = el(0x1549A966, info) if info_size is None else (0x1549A966).to_bytes(4, "big") + size_field(info_size) + info
+    segment = info_el + el(0x1654AE6B, tracks) + b"".join(clusters)
     return header + el(0x18538067, el(0xEC, bytes(30)) + segment, unknown=unknown_sizes or unknown_segment)
 
 
@@ -256,6 +258,39 @@ class WebmDecodeTest(unittest.TestCase):
         done = self.run_file(self.small(), 99999999, 10)
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("past the end of the file", self.result(done))
+
+    def test_a_window_whose_size_wraps_is_past_the_end(self) -> None:
+        done = self.run_file(self.small(), 2, 2**64 - 1)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("past the end of the file", self.result(done))
+
+    def test_a_window_shorter_than_the_file_is_read_as_cut(self) -> None:
+        # the file sits inside a larger one with bytes on both sides; a window that stops inside a block, or inside an
+        # element that is skipped, must fail as truncated rather than read on past its end
+        data = self.small()
+        image = b"P" * 7 + data + b"T" * 4096
+        void_at = data.index(b"\xec\x9e")                              # the void element the reader skips
+        for size in (len(data) - 40, void_at + 10):
+            done = self.run_file(image, 7, size)
+            self.assertEqual(done.returncode, 1, done.stdout)
+            self.assertIn("result FAIL", self.result(done))
+            self.assertIn("truncated", self.result(done))
+        self.assertEqual(self.run_file(image, 7, len(data)).returncode, 0)
+
+    def test_a_size_past_the_window_is_truncated_before_anything_is_held(self) -> None:
+        done = self.run_file(self.small(info_size=1 << 31))
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("truncated: element 0x1549A966", self.result(done))
+
+    def test_a_byte_that_starts_no_id_is_named(self) -> None:
+        done = self.run_file(self.small(unknown_sizes=True) + b"\x00\x00")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("starts no element id", self.result(done))
+
+    def test_a_malformed_block_group_is_named(self) -> None:
+        done = self.run_file(self.small(groups=True, group_tail=b"\xfb\x85\x01"))
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("is malformed", self.result(done))
 
     def test_the_driver_is_told_how_to_be_called(self) -> None:
         done = subprocess.run([str(self.exes["-O2"])], capture_output=True, text=True)

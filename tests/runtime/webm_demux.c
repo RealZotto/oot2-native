@@ -162,7 +162,7 @@ static int rd_id(Webm *w, uint32_t *id) {
     int r = rd(w, &b, 1);
     if (r <= 0) return r;
     int len = id_len(b);
-    if (!len) return -1;
+    if (!len) return -2;   // a byte that starts no id
     uint32_t v = b;
     for (int i = 1; i < len; i++) {
         if (rd(w, &b, 1) != 1) return -1;
@@ -203,6 +203,11 @@ static int grow(Webm *w, size_t n) {
 
 // The payload of the element whose header was just read into w->buf. 1, or -1 with err.
 static int load(Webm *w, int64_t size, uint32_t id, char *err, size_t errsz) {
+    if (size != UNKNOWN && (uint64_t)size > w->limit - w->pos) {   // before any allocation: a header names the size
+        fail(err, errsz, "truncated: element 0x%X at %llu wants %lld bytes and the file ends at %llu", (unsigned)id,
+             (unsigned long long)w->pos, (long long)size, (unsigned long long)w->limit);
+        return -1;
+    }
     if (size == UNKNOWN || size > (1 << 30) || !grow(w, (size_t)size + 1)) {
         fail(err, errsz, "element 0x%X at %llu has size %lld, which is not read", (unsigned)id, (unsigned long long)w->pos, (long long)size);
         return -1;
@@ -251,8 +256,9 @@ int webm_open(Webm *w, const char *path, uint64_t offset, uint64_t size, char *e
     }
     w->base = offset;
     w->limit = size ? size : (uint64_t)end - offset;
-    if (offset + w->limit > (uint64_t)end) {
-        fail(err, errsz, "the window ends at %llu, past the end of the file (%lld)", (unsigned long long)(offset + w->limit), end);
+    if (w->limit > (uint64_t)end - offset) {   // offset <= end, checked above; offset + limit could wrap
+        fail(err, errsz, "the window of %llu bytes at %llu goes past the end of the file (%lld)", (unsigned long long)w->limit,
+             (unsigned long long)offset, end);
         goto bad;
     }
     if (seek_to(w, 0) < 0) goto bad;
@@ -280,6 +286,10 @@ int webm_open(Webm *w, const char *path, uint64_t offset, uint64_t size, char *e
         uint64_t start = w->pos;
         int r = rd_id(w, &id);
         if (r == 0) break;
+        if (r == -2) {
+            fail(err, errsz, "the byte at %llu starts no element id", (unsigned long long)start);
+            goto bad;
+        }
         if (r < 0 || rd_size(w, &sz) != 1) {
             fail(err, errsz, "truncated: a segment child at %llu does not fit in the file", (unsigned long long)start);
             goto bad;
@@ -339,7 +349,7 @@ static int block_head(Webm *w, const uint8_t *p, size_t n, WebmPacket *out) {
     int16_t rel = (int16_t)(p[len] << 8 | p[len + 1]);
     uint8_t flags = p[len + 2];
     out->track = (uint32_t)track;
-    out->ticks = w->cluster_tc + rel;
+    out->ticks = (int64_t)((uint64_t)w->cluster_tc + (uint64_t)(int64_t)rel);   // wraps on a hostile timecode, defined
     out->key = flags >> 7;
     out->lacing = (flags >> 1) & 3;
     out->data = p + len + 3;
@@ -368,6 +378,10 @@ int webm_next(Webm *w, WebmPacket *p, char *err, size_t errsz) {
                 return -1;
             }
             return finish(w, err, errsz);
+        }
+        if (r == -2) {
+            fail(err, errsz, "the byte at %llu starts no element id", (unsigned long long)start);
+            return -1;
         }
         if (r < 0 || rd_size(w, &sz) != 1) {
             fail(err, errsz, "truncated: an element header at %llu does not fit in the file (ends at %llu)", (unsigned long long)start,
@@ -413,9 +427,14 @@ int webm_next(Webm *w, WebmPacket *p, char *err, size_t errsz) {
                 const uint8_t *blk = NULL, *v;
                 size_t blk_n = 0, at = 0, vn;
                 uint32_t cid;
-                while (el_next(body, n, &at, &cid, &v, &vn) > 0) {
+                int q;
+                while ((q = el_next(body, n, &at, &cid, &v, &vn)) > 0) {
                     if (cid == ID_BLOCK) blk = v, blk_n = vn;
                     else if (cid == ID_REF) has_ref = 1;
+                }
+                if (q < 0) {
+                    fail(err, errsz, "a block group at %llu is malformed", (unsigned long long)start);
+                    return -1;
                 }
                 if (!blk) {
                     fail(err, errsz, "a block group at %llu holds no block", (unsigned long long)start);

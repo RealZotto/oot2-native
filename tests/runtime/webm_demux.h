@@ -9,8 +9,10 @@
 // image can be read in place.
 //
 // What it refuses, by name: a file that ends before the size it declares (truncated), a size or id that cannot be
-// read, a block of a video track with lacing, a block of a track the track list lacks, a track list after the first
-// cluster.
+// read, a byte that starts no element id, a block group that is malformed, a block of a video track with lacing, a
+// block of a track the track list lacks, a track list after the first cluster. Only the first WEBM_TRACKS_MAX tracks of
+// the list are kept; the others are dropped without a word, and a block of one of them is then refused as a block of a
+// track the list lacks.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
