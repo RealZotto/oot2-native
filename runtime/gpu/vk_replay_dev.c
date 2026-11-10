@@ -27,6 +27,7 @@
 #include "oot2/vk_pipeline.h"
 #include "oot2/vk_raw.h"
 #include "oot2/vk_rec.h"
+#include "oot2/vk_view_plan.h"
 #include "oot2/vk_replay.h"
 #include "plat.h"
 
@@ -100,14 +101,27 @@ static int dev_target(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarg
     if (row->flags & VKF_DEPTH) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (row->flags & VKF_STENCIL) aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!aspect) aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-                                      .usage = storage ? VK_IMAGE_USAGE_STORAGE_BIT
-                                               : aspect == VK_IMAGE_ASPECT_COLOR_BIT
-                                                   ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-                                                   : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT};
+    VkImageUsageFlags want_usage = storage ? VK_IMAGE_USAGE_STORAGE_BIT
+                                   : aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                                                                         : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    // what the image gives for this level and these layers (a slice of a volume is a 2D view of it, its depth slices
+    // counted as layers); a view it cannot give stops by name, with the texture, what was asked and what the image has
+    VkbShape sh;
+    vkb_image_shape(img, &sh);
+    VkvImage vim = {sh.type, sh.depth, sh.layers, sh.levels, sh.flags, sh.usage, gpu_vk.image_2d_view_of_3d};
+    VkvWant vw = {VKV_PICK, level, base_layer, layers, want_usage};
+    VkvPlan plan;
+    const char *refusal;
+    if (!vkv_plan(&vim, &vw, &plan, &refusal))
+        rt_fatal("gfx: vulkan: the %s view of the texture at %#llx (NVN format %#x, level %u, layers %u..%u) cannot be made: "
+                 "%s (the image has %u levels, %u layers, a depth of %u and usage %#x)",
+                 storage ? "storage" : "render target", (unsigned long long)(uintptr_t)t->tex.mem, fmt, level, base_layer,
+                 base_layer + layers, refusal, sh.levels, sh.layers, sh.depth, (unsigned)sh.usage);
+    base_layer = plan.base_layer, layers = plan.layers;
+    VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = want_usage};
     VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = &use,
                                 .image = vkb_image_handle(img),
-                                .viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+                                .viewType = plan.type,
                                 .format = row->vk, .subresourceRange = {aspect, level, 1, base_layer, layers}};
     VkImageView view;
     GPU_VK_OK(vkCreateImageView(gpu_vk.device, &vi, NULL, &view), "vkCreateImageView (a render target)");

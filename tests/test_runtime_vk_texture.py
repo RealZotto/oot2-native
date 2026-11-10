@@ -133,6 +133,14 @@ class DeviceTest(unittest.TestCase):
         self.assertEqual(len(re.findall(r"^BC\d image: a raw view as format \d+ of mip level 1 with sampled and storage usage was made$",
                                          done.stdout, re.M)), 4)
 
+    def test_render_target_and_storage_views_of_volumes_and_layered_textures_are_valid(self) -> None:
+        done = self.passing("views")
+        self.assertRegex(done.stdout, r"volume, last slice as a render target: view type 1, layers 7..8 made")
+        self.assertRegex(done.stdout, r"volume, slices 2..5 as a layered render target: view type 5, layers 2..6 made")
+        self.assertRegex(done.stdout, r"four layers, last layer as a render target: view type 1, layers 3..4 made")
+        self.assertIn("volume, slice 8 of 8: refused", done.stdout)
+        self.assertIn("plain 2D texture, layer 1 of 1: refused", done.stdout)
+
     def test_the_arena_gets_its_memory_back_when_textures_are_replaced(self) -> None:
         done = self.passing("churn")
         self.assertRegex(done.stdout, r"90 textures registered one after another at one ID: 90 images made, \d+ destroyed, arena peak \d+ MiB, \d+ MiB in use now")

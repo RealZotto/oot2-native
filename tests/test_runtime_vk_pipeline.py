@@ -1361,13 +1361,14 @@ class OptionalFeatureTest(unittest.TestCase):
         self.assertGreater(len(ids), 19)
         self.assertEqual(len(set(ids)), len(ids))
         self.assertEqual([l[len("item "):] for l in self.lines if l.startswith("item ")], ids)   # contents and order
-        self.assertIn(f"items {len(ids)} optional 3", self.lines)
+        self.assertIn(f"items {len(ids)} optional 4", self.lines)
         self.assertEqual([l for l in self.lines if l.startswith("optional ")],
                          ["optional storage_image_array_indexing", "optional zero_initialize_workgroup_memory",
-                          "optional shader_float16"])
+                          "optional shader_float16", "optional image_2d_view_of_3d"])
         self.assertNotIn("storage_image_array_indexing", ids)
         self.assertNotIn("zero_initialize_workgroup_memory", ids)
         self.assertNotIn("shader_float16", ids)
+        self.assertNotIn("image_2d_view_of_3d", ids)
         self.assertEqual([l for l in self.lines if l.startswith("present: lacks")], [])   # the feature changes no item
 
 

@@ -375,6 +375,7 @@ static void create_device(uint64_t after) {
         en.ext[OOT2_VK_EXT_device_fault] = en.ext[OOT2_VK_EXT_diagnostic_checkpoints] = 0;
         memset(&en.fault, 0, sizeof en.fault);
     }
+    gpu_vk.image_2d_view_of_3d = en.view2d.image2DViewOf3D ? 1 : 0;
     VkPhysicalDeviceFeatures2 features;
     oot2_vk_chain_features(&en, &features);
     features.features = en.features;

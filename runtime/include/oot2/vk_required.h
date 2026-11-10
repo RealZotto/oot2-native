@@ -172,13 +172,17 @@
 // builder zero-initializes a compute module's workgroup memory (spv_zero_workgroup) when it was enabled and leaves the
 // module as translated when it was not. shader_float16 is the 16-bit floats of the translated modules' native HMMA
 // (oot2/vk_hmma.h): with it off, the start-up gate keeps the helper and the pipeline builder takes the native function and
-// its Float16 declaration out of every module (spv_hmma_fallback).
+// its Float16 declaration out of every module (spv_hmma_fallback). image_2d_view_of_3d (VK_EXT_image_2d_view_of_3d) lets a
+// storage image be a 2D view of one slice of a 3D image (oot2/vk_view_plan.h): the 3D images are made 2D-view compatible
+// where it is on, and a storage view of a slice on a device without it is a named stop at the view (the render targets
+// over a 3D image need no extension, they use the core 2D-array compatibility).
 #define OOT2_VK_OPTIONAL(X)                                                                                            \
     X(storage_image_array_indexing,                                                                                    \
       (e->f12.shaderStorageImageArrayNonUniformIndexing = f->f12.shaderStorageImageArrayNonUniformIndexing))          \
     X(zero_initialize_workgroup_memory,                                                                                \
       (e->f13.shaderZeroInitializeWorkgroupMemory = f->f13.shaderZeroInitializeWorkgroupMemory))                      \
-    X(shader_float16, (e->f12.shaderFloat16 = f->f12.shaderFloat16))
+    X(shader_float16, (e->f12.shaderFloat16 = f->f12.shaderFloat16))                                                   \
+    X(image_2d_view_of_3d, (e->view2d.image2DViewOf3D = f->view2d.image2DViewOf3D))
 
 // The device extensions the items read, E(id, name), and the ones they depend on below Vulkan 1.4 (pipeline_library
 // for graphics_pipeline_library, maintenance5 for pipeline_binary). The device the back end creates enables every one
@@ -199,7 +203,9 @@
     E(shader_atomic_float, "VK_EXT_shader_atomic_float")                                                              \
     E(depth_clip_control, "VK_EXT_depth_clip_control")                                                                \
     E(pipeline_library, "VK_KHR_pipeline_library")                                                                    \
-    E(maintenance5, "VK_KHR_maintenance5")                                                                                E(index_type_uint8, "VK_KHR_index_type_uint8")
+    E(maintenance5, "VK_KHR_maintenance5")                                                                             \
+    E(image_2d_view_of_3d, "VK_EXT_image_2d_view_of_3d")                                                               \
+    E(index_type_uint8, "VK_KHR_index_type_uint8")
 
 enum {
 #define OOT2_VK_ITEM_ENUM(id, what, test, enable) OOT2_VK_ITEM_##id,
@@ -300,6 +306,7 @@ typedef struct Oot2VkFacts {
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float;
     VkPhysicalDeviceDepthClipControlFeaturesEXT depth_clip;
     VkPhysicalDeviceIndexTypeUint8FeaturesKHR index_u8;
+    VkPhysicalDeviceImage2DViewOf3DFeaturesEXT view2d;
     unsigned char ext[OOT2_VK_EXT_COUNT];   // 1 for each extension of OOT2_VK_EXTENSIONS the device lists
 } Oot2VkFacts;
 
@@ -342,6 +349,8 @@ static inline void oot2_vk_chain_features(Oot2VkFacts *f, VkPhysicalDeviceFeatur
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT)
     OOT2_VK_LINK(f->ext[OOT2_VK_EXT_index_type_uint8], f->index_u8,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR)
+    OOT2_VK_LINK(f->ext[OOT2_VK_EXT_image_2d_view_of_3d], f->view2d,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT)
     (void)tail;
 }
 

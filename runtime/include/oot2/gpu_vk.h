@@ -76,6 +76,7 @@ typedef struct GpuVk {
     VkCommandPool pool_main;    // their main command buffers, recorded by the recorder thread (oot2/vk_rec.h)
     GpuVkSettings settings;
     int fault, checkpoints;     // VK_EXT_device_fault (with its vendor binary when fault == 2), the checkpoints
+    int image_2d_view_of_3d;    // image2DViewOf3D was enabled (an optional feature): a 3D image can be viewed as 2D for storage
 } GpuVk;
 extern GpuVk gpu_vk;            // valid once gpu_vk_open returned
 

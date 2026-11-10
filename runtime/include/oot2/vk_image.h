@@ -50,6 +50,8 @@ typedef struct VkbShape {
     uint32_t width, height, depth, layers, levels, samples;
     VkImageAspectFlags aspect, all_aspects;
     VkFormat format;
+    VkImageCreateFlags flags;   // what the image was created with
+    VkImageUsageFlags usage;
 } VkbShape;
 void vkb_image_shape(const VkbImage *i, VkbShape *out);
 // The submission that will signal `value` uses the image: its pool and the image itself wait for it.

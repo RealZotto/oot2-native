@@ -36,6 +36,11 @@
 //              again, only in the regions over its page
 //   rawview    the images of BC textures (BC1, BC4, BC5, BC7) can be viewed as the 64 or 128-bit integer format of their
 //              block, with storage usage on the view, with the validation layer clean
+//   views      the render target and storage views of volumes and layered textures, built as the replay builds them
+//              (oot2/vk_view_plan.h) with the validation layer on: a 2D view of one slice of a 3D RGBA8 texture (the first
+//              and the last slice) as colour attachment and, where the device has image2DViewOf3D, as storage; a 2D array
+//              view of slices; the last layer of a layered texture and a 2D one; a layer past the image is refused by the
+//              plan, so no call carries it; the validation layer reports nothing
 //   depth_stop (fatal) a depth texture the CPU wrote stops by name at the first submission that binds it
 // Every device case ends with the validation layer's counts (the driver sets synchronization validation): 0 and 0.
 #include <stdio.h>
@@ -57,6 +62,7 @@
 #include "oot2/vk_format.h"
 #include "oot2/vk_image.h"
 #include "oot2/vk_texture.h"
+#include "oot2/vk_view_plan.h"
 #include "plat.h"
 #include "astc_blocks.h"
 #include "untile_table.h"
@@ -931,6 +937,86 @@ static void case_rawview(void) {
     finish("rawview");
 }
 
+// A view of image `img` as the plan says, for `usage`, created and destroyed: the call the validation layer judges.
+static void make_view(VkbImage *img, int type, uint32_t level, uint32_t base, uint32_t n, VkImageUsageFlags usage,
+                      const char *what) {
+    VkbShape sh;
+    vkb_image_shape(img, &sh);
+    VkvImage vim = {sh.type, sh.depth, sh.layers, sh.levels, sh.flags, sh.usage, gpu_vk.image_2d_view_of_3d};
+    VkvWant w = {type, level, base, n, usage};
+    VkvPlan plan;
+    const char *why;
+    if (!vkv_plan(&vim, &w, &plan, &why)) {
+        printf("%s: refused by the plan (%s)\n", what, why);
+        CHECK(0);
+    }
+    VkImageViewUsageCreateInfo ui = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = usage};
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = &ui, .image = vkb_image_handle(img),
+                                .viewType = plan.type, .format = sh.format,
+                                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, plan.base_layer, plan.layers}};
+    VkImageView view;
+    CHECK(vkCreateImageView(gpu_vk.device, &vi, NULL, &view) == VK_SUCCESS);
+    vkDestroyImageView(gpu_vk.device, view, NULL);
+    printf("%s: view type %d, layers %u..%u made\n", what, (int)plan.type, plan.base_layer, plan.base_layer + plan.layers);
+}
+
+static VkbImage *image_for(uint64_t *at, const Spec *s, uint32_t id) {
+    uint64_t storage = (*at + 0xFFFF) & ~0xFFFFull;
+    tex_t *t = malloc(sizeof *t);   // the texture outlives the case: the registry keeps looking at it
+    CHECK(t);
+    *t = tex_of(storage, s);
+    *at = storage + t->L.size + 0x10000;
+    write_storage(t, storage);
+    dpool_ref pool = k_pool;
+    bindless_texture_register(&pool, (int)id, t, NULL);
+    bind_once(id);
+    VkbImage *img = vkb_image_demand(t);
+    CHECK(img);
+    return img;
+}
+
+static void case_views(void) {
+    setup(64 * MiB, 1024 * MiB);
+    uint64_t at = g_heap + 4 * MiB;
+    const VkImageUsageFlags color = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, store = VK_IMAGE_USAGE_STORAGE_BIT;
+    // a volume of 8 slices
+    Spec vol = {NVN_TEXTURE_TARGET_3D, NVN_FORMAT_RGBA8, 0, 32, 32, 8, 1, 0};
+    VkbImage *v = image_for(&at, &vol, 1);
+    VkbShape sh;
+    vkb_image_shape(v, &sh);
+    CHECK(sh.type == VK_IMAGE_TYPE_3D && sh.depth == 8 && sh.layers == 1);
+    CHECK(sh.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT);
+    CHECK(!!(sh.flags & VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT) == !!gpu_vk.image_2d_view_of_3d);
+    CHECK(sh.usage & color);
+    make_view(v, VKV_PICK, 0, 0, 1, color, "volume, first slice as a render target");
+    make_view(v, VKV_PICK, 0, 7, 1, color, "volume, last slice as a render target");
+    make_view(v, VKV_PICK, 0, 2, 4, color, "volume, slices 2..5 as a layered render target");
+    if (gpu_vk.image_2d_view_of_3d) make_view(v, VKV_PICK, 0, 7, 1, store, "volume, last slice as a storage image");
+    else printf("volume, a slice as a storage image: skipped, the device lacks image2DViewOf3D\n");
+    make_view(v, BV_3D, 0, 0, 1, store, "volume as a 3D storage image");
+    // a layer past the volume is the plan's refusal, so no call carries it
+    VkvImage vim = {sh.type, sh.depth, sh.layers, sh.levels, sh.flags, sh.usage, gpu_vk.image_2d_view_of_3d};
+    VkvWant past = {VKV_PICK, 0, 8, 1, color};
+    VkvPlan plan;
+    const char *why;
+    CHECK(!vkv_plan(&vim, &past, &plan, &why));
+    printf("volume, slice 8 of 8: refused (%s)\n", why);
+    // a texture of four layers, and a plain one
+    Spec arr = {NVN_TEXTURE_TARGET_2D_ARRAY, NVN_FORMAT_RGBA8, 0, 32, 32, 4, 1, 0};
+    VkbImage *a = image_for(&at, &arr, 2);
+    make_view(a, VKV_PICK, 0, 3, 1, color, "four layers, last layer as a render target");
+    make_view(a, VKV_PICK, 0, 0, 4, color, "four layers as a layered render target");
+    Spec flat = {NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8, 0, 32, 32, 1, 1, 0};
+    VkbImage *f = image_for(&at, &flat, 3);
+    make_view(f, VKV_PICK, 0, 0, 1, color, "plain 2D texture as a render target");
+    vkb_image_shape(f, &sh);
+    VkvImage fim = {sh.type, sh.depth, sh.layers, sh.levels, sh.flags, sh.usage, gpu_vk.image_2d_view_of_3d};
+    VkvWant one_past = {VKV_PICK, 0, 1, 1, color};
+    CHECK(!vkv_plan(&fim, &one_past, &plan, &why));
+    printf("plain 2D texture, layer 1 of 1: refused (%s)\n", why);
+    finish("views");
+}
+
 static void case_stop(int depth) {
     setup(64 * MiB, 1024 * MiB);
     Spec s = {NVN_TEXTURE_TARGET_2D, NVN_FORMAT_DEPTH24_STENCIL8, 0, 64, 64, 1, 1, 0};
@@ -966,6 +1052,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "ring_full")) ring_run(6, 1);
     else if (!strcmp(argv[1], "astc")) case_astc();
     else if (!strcmp(argv[1], "rawview")) case_rawview();
+    else if (!strcmp(argv[1], "views")) case_views();
     else if (!strcmp(argv[1], "depth_stop")) case_stop(1);
     else {
         fprintf(stderr, "unknown case %s\n", argv[1]);

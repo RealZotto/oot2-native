@@ -20,6 +20,7 @@
 #include "oot2/vk_format.h"
 #include "oot2/vk_image.h"
 #include "oot2/vk_texture.h"
+#include "oot2/vk_view_plan.h"
 #include "kernel_lock.h"
 #include "plat.h"
 
@@ -184,6 +185,10 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
     if (!(row->flags & (VKF_DEPTH | VKF_STENCIL))) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     const int compressed = vkf_class(fmt) >= 2001 && vkf_class(fmt) < 4000;   // the BC and ASTC families
     const int decoded = vkf_decoded(row, fmt);   // an ASTC texture the device does not sample: its image holds RGBA8 texels
+    // A volume a pass renders into slice by slice or a program stores into as 2D slices: the flags that make those views
+    // exist (oot2/vk_view_plan.h). Depth, block-compressed and decoded images are never such targets.
+    if (!(row->flags & (VKF_DEPTH | VKF_STENCIL)) && !compressed && !decoded)
+        flags |= vkv_image_flags(sh->type, gpu_vk.image_2d_view_of_3d);
     int raw_storage = 0;
     if (compressed && (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
         flags |= RAW_VIEW_FLAGS;
@@ -200,6 +205,16 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
         }
         if (flags & RAW_VIEW_FLAGS) {   // a device that takes no raw views of this image still takes the image
             flags &= ~(VkImageCreateFlags)RAW_VIEW_FLAGS;
+            continue;
+        }
+        // a device that takes the volume's view flags in no combination with this usage still takes the volume, then the
+        // view the plan refuses is a stop by name where it is asked for
+        if (flags & VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT) {
+            flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
+            continue;
+        }
+        if (flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT) {
+            flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
             continue;
         }
         if (arena) break;
@@ -374,7 +389,7 @@ int vkb_image_placed(const VkbImage *i) { return i->placed; }
 
 void vkb_image_shape(const VkbImage *i, VkbShape *out) {
     *out = (VkbShape){(VkImageType)i->key.type, i->key.w, i->key.h, i->key.d, i->key.layers, i->key.levels,
-                      i->key.samples, i->aspect, i->all_aspects, i->format};
+                      i->key.samples, i->aspect, i->all_aspects, i->format, i->flags, i->usage};
 }
 
 void vkb_image_use(VkbImage *i, uint64_t value) {
@@ -651,9 +666,9 @@ VkImageView vkb_storage_view(const tex_t *t, const view_t *v, int type, uint64_t
         rt_fatal("gfx: vulkan: %s over the texture at %#llx (NVN format %#x) reaches an image of ASTC blocks decoded to RGBA8: "
                  "a program would store texels where it expects the game's blocks, which this layer does not serve yet",
                  refused, (ull)img->key.storage, nvn_format);
-    if (!(img->usage & VK_IMAGE_USAGE_STORAGE_BIT) || !view_ok(img, type))
+    if (!(img->usage & VK_IMAGE_USAGE_STORAGE_BIT))
         rt_fatal("gfx: vulkan: a storage image over the texture at %#llx (NVN format %#x, view type %d): its image was made "
-                 "without storage usage or cannot be seen as that type", (ull)img->key.storage, nvn_format, type);
+                 "without storage usage", (ull)img->key.storage, nvn_format, type);
     const VkfRow *row = vkf_row(nvn_format);
     uint8_t swz[4];
     const char *why;
@@ -669,15 +684,22 @@ VkImageView vkb_storage_view(const tex_t *t, const view_t *v, int type, uint64_t
     uint32_t layers = v && v->set_layers && v->nlayers ? v->nlayers : img->key.layers - base_layer;
     if (type == BV_1D || type == BV_2D || type == BV_3D) layers = 1;
     else if (type == BV_CUBE) layers = 6;
-    if (img->key.type == VK_IMAGE_TYPE_3D) base_layer = 0, layers = 1;
-    if (level >= img->key.levels || base_layer + layers > img->key.layers)
-        rt_fatal("gfx: vulkan: a storage image over the texture at %#llx asks level %u and layers %u..%u of an image of %u "
-                 "levels and %u layers", (ull)img->key.storage, level, base_layer, base_layer + layers, img->key.levels,
-                 img->key.layers);
+    // the view the image gives for what the program stores to (a 3D image: the volume as 3D, a slice as 2D where the device
+    // allows it); a refusal stops by name, never a view the specification forbids
+    VkvPlan plan;
+    const char *refusal;
+    VkvImage vi = {img->key.type, img->key.d, img->key.layers, img->key.levels, img->flags, img->usage,
+                   gpu_vk.image_2d_view_of_3d};
+    VkvWant want = {type, level, base_layer, layers, VK_IMAGE_USAGE_STORAGE_BIT};
+    if (!vkv_plan(&vi, &want, &plan, &refusal))
+        rt_fatal("gfx: vulkan: a storage image over the texture at %#llx (view type %d, level %u, layers %u..%u) cannot be "
+                 "made: %s (the image has %u levels, %u layers and a depth of %u)", (ull)img->key.storage, type, level,
+                 base_layer, base_layer + layers, refusal, img->key.levels, img->key.layers, img->key.d);
+    base_layer = plan.base_layer, layers = plan.layers;
     VkImageViewUsageCreateInfo uc = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
                                      .usage = VK_IMAGE_USAGE_STORAGE_BIT};
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = &uc, .image = img->image,
-                                .viewType = (VkImageViewType)type, .format = vf,
+                                .viewType = plan.type, .format = vf,
                                 .subresourceRange = {img->aspect, level, 1, base_layer, layers}};
     VkImageView view;
     GPU_VK_OK(vkCreateImageView(gpu_vk.device, &ci, NULL, &view), "vkCreateImageView (a storage view)");
