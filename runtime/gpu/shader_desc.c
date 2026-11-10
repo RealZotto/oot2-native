@@ -251,6 +251,17 @@ static int raw_member(J *j, const char *key, void *c) {
     return jskip(j, 2);
 }
 
+static int mesh_stage_member(J *j, const char *key, void *c) {
+    Ctx *x = c;
+    long long v;
+    if (!strcmp(key, "payload_bytes")) {
+        if (!jint(j, &v)) return 0;
+        x->d->mesh_payload_bytes = (uint32_t)(v < 0 ? 0 : v > 0x7fffffff ? 0x7fffffff : v);
+        return 1;
+    }
+    return jskip(j, 2);
+}
+
 static int top_member(J *j, const char *key, void *c) {
     Ctx *x = c;
     long long v;
@@ -266,6 +277,11 @@ static int top_member(J *j, const char *key, void *c) {
     if (!strcmp(key, "layout")) return jobject(j, layout_member, x, 1);
     if (!strcmp(key, "interface")) return jobject(j, iface_member, x, 1);
     if (!strcmp(key, "raw_access")) return jobject(j, raw_member, x, 1);
+    if (!strcmp(key, "mesh_stage")) {
+        ws(j);
+        if (jword(j, "null")) return 1;   // a stage that is not a task or mesh stage
+        return jobject(j, mesh_stage_member, x, 1);
+    }
     return jskip(j, 1);
 }
 

@@ -67,12 +67,16 @@ typedef struct SpvMeshOutput {
 // block after OpSetMeshOutputsEXT keeps it, now behind the new blocks. When max_bytes or max_components is not 0 the
 // padded module's mesh output use, by Vulkan's formula (every output location is four scalars of four bytes for the
 // vertex or primitive count rounded up to 32, the position built-in one such location), is held to it, as the translator
-// holds a program to the device's limits: past one the module is refused. Returns a malloc'd module of *out_words words,
-// or NULL with the reason in why (not SPIR-V 1.4 or later, not exactly one MeshEXT entry point, no OpSetMeshOutputsEXT
-// or more than one, a mode (LocalSize, OutputVertices, OutputPrimitivesEXT) missing, an unpaddable shape, a limit passed,
-// out of memory).
+// holds a program to the device's limits: past one the module is refused. max_payload_and_output (the device's
+// maxMeshPayloadAndOutputMemorySize, 0 for none) holds the output memory and payload_bytes, the task payload the stage
+// reads (its description's payload_bytes, 0 for a stage without a task), to their sum. Returns a malloc'd module of
+// *out_words words, or NULL with the reason in why (not SPIR-V 1.4 or later, not exactly one MeshEXT entry point, no
+// OpSetMeshOutputsEXT or more than one, a mode (LocalSize, OutputVertices, OutputPrimitivesEXT) missing, an unpaddable
+// shape, a limit passed, too few threads for the counts (a chunk offset for each share of the elements, more than the
+// rewrite holds: named by the threads and the counts), out of memory).
 uint32_t *spv_add_mesh_outputs(const uint32_t *words, size_t nwords, const SpvMeshOutput *add, uint32_t nadd,
-                               uint32_t max_bytes, uint32_t max_components, size_t *out_words, char *why, size_t cap);
+                               uint32_t max_bytes, uint32_t max_components, uint32_t max_payload_and_output,
+                               uint32_t payload_bytes, size_t *out_words, char *why, size_t cap);
 
 // The module with every Workgroup variable that has no initializer given the null value of its type. A translated
 // compute module can read workgroup words it never wrote (the title movie's last pass does: with those words zero its

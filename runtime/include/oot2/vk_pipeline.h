@@ -40,6 +40,7 @@
 #include "oot2/nvn_program.h"
 #include "oot2/shader_cache.h"
 #include "oot2/shader_desc.h"
+#include "oot2/spirv.h"
 #include "oot2/vk_required.h"
 
 // ---- the layout's tables (no device needed)
@@ -162,6 +163,14 @@ VkPipeline vkp_compute(const VkpStage *cs);
 // What the miss path (oot2/vk_miss.h) needs of the builder. The same key text vkp_graphics keeps its object under.
 void vkp_graphics_key(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
                       char *out, size_t cap);
+// The key a mesh stage's pre-rasterization library is kept under (the task stage, when there is one, the mesh stage, each
+// with its answers, and the pad set the pixel stage needs: shd_mesh_link's runs, each with its rate), the one build_link
+// uses. Two pad sets give two keys, one set gives one whatever the pixel stage, and a run read per primitive differs from
+// the same words read per vertex; without the pad set in it two pixel stages would share a library padded for one of them.
+void vkp_mesh_library_key(const VkpStage *task, const VkpStage *mesh, const ShdPad *pad, int npad, char *out, size_t cap);
+// The runs of a pad set as spv_add_mesh_outputs takes them (what build_mesh_library hands the rewrite): the same location,
+// component, count and type, and the rate of the pixel input that reads each. Fills out[0..npad) and returns npad.
+uint32_t vkp_mesh_pad_outputs(const ShdPad *pad, int npad, SpvMeshOutput *out);
 // The pipeline when it exists already, else VK_NULL_HANDLE (nothing is created, also not while another thread makes it).
 VkPipeline vkp_find_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats);
 VkPipeline vkp_find_compute(const VkpStage *cs);

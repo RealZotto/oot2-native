@@ -313,6 +313,7 @@ typedef struct MeshGen {    // the declarations and code a padded module gets, w
     PtrType ptr[MAX_TYPES];    // Output pointer types
     ConstId consts[MAX_CONSTS];
     int bad;                // a table was full
+    int bad_const;          // the table of constants was: a chunk offset for each share of the elements the threads take
 } MeshGen;
 
 static uint32_t gen_scalar(MeshGen *g, uint32_t t) {
@@ -346,7 +347,7 @@ static uint32_t gen_output_pointer(MeshGen *g, uint32_t pointee) {
 static uint32_t gen_u32(MeshGen *g, uint32_t value) {
     for (uint32_t c = 0; c < g->nconst; c++)
         if (g->consts[c].value == value) return g->consts[c].id;
-    if (g->nconst == MAX_CONSTS) return g->bad = 1, 0;
+    if (g->nconst == MAX_CONSTS) return g->bad = g->bad_const = 1, 0;
     g->consts[g->nconst] = (ConstId){value, g->next++};
     inst(&g->types, OP_CONSTANT, (uint32_t[]){gen_scalar(g, SPV_PAD_UINT), g->consts[g->nconst].id, value}, 3);
     return g->consts[g->nconst++].id;
@@ -366,7 +367,8 @@ static int mesh_slot(const MeshId *id) {
 typedef struct MeshPad { uint32_t var, element_pointer, value, rate; } MeshPad;
 
 uint32_t *spv_add_mesh_outputs(const uint32_t *w, size_t n, const SpvMeshOutput *add, uint32_t nadd, uint32_t max_bytes,
-                               uint32_t max_components, size_t *out_words, char *why, size_t cap) {
+                               uint32_t max_components, uint32_t max_payload_and_output, uint32_t payload_bytes,
+                               size_t *out_words, char *why, size_t cap) {
     uint32_t *o = NULL;
     MeshGen *g = calloc(1, sizeof *g);
     MeshId *ids = NULL;
@@ -461,7 +463,7 @@ uint32_t *spv_add_mesh_outputs(const uint32_t *w, size_t n, const SpvMeshOutput 
         if ((rates & 1) && !vertices) FAIL("the module gives no OutputVertices");
         if ((rates & 2) && !primitives) FAIL("the module gives no OutputPrimitivesEXT");
     }
-    if (nadd && (max_bytes || max_components)) {
+    if (nadd && (max_bytes || max_components || max_payload_and_output)) {
         for (uint32_t k = 0; k < nadd; k++) {
             uint32_t r = add[k].per_primitive;
             if (!seen[r][add[k].location]) seen[r][add[k].location] = 1, slots[r]++;
@@ -476,6 +478,10 @@ uint32_t *spv_add_mesh_outputs(const uint32_t *w, size_t n, const SpvMeshOutput 
         if (max_components && comps > max_components)
             FAIL("padded, the stage would have %u mesh output components (%u vertex and %u primitive output locations), "
                  "and the device allows %u", comps, slots[0], slots[1], max_components);
+        if (max_payload_and_output && bytes + payload_bytes > max_payload_and_output)
+            FAIL("maxMeshPayloadAndOutputMemorySize: padded, the stage would take %llu bytes of mesh output memory and "
+                 "%u of task payload, %llu together, and the device allows %u", bytes, payload_bytes,
+                 bytes + payload_bytes, max_payload_and_output);
     }
 
     // ---- the declarations, their decorations and the stores
@@ -550,6 +556,10 @@ uint32_t *spv_add_mesh_outputs(const uint32_t *w, size_t n, const SpvMeshOutput 
         }
     }
     interface_extra = nadd + added_lii;
+    if (g->bad_const)
+        FAIL("the stage has %u threads for %u vertices and %u primitives: padding it takes a chunk offset for each of its "
+             "threads' shares of them, more than the %d constants the rewrite holds", threads, vertices, primitives,
+             MAX_CONSTS);
     if (g->types.bad || g->decs.bad || g->code.bad || g->bad || ep_len + interface_extra > 0xffff)
         FAIL("out of memory, a table of types or constants full, or an entry point too long to extend");
 

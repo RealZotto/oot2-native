@@ -382,6 +382,26 @@ typedef struct MeshCtx {
 
 static VkPipeline create_graphics(VkGraphicsPipelineCreateInfo ci, int kind, int flags, const char *what);
 
+// The key a mesh stage's pre-rasterization library is kept under: the task stage and the mesh stage with their answers,
+// and the pad set (shd_pad_text: each run's location, component, count, type and, read per primitive, its rate), so that
+// two pixel stages that need different padding of one mesh stage get two libraries and two that need the same share one.
+void vkp_mesh_library_key(const VkpStage *task, const VkpStage *mesh, const ShdPad *pad, int npad, char *out, size_t cap) {
+    char md[66], td[66], pads[MAX_PADS * 16 + 8];
+    shd_pad_text(pad, npad, pads, sizeof pads);
+    cache_digest_text(mesh, md, sizeof md);
+    if (task) {
+        cache_digest_text(task, td, sizeof td);
+        snprintf(out, cap, "m|t:%s%s|m:%s%s|%s", task->key, td, mesh->key, md, pads);
+    } else snprintf(out, cap, "m|m:%s%s|%s", mesh->key, md, pads);
+}
+
+// The runs of a pad set as the rewrite takes them, each with the rate of the pixel input that reads it.
+uint32_t vkp_mesh_pad_outputs(const ShdPad *pad, int npad, SpvMeshOutput *out) {
+    for (int i = 0; i < npad; i++)
+        out[i] = (SpvMeshOutput){pad[i].location, pad[i].component, pad[i].components, pad[i].type, pad[i].per_primitive};
+    return (uint32_t)npad;
+}
+
 static VkPipeline build_mesh_library(void *c) {
     MeshCtx *x = c;
     require_idle("a mesh pre-rasterization library would be created", x->mesh->key, x->late);
@@ -397,14 +417,15 @@ static VkPipeline build_mesh_library(void *c) {
     if (x->npad) {
         // The mesh stage writes less than its pixel stage reads: it gets the missing words as outputs of the value the
         // console's next stage reads from an unwritten one, (0, 0, 0, 1), as a vertex stage does. The device's mesh
-        // output limits hold the padded stage to what the translator held the program to.
+        // output limits hold the padded stage to what the translator held the program to: the output memory, the output
+        // components, and the task payload and the output memory together (the stage's payload as its description says).
         SpvMeshOutput add[MAX_PADS];
-        for (int i = 0; i < x->npad; i++)
-            add[i] = (SpvMeshOutput){x->pad[i].location, x->pad[i].component, x->pad[i].components, x->pad[i].type,
-                                     x->pad[i].per_primitive};
+        uint32_t nadd = vkp_mesh_pad_outputs(x->pad, x->npad, add);
         char why[256], shape[256], ranges[MAX_PADS * 16 + 8];
-        padded = spv_add_mesh_outputs(code, words, add, (uint32_t)x->npad, gpu_vk.facts.mesh_props.maxMeshOutputMemorySize,
-                                      gpu_vk.facts.mesh_props.maxMeshOutputComponents, &words, why, sizeof why);
+        padded = spv_add_mesh_outputs(code, words, add, nadd, gpu_vk.facts.mesh_props.maxMeshOutputMemorySize,
+                                      gpu_vk.facts.mesh_props.maxMeshOutputComponents,
+                                      gpu_vk.facts.mesh_props.maxMeshPayloadAndOutputMemorySize,
+                                      x->mesh_module->desc.mesh_payload_bytes, &words, why, sizeof why);
         if (!padded) {
             shape_text(x->mesh, shape, sizeof shape);
             shd_pad_text(x->pad, x->npad, ranges, sizeof ranges);
@@ -572,7 +593,7 @@ static VkPipeline build_link(void *c) {
         if (x->task) vkp_module(x->task, SHD_TS, &tm);
         vkp_module(x->vs, SHD_MS, &mm);
         vkp_module(x->ps, SHD_PS, &pm);
-        char why[256], md[66], td[66], pd[66], ft[96], pads[MAX_PADS * 16 + 8];
+        char why[256], pd[66], ft[96];
         MeshCtx mx = {.task = x->task, .mesh = x->vs, .task_module = x->task ? &tm : NULL, .mesh_module = &mm,
                       .late = x->late};
         mx.npad = shd_mesh_link(&mm.desc, &pm.desc, mx.pad, MAX_PADS, why, sizeof why);
@@ -581,12 +602,7 @@ static VkPipeline build_link(void *c) {
         // What the pixel stage reads and the mesh stage does not write is added to the mesh stage as outputs, as a vertex
         // stage is padded, and the library is keyed by the pad set. vkp_unpad is the tests' counter-run of the rule.
         if (vkp_unpad) mx.npad = 0;
-        shd_pad_text(mx.pad, mx.npad, pads, sizeof pads);
-        cache_digest_text(x->vs, md, sizeof md);
-        if (x->task) {
-            cache_digest_text(x->task, td, sizeof td);
-            snprintf(x->vkey, sizeof x->vkey, "m|t:%s%s|m:%s%s|%s", x->task->key, td, x->vs->key, md, pads);
-        } else snprintf(x->vkey, sizeof x->vkey, "m|m:%s%s|%s", x->vs->key, md, pads);
+        vkp_mesh_library_key(x->task, x->vs, mx.pad, mx.npad, x->vkey, sizeof x->vkey);
         cache_digest_text(x->ps, pd, sizeof pd);
         snprintf(x->pkey, sizeof x->pkey, "f|%s%s", x->ps->key, pd);
         formats_text(x->formats, ft, sizeof ft);

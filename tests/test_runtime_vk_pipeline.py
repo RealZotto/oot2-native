@@ -613,9 +613,9 @@ class MeshLinkTest(unittest.TestCase):
                          "missing 6 1:3:1:0;2:3:1:0;3:1:3:0;4:3:1:0;5:2:2:0;13:2:2:0;")
 
     def test_the_ten_ranges_of_the_widest_stop_are_listed(self) -> None:
-        outs = [mesh_out(loc, c) for loc, c in SpirvTest.R5_WRITTEN]
-        ins = [pixel_in(loc) for loc in sorted({loc for loc, _ in SpirvTest.R5_WRITTEN})]
-        text = "".join(f"{part};" for part in SpirvTest.R5_PADS.split(","))
+        outs = [mesh_out(loc, c) for loc, c in SpirvTest.WIDE_WRITTEN]
+        ins = [pixel_in(loc) for loc in sorted({loc for loc, _ in SpirvTest.WIDE_WRITTEN})]
+        text = "".join(f"{part};" for part in SpirvTest.WIDE_PADS.split(","))
         self.assertEqual(self.link(outs, ins), f"missing 10 {text}")
 
     def test_a_location_the_mesh_stage_writes_nothing_of_is_one_run_of_its_words(self) -> None:
@@ -1032,12 +1032,12 @@ class SpirvTest(unittest.TestCase):
 
     # ---- outputs added to a mesh module (oot2/spirv.h, spv_add_mesh_outputs)
 
-    # The pad set of a mesh stage shaped like the game's: 10 runs, in the shapes the r5 stops list (n:3:1, n:1:3), over a module
-    # whose outputs are the other words of those locations.
-    R5_WRITTEN = ((0, 0), (1, 0), (2, 0), (3, 0), (3, 1), (3, 2), (3, 3), (4, 0), (4, 1), (4, 2), (5, 0), (5, 1), (5, 2), (6, 0),
+    # The pad set of a mesh stage shaped like the game's: 10 runs, in the shapes of the widest gaps measured in the game's
+    # archives (n:3:1, n:1:3), over a module whose outputs are the other words of those locations.
+    WIDE_WRITTEN = ((0, 0), (1, 0), (2, 0), (3, 0), (3, 1), (3, 2), (3, 3), (4, 0), (4, 1), (4, 2), (5, 0), (5, 1), (5, 2), (6, 0),
                   (7, 0), (7, 1), (7, 2), (8, 0), (8, 1), (8, 2), (9, 0), (9, 1), (9, 2), (9, 3), (11, 0), (11, 1), (11, 2),
                   (12, 0), (12, 1), (12, 2))
-    R5_PADS = "0:1:3:0,1:1:3:0,2:1:3:0,4:3:1:0,5:3:1:0,6:1:3:0,7:3:1:0,8:3:1:0,11:3:1:0,12:3:1:0"
+    WIDE_PADS = "0:1:3:0,1:1:3:0,2:1:3:0,4:3:1:0,5:3:1:0,6:1:3:0,7:3:1:0,8:3:1:0,11:3:1:0,12:3:1:0"
 
     def mesh_padded(self, spec: str, mod: bytes, *limits: int) -> MeshModule:
         done = run("spvmeshpad", self.write("min.spv", mod), str(self.dir / "mout.spv"), spec, *map(str, limits))
@@ -1130,11 +1130,11 @@ class SpirvTest(unittest.TestCase):
             self.assertIn(5271, after.decor[var])
 
     def test_the_shapes_of_the_widest_stops_pad_and_pass_the_validator(self) -> None:
-        mod = self.module_around(self.R5_PADS, vertices=96, primitives=64)
-        after = self.check_pads(self.R5_PADS, mod, vertices=96, primitives=64)
+        mod = self.module_around(self.WIDE_PADS, vertices=96, primitives=64)
+        after = self.check_pads(self.WIDE_PADS, mod, vertices=96, primitives=64)
         self.assertEqual(len(after.interface) - len(MeshModule(mod).interface), 11)   # ten runs and the invocation index
         val = self.spirv_val()
-        for spec in (self.R5_PADS, "1:3:1:0,2:3:1:0,3:1:3:0,4:3:1:0,5:2:2:0,13:2:2:0", "0:0:4:2,1:0:2:1,2:1:1:2",
+        for spec in (self.WIDE_PADS, "1:3:1:0,2:3:1:0,3:1:3:0,4:3:1:0,5:2:2:0,13:2:2:0", "0:0:4:2,1:0:2:1,2:1:1:2",
                      "5:2:2:0:p,6:3:1:0:p,7:0:4:0,8:1:3:0"):
             self.mesh_padded(spec, self.module_around(spec))
             done = subprocess.run([val, "--target-env", "vulkan1.3", str(self.dir / "mout.spv")], capture_output=True, text=True)
@@ -1212,6 +1212,39 @@ class SpirvTest(unittest.TestCase):
         # a per-primitive pad is counted at the primitive count, apart from the vertex outputs
         self.assertIn("bytes of mesh output memory", self.mesh_refused("10:0:4:0:p", mod, 28160, 0))
         self.mesh_padded("10:0:4:0:p", mod, 28160 + 16 * 128, 0)
+
+    def test_the_task_payload_and_the_output_memory_together_hold_the_padded_module(self) -> None:
+        # maxMeshPayloadAndOutputMemorySize, as the translator checks it (MeshChecks.Enforce): the payload the stage reads plus
+        # its output memory. Ten locations of three words and the position are 28,160 bytes at 160 vertices; padding one more
+        # location makes 12 slots, 30,720.
+        mod = mesh_module(outputs=tuple((loc, c) for loc in range(10) for c in range(3)), vertices=160)
+        limit = 48128                                                        # the reference device's
+        self.mesh_padded("10:0:4:0", mod, 32768, 128, limit, 16384)          # 30,720 + 16,384 = 47,104
+        self.mesh_padded("10:0:4:0", mod, 32768, 128, limit, limit - 30720)  # exactly the limit
+        said = self.mesh_refused("10:0:4:0", mod, 32768, 128, limit, limit - 30720 + 1)
+        for needle in ("maxMeshPayloadAndOutputMemorySize", "30720 bytes of mesh output memory", "17409 of task payload",
+                       "48129 together", "allows 48128"):
+            self.assertIn(needle, said)
+        self.mesh_padded("10:0:4:0", mod, 32768, 128, 0, 1 << 20)            # no limit given: none held
+        # a word of a location the module has takes no new slot, and the sum is still held
+        self.mesh_padded("1:3:1:0", mod, 32768, 128, limit, 16384)
+        self.assertIn("maxMeshPayloadAndOutputMemorySize", self.mesh_refused("1:3:1:0", mod, 32768, 128, 40000, 16384))
+        # the output memory limit is the one named when both are past
+        self.assertIn("32768", self.mesh_refused("10:0:4:0,11:0:4:0,12:0:4:0", mod, 32768, 0, limit, 16384))
+
+    def test_a_stage_with_too_few_threads_for_its_outputs_is_refused_by_the_cause(self) -> None:
+        # Each thread stores to its share of an array, one chunk offset for every `threads` elements, and the rewrite holds
+        # 64 constants: 160 vertices on 2 threads is 79 offsets, on 32 threads 4.
+        spec = "10:0:4:0"
+        self.mesh_padded(spec, mesh_module(threads=32, vertices=160))
+        self.mesh_padded(spec, mesh_module(threads=3, vertices=160))            # 53 offsets: still fits
+        for threads in (2, 1):
+            said = self.mesh_refused(spec, mesh_module(threads=threads, vertices=160))
+            for needle in (f"{threads} threads", "160 vertices", "chunk offset", "64 constants"):
+                self.assertIn(needle, said)
+            self.assertNotIn("out of memory", said)
+        said = self.mesh_refused("10:0:4:0:p", mesh_module(threads=1, vertices=8, primitives=128))   # per primitive: 127
+        self.assertIn("1 threads for 8 vertices and 128 primitives", said)
 
     # ---- workgroup memory zeroed (oot2/spirv.h, spv_zero_workgroup)
 
@@ -1535,6 +1568,71 @@ class NoDeviceBuilderTest(unittest.TestCase):
         done = run("devbinds", str(self.pack), "ps.bind", "64")
         self.assertEqual(done.returncode, 0, f"exit {done.returncode}\n{done.stdout}{done.stderr}")
         self.assertEqual(done.stdout.strip(), "binds 64 distinct 64 stable 64 kind ps")
+
+    def mesh_pairs(self, pixel_inputs: dict[str, list[dict]]) -> dict[str, dict[str, str]]:
+        """One mesh stage (it writes words 0 and 1 of location 1 and all of location 2) linked to each pixel stage: what the
+        builder makes of the pair up to its mesh library's key, as a record of the pad text, the key without and with a task
+        stage and the runs handed to the rewrite, by the pixel stage's name."""
+        mod = vertex_module()
+        outs = [mesh_out(1, 0), mesh_out(1, 1)] + [mesh_out(2, c) for c in range(4)]
+        (self.dir / "mk.json").write_bytes(describe("mk.1", "ms", mod, outputs=outs))
+        for name, ins in pixel_inputs.items():
+            (self.dir / f"pk-{name}.json").write_bytes(describe(f"pk.{name}", "ps", mod, inputs=ins))
+        names = list(pixel_inputs)
+        done = run("meshlibkey", str(self.dir / "mk.json"), *(str(self.dir / f"pk-{n}.json") for n in names))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        lines = done.stdout.splitlines()
+        self.assertEqual(len(lines), 4 * len(names), done.stdout)
+        records = {}
+        for i, name in enumerate(names):
+            pad, key, task_key, rest = lines[4 * i:4 * i + 4]
+            self.assertEqual((pad[:4], key[:4], task_key[:9], rest[:4]), ("pad ", "key ", "task-key ", "outs"), done.stdout)
+            records[name] = {"pad": pad[4:], "key": key[4:], "task_key": task_key[9:], "outs": rest[4:].split()}
+        return records
+
+    def test_the_mesh_library_key_holds_the_pad_set_and_its_rates(self) -> None:
+        # Without the pad set in the key, two pixel stages that need different padding of one mesh stage share the library
+        # made for the first, and the second pair is linked to a mesh stage that lacks (or has the wrong rate of) its words.
+        r = self.mesh_pairs({
+            "a": [pixel_in(1)],                                            # words 2 and 3 of location 1
+            "same": [pixel_in(1), pixel_in(2)],                            # another pixel stage with the same gap
+            "more": [pixel_in(1), pixel_in(5, 2)],                         # one more run
+            "vertex": [pixel_in(1), pixel_in(5)],                          # location 5, written by nothing, read per vertex
+            "primitive": [pixel_in(1), pixel_in(5, per_primitive=True)],   # the same words, read per primitive
+            "none": [pixel_in(2)],                                         # nothing missing
+        })
+        self.assertEqual(r["a"]["pad"], "1:2:2:0;")
+        self.assertEqual(r["same"]["pad"], r["a"]["pad"])
+        self.assertEqual(r["more"]["pad"], "1:2:2:0;5:0:2:0;")
+        self.assertEqual(r["vertex"]["pad"], "1:2:2:0;5:0:4:0;")
+        self.assertEqual(r["primitive"]["pad"], "1:2:2:0;5:0:4:0:p;")
+        self.assertEqual(r["none"]["pad"], "")
+        # equal pad sets, equal keys, whatever the pixel stage; different sets, different keys
+        self.assertEqual(r["same"]["key"], r["a"]["key"])
+        self.assertEqual(r["same"]["task_key"], r["a"]["task_key"])
+        for kind in ("key", "task_key"):
+            keys = [r[n][kind] for n in ("a", "more", "vertex", "primitive", "none")]
+            self.assertEqual(len(set(keys)), len(keys), keys)
+        # the key names the mesh stage, and the task stage when there is one
+        self.assertTrue(r["a"]["key"].startswith("m|m:6100000000000003.00000000|"), r["a"]["key"])
+        self.assertTrue(r["a"]["task_key"].startswith("m|t:6100000000000002.00000000|m:6100000000000003.00000000|"))
+        # the runs the rewrite is handed are the pad set's, each with the rate of the pixel input that reads it
+        self.assertEqual(r["a"]["outs"], ["1:2:2:0:0"])
+        self.assertEqual(r["vertex"]["outs"], ["1:2:2:0:0", "5:0:4:0:0"])
+        self.assertEqual(r["primitive"]["outs"], ["1:2:2:0:0", "5:0:4:0:1"])
+        self.assertEqual(r["none"]["outs"], [])
+
+    def test_a_mesh_stages_task_payload_is_read_from_its_description(self) -> None:
+        mod = vertex_module()
+        base = json.loads(describe("pl.1", "ms", mod))
+        path = self.dir / "payload.json"
+        for stage, want in (({"payload_bytes": 20480, "threads": 32, "first_task": {"read": True}}, 20480), (None, 0),
+                            ({"threads": 32}, 0)):
+            path.write_text(json.dumps(base | {"mesh_stage": stage}), encoding="utf-8")
+            done = run("meshpayload", str(path))
+            self.assertEqual(done.stdout, f"payload {want}\n", done.stdout + done.stderr)
+        path.write_bytes(describe("pl.1", "ms", mod))   # a description with no such member
+        self.assertEqual(run("meshpayload", str(path)).stdout, "payload 0\n")
 
     def linked(self, kind: str, vkey: str, pkey: str) -> str:
         done = run("linkchoice", str(self.pack), vkey, pkey, kind)

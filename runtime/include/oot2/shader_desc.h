@@ -40,6 +40,7 @@ typedef struct ShaderDesc {
     int fits;              // layout.fits: the module's resources fit the stage's slots of the layout
     int raw_pointers;      // raw_access.physical_pointers
     uint32_t ninputs, noutputs;
+    uint32_t mesh_payload_bytes;   // mesh_stage.payload_bytes: the task payload a mesh stage reads, 0 for any other stage
     ShdIo inputs[SHD_MAX_IO], outputs[SHD_MAX_IO];
 } ShaderDesc;
 

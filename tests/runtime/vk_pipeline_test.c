@@ -11,11 +11,15 @@
 //   pad VS_DESC PS_DESC          the padding a vertex stage needs for a pixel stage
 //   meshlink MS_DESC PS_DESC     the rule a mesh stage is linked to a pixel stage by: the ranges it does not write, or
 //                                the refusal
+//   meshlibkey MS_DESC PS_DESC...   for each pixel stage: the pad set its link to the mesh stage needs, the key of the mesh
+//                                library for it (without and with a task stage) and the runs handed to the rewrite
+//   meshpayload FILE             the task payload bytes a mesh stage's description declares
 //   binds FILE                   a description's bindings parsed (shd_parse_binds), or the refusal
 //   spvdecl MODULE               the capabilities and extensions a module declares
 //   spvpad IN OUT SPEC           a module with outputs added (SPEC "location:component:components:type,...")
-//   spvmeshpad IN OUT SPEC [MAX_BYTES MAX_COMPONENTS]   a mesh module with outputs added and stored (a ":p" after a
-//                                run: read per primitive), held to the device's mesh output limits when they are given
+//   spvmeshpad IN OUT SPEC [MAX_BYTES MAX_COMPONENTS [MAX_PAYLOAD_AND_OUTPUT PAYLOAD_BYTES]]   a mesh module with outputs
+//                                added and stored (a ":p" after a run: read per primitive), held to the device's mesh output
+//                                limits when they are given, the output memory and the task payload together to the last
 //   spvzero IN OUT               a module with its workgroup variables given the null initializer: how many, or why not
 //   capcheck MODULE [storage-image-indexing] [drop CAP]   a module judged against the capabilities of a device that has
 //                                every item (with the optional feature when the argument names it; a capability may be dropped)
@@ -293,7 +297,8 @@ static void case_spvpad(const char *in, const char *out, const char *spec) {
 
 // spvmeshpad IN OUT SPEC [MAX_BYTES MAX_COMPONENTS]: SPEC is "location:component:components:type" for each output, with a
 // fifth ":p" for one read per primitive; the limits are the device's, 0 for none.
-static void case_spvmeshpad(const char *in, const char *out, const char *spec, uint32_t max_bytes, uint32_t max_components) {
+static void case_spvmeshpad(const char *in, const char *out, const char *spec, uint32_t max_bytes, uint32_t max_components,
+                            uint32_t max_payload_and_output, uint32_t payload_bytes) {
     size_t n;
     uint32_t *w = read_all(in, &n);
     SpvMeshOutput add[32];
@@ -310,7 +315,8 @@ static void case_spvmeshpad(const char *in, const char *out, const char *spec, u
     }
     size_t words = 0;
     char why[512];
-    uint32_t *o = spv_add_mesh_outputs(w, n / 4, add, nadd, max_bytes, max_components, &words, why, sizeof why);
+    uint32_t *o = spv_add_mesh_outputs(w, n / 4, add, nadd, max_bytes, max_components,
+                                       max_payload_and_output, payload_bytes, &words, why, sizeof why);
     if (!o) {
         printf("refused: %s\n", why);
         free(w);
@@ -321,6 +327,42 @@ static void case_spvmeshpad(const char *in, const char *out, const char *spec, u
     fclose(f);
     printf("padded %zu words to %zu\n", n / 4, words);
     free(o), free(w);
+}
+
+// meshlibkey MS_DESC PS_DESC...: what build_link makes of each pair, up to the library's key and the rewrite's runs.
+static void case_meshlibkey(const char *ms, int npix, char **pix) {
+    static ShaderDesc m, p;
+    char why[256];
+    CHECK(load_desc(ms, &m, why, sizeof why));
+    nvn_stage ts_shape = {.kind = NVN_STAGE_TS}, ms_shape = {.kind = NVN_STAGE_MS};
+    VkpStage task = {.key = "6100000000000002.00000000", .shape = &ts_shape};
+    VkpStage mesh = {.key = "6100000000000003.00000000", .shape = &ms_shape};
+    for (int i = 0; i < npix; i++) {
+        CHECK(load_desc(pix[i], &p, why, sizeof why));
+        ShdPad pad[16];
+        int n = shd_mesh_link(&m, &p, pad, 16, why, sizeof why);
+        if (n < 0) {
+            printf("refused: %s\n", why);
+            continue;
+        }
+        char text[256], key[512], task_key[512];
+        shd_pad_text(pad, n, text, sizeof text);
+        vkp_mesh_library_key(NULL, &mesh, pad, n, key, sizeof key);
+        vkp_mesh_library_key(&task, &mesh, pad, n, task_key, sizeof task_key);
+        SpvMeshOutput out[16];
+        uint32_t nout = vkp_mesh_pad_outputs(pad, n, out);
+        printf("pad %s\nkey %s\ntask-key %s\nouts", text, key, task_key);
+        for (uint32_t k = 0; k < nout; k++)
+            printf(" %u:%u:%u:%u:%u", out[k].location, out[k].component, out[k].components, out[k].type, out[k].per_primitive);
+        printf("\n");
+    }
+}
+
+static void case_meshpayload(const char *path) {
+    static ShaderDesc d;
+    char why[256];
+    CHECK(load_desc(path, &d, why, sizeof why));
+    printf("payload %u\n", d.mesh_payload_bytes);
 }
 
 static void case_spvzero(const char *in, const char *out) {
@@ -1235,7 +1277,11 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "spvpad") && argc >= 5) case_spvpad(argv[2], argv[3], argv[4]);
     else if (!strcmp(cs, "spvmeshpad") && argc >= 5)
         case_spvmeshpad(argv[2], argv[3], argv[4], argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 10) : 0,
-                        argc >= 7 ? (uint32_t)strtoul(argv[6], NULL, 10) : 0);
+                        argc >= 7 ? (uint32_t)strtoul(argv[6], NULL, 10) : 0,
+                        argc >= 8 ? (uint32_t)strtoul(argv[7], NULL, 10) : 0,
+                        argc >= 9 ? (uint32_t)strtoul(argv[8], NULL, 10) : 0);
+    else if (!strcmp(cs, "meshlibkey") && argc >= 4) case_meshlibkey(argv[2], argc - 3, argv + 3);
+    else if (!strcmp(cs, "meshpayload") && argc >= 3) case_meshpayload(argv[2]);
     else if (!strcmp(cs, "spvzero") && argc >= 4) case_spvzero(argv[2], argv[3]);
     else if (!strcmp(cs, "capcheck") && argc >= 3) case_capcheck(argv[2], argc - 3, argv + 3);
     else if (!strcmp(cs, "optional")) case_optional();
