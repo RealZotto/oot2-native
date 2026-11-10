@@ -31,6 +31,7 @@
 #include "plat.h"
 
 #include "oot2/hid_input.h"
+#include "oot2/hid_replay.h"
 
 typedef struct {
     int64_t sampling;
@@ -165,6 +166,7 @@ static void npad_states(Cpu *c, uint32_t want) {
     if (live) {
         HidHostInput in;
         hid_host_input_read(&in);
+        hid_replay_filter(&in);   // the input file and the recorder, when asked for (oot2/hid_replay.h); else nothing
         s.buttons = in.buttons;
         s.lx = in.lx, s.ly = in.ly, s.rx = in.rx, s.ry = in.ry;
         s.attributes = ATTR_CONNECTED;

@@ -15,6 +15,8 @@
 #include "hos.h"
 #include "plat.h"
 
+#include "oot2/hid_replay.h"
+
 #define MAX_EVENTS 256
 #define SYM_ATTACH_READABLE "_ZN2nn2os33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE"
 
@@ -159,6 +161,7 @@ void hos_init(const char *game_folder, const RtGameFile *files, int file_count) 
     srv_audsmx_register();
     boot_register();
     census_init();
+    hid_replay_start();   // OOT2_INPUT_FILE and OOT2_INPUT_RECORD, off by default
     // Overrides no import or definition named: written for a name this game's SDK does not define (drift by name).
     int unbound = 0;
     for (const char *name; (name = rt_hostfn_unbound(unbound)); unbound++)

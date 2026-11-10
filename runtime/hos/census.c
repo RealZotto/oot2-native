@@ -7,7 +7,8 @@
 //
 // One row per object met, tab separated, after a header line:
 //   kind      svc, service, command, import (a host function the loader bound), nvn (an NVN2 entry point), boot (the
-//             boot driver's host functions), d3 (setjmp and longjmp), memory, stop
+//             boot driver's host functions), d3 (setjmp and longjmp), memory, input (the input file the run replayed:
+//             its name, SHA-256 and what the run took from it), input-record (the file the run recorded), stop
 //   key       "0x1f ConnectToNamedPort", a service name, "sm: tipc 1", a symbol
 //   status    implemented, offline, stub, absent (hos.h), named-fatal (the run stops when it is met)
 //   calls     how many times the run met it
@@ -18,6 +19,7 @@
 
 #include "hos.h"
 #include "oot2/gfx.h"
+#include "oot2/hid_replay.h"
 #include "oot2/nvn_pace.h"
 #include "oot2/runtime.h"
 #include "plat.h"
@@ -109,6 +111,10 @@ static void stat_row(void *f, const char *key, uint64_t count, const char *why) 
     row(f, "nvn-stat", key, "implemented", count, 0, why);
 }
 
+static void input_row(void *f, const char *kind, const char *key, const char *status, uint64_t calls, const char *why) {
+    row(f, kind, key, status, calls, 0, why);
+}
+
 static void write_rows(FILE *f, int code, const char *line) {
     if (rt_census_on()) fprintf(f, "#census-mode OOT2_CENSUS=1: gaps in NVN2 were answered 0 and passed; not a default run\n");
     fprintf(f, "kind\tkey\tstatus\tcalls\tfirst_at\twhy\n");
@@ -153,6 +159,7 @@ static void write_rows(FILE *f, int code, const char *line) {
     // inline begins are the game's own BeginRecording code, which no call counter sees; inline + slow begins equal the
     // EndRecordings with a handle.
     nvn_census_stats(stat_row, f);
+    hid_replay_rows(input_row, f);   // the input file and the recorder, when the run had them
     uint64_t setjmps, longjmps;
     rt_jmp_counts(&setjmps, &longjmps);
     row(f, "d3", "setjmp", "implemented", setjmps, 0, "guest jmp_buf records made (RT_SETJMP)");
@@ -224,9 +231,16 @@ static void census_flush(void) {
     plat_mutex_unlock(&g_files_lock);
 }
 
-void hos_census_write(const char *why) { write_census(0, why); }
+// Both ends of a run close the recorder's last run first, so the report says what it wrote.
+void hos_census_write(const char *why) {
+    hid_replay_finish();
+    write_census(0, why);
+}
 
-static void stop_hook(int code, const char *line) { write_census(code, line); }
+static void stop_hook(int code, const char *line) {
+    hid_replay_finish();
+    write_census(code, line);
+}
 
 void census_init(void) {
     rt_set_stop_hook(stop_hook);
