@@ -102,6 +102,12 @@ typedef struct Backing {
     // (note_resolved), and the count of them. Empty is res_lo == UINT64_MAX with res_hi == 0, which a new backing starts
     // with; the raw path's refusal reads it for mirrors only (the straddle dump prints it for imports).
     uint64_t res_value, res_lo, res_hi, res_n;
+    // An import's: some resolve of submission res_value stated no extent (size 0, which the resolver counts as 1), so the
+    // hull above is not what that submission reached (import_gives).
+    int res_loose;
+    // An import's: the range its host import covers. gpu_lo and gpu_hi shrink when a growth trims it (grow_taken); the
+    // host pages it gave away stay under its buffer until it is freed, and a decommit of one retires it (rescan_cell).
+    uint64_t span_lo, span_hi;
     // Where the backing, or its current range, came from (diag_born): what made it, for which submission, and the range
     // it had before the cut or growth that gave it its present one. Written under the exclusive lock, read by the dump.
     uint64_t born_value, born_lo, born_hi;
@@ -171,6 +177,11 @@ static uint64_t g_raw_last;      // atomic
 static uint64_t g_raw_prev;      // atomic: the raw-access submission that began before the newest one (0: none)
 static uint64_t g_pools_version, g_fill_epoch, g_fill_pools;
 static int g_filled;
+
+// The submission whose bind or begin is making backings now (0: none): fill_pool and rescan_cell take it for the birth
+// record of their imports, and cell_put for what an import takes over from the ones it replaces. g_lock exclusive.
+static uint64_t g_born_value;
+static int g_grow_cap_logged;   // a growth took the mirrors past BACKING_PROMOTE_MIRROR_MAX and said so (once a run)
 
 // The block thread.
 static PlatMutex g_bt_lock = PLAT_MUTEX_INIT;
@@ -732,7 +743,8 @@ static Backing *import_new(uint64_t lo, uint64_t hi, uint64_t probe, const char 
     }
     Backing *b = calloc(1, sizeof *b);
     if (!b) rt_fatal("gfx: vulkan: backing map: out of memory for an import");
-    *b = (Backing){.kind = BACKING_IMPORT, .gpu_lo = lo, .gpu_hi = hi, .mem = m, .res_lo = UINT64_MAX};
+    *b = (Backing){.kind = BACKING_IMPORT, .gpu_lo = lo, .gpu_hi = hi, .mem = m, .res_lo = UINT64_MAX, .span_lo = lo,
+                   .span_hi = hi};
     g_st.imports++, g_st.import_bytes += hi - lo, g_st.imports_made++;
     return b;
 }
@@ -767,12 +779,38 @@ static Backing *cell_import(const Cell *c, uint64_t addr) {
     return a && addr < c->imp[a - 1]->gpu_hi ? c->imp[a - 1] : NULL;
 }
 
+// The import b takes the place of the import o: what the submission being recorded (g_born_value) knows of o goes to b, so
+// that a later growth sees one hull and one write record for the bytes where two backings stood. b takes the newest
+// declared GPU write of o, and the hull of what that submission resolved in o when o holds the hull of that submission
+// and no other (a hull of an older value says nothing about this one). Not taken: the stamp of the last use (b is stamped
+// by the resolve that made it), the hot flag and the birth. g_lock exclusive.
+static void heir_take(Backing *b, const Backing *o) {
+    if (b->kind != BACKING_IMPORT || o->kind != BACKING_IMPORT) return;
+    int carried = 0;
+    uint64_t w = __atomic_load_n(&o->written, __ATOMIC_ACQUIRE);
+    if (w) {
+        stamp(&b->written, w);
+        g_st.raw_heir_written++;
+        carried = 1;
+    }
+    if (g_born_value && o->res_value == g_born_value && o->res_n && o->res_lo < o->res_hi) {
+        if (b->res_value != g_born_value) b->res_value = g_born_value, b->res_lo = UINT64_MAX, b->res_hi = 0, b->res_n = 0, b->res_loose = 0;
+        if (o->res_lo < b->res_lo) b->res_lo = o->res_lo;
+        if (o->res_hi > b->res_hi) b->res_hi = o->res_hi;
+        b->res_n += o->res_n;
+        b->res_loose |= o->res_loose;
+        carried = 1;
+    }
+    g_st.raw_heirs += (uint64_t)carried;
+}
+
 // Put the import b over [rs, re) in c in place of every import inside that run, which are deferred. g_lock exclusive.
 static void cell_put(Cell *c, uint64_t rs, uint64_t re, Backing *b) {
     int k = 0, at = -1, replaced = 0;
     for (int i = 0; i < c->nimp; i++) {
         Backing *o = c->imp[i];
         if (o->gpu_hi > rs && o->gpu_lo < re) {
+            heir_take(b, o);
             defer(o);
             replaced++;
             continue;
@@ -953,6 +991,37 @@ static int overlaps(uint64_t lo, uint64_t hi, uint64_t a, uint64_t b) {
     return lo < b && a < hi;
 }
 
+// What a growth of a mirror may take of an import that lies on the pages it adds. An import no bind of the submission
+// reached is deferred whole (its other pages get an import again). One the submission reached stays: a command recorded
+// earlier holds its buffer, so it is trimmed in place instead (same buffer, same stamps, hull and write record; only its
+// start moves up), and that is exact only where nothing the submission recorded can reach the pages it gives away:
+//   S1 the submission declared no GPU write in it (a write into the pages would have to move to the mirror),
+//   S2 the submission's hull in it exists and states its extent (res_loose says a resolve did not),
+//   S3 the pages, rounded to host pages, do not overlap that hull,
+//   and the pages lie below the hull: a resolve reaches upward past its declared size (a stream of size 0, an indirect
+//   index buffer), never downward, except by a negative base vertex, which vk_replay.c turns into a size-1 resolve of the
+//   stream's start, i.e. loose. So only a tail growth, whose pages are the import's lowest, can be given.
+// Pure: no store, no counter, no log (the dump evaluates it too). glo and ghi are the pages of the import the growth takes.
+enum { GI_OK, GI_NEWER, GI_WRITTEN, GI_NOHULL, GI_LOOSE, GI_HULL, GI_UP, GI_N };
+_Static_assert(GI_N == BACKING_GROW_RULES, "the counters and the rule's answers are the same list");
+static const char *const k_gi[GI_N] = {"ok", "newer", "written", "no_hull", "loose", "hull", "up"};
+static const char *const k_gi_why[GI_N] = {
+    "", "", "was written on the GPU by this submission", "has no hull of this submission",
+    "was reached by a resolve whose extent is not stated",
+    "", "lies above the part of it this submission reached, and how far a resolve reaches upward is not bounded"};
+
+static int import_gives(const Backing *b, uint64_t glo, uint64_t ghi, uint64_t value) {
+    uint64_t u = used_by(b);
+    if (u < value) return GI_OK;   // no bind of this submission reached it
+    if (u > value) return GI_NEWER;
+    if (__atomic_load_n(&b->written, __ATOMIC_ACQUIRE) >= value) return GI_WRITTEN;   // S1
+    if (b->res_value != value || !b->res_n || b->res_lo >= b->res_hi) return GI_NOHULL;   // S2, emptiness first
+    if (b->res_loose) return GI_LOOSE;
+    uint64_t hlo = down(b->res_lo, HPAGE), hhi = up(b->res_hi, HPAGE);   // rounded after the tests above
+    if (overlaps(glo, ghi, hlo, hhi)) return GI_HULL;   // S3
+    return ghi <= hlo ? GI_OK : GI_UP;
+}
+
 // ---------- what the raw path's stop reports
 // The refusal in beside() names one import and says nothing of which binds of the submission reached which backing, nor
 // where the backings it names came from. This block keeps that (a birth record per backing, the hull of what each
@@ -961,12 +1030,10 @@ static int overlaps(uint64_t lo, uint64_t hi, uint64_t a, uint64_t b) {
 // The dump's one effect is the write watch's scan in guard G8, which resets the marks it reports: it runs only there.
 #define DIAG "gfx: vulkan: backing map: straddle dump: "
 
-enum { BORN_NONE, BORN_BIND, BORN_FILL_POOL, BORN_PROMOTE, BORN_BESIDE_FRONT, BORN_BESIDE_END, BORN_GROW, BORN_RESCAN };
-static const char *const k_born[] = {"none", "bind", "fill_pool", "promote", "beside_front", "beside_end", "grow", "rescan"};
-
-// The submission whose bind or begin is making backings now (0: none): fill_pool and rescan_cell take it for the birth
-// record of their imports. g_lock exclusive.
-static uint64_t g_born_value;
+enum { BORN_NONE, BORN_BIND, BORN_FILL_POOL, BORN_PROMOTE, BORN_BESIDE_FRONT, BORN_BESIDE_END, BORN_GROW, BORN_RESCAN,
+       BORN_TRIM };
+static const char *const k_born[] = {"none", "bind", "fill_pool", "promote", "beside_front", "beside_end", "grow", "rescan",
+                                     "trim"};
 
 // beside_front: a mirror that kept its start (the bind took its end); beside_end: one that kept its end. born_lo/born_hi
 // are the range the backing had before that cut or growth.
@@ -1131,13 +1198,16 @@ static void diag_guards(const Cell *c, const Backing *m, uint64_t plo, uint64_t 
         int on_added = has && ((lo < old_lo && overlaps(lo, old_lo, b->res_lo, b->res_hi)) ||
                                (old_hi < hi && overlaps(old_hi, hi, b->res_lo, b->res_hi)));
         int on_bind = has && overlaps(plo, phi, b->res_lo, b->res_hi);
-        int used = used_by(b) >= value;
-        refuse |= used;
+        int gi = import_gives(b, b->gpu_lo > lo ? b->gpu_lo : lo, b->gpu_hi < hi ? b->gpu_hi : hi, value);
+        refuse |= gi != GI_OK;
         snprintf(d, sizeof d, "the import [%#llx, %#llx) used_by %llu written %llu hull %s%s hull_on_added_pages %s "
                  "hull_on_bind %s", (ull)b->gpu_lo, (ull)b->gpu_hi, (ull)used_by(b),
                  (ull)__atomic_load_n(&b->written, __ATOMIC_ACQUIRE), hull, has ? "" : " (not this submission's)",
                  on_added ? "yes" : "no", on_bind ? "yes" : "no");
-        guard_line("G4", used, d);
+        guard_line("G4", gi != GI_OK, d);
+        // Which answer of the rule it was, on a line of its own (the line above is pinned byte for byte)
+        rt_log(DIAG "guard G4 rule: %s%s%s%s", k_gi[gi], gi != GI_LOOSE && b->res_loose && b->res_value == value ? ", loose" : "",
+               *k_gi_why[gi] ? ": it " : "", k_gi_why[gi]);
     }
     if (!refuse) guard_line("G4", 0, "no import of the cell the submission bound lies on the pages");
     if (old_lo - lo > m->offset) {
@@ -1197,6 +1267,17 @@ static void diag_ring(uint64_t value) {
         if (before && g_ring[(i - 1) % RING_N].value == before) idx[seen++] = i - 1;
     rt_log(DIAG "the last %d binds of the raw-access submission before it (%llu)", seen, (ull)before);
     while (seen > 0) ring_line(&g_ring[idx[--seen] % RING_N]);
+}
+
+// What the growths of this run did and what they refused an import for, the one list the dump and the exit line print.
+static void growth_counts(char *out, size_t n) {
+    size_t at = sn(out, n, "grows %llu (%llu bytes), %llu trimmed a used import (%llu imports, %llu bytes), "
+                                 "%llu waited, heirs %llu (%llu with a GPU write); import refusals:",
+                                 (ull)g_st.raw_grows, (ull)g_st.raw_grow_bytes, (ull)g_st.raw_grow_used,
+                                 (ull)g_st.raw_grow_trims, (ull)g_st.raw_grow_trim_bytes, (ull)g_st.raw_grow_waits,
+                                 (ull)g_st.raw_heirs, (ull)g_st.raw_heir_written);
+    for (int i = GI_NEWER; i < GI_N && at < n; i++)
+        at += sn(out + at, n - at, " %s %llu", k_gi[i], (ull)g_st.raw_refused[i]);
 }
 
 // The refusal of the growth, as it happens: the reason and the mirror. The stop's dump follows from beside().
@@ -1337,7 +1418,7 @@ static void dry_growth(const Rec *rec, const Cell *c, const Backing *m, uint64_t
         if (b == m || !overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) continue;
         if (b->kind != BACKING_IMPORT) {
             mask |= 1u << DRY_G2;
-        } else if (used_by(b) >= value) {
+        } else if (import_gives(b, b->gpu_lo > lo ? b->gpu_lo : lo, b->gpu_hi < hi ? b->gpu_hi : hi, value) != GI_OK) {
             mask |= 1u << DRY_G4;
             used_on_added |= hull_on_added(b, value, lo, hi, old_lo, old_hi) != 1;
         }
@@ -1448,7 +1529,8 @@ static void ev_line(const EvEnt *e) {
                  (ull)x[0], (ull)x[1], e->s.n, e->s.more);
         break;
     case EV_GREW:
-        snprintf(d, sizeof d, "mirror [%#llx, %#llx) grew to [%#llx, %#llx), replacing %d recorded and %d more imports",
+        snprintf(d, sizeof d, "mirror [%#llx, %#llx) grew to [%#llx, %#llx), over %d recorded and %d more imports (one "
+                 "the submission reached was trimmed at its start, the others deferred)",
                  (ull)x[0], (ull)x[1], (ull)x[2], (ull)x[3], e->s.n, e->s.more);
         break;
     case EV_CUT:
@@ -1536,6 +1618,9 @@ static void diag_stop(const Cell *c, const Backing *m, uint64_t plo, uint64_t ph
     rt_log(DIAG "mirror_bytes %llu cell [%#llx, %#llx) with %d backings; one growth adds at most %#llx, a mirror reserves "
            "%#llx at each end", (ull)g_st.mirror_bytes, (ull)c->lo, (ull)c->hi, c->nimp,
            (ull)BACKING_MIRROR_GROW_MAX, (ull)BACKING_MIRROR_GUARD);
+    char counts[320];
+    growth_counts(counts, sizeof counts);
+    rt_log(DIAG "growths so far: %s", counts);
     uint64_t span = 2ull << 20, from = plo > span ? plo - span : 0, to = phi + span;
     for (int i = 0; i < c->nimp; i++)
         if (overlaps(from, to, c->imp[i]->gpu_lo, c->imp[i]->gpu_hi)) diag_backing(c->imp[i], m);
@@ -1557,8 +1642,9 @@ static void diag_stop(const Cell *c, const Backing *m, uint64_t plo, uint64_t ph
 // has two copies. It grows when: the growth adds at most BACKING_MIRROR_GROW_MAX bytes (the size of this growth, not the
 // mirrors' total, which the bind-made mirrors do not keep under any cap; the raw write-back stops by name at the end of
 // a submission whose stores reach more pages than it holds); the imports its new range overlaps in this cell are ones no
-// bind of this submission used (they go, whole, and fill_pool imports their pages outside the range again) and no
-// other mirror of the cell, nor any backing of another cell, overlaps it; no GPU write of this submission is declared
+// bind of this submission used (they go, whole, and fill_pool imports their pages outside the range again) or ones the
+// submission used that import_gives lets give their lowest pages (they are trimmed in place, after the submissions issued
+// before are done) and no other mirror of the cell, nor any backing of another cell, overlaps it; no GPU write of this submission is declared
 // over it; the range lies in m's buffer and the block's free list gives the part beyond m's own (the reserved ends of a
 // mirror's allocation, BACKING_MIRROR_GUARD each, are what normally make room); and the write watch covers it. The older
 // submissions that reached the replaced imports are waited for, the new pages are copied in as a sync copies them, and
@@ -1582,9 +1668,18 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
                      (ull)b->gpu_hi);
             return 0;
         }
-        if (used_by(b) >= value) {
+        int gi = import_gives(b, b->gpu_lo > lo ? b->gpu_lo : lo, b->gpu_hi < hi ? b->gpu_hi : hi, value);
+        if (gi != GI_OK) {   // the head and the text of the first rule, the answer after it when there is one to name
             snprintf(why, GROW_WHY, "the import [%#llx, %#llx), which this submission bound, lies on the pages it "
-                     "would add", (ull)b->gpu_lo, (ull)b->gpu_hi);
+                     "would add%s%s", (ull)b->gpu_lo, (ull)b->gpu_hi, *k_gi_why[gi] ? ": it " : "", k_gi_why[gi]);
+            g_st.raw_refused[gi]++;
+            return 0;
+        }
+        // A used import is trimmed at its start (below), so it must start on the tail the mirror grows over and run past it;
+        // import_gives let nothing else through (its pages are below its hull, so they are its first), so this is a check.
+        if (used_by(b) >= value && (b->gpu_lo < old_hi || b->gpu_hi <= hi)) {
+            snprintf(why, GROW_WHY, "the import [%#llx, %#llx) this submission bound would be cut at its start by the "
+                     "growth", (ull)b->gpu_lo, (ull)b->gpu_hi);
             return 0;
         }
     }
@@ -1634,11 +1729,25 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
     }
 
     uint64_t wait = raw_before(value);
+    int trims = 0;
     for (int i = 0; i < c->nimp; i++) {
         const Backing *b = c->imp[i];
         if (b == m || !overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) continue;
+        if (used_by(b) >= value) {   // reach_before would name this submission, which cannot be waited for (see below)
+            trims++;
+            continue;
+        }
         uint64_t u = reach_before(b, value);
         if (u > wait) wait = u;
+    }
+    // An import this submission used is kept (trimmed), and its stamp was overwritten by this submission's, so which older
+    // submission wrote through it is not known from the stamps: every one issued is waited for (the gate admits one open
+    // submission, so these are all below value; the one being recorded is not issued and is not waited for). Nothing is
+    // waited for when they are all done, which is the usual state.
+    if (trims) {
+        uint64_t issued = gpu_sync_issued();
+        if (issued >= value) issued = value - 1;
+        if (issued > wait) wait = issued;
     }
     plat_mutex_lock(&g_coh);
     for (int i = 0; i < g_npend; i++) {
@@ -1653,8 +1762,10 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
         if (p->value > wait) wait = p->value;
     }
     plat_mutex_unlock(&g_coh);
-    if (wait > gpu_sync_done()) {
+    int waited = wait > gpu_sync_done();
+    if (waited) {
         g_st.replace_waits++;
+        g_st.raw_grow_waits += (uint64_t)(trims > 0);
         wait_value(wait);
     }
 
@@ -1664,19 +1775,54 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
     m->part_at = part_lo, m->part = part_hi - part_lo;
     m->gpu_lo = lo, m->gpu_hi = hi, m->offset = offset;
     int k = 0, replaced = 0;
+    char did[512] = "";
+    size_t at = 0;
     for (int i = 0; i < c->nimp; i++) {
         Backing *b = c->imp[i];
-        if (b != m && overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) {
+        if (b == m || !overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) {
+            c->imp[k++] = b;
+            continue;
+        }
+        char hull[80];
+        diag_hull(hull, sizeof hull, b);
+        int used = used_by(b) >= value;
+        if (at < sizeof did)
+            at += sn(did + at, sizeof did - at, "; %s [%#llx, %#llx) used_by %llu written %llu hull %s%s",
+                                   used ? "trimmed" : "deferred", (ull)b->gpu_lo, (ull)b->gpu_hi, (ull)used_by(b),
+                                   (ull)__atomic_load_n(&b->written, __ATOMIC_ACQUIRE), hull,
+                                   b->res_loose && b->res_value == value ? " (loose)" : "");
+        if (!used) {   // no bind of this submission reached it: it goes whole, and its pages outside the growth get an import again
             defer(b);
             replaced++;
-        } else {
-            c->imp[k++] = b;
+            continue;
         }
+        // One it reached stays, with its buffer, its stamps and its hull; only its start moves up to the end of the growth
+        // (import_gives: the pages are its lowest, and below everything this submission resolved in it).
+        uint64_t cut = hi - b->gpu_lo;
+        born(b, BORN_TRIM, value, b->gpu_lo, b->gpu_hi);
+        b->offset += cut;
+        b->gpu_lo = hi;
+        g_st.import_bytes -= cut;
+        g_st.raw_grow_trims++, g_st.raw_grow_trim_bytes += cut;
+        c->imp[k++] = b;
     }
     c->nimp = k;
     g_st.imports_grown += (uint64_t)replaced;
     g_st.mirror_bytes += added;
+    g_st.raw_grows++, g_st.raw_grow_bytes += added;
+    g_st.raw_grow_used += (uint64_t)(trims > 0);
     changed();
+    if (g_st.raw_grows <= 64)
+        rt_log("gfx: vulkan: backing map: raw growth %llu in submission %llu: the mirror [%#llx, %#llx) grew to [%#llx, "
+               "%#llx), adding %#llx bytes; %d used imports trimmed, %d unused deferred%s; mirror_bytes %llu%s",
+               (ull)g_st.raw_grows, (ull)value, (ull)old_lo, (ull)old_hi, (ull)lo, (ull)hi, (ull)added, trims, replaced,
+               waited ? ", waited for the submissions issued" : "", (ull)g_st.mirror_bytes, did);
+    if (g_st.mirror_bytes > BACKING_PROMOTE_MIRROR_MAX && !g_grow_cap_logged) {
+        g_grow_cap_logged = 1;
+        rt_log("gfx: vulkan: backing map: a growth of a mirror left the mirrors at %llu bytes, past the %llu a promotion "
+               "leaves; the growth is exempt (it adds at most %llu bytes)", (ull)g_st.mirror_bytes,
+               (ull)BACKING_PROMOTE_MIRROR_MAX, (ull)BACKING_MIRROR_GROW_MAX);
+    }
 
     plat_mutex_lock(&g_coh);
     Ups u = {.m = m};
@@ -1805,14 +1951,18 @@ static Backing *find(uint64_t *addr, uint64_t size, Rec **rec, Rec **virt) {
 
 // What submission value resolved in backing m, as a hull (beside reads a mirror's; the straddle dump prints an import's
 // too) and the count of the resolves. Only the thread recording value gets here with it.
+// A submission older than the hull's is not part of it (a growth reads the hull of the submission it is recorded in). A
+// resolve of size 1 or less states no extent (the resolver counts size 0 as 1): the hull is then marked loose.
 static void note_resolved(Backing *m, uint64_t addr, uint64_t size, uint64_t value) {
+    if (value < m->res_value) return;
     if (m->res_value != value) {
-        m->res_value = value, m->res_lo = addr, m->res_hi = addr + size, m->res_n = 1;
+        m->res_value = value, m->res_lo = addr, m->res_hi = addr + size, m->res_n = 1, m->res_loose = size <= 1;
         return;
     }
     if (addr < m->res_lo) m->res_lo = addr;
     if (addr + size > m->res_hi) m->res_hi = addr + size;
     m->res_n++;
+    if (size <= 1) m->res_loose = 1;
 }
 
 // The backing of [addr, addr + size) when the map holds one, stamped, and a mirror brought current; g_lock, shared at
@@ -2113,11 +2263,13 @@ void backing_cpu_synced(uint64_t fence) {
 static void rescan_cell(Cell *c) {
     for (int i = 0; i < c->nimp;) {
         Backing *o = c->imp[i];
-        uint64_t a = o->gpu_lo;
+        // An import trimmed by a growth still stands over the pages it gave away (its host import is whole): a decommit of
+        // one of them retires it too, so its buffer never lies over uncommitted memory.
+        uint64_t a = o->kind == BACKING_IMPORT ? o->span_lo : o->gpu_lo, end = o->kind == BACKING_IMPORT ? o->span_hi : o->gpu_hi;
         int whole = 1;
-        while (a < o->gpu_hi && whole) {
+        while (a < end && whole) {
             int st;
-            uint64_t n = rt_mem_commit_run(a, o->gpu_hi - a, &st);
+            uint64_t n = rt_mem_commit_run(a, end - a, &st);
             whole = n != UINT64_MAX && n && st;
             a += whole ? n : 0;
         }
@@ -2459,7 +2611,7 @@ void backing_open(const BackingOps *ops) {
     memset(g_evc, 0, sizeof g_evc);
     memset(&g_dry, 0, sizeof g_dry);
     g_ev_seq = g_ev_misses = g_ev_cur = 0;
-    g_ring_seq = 0, g_ring_skip = 0, g_born_value = 0;
+    g_ring_seq = 0, g_ring_skip = 0, g_born_value = 0, g_grow_cap_logged = 0;
     g_raw_last = g_raw_prev = 0, g_filled = 0, g_pools_version = g_fill_pools = g_fill_epoch = 0;
     g_open = 1;
     g_bt_stop = 0, g_bt_want = 1, g_bt_running = 1;
@@ -2479,6 +2631,12 @@ void backing_close(void) {
         rt_log("gfx: vulkan: backing map: dry growth at exit: %llu raw-access submissions, %llu binds cut a mirror the "
                "submission had not resolved there, %llu would have grown it, %llu refused (refusals: %s), the evaluation changed the map %llu times",
                (ull)g_st.raw_begins, (ull)g_dry.evals, (ull)g_dry.would, (ull)g_dry.refused, d, (ull)g_dry.mutated);
+    }
+    if (g_st.raw_grows || g_st.raw_heirs || g_st.raw_refused[GI_NEWER] + g_st.raw_refused[GI_WRITTEN] +
+        g_st.raw_refused[GI_NOHULL] + g_st.raw_refused[GI_LOOSE] + g_st.raw_refused[GI_HULL] + g_st.raw_refused[GI_UP]) {
+        char counts[320];
+        growth_counts(counts, sizeof counts);
+        rt_log("gfx: vulkan: backing map: raw growth at exit: %s", counts);
     }
     plat_mutex_lock(&g_bt_lock);
     g_bt_stop = 1;

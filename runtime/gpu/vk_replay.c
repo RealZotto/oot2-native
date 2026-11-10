@@ -1143,8 +1143,16 @@ static void vertex_count(const ShaderBinds *vb) {
     vkrc_vin(&k, offsetof(__typeof__(k), vb), offsetof(__typeof__(k), vbuf), sizeof k);
 }
 
+// An indexed draw with a negative base vertex reads below the start of each vertex stream it resolves, inside the stream's
+// buffer. The resolve states the stream's extent upward only, so such a draw resolves the stream's first byte once more:
+// the backing map takes a resolve of one byte for an extent not stated and will not give pages away below it (backing.c,
+// import_gives). Set by op_draw_idx for the one draw, read and cleared by the first vertex_input after it.
+static int g_reach_below;
+
 static void vertex_input(const ShaderBinds *vb) {
     if (RC_ON()) vertex_count(vb);
+    const int below = g_reach_below;
+    g_reach_below = 0;
     VertexInput in;
     memset(&in, 0, sizeof in);
     uint32_t used = 0;   // streams the attributes read
@@ -1193,6 +1201,10 @@ static void vertex_input(const ShaderBinds *vb) {
         uint64_t size = S.vbuf[s].size ? S.vbuf[s].size : 1;
         BT_TIME(BT_S4_RESOLVE, F.ops->resolve(S.vbuf[s].address, size, F.value, &ref));
         RC_ADD(RC_RES_VERTEX, 1);
+        if (below) {
+            BackingRef start;
+            F.ops->resolve(S.vbuf[s].address, 1, F.value, &start);
+        }
         VkBuffer buf = (VkBuffer)(uintptr_t)ref.buffer;
         VkDeviceSize off = ref.offset;
         BT_TIME(BT_S4_PACK, vkrec_BindVertexBuffers2(s, 1, &buf, &off, NULL, NULL));
@@ -1316,7 +1328,10 @@ static void index_buffer(int itype, uint64_t ibuf, uint64_t count) {
 
 static void op_draw_idx(const p_draw_idx *d) {
     VkBool32 restart;
-    if (!draw_prepare(d->prim, (uint32_t)d->base_instance, &restart)) return;
+    g_reach_below = d->base_vertex < 0;
+    const int prepared = draw_prepare(d->prim, (uint32_t)d->base_instance, &restart);
+    g_reach_below = 0;
+    if (!prepared) return;
     index_buffer(d->itype, d->ibuf, (uint64_t)(uint32_t)d->count);
     vkrec_DrawIndexed((uint32_t)d->count, instances(d->instances), 0, d->base_vertex, (uint32_t)d->base_instance);
 }

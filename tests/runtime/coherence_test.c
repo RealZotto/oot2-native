@@ -74,6 +74,18 @@
 //                uniform's of becomes a mirror at the next raw-access begin: brought current, in the page table, left alone when
 //                the submission bound it before its raw stage or the admission refuses, never for a small bind, after the older
 //                raw-access submission in flight, and not past the mirrors' cap (BACKING_PROMOTE_MIRROR_MAX)
+//   raw_grow_used_import, raw_grow_used_edge   the growth's pages are the lowest of an import the submission used, below
+//                everything it resolved in it: the import is trimmed in place (same buffer, memory and offset of what it still
+//                holds, one page less at its start), no page has two backings, the page the mirror took is copied in and
+//                a write through the mirror reaches guest memory; the edge case has the hull start on the page after
+//   raw_grow_used_wait   the growth waits for the plain submission issued before it that wrote through the import, not for
+//                the submission being recorded, whose stamp the import carries
+//   raw_grow_used_written, raw_grow_used_hull, raw_grow_used_hull_edge, raw_grow_used_loose, raw_grow_used_up   stop by the
+//                rule that refuses such an import: written on the GPU by the submission, its hull on the pages (a byte
+//                before the page's end included), an extent not stated, the pages above the hull (a head growth)
+//   raw_grow_heir, raw_grow_heir_old   an import that replaces two used ones takes over their hull, so a growth over it
+//                sees it; a hull of an older submission is not taken over; raw_grow_heir_hull, raw_grow_heir_written stop
+//                by the rule that sees what was taken over (the hull on the pages, a GPU write of the submission)
 //   unwritten, replace_written, raw_grow_bound_import, raw_grow_fragmented, raw_grow_guarded_blocked,
 //   raw_grow_untracked, raw_grow_cap   stop by name, each with the reason the mirror could not grow
 #include <stdio.h>
@@ -2258,6 +2270,242 @@ static void case_raw_dry_none(void) {
     ev_finish(p, "raw_dry_none");
 }
 
+// ---------- a growth over an import the submission used (backing.c, import_gives)
+// A mirror M = [p, E) with E = p + 256 KiB, made by an earlier submission; 256 KiB the CPU wrote at E, committed since, which
+// the raw-access begin of v gives an import I = [E, E + 256 KiB). In v the mirror is resolved at E - 0xc00 and the import at
+// the places the mode says, then a bind across the boundary, [E - 0x600, E + 0x810), takes the mirror's tail growth over E's
+// page: the pages [E, E + 0x1000) are I's lowest. Passing: the mirror grows and I is trimmed in place (its start moves up
+// one page, its buffer, stamps and hull stay). Stopping: the rule that refused I is named in the stop.
+enum { U_OK, U_EDGE, U_HULL, U_EDGE_HULL, U_WRITTEN, U_LOOSE };
+static BackingRef g_u_big, g_u_import;
+
+static void used_resolves(int mode, uint64_t E, uint64_t v) {
+    CHECK(resolve(E - 0xc00, 0x1d0, v).kind == BACKING_MIRROR);
+    g_u_import = mode == U_HULL        ? resolve(E + 0x100, 8, v)    // the hull starts inside the page the mirror takes
+                 : mode == U_EDGE_HULL ? resolve(E + 0xff8, 8, v)    // ... in its last 8 bytes
+                 : mode == U_EDGE      ? resolve(E + 0x1000, 8, v)   // ... in the page after it
+                 : mode == U_LOOSE     ? resolve(E + 0x1800, 0, v)   // an extent not stated
+                                       : resolve(E + 0x1800, 0x2000, v);
+    CHECK(g_u_import.kind == BACKING_IMPORT);
+    CHECK(resolve(E + 0x9000, 0x1d0, v).kind == BACKING_IMPORT);
+    if (mode == U_WRITTEN) backing_gpu_wrote(E + 0x1800, 4, v);
+}
+
+static void used_world(uint64_t *p_out, pool_t *pp_out) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 8 * MiB;
+    *pp_out = pool(p - 1 * MiB, 16 * MiB);
+    CHECK(p / BACKING_IMPORT_WINDOW == (p + 512 * KiB) / BACKING_IMPORT_WINDOW);   // one cell
+    cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(p + 256 * KiB, 256 * KiB, 0xBBBBBBBBu);   // committed since: an import at the next begin
+    *p_out = p;
+}
+
+static uint64_t used_scene(int mode, uint64_t *p_out, pool_t *pp_out) {
+    uint64_t p;
+    used_world(&p, pp_out);
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    CHECK(s.mirrors == 1 && s.mirror_bytes == 256 * KiB && s.imports == 1 && s.import_bytes == 256 * KiB);
+    used_resolves(mode, p + 256 * KiB, v);
+    *p_out = p;
+    return v;
+}
+
+static void gpu_used(void) {
+    uint8_t *page = bytes(&g_u_big) + 0x600;   // the page at E, as the mirror holds it
+    CHECK(*(uint32_t *)page == 0xBBBBBBBBu && *(uint32_t *)(page + 0xff8) == 0xBBBBBBBBu);   // copied in from guest memory
+    *(uint32_t *)(page + 0x100) = 0xCCCCCCCCu;   // a store through the mirror, declared below
+    CHECK(words_are(bytes(&g_u_import), 0x100, 0xBBBBBBBBu));
+}
+
+// Passing: the growth trims I. The mirror and the import reach the same bytes as before, no page has two backings, the
+// device copy of the given page is the guest's, and a write through the mirror to it reaches guest memory.
+static void used_pass(const char *name, int mode) {
+    uint64_t p;
+    pool_t pp;
+    uint64_t v = used_scene(mode, &p, &pp);
+    const uint64_t E = p + 256 * KiB;
+    BackingRef before = g_u_import;
+    BackingStats s0 = stats();
+    uint64_t ver0 = backing_version(), up0 = D.upload_bytes;
+    BackingRun *r0;
+    uint64_t rv;
+    int n0 = backing_raw_runs(&r0, &rv);
+    CHECK(run_at(r0, n0, E) && run_at(r0, n0, E)->kind == BACKING_IMPORT);
+    free(r0);
+
+    g_u_big = resolve(E - 0x600, 0xe10, v);
+    CHECK(g_u_big.kind == BACKING_MIRROR);
+    BackingStats s = stats();
+    CHECK(s.mirror_bytes == s0.mirror_bytes + 0x1000 && s.import_bytes == s0.import_bytes - 0x1000 && s.imports == s0.imports);
+    CHECK(s.raw_grows == 1 && s.raw_grow_bytes == 0x1000 && s.raw_grow_used == 1 && s.raw_grow_trims == 1 &&
+          s.raw_grow_trim_bytes == 0x1000 && s.raw_grow_waits == 0 && s.replace_waits == 0);
+    CHECK(s.raw_refused[1] + s.raw_refused[2] + s.raw_refused[3] + s.raw_refused[4] + s.raw_refused[5] + s.raw_refused[6] == 0);
+    CHECK(D.upload_bytes - up0 == 0x1000);   // the one page, copied from guest memory
+    CHECK(backing_version() > ver0);   // the table is out of date: the page changed hands
+    BackingPage pg;
+    backing_page(E, &pg);
+    CHECK(pg.kind == BACKING_MIRROR);
+    backing_page(E + 0x1000, &pg);
+    CHECK(pg.kind == BACKING_IMPORT);
+    BackingRun *runs;
+    int n = backing_raw_runs(&runs, &rv);
+    CHECK(run_at(runs, n, E) && run_at(runs, n, E)->kind == BACKING_MIRROR);
+    CHECK(run_at(runs, n, E + 0x1000) && run_at(runs, n, E + 0x1000)->kind == BACKING_IMPORT);
+    for (uint64_t a = p; a < E + 256 * KiB; a += PG) CHECK(runs_cover(runs, n, a) == 1);   // no page twice
+    CHECK(raw_address(runs, n, E + 0x1000) == E + 0x1000 && raw_address(runs, n, E + 0x9000) == E + 0x9000);
+    CHECK(raw_address(runs, n, E) == g_u_big.address + 0x600);
+    free(runs);
+    // what was recorded before the growth still reaches the same bytes: the import's buffer, memory and offset are as they were
+    BackingRef again = resolve(E + 0x1800, 0x2000, v);
+    CHECK(again.kind == BACKING_IMPORT && again.buffer == before.buffer && again.memory == before.memory);
+    CHECK(mode == U_OK ? again.offset == before.offset : 1);
+    BackingRef tail = resolve(E + 0x1800, 4, v);
+    CHECK(tail.kind == BACKING_IMPORT && tail.buffer == before.buffer && *(uint32_t *)bytes(&tail) == 0xBBBBBBBBu);
+    CHECK(tail.address == E + 0x1800);   // the import's device address of that guest address, unchanged by the trim
+    g_u_import = again;
+    backing_gpu_wrote(E + 0x100, 4, v);
+    sub_end(v);
+    gpu_run(v, gpu_used);
+    CHECK(*(uint32_t *)(uintptr_t)(E + 0x100) == 0xCCCCCCCCu);   // written back to where it was declared
+    CHECK(*(uint32_t *)(uintptr_t)(E + 0x104) == 0xBBBBBBBBu);
+    s = stats();
+    printf("%s: the mirror grew one page over an import the submission used, which was trimmed in place (raw_grows %llu, "
+           "raw_grow_trims %llu)\n", name, (ull)s.raw_grows, (ull)s.raw_grow_trims);
+    backing_pool_fini(&pp);
+    done(name);
+}
+
+static void case_raw_grow_used_import(void) { used_pass("raw_grow_used_import", U_OK); }
+static void case_raw_grow_used_edge(void) { used_pass("raw_grow_used_edge", U_EDGE); }
+
+static void used_stop(const char *name, int mode) {
+    uint64_t p;
+    pool_t pp;
+    uint64_t v = used_scene(mode, &p, &pp);
+    printf("%s: p=%#llx E=%#llx v=%llu\n", name, (ull)p, (ull)(p + 256 * KiB), (ull)v);
+    resolve(p + 256 * KiB - 0x600, 0xe10, v);
+    printf("returned\n");
+}
+
+static void case_raw_grow_used_written(void) { used_stop("raw_grow_used_written", U_WRITTEN); }
+static void case_raw_grow_used_hull(void) { used_stop("raw_grow_used_hull", U_HULL); }
+static void case_raw_grow_used_hull_edge(void) { used_stop("raw_grow_used_hull_edge", U_EDGE_HULL); }
+static void case_raw_grow_used_loose(void) { used_stop("raw_grow_used_loose", U_LOOSE); }
+// A head growth: the pages the bind takes are the import's highest, above everything the submission resolved in it.
+static void case_raw_grow_used_up(void) { diag_scene("raw_grow_used_up"); }
+
+// The submission's GPU work is older than the growth: a plain submission r wrote through I and is issued, not reached by the
+// device; v, a raw-access submission after a first one that is done, used I. I's stamp is v's now, so which submission wrote
+// through it is not in the stamps: the growth waits for every submission issued (r), never for v itself.
+static volatile int g_wd_done;
+static void used_watchdog(void *arg) {
+    (void)arg;
+    plat_sleep_ns(5000ull * 1000 * 1000);
+    if (g_wd_done) return;
+    fprintf(stderr, "grew waited for its own submission\n");
+    exit(1);
+}
+
+static void case_raw_grow_used_wait(void) {
+    uint64_t p;
+    pool_t pp;
+    used_world(&p, &pp);
+    const uint64_t E = p + 256 * KiB;
+    uint64_t w = sub_begin();
+    backing_raw_begin(w);   // the import is made here
+    CHECK(stats().imports == 1 && stats().import_bytes == 256 * KiB);
+    sub_end(w);
+    gpu_run(w, NULL);
+    uint64_t r = sub_begin();   // a plain submission
+    CHECK(resolve(E + 0x1800, 0x2000, r).kind == BACKING_IMPORT);
+    backing_gpu_wrote(E + 0x1800, 4, r);
+    sub_end(r);   // issued; its work waits for the test
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);
+    CHECK(gpu_sync_done() == w && gpu_sync_issued() == r);
+    used_resolves(U_OK, E, v);
+    g_older = r, g_older_work = NULL;
+    CHECK(plat_thread_start(run_older_later, NULL, 256 * KiB));
+    CHECK(plat_thread_start(used_watchdog, NULL, 256 * KiB));
+    uint64_t t0 = plat_now_ns();
+    BackingRef big = resolve(E - 0x600, 0xe10, v);
+    double waited = (double)(plat_now_ns() - t0) / 1e6;
+    g_wd_done = 1;
+    BackingStats s = stats();
+    CHECK(big.kind == BACKING_MIRROR && waited >= 150.0 && gpu_sync_done() >= r);
+    CHECK(s.raw_grow_waits == 1 && s.raw_grow_trims == 1 && s.raw_grows == 1);
+    sub_end(v);
+    gpu_run(v, NULL);
+    printf("raw_grow_used_wait: the growth waited %.1f ms for the submission issued before it\n", waited);
+    backing_pool_fini(&pp);
+    done("raw_grow_used_wait");
+}
+
+// Two used imports replaced by one bind (a miss across the uncommitted chunk between them): the import that replaces
+// them takes over what the submission knew of both, so a later growth over it sees the hull of the first one and the GPU
+// write declared in it. A hull of an older submission says nothing about this one.
+enum { H_PASS, H_HULL, H_WRITTEN, H_OLD };
+static void heir_scene(const char *name, int mode, int stop) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 8 * MiB, A = p + 256 * KiB, B = A + 128 * KiB;   // M = [p, A), I1 at A, a chunk none wrote, I2 at B
+    pool_t pp = pool(p - 1 * MiB, 16 * MiB);
+    cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(A, 64 * KiB, 0xBBBBBBBBu);
+    cpu_fill(B, 64 * KiB, 0xCCCCCCCCu);
+    if (mode == H_OLD) {   // I1 was resolved by an earlier raw-access submission, not by v
+        uint64_t w = sub_begin();
+        backing_raw_begin(w);
+        CHECK(resolve(A + 0x100, 8, w).kind == BACKING_IMPORT);
+        sub_end(w);
+        gpu_run(w, NULL);
+    }
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    CHECK(s.mirrors == 1 && s.imports == 2 && s.import_bytes == 128 * KiB);
+    CHECK(resolve(A - 0xc00, 0x1d0, v).kind == BACKING_MIRROR);
+    const uint64_t h1 = mode == H_HULL ? 0x100 : 0x4000;
+    if (mode != H_OLD) CHECK(resolve(A + h1, 8, v).kind == BACKING_IMPORT);
+    if (mode == H_WRITTEN) backing_gpu_wrote(A + h1, 4, v);
+    CHECK(resolve(B + 0x100, 8, v).kind == BACKING_IMPORT);
+    CHECK(resolve(A + 0x10100, 8, v).kind == BACKING_IMPORT);   // commits the chunk: one import over I1, it and I2
+    s = stats();
+    CHECK(s.imports == 1 && s.import_bytes == 192 * KiB);
+    CHECK(s.raw_heirs == (mode == H_OLD ? 1u : 2u) && s.raw_heir_written == (mode == H_WRITTEN ? 1u : 0u));
+    if (stop) {
+        printf("%s: p=%#llx A=%#llx v=%llu\n", name, (ull)p, (ull)A, (ull)v);
+        resolve(A - 0x600, 0xe10, v);
+        printf("returned\n");
+        return;
+    }
+    BackingRef big = resolve(A - 0x600, 0xe10, v);
+    s = stats();
+    CHECK(big.kind == BACKING_MIRROR && s.raw_grows == 1 && s.raw_grow_trims == 1 && s.raw_grow_trim_bytes == 0x1000);
+    CHECK(s.imports == 1 && s.import_bytes == 192 * KiB - 0x1000);
+    sub_end(v);
+    gpu_run(v, NULL);
+    backing_pool_fini(&pp);
+    done(name);
+}
+
+static void case_raw_grow_heir(void) { heir_scene("raw_grow_heir", H_PASS, 0); }
+static void case_raw_grow_heir_old(void) { heir_scene("raw_grow_heir_old", H_OLD, 0); }
+static void case_raw_grow_heir_hull(void) { heir_scene("raw_grow_heir_hull", H_HULL, 1); }
+static void case_raw_grow_heir_written(void) { heir_scene("raw_grow_heir_written", H_WRITTEN, 1); }
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc != 2) {
@@ -2297,6 +2545,12 @@ int main(int argc, char **argv) {
         {"raw_dry_kind", case_raw_dry_kind}, {"raw_dry_none", case_raw_dry_none}, {"raw_dry_g4_on", case_raw_dry_g4_on},
         {"raw_dry_g8", case_raw_dry_g8}, {"raw_dry_g5", case_raw_dry_g5}, {"raw_dry_g1", case_raw_dry_g1},
         {"raw_dry_g2", case_raw_dry_g2},
+        {"raw_grow_used_import", case_raw_grow_used_import}, {"raw_grow_used_edge", case_raw_grow_used_edge},
+        {"raw_grow_used_wait", case_raw_grow_used_wait}, {"raw_grow_used_written", case_raw_grow_used_written},
+        {"raw_grow_used_hull", case_raw_grow_used_hull}, {"raw_grow_used_hull_edge", case_raw_grow_used_hull_edge},
+        {"raw_grow_used_loose", case_raw_grow_used_loose}, {"raw_grow_used_up", case_raw_grow_used_up},
+        {"raw_grow_heir", case_raw_grow_heir}, {"raw_grow_heir_old", case_raw_grow_heir_old},
+        {"raw_grow_heir_hull", case_raw_grow_heir_hull}, {"raw_grow_heir_written", case_raw_grow_heir_written},
     };
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++)
         if (!strcmp(argv[1], cases[i].name)) {

@@ -101,9 +101,18 @@
 // to the mirrors that remain. A mirror already resolved where the bind takes pages can instead grow in place, over its
 // own pages and the bind's only (an import it overlaps that the submission did not bind goes, and its pages outside the
 // bind get an import again), when the growth adds at most BACKING_MIRROR_GROW_MAX bytes, its enlarged range stays
-// write-watched and fits in the block, and no other mirror, import the submission bound, or backing of another cell lies
-// on the added pages; otherwise it is a named fatal that says which of these held. The mirrors' total is not checked
-// there: the raw path's write-back reaches every mirrored page (vk_raw.h, The sinks), whatever the total.
+// write-watched and fits in the block, and no other mirror, import the submission bound (but see below), or backing of
+// another cell lies on the added pages; otherwise it is a named fatal that says which of these held. The mirrors' total
+// is not checked there: the raw path's write-back reaches every mirrored page (vk_raw.h, The sinks), whatever the total.
+// An import the submission bound is not given up whole, as a command recorded earlier holds its buffer. It is trimmed in
+// place instead (same buffer, stamps and record of what the submission resolved in it; only its start moves up) when the
+// pages the mirror takes are its lowest, the mirror's tail growth, below everything the submission resolved in it, when
+// the submission declared no GPU write in it and every resolve of it stated its extent (a resolve reaches upward past
+// the extent it states, never downward, except by a negative base vertex, which the replay marks as an extent not
+// stated), after waiting for every submission issued before. Its host import then lies under pages the mirror owns,
+// which a decommit of any of them retires. Any other import the submission bound is a named fatal that says which of
+// these did not hold (backing.c, import_gives). An import that replaces others takes over what the submission knew of
+// them (its hull and GPU writes).
 //
 // An import is never what the rule would give a bind on a discrete device, and the invariant above makes one of every
 // committed page: the GPU reads an import across the bus, so a compute program that works on its buffers stalls on every
@@ -140,6 +149,7 @@
 #define BACKING_MIRROR_RESERVE 8              // section 8: a mirror leaves an eighth of the VRAM budget free
 #define BACKING_PROMOTE_MIN (64ull << 10)     // a bind larger than a uniform's (maxUniformBufferRange) marks its import hot
 #define BACKING_PROMOTE_MIRROR_MAX (128ull << 20)   // a promotion leaves the mirrors at or under this many bytes (the raw write-back's traffic and sinks, vk_raw.h)
+#define BACKING_GROW_RULES 7                  // the answers of the rule that says what a growth may take of an import (backing.c)
 enum { BACKING_NONE, BACKING_EXTENT, BACKING_IMPORT, BACKING_MIRROR };
 
 // What a bind asks for: its range and its pool's flags (NVNmemoryPoolFlags).
@@ -301,5 +311,13 @@ typedef struct BackingStats {
     // refuses on has a hull of the submission off the pages the growth adds); one bind can count in several.
     uint64_t raw_dry_evals, raw_dry_would_grow, raw_dry_refused, raw_dry_g[13];
     uint64_t raw_dry_mutated;   // evaluations after which the map's digest differed: always 0
+    // The growth of a mirror over the pages of a bind of a raw-access submission (grow_taken), done: growths and the bytes
+    // they added; those that trimmed an import the submission used (raw_grow_used) and the imports and bytes so trimmed;
+    // waits for older submissions that a used import needed; the growths each rule refused an import for, by
+    // BACKING_GROW_RULES' order in backing.c (index 0 never counts); imports that replaced others and took over what the
+    // submission knew of them, and those that took over a GPU write.
+    uint64_t raw_grows, raw_grow_bytes, raw_grow_used, raw_grow_trims, raw_grow_trim_bytes, raw_grow_waits;
+    uint64_t raw_refused[BACKING_GROW_RULES];
+    uint64_t raw_heirs, raw_heir_written;
 } BackingStats;
 void backing_stats(BackingStats *out);

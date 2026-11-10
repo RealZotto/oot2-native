@@ -12,6 +12,10 @@ table, left alone when the submission bound it before its raw stage or the admis
 the mirrors that the raw write-back's traffic sets), pages the GPU wrote into guest memory itself (the raw path's sinks)
 told from the CPU's writes by the page generations, and the binds and waits the map refuses by name, a mirror's growth
 with the reason it could not.
+A growth also takes pages from an import the submission used when it can do so exactly (the import is trimmed in place:
+raw_grow_used_*), waits for the submissions issued before it, and hands what the submission knew of imports it replaces to
+the import that replaces them (raw_grow_heir*); every import it cannot take pages of stops by the name of the rule that
+refused it.
 The device and the write watch stand in (tests/runtime/coherence_test.c says how); the `watch` case uses the real write
 watch on Windows and prints a skip line elsewhere. The device's own tests are tests/test_runtime_vk.py.
 
@@ -46,7 +50,8 @@ PASSING = ("generations", "upload", "admission", "guarded_admission", "writeback
            "raw_grow_tail_import", "raw_grow_wait", "raw_sync_wait", "raw_sync_nowait",
            "raw_promote", "raw_promote_small", "raw_promote_wait", "raw_promote_cap",
            "raw_dry_grow", "raw_dry_g4", "raw_dry_cap", "raw_dry_kind", "raw_dry_none", "raw_dry_g4_on", "raw_dry_g8",
-           "raw_dry_g5", "raw_dry_g1", "raw_dry_g2")
+           "raw_dry_g5", "raw_dry_g1", "raw_dry_g2",
+           "raw_grow_used_import", "raw_grow_used_edge", "raw_grow_used_wait", "raw_grow_heir", "raw_grow_heir_old")
 
 # case: text the one FATAL line must hold
 FAILING = {
@@ -63,15 +68,42 @@ FAILING = {
     "raw_grow_untracked": "the mirror cannot grow over them: the write watch does not cover [",
     "raw_grow_cap": "KiB, more than the 1024 KiB one growth may add",
     # The same stop with its dump before it (test_the_stop_of_a_straddling_bind_prints_what_it_is_made_of).
-    "raw_diag_hull": "which this submission bound, lies on the pages it would add",
-    "raw_diag_dry": "which this submission bound, lies on the pages it would add",
-    "raw_diag_birth": "which this submission bound, lies on the pages it would add",
+    "raw_diag_hull": "lies on the pages it would add: it lies above the part of it this submission reached",
+    "raw_diag_dry": "lies on the pages it would add: it lies above the part of it this submission reached",
+    "raw_diag_birth": "lies on the pages it would add: it lies above the part of it this submission reached",
     # The same stop with the event ring in the dump (test_the_event_ring_*).
     "raw_ev_miss": "which this submission bound, lies on the pages it would add",
     "raw_ev_survives_hits": "which this submission bound, lies on the pages it would add",
     "raw_ev_lost": "which this submission bound, lies on the pages it would add",
     "raw_ev_origin": "which this submission bound, lies on the pages it would add",
+    # An import the submission used, which the growth cannot take pages of: each rule that refuses it, named after the head
+    # (test_a_used_import_is_refused_by_the_rule_the_dump_names).
+    "raw_grow_used_written": "lies on the pages it would add: it was written on the GPU by this submission",
+    "raw_grow_used_hull": "which this submission bound, lies on the pages it would add",
+    "raw_grow_used_hull_edge": "which this submission bound, lies on the pages it would add",
+    "raw_grow_used_loose": "lies on the pages it would add: it was reached by a resolve whose extent is not stated",
+    "raw_grow_used_up": "lies on the pages it would add: it lies above the part of it this submission reached, and how "
+                        "far a resolve reaches upward is not bounded",
+    "raw_grow_heir_hull": "which this submission bound, lies on the pages it would add",
+    "raw_grow_heir_written": "lies on the pages it would add: it was written on the GPU by this submission",
 }
+
+# The rule of import_gives that refuses the import in each of those stops, and the reason the text adds after the head (none
+# for the hull rule: its text is the head alone, as before the rule had names).
+HEAD_ENDS = "lies on the pages it would add"
+WHY = {
+    "written": "was written on the GPU by this submission",
+    "loose": "was reached by a resolve whose extent is not stated",
+    "up": "lies above the part of it this submission reached, and how far a resolve reaches upward is not bounded",
+}
+RULE_OF = {
+    "raw_grow_bound_import": "hull", "raw_grow_used_hull": "hull", "raw_grow_used_hull_edge": "hull",
+    "raw_grow_heir_hull": "hull", "raw_grow_used_written": "written", "raw_grow_heir_written": "written",
+    "raw_grow_used_loose": "loose", "raw_grow_used_up": "up", "raw_diag_hull": "up", "raw_diag_dry": "up",
+    "raw_diag_birth": "up", "raw_ev_miss": "hull", "raw_ev_survives_hits": "hull", "raw_ev_lost": "hull",
+    "raw_ev_origin": "hull",
+}
+RULE_LINE = re.compile(r"guard G4 rule: (\w+)(?:, loose)?(?:: it (.*))?$")
 
 # The dry growth's refusals, in the order of BackingStats raw_dry_g, as the exit line names them; the case that has each.
 DRY_REFUSALS = ["rule_kind", "G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G8", "G9", "cap", "G4_hull_off"]
@@ -212,6 +244,45 @@ class CoherenceTest(unittest.TestCase):
                     fatal = fatal_lines(done.stderr)
                     self.assertEqual(len(fatal), 1, done.stderr)
                     self.assertIn(text, fatal[0])
+
+    def test_a_used_import_is_refused_by_the_rule_the_dump_names(self) -> None:
+        """The stop and the dry evaluation of the guard in the dump agree on which rule refused the import, and the stop
+        names it: the text after the head is the rule's reason (the hull rule keeps the head alone), and the refusals the
+        run made so far are counted in the dump."""
+        for case, rule in RULE_OF.items():
+            for level in LEVELS:
+                with self.subTest(case=case, level=level):
+                    done, lines = self.stop_with_dump(level, case)
+                    fatal = fatal_lines(done.stderr)[0]
+                    named = [r for r, why in WHY.items() if fatal.endswith(f"{HEAD_ENDS}: it {why}")]
+                    if rule == "hull":
+                        self.assertTrue(fatal.endswith(HEAD_ENDS), fatal)
+                        self.assertEqual(named, [])
+                    else:
+                        self.assertEqual(named, [rule], fatal)
+                    seen = [RULE_LINE.match(line) for line in lines if line.startswith("guard G4 rule: ")]
+                    self.assertEqual(len(seen), 1, lines)
+                    self.assertEqual(seen[0][1], rule)
+                    if rule != "hull":
+                        self.assertEqual(seen[0][2], WHY[rule])
+                    counts = [line for line in lines if line.startswith("growths so far: ")]
+                    self.assertEqual(len(counts), 1, lines)
+                    self.assertIn(f" {rule} 1", counts[0].split("import refusals:")[1])
+
+    def test_a_growth_over_a_used_import_logs_what_it_did(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done = self.run_case(level, "raw_grow_used_import")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                logs = [line for line in done.stderr.splitlines() if "backing map: raw growth" in line]
+                self.assertEqual(len(logs), 2, done.stderr)
+                self.assertRegex(logs[0], r"raw growth 1 in submission 2: the mirror \[0x[0-9a-f]+, 0x[0-9a-f]+\) grew to "
+                                 r"\[0x[0-9a-f]+, 0x[0-9a-f]+\), adding 0x1000 bytes; 1 used imports trimmed, 0 unused "
+                                 r"deferred; mirror_bytes \d+; trimmed \[0x[0-9a-f]+, 0x[0-9a-f]+\) used_by 2 written 0 "
+                                 r"hull \[0x[0-9a-f]+, 0x[0-9a-f]+\)")
+                self.assertTrue(logs[1].endswith(
+                    "raw growth at exit: grows 1 (4096 bytes), 1 trimmed a used import (1 imports, 4096 bytes), 0 waited, "
+                    "heirs 0 (0 with a GPU write); import refusals: newer 0 written 0 no_hull 0 loose 0 hull 0 up 0"), logs[1])
 
     def stop_with_dump(self, level: str, case: str) -> tuple[subprocess.CompletedProcess, list[str]]:
         done = self.run_case(level, case)

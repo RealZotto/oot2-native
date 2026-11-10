@@ -18,7 +18,9 @@ mapped page resolving, a range a finalized pool left and another pool took reach
 grows past a mirror the table maps inside one submission of two raw-access stages (the table follows the map to the end
 of the recording, the stage recorded after the bind reaches the pages it committed, and the bound and the raw views of
 them are the same bytes), and a previously bound mirror that grows in place with consistent bound/raw writes and
-write-back, including when a GPU-only extent already occupies adjacent block space. The write-back cases (a 1024-thread
+write-back, including when a GPU-only extent already occupies adjacent block space, and a mirror that grows over the lowest
+page of an import its submission used (the import is trimmed in place; its host import stays whole under the page, where
+the mirror's sink is made). The write-back cases (a 1024-thread
 variant of the program, raw_program(big=True)) store into 10,101 pages the way the opening's chain does and check that
 the device wrote them into guest memory byte for byte (the same hash as the build that copied them on the completion
 thread), that a CPU write after the device's page and before the stamp is kept and reaches the mirror, that pages the
@@ -60,7 +62,7 @@ THREADS = 64
 BIG_THREADS = 1024   # raw_program_big: one group of the write-back cases
 TABLE = (1 << 39) + 0x4000_0000   # the pointer table: vk_raw_test.c, TABLE
 ENTRY = 32
-CASES = ("kinds", "keep", "miss", "commit", "reuse", "edges", "grow", "grow_taken", "grow_guarded_head",
+CASES = ("kinds", "keep", "miss", "commit", "reuse", "edges", "grow", "grow_taken", "grow_used", "grow_guarded_head",
          "grow_guarded_tail")
 # The write-back cases run the 1024-thread program (groups of 1024 threads, one entry each)
 BIG_CASES = ("wb", "wbcpu", "wbunmap", "wbflight", "wbremap", "wbremapflight", "wbnosink", "wbrefused", "wbreap")

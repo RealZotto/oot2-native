@@ -29,6 +29,9 @@
 //            bytes, and the mirror's kept pages were written back
 //   grow_taken   a bound mirror grows without moving: bound and raw writes before and after the growth, including newly
 //                committed pages outside the bind, reach the same bytes on the device and in guest memory
+//   grow_used    a mirror grows over the lowest page of an import the submission used, which is trimmed in place: the import's
+//                host import stays whole under the page the mirror now owns, the mirror's sink is made over it, and the raw
+//                stages, the bound views and guest memory agree
 //   grow_guarded_head, grow_guarded_tail   a bound mirror grows beside a GPU-only extent used by the same submission;
 //                the committed chunk beside the bind keeps an import over its other pages, which the raw stage reaches
 //   heap MIB what the invariant costs over a guest heap of MIB MiB committed in 256 MiB pools, with a 256 MiB pool in the
@@ -861,6 +864,104 @@ static void case_grow_taken(const char *spv) {
     pool_t *all[] = {&pp, &t};
     close_all(all, 2);
     printf("ok grow_taken\n");
+}
+
+// A mirror grows over the lowest page of an import the submission used, which is trimmed in place (backing.c, import_gives):
+// the import's host import stays whole, so its buffer lies under the page the mirror now owns, and the mirror's sink (the
+// host import the raw path keeps over a mirror's pages, vk_raw.c) is made over pages another live host import covers. The
+// device must take that: the raw stage after the growth stores into the given page (through the mirror) and into the
+// import's remaining pages, and the bound views, the raw views and guest memory hold the same bytes.
+static void case_grow_used(const char *spv) {
+    open_all(spv);
+    Entry e[THREADS], first[THREADS], got_first;
+    pool_t t = table_pool(e);
+    const uint64_t p = g_heap + 16 * MiB, E = p + 256 * KiB;
+    const uint64_t old = E - 0x800, given = E + 0x200, keep = E + 0x1800, deep = E + 0x9000;
+    g_mirror_lo = p, g_mirror_hi = p + 1 * MiB;
+    pool_t pp = make_pool(p, 16 * MiB, 0);
+    fill_words(p, 256 * KiB, 0xAAAAAAAAu);
+    uint64_t v0 = gpu_vk_begin(GPU_VK_INTERNAL);   // the mirror, made by a bind of an earlier submission
+    BackingRef m0;
+    backing_resolve(p, 0x100, v0, &m0);
+    CHECK(m0.kind == BACKING_MIRROR);
+    finish(v0);
+    fill_words(E, 256 * KiB, 0xBBBBBBBBu);   // committed since: an import at the begin of the next raw-access submission
+    memcpy(first, e, sizeof first);
+    first[0] = (Entry){old + PROBE, old + 0x100, 0, 0, {0}};
+    e[0] = (Entry){given + PROBE, given + 0x800, 0, 0, {0}};
+    e[1] = (Entry){keep + PROBE, keep + 0x800, 0, 0, {0}};
+
+    backing_sync();
+    uint64_t v = gpu_vk_begin(GPU_VK_INTERNAL);
+    VkCommandBuffer cb = gpu_vk_cmd();
+    BackingRef entries, small, imp, tail, big;
+    backing_resolve(TABLE, THREADS * sizeof(Entry), v, &entries);
+    backing_resolve(old, 0x100, v, &small);
+    CHECK(small.kind == BACKING_MIRROR);
+    uint32_t push1[4], push2[4];
+    gpu_vk_raw_begin(v, push1);   // the import over E is made here; the table of v maps both
+    stage(cb, first, push1, &entries);
+    barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBufferCopy first_copy = {.srcOffset = entries.offset, .dstOffset = 0, .size = sizeof(Entry)};
+    vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)entries.buffer, g_buf, 1, &first_copy);
+
+    backing_resolve(keep, 0x2000, v, &imp);
+    backing_resolve(deep, 0x1d0, v, &tail);
+    CHECK(imp.kind == BACKING_IMPORT && tail.kind == BACKING_IMPORT);
+    backing_resolve(E - 0x600, 0xe10, v, &big);   // the bind: the mirror takes the page at E, which the import held
+    CHECK(big.kind == BACKING_MIRROR && big.address + old - (E - 0x600) == small.address);
+    BackingRef again;
+    backing_resolve(keep, 0x2000, v, &again);
+    CHECK(again.kind == BACKING_IMPORT && again.buffer == imp.buffer && again.offset == imp.offset);   // the trim moved nothing it holds
+    BackingStats before;
+    backing_stats(&before);
+    CHECK(before.raw_grows == 1 && before.raw_grow_used == 1 && before.raw_grow_trims == 1 &&
+          before.raw_grow_trim_bytes == PG);
+    gpu_vk_raw_begin(v, push2);
+    CHECK(!memcmp(push1, push2, sizeof push1));
+    stage(cb, e, push2, &entries);
+    barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBufferCopy given_copy = {.srcOffset = big.offset + (given + PROBE - (E - 0x600)), .dstOffset = 4096, .size = 8};
+    VkBufferCopy keep_copy = {.srcOffset = imp.offset + PROBE, .dstOffset = 8192, .size = 8};
+    vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)big.buffer, g_buf, 1, &given_copy);
+    vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)imp.buffer, g_buf, 1, &keep_copy);
+    barrier(cb, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    gpu_vk_raw_end(v);
+    finish(v);
+    memcpy(&got_first, (const void *)g_words, sizeof got_first);
+    uint32_t bound_given[2], bound_keep[2];
+    for (int i = 0; i < 2; i++) bound_given[i] = g_words[4096 / 4 + i], bound_keep[i] = g_words[8192 / 4 + i];
+    read_back(TABLE, THREADS * sizeof(Entry));
+    memcpy(e, (const void *)g_words, 2 * sizeof(Entry));
+
+    CHECK(got_first.loaded == 0xAAAAAAAAu && got_first.old == 0xAAAAAAAAu);
+    CHECK(e[0].loaded == 0xBBBBBBBBu && e[0].old == 0xBBBBBBBBu);   // the page the mirror took holds the guest's bytes
+    CHECK(e[1].loaded == 0xBBBBBBBBu && e[1].old == 0xBBBBBBBBu);   // and the import's remaining page its own
+    CHECK(bound_given[0] == 0xBBBBBBBBu && bound_given[1] == MARK);
+    CHECK(bound_keep[0] == 0xBBBBBBBBu && bound_keep[1] == (MARK | 1));
+    CHECK(word_at(old + PROBE + 4) == MARK && word_at(old + 0x100) == 0xAAAAAAABu);
+    CHECK(word_at(given + PROBE + 4) == MARK && word_at(given + 0x800) == 0xBBBBBBBCu);   // written back from the mirror
+    CHECK(word_at(keep + PROBE + 4) == (MARK | 1) && word_at(keep + 0x800) == 0xBBBBBBBCu);
+    GpuVkRawStats s;
+    gpu_vk_raw_stats(&s);
+    BackingStats b;
+    backing_stats(&b);
+    CHECK(s.misses == 0 && s.submissions == 1 && s.sinks_refused == 0);
+    CHECK(b.mirrors == 1 && b.mirror_bytes == 256 * KiB + PG && b.imports == 1 && b.import_bytes == 256 * KiB - PG);
+    CHECK(s.sinks_made >= 1 && s.sink_bytes == b.mirror_bytes);   // the sink covers the page the import's host import covers too
+    BackingPage pg;
+    backing_page(E, &pg);
+    CHECK(pg.kind == BACKING_MIRROR);
+    backing_page(E + PG, &pg);
+    CHECK(pg.kind == BACKING_IMPORT);
+    printf("one submission: the mirror took the lowest page of an import the submission used (trimmed in place), its sink "
+           "was made over pages the import's host import still covers, and both raw stages, the bound views and guest "
+           "memory hold the same bytes; write-backs %llu, sinks %llu (%llu KiB, %llu made), sinks refused %llu\n",
+           (ull)s.writebacks, (ull)s.sinks, (ull)(s.sink_bytes >> 10), (ull)s.sinks_made, (ull)s.sinks_refused);
+    stats_line();
+    pool_t *all[] = {&pp, &t};
+    close_all(all, 2);
+    printf("ok grow_used\n");
 }
 
 static void case_grow_guarded(const char *spv, int head) {
@@ -1735,6 +1836,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "reuse")) case_reuse(spv);
     else if (!strcmp(cs, "grow")) case_grow(spv);
     else if (!strcmp(cs, "grow_taken")) case_grow_taken(spv);
+    else if (!strcmp(cs, "grow_used")) case_grow_used(spv);
     else if (!strcmp(cs, "grow_guarded_head")) case_grow_guarded(spv, 1);
     else if (!strcmp(cs, "grow_guarded_tail")) case_grow_guarded(spv, 0);
     else if (!strcmp(cs, "heap") && argc >= 4) case_heap(spv, strtoull(argv[3], NULL, 10));

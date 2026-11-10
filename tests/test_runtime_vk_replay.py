@@ -710,6 +710,23 @@ class ComputeTest(ReplayBase):
         refused = self.passing("raw_snap_refused")
         self.assertEqual(len([line for line in refused.splitlines() if line.startswith("op raw_snap ")]), 3)   # asked, answered 0
 
+    def test_a_negative_base_vertex_resolves_the_streams_first_byte_once_more(self) -> None:
+        # The draw reads below the start of its stream, inside the buffer, which the stream's resolve does not state: the
+        # backing map takes a resolve of one byte for an extent not stated (backing.c, import_gives). Frames 1 and 3 draw
+        # with base vertex 2, frame 2 with -2: the one extra resolve is the negative draw's, after the stream's own.
+        out = self.passing("base_vertex")
+        frames: list[list[str]] = []
+        for line in (line for line in out.splitlines() if line.startswith("op ")):
+            if line == "op frame_begin":
+                frames.append([])
+            else:
+                frames[-1].append(line)
+        self.assertEqual(len(frames), 3)
+        stream = [[line for line in ops if line.startswith("op resolve 0x30003000+")] for ops in frames]
+        self.assertEqual(stream, [["op resolve 0x30003000+0x40"],
+                                  ["op resolve 0x30003000+0x40", "op resolve 0x30003000+0x1"],
+                                  ["op resolve 0x30003000+0x40"]])
+
     def test_dispatches_become_their_packets(self) -> None:
         out = self.passing("compute")
         f = frame(out, 1)

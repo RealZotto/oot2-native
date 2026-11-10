@@ -991,6 +991,27 @@ static void case_raw_snap_mesh(void) {
     printf("ok raw_snap_mesh\n");
 }
 
+// An indexed draw with a negative base vertex reads below the start of its vertex stream, so it resolves the stream's first
+// byte once more, after the resolve of the stream's range (the backing map takes that for an extent not stated and will
+// not give pages away below it); one with a base vertex of zero or more, and the draw after a negative one, resolve it
+// once. Frame 1 draws with base vertex 2, frame 2 with -2, frame 3 with 2 again.
+static void case_base_vertex(void) {
+    open_fakes();
+    g_log_resolves = 1;
+    static const int32_t base[3] = {2, -2, 2};
+    for (int f = 0; f < 3; f++) {
+        Rec *r = rec_begin(f);
+        if (!f) graphics_state(r);
+        PUT(r, OP_DRAW_IDX, (p_draw_idx){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .itype = NVN_INDEX_TYPE_UNSIGNED_SHORT,
+                                         .count = 6, .base_vertex = base[f], .base_instance = 0, .instances = 1,
+                                         .ibuf = MIRROR + 0x5000});
+        uint64_t h = rec_end(r);
+        vkr_submit(&h, 1);
+    }
+    close_fakes();
+    printf("ok base_vertex\n");
+}
+
 // ---------- storage images
 static p_bind_program program_img(void) {
     p_bind_program p = program(1);
@@ -1818,6 +1839,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "movie_stop") && argc >= 3) case_movie_stop(argv[2]);
     else if (!strcmp(cs, "movie_open")) case_movie_open();
     else if (!strcmp(cs, "storage_stop") && argc >= 3) case_storage_stop(argv[2]);
+    else if (!strcmp(cs, "base_vertex")) case_base_vertex();
     else if (!strcmp(cs, "conflict_read_first")) case_conflict(0);
     else if (!strcmp(cs, "conflict_write_first")) case_conflict(1);
     else if (!strcmp(cs, "transfers")) case_transfers();
