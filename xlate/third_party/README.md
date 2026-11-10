@@ -245,9 +245,12 @@ Changes of this project:
   (new); `Instructions/InstEmitAmpereAlu.cs`, `AF2i`: F2I of a single or of a
   half bounds its float before it converts it. Its select of 0 for a NaN came
   after the conversion, and a select does not take back a conversion that was
-  undefined: a NaN, an infinity or a value outside the integer's range still
-  went into `OpConvertFToS` or `OpConvertFToU`. The console saturates such a
-  value to the integer's range and gives 0 for a NaN. The rounded float is now
+  undefined: an infinity or a value outside the integer's range still went
+  into `OpConvertFToS` or `OpConvertFToU`, and so did a NaN for a signed
+  integer (an unsigned one had `NMax` against 0 before its conversion, which
+  takes a NaN to 0). The console saturates such a value to the integer's
+  range and gives 0 for a NaN; that is read in PTX's description of `cvt`
+  and has not been measured on the console. The rounded float is now
   clamped (`NClamp`) between two floats the integer holds and then converted:
   -2^31 and 2147483520 for a signed 32-bit integer, 0 and 4294967040 for an
   unsigned one (the largest floats below 2^31 and 2^32, since 2^31 - 1 and
@@ -267,20 +270,36 @@ Changes of this project:
   for an unsigned 32-bit and for a signed 16-bit one, 1 fewer for a signed
   8-bit one, 9 fewer for an unsigned 16-bit one and 10 fewer for an unsigned
   8-bit one; toward zero each has 1 fewer than that, so 3 more for a signed
-  32-bit integer and 1 fewer than before for an unsigned one. A signed 32-bit
-  site also has one more `NoContraction` decoration, on the clamp. Over the
-  56,381 programs of the corpus, which all translate with and without this
-  change, 42,885 modules change, the 42,885 that hold a F2I word, and nothing
-  else; all of them pass spirv-val and none of their descriptions changes but
-  the module's hash and size. 38,533 grow, 4,322 shrink and 30 keep their
-  size; together they have 0.22 percent more words. The corpus converts to a
-  signed or unsigned 32-bit integer and to an unsigned 16-bit one, from a
-  single; the other forms (a signed 16-bit integer, either 8-bit one, a half
-  source) have the synthetic tests only. Four pixel programs of the corpus
-  convert the constant 0x7FFFFFFF, a NaN, to an unsigned 32-bit integer and
-  give the result to an atomic minimum and maximum: the clamp folds to 0
-  there, where the module held `OpConvertFToU` of the NaN before. What the
-  sequence gives for a NaN or an
+  32-bit integer and 1 fewer than before for an unsigned one. A site with a
+  signed result, of any width, also has one more `NoContraction` decoration,
+  on the clamp. Over the 56,381 programs of the corpus, which all translate
+  with and without this change, 42,885 modules change, the 42,885 that hold
+  a F2I word, and no other module; all of them pass spirv-val and none of
+  their descriptions changes but the module's hash and size. 38,533 grow,
+  4,322 shrink and 30 keep their size; together they have 0.22 percent more
+  words. Inside a changed module the sequence's length also decides where
+  some other expressions are emitted: the generator carries a memory read or
+  a texture sample to its use only when the use is among the next 64
+  statements and otherwise holds it in a variable where the program read it,
+  so a site that is longer or shorter between a read and its use changes
+  which of the two happens. 2,688 modules hold more function variables than
+  before; in the eight modules read for this, the variables added or gone
+  are such reads (two texture samples in one of them). The cause is read in
+  the generator's source and, for one module, in its statement counts (61
+  statements between a read and its use before, 64 now); no translation with
+  another window was made. The corpus converts to a signed or unsigned
+  32-bit integer and to an unsigned 16-bit one, from a single; the other
+  forms (a signed 16-bit integer, either 8-bit one, a half source) have the
+  synthetic tests only.
+  Thirteen programs of the corpus convert the constant 0x7FFFFFFF, a NaN.
+  Twelve are pixel programs that convert it to an unsigned 32-bit integer
+  and give the result to an atomic minimum, to an atomic maximum or to both
+  (four programs each): the clamp folds to the constant 0 there, where the
+  module converted `NMax` of the truncated NaN and 0 before, which is 0 by
+  `NMax`'s rule. One is a compute program that converts it to a signed
+  32-bit integer: the clamp folds to -2^31 there, where the module converted
+  the truncated NaN before, and its 0 comes, as before, from the select on
+  `OpIsNan` of the constant. What the sequence gives for a NaN or an
   infinity, here and in the conversions of the entry above, is what SPIR-V
   says, and Vulkan does not hold a driver to it: the modules do not declare
   `SignedZeroInfNanPreserve`, and without it a driver may assume that no
