@@ -127,11 +127,31 @@ static uint64_t *new_bitmap(uint64_t bits) {
 // moves it once, after the bits changed
 static uint64_t g_commit_epoch;   // atomic
 
+// The decommit record (rt_mem_decommitted): the range of each of the last DECOMMIT_LOG decommits of committed pages, by
+// number. Every decommit is made under the exclusive lock (SetHeapSize, MapMemory and UnmapMemory, UnmapPhysicalMemory, a
+// kernel page freed, a page released), so one writer at a time; readers take no lock (the GPU back end's completion thread
+// is one), so a slot can be written again under a reader: the writer names the number it is writing first (g_dec_start),
+// behind a release fence, and a reader that may have read a slot a newer decommit took answers "decommitted".
+#define DECOMMIT_LOG 1024u
+static uint64_t g_dec_lo[DECOMMIT_LOG], g_dec_hi[DECOMMIT_LOG];   // atomic: decommit k at k % DECOMMIT_LOG
+static uint64_t g_dec_start;                                       // atomic: the newest decommit being written
+static uint64_t g_dec_epoch;                                       // atomic: the newest decommit written
+
+static void decommit_note(uint64_t a, uint64_t n) {
+    uint64_t k = __atomic_load_n(&g_dec_epoch, __ATOMIC_RELAXED) + 1;
+    __atomic_store_n(&g_dec_start, k, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&g_dec_lo[k % DECOMMIT_LOG], a, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_dec_hi[k % DECOMMIT_LOG], a + n, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_dec_epoch, k, __ATOMIC_RELEASE);
+}
+
 static void account(int r, uint64_t a, uint64_t n, int on) {
     uint64_t first = (a - R[r].base) / PAGE, changed = 0;
     for (uint64_t i = 0; i < n / PAGE; i++) changed += (uint64_t)bit_change(R[r].bits, first + i, on);
     if (on) __atomic_fetch_add(&R[r].committed, changed * PAGE, __ATOMIC_RELAXED);
     else __atomic_fetch_sub(&R[r].committed, changed * PAGE, __ATOMIC_RELAXED);
+    if (changed && !on) decommit_note(a, n);   // before the lock is dropped, so before any commit of these pages again
     if (changed) __atomic_fetch_add(&g_commit_epoch, 1, __ATOMIC_RELEASE);
 }
 
@@ -1099,6 +1119,22 @@ uint64_t rt_mem_commit_run(uint64_t addr, uint64_t size, int *committed) {
 }
 
 uint64_t rt_mem_commit_epoch(void) { return __atomic_load_n(&g_commit_epoch, __ATOMIC_ACQUIRE); }
+
+uint64_t rt_mem_decommit_epoch(void) { return __atomic_load_n(&g_dec_epoch, __ATOMIC_ACQUIRE); }
+
+int rt_mem_decommitted(uint64_t since, uint64_t lo, uint64_t hi) {
+    uint64_t e = __atomic_load_n(&g_dec_epoch, __ATOMIC_ACQUIRE);
+    if (e <= since) return 0;
+    if (e - since >= DECOMMIT_LOG) return 1;   // the oldest of them are no longer recorded
+    for (uint64_t k = since + 1; k <= e; k++)
+        if (__atomic_load_n(&g_dec_lo[k % DECOMMIT_LOG], __ATOMIC_RELAXED) < hi &&
+            lo < __atomic_load_n(&g_dec_hi[k % DECOMMIT_LOG], __ATOMIC_RELAXED))
+            return 1;
+    // A decommit newer than e writes the slot of the one DECOMMIT_LOG before it: a slot read here was its own unless a
+    // decommit past since + DECOMMIT_LOG began (the writer's fence pairs with this one)
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return __atomic_load_n(&g_dec_start, __ATOMIC_RELAXED) - since >= DECOMMIT_LOG;
+}
 
 static uint64_t resident_bytes(const Region *g) {
     uint64_t pages = g->size / PAGE, total = 0;

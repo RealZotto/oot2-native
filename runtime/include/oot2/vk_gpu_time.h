@@ -30,7 +30,7 @@
 //       the backing map's and the raw path's counters (cumulative; imports and mirrors as they stand) when this frame ended, in
 //       the first frame and every 60th after it; the last seven are the raw write-back's: the time its effect took on the
 //       completion thread and the part of it in pagegen_mark_gpu_direct, the pages of it the CPU had written since the
-//       submission began (plain stamp), the bytes of host imports under mirrors (the write-back's sinks) as they stand and the
+//       mirrors were brought current (plain stamp), the bytes of host imports under mirrors (the write-back's sinks) as they stand and the
 //       sinks made, then the write watch queries of all the page generations' consumers (their time and their number)
 //   M value index what label x y z ns notes
 //       one marked command: what (dispatch, pass, xfer, barrier), its label (a dispatch's stage key, a pass's first

@@ -408,14 +408,15 @@ static void case_writewatch(void) {
 
 // The commit query and the commit epoch (architecture D14, for the GPU back end's host imports): a run of pages in one
 // state from addr, clipped to the size asked and to the region; the epoch moves once for each change of the page map
-// (a first touch by a write or a read, host I/O, a heap that shrinks) and never for an access to committed pages.
+// (a first touch by a write or a read, host I/O, a heap that shrinks) and never for an access to committed pages. The
+// decommit record moves on the decommits alone and names the ranges they took, through a commit of the same pages again.
 static void case_commitrun(void) {
     RtMemConfig cfg = test_config();
     rt_mem_init(&cfg);
     CHECK(svc(0x01, 0, 4 * MiB, 0) == 0);
     const uint64_t heap = info(4), region = info(5);
     int st = -1;
-    const uint64_t e0 = rt_mem_commit_epoch();
+    const uint64_t e0 = rt_mem_commit_epoch(), d0 = rt_mem_decommit_epoch();
     CHECK(rt_mem_commit_run(heap, 4 * MiB, &st) == 4 * MiB && st == 0);
     ST32(heap + 0x10010, 1);   // commits the chunk [0x10000, 0x20000)
     CHECK(rt_mem_commit_epoch() == e0 + 1);
@@ -434,11 +435,36 @@ static void case_commitrun(void) {
     CHECK(rt_mem_commit_io(heap + 0x100000, 0x1000, 1));   // host I/O
     CHECK(rt_mem_commit_epoch() == e0 + 3);
     CHECK(rt_mem_commit_run(heap + 0x100000, 0x10000, &st) == 0x10000 && st == 1);
+    CHECK(rt_mem_decommit_epoch() == d0 && !rt_mem_decommitted(d0, heap, heap + 4 * MiB));   // commits are no decommit
     CHECK(svc(0x01, 0, 2 * MiB, 0) == 0);   // the heap shrinks over the chunk at 3 MiB
     CHECK(rt_mem_commit_epoch() == e0 + 4);
     CHECK(rt_mem_commit_run(heap + 2 * MiB, 2 * MiB, &st) == 2 * MiB && st == 0);
     CHECK(svc(0x01, 0, 2 * MiB, 0) == 0);   // nothing past 2 MiB is committed now: no change, no move
     CHECK(rt_mem_commit_epoch() == e0 + 4);
+    // The decommit record: the shrink is one decommit, of the range it gave back; pages beside it, and anything after it,
+    // were not decommitted
+    CHECK(rt_mem_decommit_epoch() == d0 + 1);
+    CHECK(rt_mem_decommitted(d0, heap + 0x300000, heap + 0x301000));
+    CHECK(rt_mem_decommitted(d0, heap + 2 * MiB - 0x1000, heap + 2 * MiB + 0x1000));
+    CHECK(!rt_mem_decommitted(d0, heap + 0x10000, heap + 0x20000));
+    CHECK(!rt_mem_decommitted(d0, heap, heap + 2 * MiB));
+    CHECK(!rt_mem_decommitted(d0 + 1, heap + 0x300000, heap + 0x301000));
+    // committed again (the heap grows back, a write touches the chunk): still decommitted since d0, which an import made
+    // before the shrink needs to know
+    CHECK(svc(0x01, 0, 4 * MiB, 0) == 0);
+    ST32(heap + 0x300000, 5);
+    CHECK(rt_mem_commit_run(heap + 0x300000, 0x1000, &st) == 0x1000 && st == 1);
+    CHECK(rt_mem_decommit_epoch() == d0 + 1 && rt_mem_decommitted(d0, heap + 0x300000, heap + 0x301000));
+    // The record keeps the last 1024: a reader further behind is told decommitted, whatever the range, and one less far
+    // behind is told the truth
+    for (int i = 0; i < 1024; i++) {
+        ST32(heap + 2 * MiB + (uint64_t)(i % 32) * 0x10000, 6);   // another chunk each time: the same one would be a fault loop
+        CHECK(svc(0x01, 0, 2 * MiB, 0) == 0 && svc(0x01, 0, 4 * MiB, 0) == 0);
+    }
+    CHECK(rt_mem_decommit_epoch() == d0 + 1025);
+    CHECK(rt_mem_decommitted(d0, heap + 0x10000, heap + 0x20000));
+    CHECK(!rt_mem_decommitted(d0 + 2, heap + 0x10000, heap + 0x20000));
+    CHECK(rt_mem_decommitted(d0 + 2, heap + 0x300000, heap + 0x301000));
 }
 
 // Watched reservations in pieces (Windows; plat.h, PLAT_PIECE): the alias region is made of allocations that start at

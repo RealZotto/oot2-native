@@ -39,7 +39,8 @@ typedef struct Copy {
     RawLayout l;
     uint64_t pages_at;   // byte offset of the mirrored pages' list
     uint64_t *guest;     // the guest address of each mirrored page (host memory)
-    uint8_t *sunk;       // whether each has a sink (host memory)
+    uint64_t *made;      // the decommit epoch each one's sink was made at (Sink.made), NO_SINK for none (host memory)
+    uint64_t unsunk;     // how many have none
     uint64_t sink_gen;   // the sinks' generation it was built at (g_sink_gen)
 } Copy;
 
@@ -54,17 +55,21 @@ typedef struct Out {
 typedef struct Sink {
     BackingMem m;
     uint64_t lo, hi;
+    uint64_t made;   // the decommit epoch it holds its pages since: read before its import, moved up by each scrub it passes
     uint64_t gone;   // a dead sink: freed once this submission is done
     uint64_t seen;   // the build that last mapped a page to it
 } Sink;
+
+#define NO_SINK UINT64_MAX   // Copy.made of a mirrored page with no sink
 
 // What an end hands its effect.
 typedef struct Done {
     Out *out;
     const uint64_t *guest;
-    const uint8_t *sunk;
-    uint64_t pages;   // the mirrored pages
-    uint64_t since;   // the page generation when the submission began (pagegen_mark_gpu_direct)
+    const uint64_t *made;
+    uint64_t pages;      // the mirrored pages
+    uint64_t since;      // the page generation every mirror was current at (pagegen_mark_gpu_direct)
+    uint64_t scrubbed;   // the decommit epoch up to which the begin found every live sink's pages its own (sinks_scrub)
 } Done;
 
 static Copy g_copy[RAW_COPIES_MAX];
@@ -75,23 +80,25 @@ static uint32_t g_push[4];
 static uint32_t *g_image;            // the build's host image
 static uint64_t g_image_bytes;
 static RawMirrorPage *g_pages;
-static uint64_t *g_guest_scratch;
-static uint64_t g_pages_cap, g_guest_cap;
+static uint64_t *g_guest_scratch, *g_made_scratch;
+static uint64_t g_pages_cap, g_guest_cap, g_made_cap;
 static VkShaderModule g_module;
 static VkPipelineLayout g_layout;
 static VkPipeline g_pipe;
 static PlatMutex g_lock = PLAT_MUTEX_INIT;   // the out buffers' free list and the counters
 static Out *g_free;
 static GpuVkRawStats g_st;
+static const BackingOps *g_ops = &gpu_vk_backing_ops;   // what the sinks are made and freed with (gpu_vk_raw_set_ops)
 static Sink *g_sinks;                // live, sorted by address, disjoint
 static int g_nsinks, g_sinks_cap;
 static Sink *g_dead;                 // dropped, waiting for the submissions that may use them
 static int g_ndead, g_dead_cap;
 static uint64_t g_sink_gen = 1;      // moves when a sink is made or dropped: a table built before names sinks that may be gone
-static uint64_t g_sink_epoch;        // the commit epoch the live sinks were last checked at
+static uint64_t g_sink_epoch;        // the decommit epoch the live sinks were last checked at
+static uint64_t g_scrubbed;          // the same, read by the begin of the submission being recorded (Done.scrubbed)
 static uint64_t g_sinks_version;     // the map's version sinks_prepare last made sinks for (0: never)
 static uint64_t g_build_id;          // counts the table images built (Sink.seen)
-static uint64_t g_since;             // the page generation when the submission being recorded began
+static uint64_t g_since;             // the page generation every mirror was current at when the submission began
 
 // ---------- memory
 static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
@@ -220,7 +227,7 @@ static void sinks_count(void) {
     uint64_t bytes = 0;
     for (int i = 0; i < g_nsinks; i++) bytes += g_sinks[i].hi - g_sinks[i].lo;
     plat_mutex_lock(&g_lock);
-    g_st.sinks = (uint64_t)g_nsinks, g_st.sink_bytes = bytes;
+    g_st.sinks = (uint64_t)g_nsinks, g_st.sink_bytes = bytes, g_st.sinks_dead = (uint64_t)g_ndead;
     plat_mutex_unlock(&g_lock);
 }
 
@@ -234,50 +241,82 @@ static void sink_drop(int i) {
     g_nsinks--;
     g_sink_gen++;
     plat_mutex_lock(&g_lock);
-    g_st.sinks_dropped++;
+    g_st.sinks_dropped++, g_st.sinks_dead = (uint64_t)g_ndead;
     plat_mutex_unlock(&g_lock);
 }
 
 // Free the dead sinks whose submissions are done (all of them at close).
 static void sinks_reap(int all) {
     uint64_t done = gpu_sync_done();
-    int k = 0;
+    int k = 0, freed = 0;
     for (int i = 0; i < g_ndead; i++) {
         if (!all && g_dead[i].gone > done) {
             g_dead[k++] = g_dead[i];
             continue;
         }
-        gpu_vk_backing_ops.free(&g_dead[i].m);
+        g_ops->free(&g_dead[i].m);
+        freed++;
     }
     g_ndead = k;
+    plat_mutex_lock(&g_lock);
+    g_st.sinks_freed += (uint64_t)freed, g_st.sinks_dead = (uint64_t)g_ndead;
+    plat_mutex_unlock(&g_lock);
 }
 
-// A sink over the committed pages [lo, hi). A refused import is retried once after a 4 KiB import of the first page clears
-// it (the write-watch study), and a second refusal is a named stop.
-static void sink_make(uint64_t lo, uint64_t hi) {
-    const BackingOps *ops = &gpu_vk_backing_ops;
-    uint64_t t0 = plat_now_ns();
+// Whether the guest has every page of [lo, hi) committed now.
+static int committed_whole(uint64_t lo, uint64_t hi) {
+    for (uint64_t a = lo; a < hi;) {
+        int c;
+        uint64_t n = rt_mem_commit_run(a, hi - a, &c);
+        if (n == UINT64_MAX || !n || !c) return 0;
+        a += n;
+    }
+    return 1;
+}
+
+static int sink_refused(uint64_t lo, uint64_t hi) {
+    plat_mutex_lock(&g_lock);
+    g_st.sinks_refused++;
+    plat_mutex_unlock(&g_lock);
+    rt_log("gfx: vulkan: raw path: the import of [%#llx, %#llx) as the sink of a mirror's write-back was refused, and the "
+           "guest no longer has all of it committed (it decommitted pages while the sink was made): no sink there now",
+           (ull)lo, (ull)hi);
+    return 0;
+}
+
+// A sink over the committed pages [lo, hi): 1, or 0 when the device refused the import and the guest no longer has all of
+// [lo, hi) committed (another thread decommitted pages between the caller's look at the page map and the import): those
+// pages get no sink, the effect leaves their stores out (or counts them lost, when committed again by then), and the next
+// begin looks again. A refused import of pages still committed is retried once after a 4 KiB import of the first page
+// clears it (the write-watch study), and a second refusal of pages still committed is a named stop.
+static int sink_make(uint64_t lo, uint64_t hi) {
+    uint64_t t0 = plat_now_ns(), made = rt_mem_decommit_epoch();   // before the import: a decommit after it may take its pages
     BackingMem m;
-    if (!ops->import(lo, hi - lo, &m)) {
+    if (!g_ops->import(lo, hi - lo, &m)) {
+        if (!committed_whole(lo, hi)) return sink_refused(lo, hi);
         BackingMem probe;
-        int cleared = ops->import(lo, BACKING_IMPORT_PROBE, &probe);
-        if (cleared) ops->free(&probe);
-        if (!cleared || !ops->import(lo, hi - lo, &m))
+        int cleared = g_ops->import(lo, BACKING_IMPORT_PROBE, &probe);
+        if (cleared) g_ops->free(&probe);
+        made = rt_mem_decommit_epoch();
+        if (!cleared || !g_ops->import(lo, hi - lo, &m)) {
+            if (!committed_whole(lo, hi)) return sink_refused(lo, hi);
             rt_fatal("gfx: vulkan: raw path: the device refused to import committed host memory [%#llx, %#llx) (%llu KiB) "
                      "as the sink of a mirror's write-back, %s: the raw path cannot write the mirror's pages into guest "
                      "memory without it", (ull)lo, (ull)hi, (ull)((hi - lo) >> 10),
                      cleared ? "again after a 4 KiB import cleared the first refusal"
                              : "and a 4 KiB import of its first page was refused too");
+        }
     }
     int at = sink_after(lo);
     g_sinks = sinks_room(g_sinks, &g_sinks_cap, g_nsinks + 1, sizeof *g_sinks);
     memmove(g_sinks + at + 1, g_sinks + at, (size_t)(g_nsinks - at) * sizeof *g_sinks);
-    g_sinks[at] = (Sink){.m = m, .lo = lo, .hi = hi};
+    g_sinks[at] = (Sink){.m = m, .lo = lo, .hi = hi, .made = made};
     g_nsinks++;
     g_sink_gen++;
     plat_mutex_lock(&g_lock);
     g_st.sinks_made++, g_st.sink_ns += plat_now_ns() - t0;
     plat_mutex_unlock(&g_lock);
+    return 1;
 }
 
 // Sinks over every committed page of [lo, hi): each gap between the live sinks gets one, cut at the import windows (an
@@ -305,24 +344,23 @@ static void sinks_cover(uint64_t lo, uint64_t hi) {
     }
 }
 
-// The live sinks with a page that is no longer committed go, when the commit epoch moved since they were last checked.
+// The live sinks a guest decommit took a page of since they were made go, whether or not the guest has the page committed
+// again: an import holds the pages it was made over, and a page committed again is another one, which the device would not
+// write (oot2/memory.h, the decommit record). Looked at when the decommit epoch moved since the last look, so a commit, or
+// a decommit elsewhere, drops none. A sink that passes holds its pages as one made now would: its epoch moves up, so the
+// record's last decommits always cover it. What lay under the mirrors over the pages that remain is made again by
+// sinks_prepare.
 static void sinks_scrub(void) {
-    uint64_t e = rt_mem_ready() ? rt_mem_commit_epoch() : 0;
+    uint64_t e = rt_mem_decommit_epoch();
+    g_scrubbed = e;
     if (e == g_sink_epoch) return;
     g_sink_epoch = e;
     for (int i = 0; i < g_nsinks;) {
-        int whole = 1;
-        for (uint64_t a = g_sinks[i].lo; a < g_sinks[i].hi && whole;) {
-            int c;
-            uint64_t n = rt_mem_commit_run(a, g_sinks[i].hi - a, &c);
-            whole = n != UINT64_MAX && n && c;
-            a += whole ? n : 0;
-        }
-        if (whole) {
-            i++;
-        } else {
+        if (rt_mem_decommitted(g_sinks[i].made, g_sinks[i].lo, g_sinks[i].hi)) {
             sink_drop(i);
-            g_sinks_version = 0;   // what lay over the pages that remain is made again (sinks_prepare)
+            g_sinks_version = 0;
+        } else {
+            g_sinks[i++].made = e;
         }
     }
     sinks_count();
@@ -334,10 +372,12 @@ static void sinks_scrub(void) {
 // writes through the import do not mark them (Measured: vk_raw_test.c, wb). So the imports come first, and the mirrors'
 // own sync query takes the marks together with any write the CPU made, losing none. A mirror made after this (a
 // promotion in this very begin, a bind later in the submission) gets its sink when its table is built, and its pages
-// are copied once more by the next submission.
+// are copied once more by the next submission. While the table in use names mirrored pages with no sink (the guest had
+// not committed them when it was built, or their import was refused), every begin looks again, so a page committed since
+// gets its sink, and the table is built again over it, at the next begin rather than at the map's next change.
 static void sinks_prepare(void) {
     uint64_t version = backing_version();
-    if (version == g_sinks_version) return;
+    if (version == g_sinks_version && !(g_current && g_current->unsunk)) return;
     BackingRun *runs;
     uint64_t seen;
     int n = backing_raw_runs(&runs, &seen);
@@ -348,9 +388,10 @@ static void sinks_prepare(void) {
     sinks_count();
 }
 
-// Name the sink of each of the n mirrored pages (guest[i] their guest addresses): sinks are made over every committed run
-// under them, and those no page maps to go.
-static void sinks_assign(RawMirrorPage *pages, const uint64_t *guest, uint64_t n) {
+// Name the sink of each of the n mirrored pages (guest[i] their guest addresses), and the epoch it was made at into made[i]
+// (NO_SINK for none): sinks are made over every committed run under them, and those no page maps to go. A page the guest
+// has not committed now gets no sink (made over committed pages only): the effect leaves its store out, or counts it lost.
+static void sinks_assign(RawMirrorPage *pages, const uint64_t *guest, uint64_t *made, uint64_t n) {
     g_build_id++;
     for (uint64_t i = 0; i < n;) {
         uint64_t j = i;
@@ -361,6 +402,7 @@ static void sinks_assign(RawMirrorPage *pages, const uint64_t *guest, uint64_t n
     for (uint64_t i = 0; i < n; i++) {
         Sink *s = sink_at(guest[i]);
         pages[i].sink = s ? s->m.address + (guest[i] - s->lo) : 0;
+        made[i] = s ? s->made : NO_SINK;
         if (s) s->seen = g_build_id;
     }
     for (int i = 0; i < g_nsinks;) {
@@ -403,9 +445,11 @@ static void make_image(uint32_t span_base, uint32_t span_count, RawLayout *l, ui
     g_pages = grow_to(g_pages, &g_pages_cap, (l->mirror_pages + 1) * sizeof *g_pages, "the mirrored pages");
     g_guest_scratch = grow_to(g_guest_scratch, &g_guest_cap, (l->mirror_pages + 1) * sizeof *g_guest_scratch,
                               "the mirrored pages");
+    g_made_scratch = grow_to(g_made_scratch, &g_made_cap, (l->mirror_pages + 1) * sizeof *g_made_scratch,
+                             "the mirrored pages");
     raw_write(runs, n, l, g_image, g_pages, g_guest_scratch);
     free(runs);
-    sinks_assign(g_pages, g_guest_scratch, l->mirror_pages);
+    sinks_assign(g_pages, g_guest_scratch, g_made_scratch, l->mirror_pages);
 }
 
 static uint64_t table_bytes_of(const RawLayout *l) { return (l->words * 4 + 15) & ~15ull; }
@@ -417,13 +461,15 @@ static void store(Copy *c, const RawLayout *l, uint64_t version) {
     memcpy(c->m.map, g_image, (size_t)l->words * 4);
     memcpy(c->m.map + table_bytes, g_pages, (size_t)(l->mirror_pages * sizeof *g_pages));
     free(c->guest);
-    free(c->sunk);
+    free(c->made);
     c->guest = malloc((size_t)(l->mirror_pages + 1) * sizeof *c->guest);
-    c->sunk = malloc((size_t)(l->mirror_pages + 1));
-    if (!c->guest || !c->sunk)
+    c->made = malloc((size_t)(l->mirror_pages + 1) * sizeof *c->made);
+    if (!c->guest || !c->made)
         rt_fatal("gfx: vulkan: raw path: out of memory for %llu mirrored pages", (ull)l->mirror_pages);
     memcpy(c->guest, g_guest_scratch, (size_t)l->mirror_pages * sizeof *c->guest);
-    for (uint64_t i = 0; i < l->mirror_pages; i++) c->sunk[i] = g_pages[i].sink != 0;
+    memcpy(c->made, g_made_scratch, (size_t)l->mirror_pages * sizeof *c->made);
+    c->unsunk = 0;
+    for (uint64_t i = 0; i < l->mirror_pages; i++) c->unsunk += c->made[i] == NO_SINK;
     c->l = *l, c->version = version, c->pages_at = table_bytes, c->sink_gen = g_sink_gen;
 }
 
@@ -570,64 +616,93 @@ static void miss_log(const uint32_t *head, uint64_t value) {
 
 static int bit_set(const uint32_t *bits, uint64_t i) { return bits[i >> 5] >> (i & 31) & 1; }
 
+// What the walk of one submission's bitmap found: pages stamped as the GPU's, left out, lost; of the first, those the
+// CPU had written; the time in pagegen_mark_gpu_direct; the first page left out and the first lost, for the log.
+typedef struct Walk { uint64_t marked, skipped, lost, cpu, mark_ns, first_skipped, first_lost; } Walk;
+
+static void left_out(Walk *w, uint64_t lo, uint64_t pages) {
+    w->skipped += pages, w->first_skipped = w->first_skipped ? w->first_skipped : lo;
+}
+
+// Pages [lo, hi) whose GPU store the guest's page does not hold: the plain stamp, so the mirror takes the guest's bytes at
+// its next sync, never the GPU-current one.
+static void lost(Walk *w, uint64_t lo, uint64_t hi) {
+    pagegen_mark(lo, hi);
+    w->lost += (hi - lo) / PAGE, w->first_lost = w->first_lost ? w->first_lost : lo;
+}
+
+// Pages [lo, hi) the write-back noted, all through one sink made at decommit epoch `made` (NO_SINK: none). A page the
+// guest has not committed now is left out: the device wrote it into memory its sink keeps valid and the guest no longer
+// sees. A committed page is stamped as the GPU's, unless the guest's page is not the one the device wrote: a decommit took
+// it from under its sink since the sink was made (before the device wrote it, or while it did, or while this ran: checked
+// after the stamp, which the plain one then replaces), or it had no sink (the guest had not committed it when the table
+// was built, and has since). Those are lost.
+static void stamp_run(Walk *w, uint64_t lo, uint64_t hi, uint64_t made, uint64_t since) {
+    for (uint64_t a = lo; a < hi;) {
+        int committed;
+        uint64_t n = rt_mem_commit_run(a, hi - a, &committed);
+        if (n == UINT64_MAX || !n) {
+            left_out(w, a, (hi - a) / PAGE);
+            return;
+        }
+        if (!committed) {
+            left_out(w, a, n / PAGE);
+        } else if (made == NO_SINK) {
+            lost(w, a, a + n);
+        } else {
+            uint64_t t1 = plat_now_ns(), cpu = 0;
+            pagegen_mark_gpu_direct(a, a + n, since, &cpu);   // the mirror holds these bytes: the next sync does not copy them back
+            w->mark_ns += plat_now_ns() - t1, w->cpu += cpu, w->marked += n / PAGE;
+            if (rt_mem_decommitted(made, a, a + n))
+                for (uint64_t p = a; p < a + n; p += PAGE)
+                    if (rt_mem_decommitted(made, p, p + PAGE)) w->marked--, lost(w, p, p + PAGE);
+        }
+        a += n;
+    }
+}
+
 // The completion thread, once the device reached value and before it is done: the pages the GPU wrote into guest memory
 // through their sinks are stamped. No byte of them is read or copied here. The pages are the set bits of the bitmap, in
 // address order (the mirrored pages' order), so the runs of neighbouring pages are found without a sort.
 static void ended(void *arg, uint64_t value) {
     uint64_t t0 = plat_now_ns();
     Done *d = arg;
-    const uint32_t *w = (const uint32_t *)d->out->m.map;
-    if (w[OUT_HEAD + RAW_HEADER_MISS_COUNT]) miss_log(w + OUT_HEAD, value);
-    const uint32_t *bits = w + OUT_HEAD + HEAD_WORDS;
-    uint64_t marked = 0, skipped = 0, cpu_pages = 0, mark_ns = 0, first_skipped = 0;
+    const uint32_t *words = (const uint32_t *)d->out->m.map;
+    if (words[OUT_HEAD + RAW_HEADER_MISS_COUNT]) miss_log(words + OUT_HEAD, value);
+    const uint32_t *bits = words + OUT_HEAD + HEAD_WORDS;
+    Walk w = {0};
     for (uint64_t i = 0; i < d->pages;) {
         if (!bit_set(bits, i)) {
             i += !(i & 31) && !bits[i >> 5] ? 32 : 1;   // a word with no bit set goes at once
             continue;
         }
-        // The run [i, j]: pages written, next to each other in guest memory, all with a sink or all without.
+        // The run [i, j]: pages written, next to each other in guest memory, through sinks made at one epoch (or none).
         uint64_t j = i;
-        while (j + 1 < d->pages && bit_set(bits, j + 1) && d->sunk[j + 1] == d->sunk[i] &&
+        while (j + 1 < d->pages && bit_set(bits, j + 1) && d->made[j + 1] == d->made[i] &&
                d->guest[j + 1] == d->guest[j] + PAGE)
             j++;
-        uint64_t lo = d->guest[i], hi = d->guest[j] + PAGE;
-        if (!d->sunk[i]) {   // the table was built over a page the guest had nothing committed on: not copied
-            skipped += j - i + 1, first_skipped = first_skipped ? first_skipped : lo;
-        } else {
-            // Only what the guest still has committed is stamped: a page it unmapped since the table was built was
-            // written, by the device, into memory the sink keeps valid and the guest no longer sees.
-            for (uint64_t a = lo; a < hi;) {
-                int committed;
-                uint64_t n = rt_mem_commit_run(a, hi - a, &committed);
-                if (n == UINT64_MAX || !n) {
-                    skipped += (hi - a) / PAGE, first_skipped = first_skipped ? first_skipped : a;
-                    break;
-                }
-                if (committed) {
-                    uint64_t t1 = plat_now_ns(), cpu = 0;
-                    pagegen_mark_gpu_direct(a, a + n, d->since, &cpu);   // the mirror holds these bytes: the next sync does not copy them back
-                    mark_ns += plat_now_ns() - t1;
-                    cpu_pages += cpu, marked += n / PAGE;
-                } else {
-                    skipped += n / PAGE, first_skipped = first_skipped ? first_skipped : a;
-                }
-                a += n;
-            }
-        }
+        // A sink the begin kept held its pages up to d->scrubbed: only a decommit after that can have taken one
+        uint64_t made = d->made[i] == NO_SINK || d->made[i] > d->scrubbed ? d->made[i] : d->scrubbed;
+        stamp_run(&w, d->guest[i], d->guest[j] + PAGE, made, d->since);
         i = j + 1;
     }
-    if (first_skipped)
+    if (w.first_skipped)
         rt_log("gfx: vulkan: raw path: a raw store of submission %llu into the mirror of %#llx lands in memory the guest "
-               "no longer maps: left out (%llu pages)", (ull)value, (ull)first_skipped, (ull)skipped);
+               "no longer maps: left out (%llu pages)", (ull)value, (ull)w.first_skipped, (ull)w.skipped);
+    if (w.first_lost)
+        rt_log("gfx: vulkan: raw path: raw stores of submission %llu into the mirror of %#llx are lost (%llu pages): the "
+               "guest decommitted the page under the store's sink and committed it again, or had it committed only after "
+               "the table was built, so its page does not hold the device's bytes; stamped as the CPU's, the mirror takes "
+               "the guest's", (ull)value, (ull)w.first_lost, (ull)w.lost);
     // The shader counts a page when it sets its bit: the two must agree, or a page was written back that this walk lost.
-    if (marked + skipped != w[0])
+    if (w.marked + w.skipped + w.lost != words[0])
         rt_fatal("gfx: vulkan: raw path: the write-back of submission %llu took %u pages and the walk of its bitmap found "
-                 "%llu", (ull)value, w[0], (ull)(marked + skipped));
+                 "%llu", (ull)value, words[0], (ull)(w.marked + w.skipped + w.lost));
     uint64_t ns = plat_now_ns() - t0;
     plat_mutex_lock(&g_lock);
-    g_st.writebacks += marked, g_st.writeback_bytes += marked * PAGE, g_st.writebacks_skipped += skipped;
-    g_st.writeback_cpu_pages += cpu_pages;
-    g_st.ended_ns += ns, g_st.mark_ns += mark_ns;
+    g_st.writebacks += w.marked, g_st.writeback_bytes += w.marked * PAGE, g_st.writebacks_skipped += w.skipped;
+    g_st.writebacks_lost += w.lost, g_st.writeback_cpu_pages += w.cpu;
+    g_st.ended_ns += ns, g_st.mark_ns += w.mark_ns;
     if (ns > g_st.ended_ns_max) g_st.ended_ns_max = ns;
     d->out->next = g_free, g_free = d->out;
     plat_mutex_unlock(&g_lock);
@@ -643,7 +718,7 @@ void gpu_vk_raw_end(uint64_t value) {
     Out *o = out_take(pages);
     Done *d = malloc(sizeof *d);
     if (!d) rt_fatal("gfx: vulkan: raw path: out of memory for a submission's end");
-    *d = (Done){o, c->guest, c->sunk, pages, g_since};
+    *d = (Done){o, c->guest, c->made, pages, g_since, g_scrubbed};
     pipeline();
     VkCommandBuffer cb = gpu_vk_epilogue();   // after a full barrier over the submission's own work
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_pipe);
@@ -675,18 +750,22 @@ void gpu_vk_raw_stats(GpuVkRawStats *out) {
     plat_mutex_unlock(&g_lock);
 }
 
+void gpu_vk_raw_set_ops(const BackingOps *ops) { g_ops = ops ? ops : &gpu_vk_backing_ops; }
+
 void gpu_vk_raw_close(void) {
     for (int i = 0; i < g_ncopies; i++) {
         mem_free(&g_copy[i].m);
         free(g_copy[i].guest);
-        free(g_copy[i].sunk);
+        free(g_copy[i].made);
     }
     memset(g_copy, 0, sizeof g_copy);
     g_ncopies = 0, g_current = NULL, g_value = 0;
-    for (int i = g_nsinks - 1; i >= 0; i--) gpu_vk_backing_ops.free(&g_sinks[i].m);   // every submission is done
+    for (int i = g_nsinks - 1; i >= 0; i--) g_ops->free(&g_sinks[i].m);   // every submission is done
     sinks_reap(1);
     free(g_sinks), free(g_dead);
-    g_sinks = g_dead = NULL, g_nsinks = g_sinks_cap = g_ndead = g_dead_cap = 0, g_sink_epoch = 0;
+    g_sinks = g_dead = NULL, g_nsinks = g_sinks_cap = g_ndead = g_dead_cap = 0;
+    g_sink_epoch = g_scrubbed = g_sinks_version = g_build_id = g_since = 0, g_sink_gen = 1;
+    g_ops = &gpu_vk_backing_ops;
     while (g_free) {
         Out *o = g_free;
         g_free = o->next;
@@ -697,7 +776,8 @@ void gpu_vk_raw_close(void) {
     if (g_layout) vkDestroyPipelineLayout(gpu_vk.device, g_layout, NULL);
     if (g_module) vkDestroyShaderModule(gpu_vk.device, g_module, NULL);
     g_pipe = VK_NULL_HANDLE, g_layout = VK_NULL_HANDLE, g_module = VK_NULL_HANDLE;
-    free(g_image), free(g_pages), free(g_guest_scratch);
-    g_image = NULL, g_pages = NULL, g_guest_scratch = NULL, g_image_bytes = g_pages_cap = g_guest_cap = 0;
+    free(g_image), free(g_pages), free(g_guest_scratch), free(g_made_scratch);
+    g_image = NULL, g_pages = NULL, g_guest_scratch = g_made_scratch = NULL;
+    g_image_bytes = g_pages_cap = g_guest_cap = g_made_cap = 0;
     memset(&g_st, 0, sizeof g_st);
 }

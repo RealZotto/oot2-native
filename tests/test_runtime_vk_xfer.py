@@ -259,6 +259,14 @@ class TransferTest(vp.DeviceTestCase):
         self.assertEqual(len(counters[0]), 24, counters)   # B, the value, 15 counters and the raw write-back's seven
         self.assertGreaterEqual(int(counters[0][4]), 1, counters)   # a mirror
         self.assertGreater(int(counters[0][15]), 0, counters)       # resolves
+        # the seven by name (vk_gpu_time.h): this case has no raw-access submission, so the raw path's five are 0, and the
+        # mirror was brought current, so the page generations queried the write watch, which took time
+        names = ("raw_ended_ns", "raw_mark_ns", "raw_cpu_pages", "sink_bytes", "sinks_made", "pagegen_scan_ns",
+                 "pagegen_scans")
+        raw = dict(zip(names, (int(x) for x in counters[0][17:])))
+        self.assertEqual([raw[k] for k in names[:5]], [0] * 5, raw)
+        self.assertGreaterEqual(raw["pagegen_scans"], 1, raw)
+        self.assertGreater(raw["pagegen_scan_ns"], 0, raw)
         # the marks split the main command buffer between its first and last timestamps: they cannot add up to more
         self.assertLessEqual(sum(int(m[8]) for m in marks), main)
 

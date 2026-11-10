@@ -21,11 +21,12 @@ them are the same bytes), and a previously bound mirror that grows in place with
 write-back, including when a GPU-only extent already occupies adjacent block space. The write-back cases (a 1024-thread
 variant of the program, raw_program(big=True)) store into 10,101 pages the way the opening's chain does and check that
 the device wrote them into guest memory byte for byte (the same hash as the build that copied them on the completion
-thread), that a CPU write after the device's page and before the stamp is kept and reaches the mirror, and that pages the
-guest unmapped in between are left out. Each runs under the synchronization
-validation layer, which must report no error. The heap case measures
-what the invariant costs (resident bytes, VRAM, the invariant's pass and the table's build) over a heap of
-OOT2_RAW_HEAP_MIB MiB, 256 by default.
+thread), that a CPU write after the device's page and before the stamp is kept and reaches the mirror, that pages the
+guest unmapped in between are left out, that pages it gave back and mapped again under a sink get a new sink or have their
+stores counted lost (the mirror then takes the guest's bytes), never stamped as the GPU's, that a sink refused over pages
+decommitted on its way stops nothing, and that a dropped sink is freed only once its submissions are done. Each runs under
+the synchronization validation layer, which must report no error. The heap case measures what the invariant costs
+(resident bytes, VRAM, the invariant's pass and the table's build) over a heap of OOT2_RAW_HEAP_MIB MiB, 256 by default.
 
 Needs clang, the Vulkan SDK, the translator (py -3 tools/build_xlate.py) and a Vulkan device with every item the
 renderer requires; skips without them, unless OOT2_REQUIRE_CLANG, OOT2_REQUIRE_VULKAN, OOT2_REQUIRE_XLATE or
@@ -62,7 +63,13 @@ ENTRY = 32
 CASES = ("kinds", "keep", "miss", "commit", "reuse", "edges", "grow", "grow_taken", "grow_guarded_head",
          "grow_guarded_tail")
 # The write-back cases run the 1024-thread program (groups of 1024 threads, one entry each)
-BIG_CASES = ("wb", "wbcpu", "wbunmap", "wbflight")
+BIG_CASES = ("wb", "wbcpu", "wbunmap", "wbflight", "wbremap", "wbremapflight", "wbnosink", "wbrefused", "wbreap")
+# What the runtime logs by name in those cases (stderr): the lost stores, the refused sink
+LOGS = {
+    "wbremapflight": "are lost (64 pages): the guest decommitted the page under the store's sink",
+    "wbnosink": "are lost (64 pages): the guest decommitted the page under the store's sink",
+    "wbrefused": "as the sink of a mirror's write-back was refused, and the guest no longer has all of it committed",
+}
 
 
 def mov_imm(rd: int, imm: int) -> bytes:
@@ -182,13 +189,17 @@ class VkRawTest(unittest.TestCase):
     def test_the_write_back_of_a_movie_frame_reaches_guest_memory_whole(self) -> None:
         # wb: 10,101 pages (39.5 MiB, what the opening's chain writes a present) byte for byte and the time the raw path's
         # effect takes on the completion thread; wbcpu: a CPU write between the GPU's write-back and its stamp is kept;
-        # wbunmap: pages the guest unmapped mid-flight are left out. The times are printed, not judged.
+        # wbunmap: pages the guest unmapped mid-flight are left out; wbremap and after: pages the guest gave back and
+        # mapped again under a sink, a page with no sink, a refused sink, a dead sink's lifetime (vk_raw_test.c). The times
+        # are printed, not judged.
         for case in BIG_CASES:
             with self.subTest(case=case):
                 done = run(case, str(self.spv_big), env={"OOT2_VK_VALIDATION": "sync"})
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr[-4000:])
                 self.assertIn(f"ok {case}", done.stdout)
                 self.assertEqual(fatal_lines(done.stderr), [])
+                if case in LOGS:
+                    self.assertIn(LOGS[case], done.stderr)
                 m = re.search(r"^validation errors (\d+) warnings (\d+)$", done.stdout, re.M)
                 self.assertIsNotNone(m, done.stdout)
                 self.assertEqual(m.group(1), "0", done.stdout + done.stderr[-4000:])

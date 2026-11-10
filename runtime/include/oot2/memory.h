@@ -82,6 +82,17 @@ uint64_t rt_mem_written(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t 
 // read the epoch, then the map, and later reads a larger epoch knows the map may have changed since its reading.
 uint64_t rt_mem_commit_run(uint64_t addr, uint64_t size, int *committed);
 uint64_t rt_mem_commit_epoch(void);
+// The decommit record, for host imports that outlive a look at the page map (the raw path's sinks, oot2/vk_raw.h): an import
+// holds the pages it was made over, so a page the guest decommits and commits again after the import is another page, which
+// the import does not reach, though rt_mem_commit_run says committed. rt_mem_decommit_epoch counts the decommits of
+// committed pages (a heap that shrinks, MapMemory's source and UnmapMemory's stack, UnmapPhysicalMemory, a kernel page
+// freed, a page released by lever L1) and moves on nothing else, a commit included. rt_mem_decommitted(since, lo, hi) is 1
+// when one of the decommits after epoch `since` took a page of [lo, hi), and also when the record no longer holds all of
+// them (it keeps the last 1024, so a reader more than that behind is told 1); 0 means no page of [lo, hi) was decommitted
+// since. A reader takes the epoch before it makes its import, and asks with it later. No lock; any thread. A decommit is
+// recorded under the memory lock, before any commit of its pages again can take that lock.
+uint64_t rt_mem_decommit_epoch(void);
+int rt_mem_decommitted(uint64_t since, uint64_t lo, uint64_t hi);
 
 // Measurement, and spike S7's first instrument: per region, what the guest declared mapped, what the runtime
 // committed, and how much of that is resident now.

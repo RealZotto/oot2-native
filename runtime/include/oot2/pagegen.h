@@ -53,13 +53,16 @@ uint64_t pagegen_mark_gpu(uint64_t lo, uint64_t hi);
 // of the call: no CPU copy was made, so there is no echo of one to settle, and what the CPU wrote while the GPU ran has
 // to be told apart from what the GPU wrote. Whole pages [lo, hi). The write watch is queried (with reset) and every page
 // it reports, and every page stamped after `since` by anything but a write-back, is a page the CPU wrote since `since`
-// (the generation at the start of the submission, taken before its mirrors were brought current): the mirror may lack that
-// write, and the page may hold it on top of the GPU's bytes or have lost it under them, so it gets the plain stamp (the next
-// sync copies it into the mirror, from the guest's page, whichever of the two it holds). Every other page is recorded
-// GPU-current as pagegen_mark_gpu records one. *cpu_pages (may be NULL) is how many pages kept the plain stamp; all of
-// them do when the source does not watch the range. Contract, as for pagegen_mark_gpu: a CPU write into bytes the GPU
-// writes in the same submission is not kept in guest memory (the GPU's whole page replaces it), and the page is stamped
-// as the CPU's all the same.
+// (the generation up to which the mirrors hold every CPU write: the lowest of their syncs, read once the submission's
+// begin brought them current, backing_synced_min): the mirror may lack that write, and the page may hold it on top of the
+// GPU's bytes or have lost it under them, so it gets the plain stamp (the next sync copies it into the mirror, from the
+// guest's page, whichever of the two it holds). Every other page is recorded GPU-current as pagegen_mark_gpu records one.
+// *cpu_pages (may be NULL) is how many pages kept the plain stamp; all of them do when the source does not watch the
+// range. Contract, as for pagegen_mark_gpu: a CPU write into bytes the GPU writes in the same submission is not kept in
+// guest memory (the GPU's whole page replaces it), and the page is stamped as the CPU's all the same. The caller passes only
+// pages the device wrote into: a page the guest decommitted under the import and committed again is another page, which
+// the device's write did not reach, and the caller gives it the plain mark (pagegen_mark) instead, after this call when
+// the decommit may have come during it (oot2/vk_raw.h, The sinks).
 uint64_t pagegen_mark_gpu_direct(uint64_t lo, uint64_t hi, uint64_t since, uint64_t *cpu_pages);
 uint64_t pagegen_gpu_stamp(uint64_t page);   // the stamp pagegen_mark_gpu gave the page (0: none)
 uint64_t pagegen_now(void);   // the newest generation handed out (0 before the first)

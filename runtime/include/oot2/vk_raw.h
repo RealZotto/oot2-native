@@ -36,15 +36,27 @@
 // guest pages (the backing map's import operation, the same device memory type as an import of the descriptor path), one
 // for each run of committed pages under a mirror, cut at the import windows; the table's page list names, for each
 // mirrored page, the device address of the guest's page through its sink. The sinks are the raw path's own, in vk_raw.c:
-// they are made when a table is built over the mirror, dropped when no mirror lies over them or a page under one is no
-// longer committed (checked when the commit epoch moved), and freed once the newest submission that may use them is done,
-// so a page unmapped while a submission is in flight is written by the device into memory that stays valid until then.
+// they are made at a begin over the mirrors the map holds and when a table is built over a mirror, dropped when no mirror
+// lies over them, and freed once the newest submission that may use them is done, so a page unmapped while a submission
+// is in flight is written by the device into memory that stays valid until then. An import holds the pages it was made
+// over: a page the guest decommits and commits again is another page, which its sink does not reach, so a sink one of
+// whose pages a decommit took since the sink was made (oot2/memory.h, the decommit record) is dropped at the next begin,
+// whether or not the page is committed again, and the pages under the mirror get a new sink; a decommit elsewhere, or a
+// commit, drops none. A device that refuses a sink's import stops by name (as a refused import of the descriptor path
+// does), unless the guest no longer has the pages committed when it is refused (it decommitted them on another thread
+// while the sink was made): those pages get no sink, counted (sinks_refused) and logged.
 // What the effect stamps is then only the pages that are still committed when it runs (the ones the guest unmapped are left
-// out and counted, as before), through pagegen_mark_gpu_direct: a page the CPU wrote since the submission began (the
-// write watch says so, or its stamp is newer than the submission's start) keeps the plain stamp and the mirror takes it
-// from guest memory at its next sync; the others are recorded GPU-current, which the mirror skips. A mirrored page with no
-// sink (the guest had nothing committed there when the table was built) is not copied and is left out and counted. A
-// device that refuses a sink's import stops by name (as a refused import of the descriptor path does).
+// out and counted, as before), through pagegen_mark_gpu_direct: a page the CPU wrote since every mirror was last brought
+// current (the write watch says so, or its stamp is newer than the generation of that sync) keeps the plain stamp and the
+// mirror takes it from guest memory at its next sync; the others are recorded GPU-current, which the mirror skips. The rule
+// for a store that did not reach the guest's page: a committed page whose sink a decommit took it from since the sink was
+// made (before the device wrote it, while it did, or while the effect runs), and a committed page that had no sink (the
+// guest had not committed it when the table was built), do not hold the device's bytes. Their stores are lost: counted
+// (writebacks_lost), logged with the submission and the first page, and the page gets the plain stamp, so the mirror takes
+// the guest's bytes at its next sync; never the GPU-current stamp, which would leave the mirror holding a store the guest
+// never sees. A mirrored page with no sink that the guest has not committed when the effect runs is left out and counted.
+// While the table in use names a mirrored page with no sink, every begin looks again, so the page gets one at the first
+// begin after the guest committed it.
 //
 // A CPU write into a page the GPU wrote in the same submission: the GPU's write is the whole page, made at the submission's
 // end from the mirror, which holds the page as it was when it was brought current, so the CPU's write is under it when it
@@ -99,8 +111,12 @@ void raw_write(const BackingRun *runs, int n, const RawLayout *l, uint32_t *word
 void gpu_vk_raw_begin(uint64_t value, uint32_t push[4]);
 // The end of submission value, on its thread before backing_submit_end and gpu_vk_end: nothing when it never began.
 void gpu_vk_raw_end(uint64_t value);
-// gpu_vk_close, once every submission is done: the copies, the sinks, the out buffers and the shader go.
+// gpu_vk_close, once every submission is done: the copies, the sinks, the out buffers and the shader go, and the state
+// between submissions starts over.
 void gpu_vk_raw_close(void);
+// Tests: the operations the sinks are imported and freed with, the device's (gpu_vk_backing_ops) unless set; NULL, and
+// gpu_vk_raw_close, restore the device's. Set between submissions, with the device open.
+void gpu_vk_raw_set_ops(const BackingOps *ops);
 
 typedef struct RawMiss {
     uint64_t address;
@@ -112,12 +128,15 @@ typedef struct GpuVkRawStats {
     uint64_t copies, copy_waits, table_bytes;               // copies made; builds that waited for one; the newest's size
     uint64_t pages, mirror_pages, blocks, span_count;        // the newest build's
     uint64_t writebacks, writeback_bytes, writebacks_skipped;   // raw stores into mirrors written back; pages left out
+    uint64_t writebacks_lost;                               // pages whose stores did not reach the guest's page (The sinks)
     uint64_t writeback_cpu_pages;                           // of the written-back pages, those the CPU wrote since the
-                                                            // submission began (plain stamp: the mirror takes them)
+                                                            // mirrors were brought current (plain stamp: the mirror takes them)
     uint64_t ended_ns, ended_ns_max, mark_ns;               // the write-back effect on the completion thread: its time in all,
                                                             // the longest, and the part in pagegen_mark_gpu_direct
     uint64_t sinks, sink_bytes, sinks_made, sinks_dropped, sink_ns;   // live now (host imports under mirrors); made, dropped
                                                             // since the start, and the time making them took
+    uint64_t sinks_dead, sinks_freed, sinks_refused;        // dropped and not freed yet (a submission that may use them
+                                                            // is not done); freed; imports refused over pages decommitted
     uint64_t misses, miss_submissions;                      // misses counted by the helper; submissions with any
     uint64_t last_miss_value;                               // the newest submission with misses
     uint32_t last_misses;                                   // its entries in last_miss (at most RAW_MISS_ENTRIES)
