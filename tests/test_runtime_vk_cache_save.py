@@ -262,7 +262,7 @@ class SaveDeviceTest(DeviceTestCase):
         done = self.save_run(folder, "fatal", "more", "openerr=13")                     # EACCES: it is there, held by someone
         self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
         self.assertIn("cache_state 0", done.stdout)
-        self.assertRegex(done.stderr, r"the pipeline cache .* could not be opened \(.+\): starting empty, and no save will "
+        self.assertRegex(done.stderr, r"the pipeline cache .* could not be opened at launch \(.+\): starting empty, and no save will "
                                       r"replace it")
         self.assertIn("the pipeline cache was NOT saved at the stop (exit 70): the cache file ", done.stderr)
         self.assertEqual(cache.read_bytes(), before)                                   # the file is as it was
