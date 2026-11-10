@@ -98,6 +98,7 @@ int capture_on(void);   // 1 once capture_start opened a file, until the closing
 // in force). Before capture_start it is kept and written with the header; after, it follows as a header line.
 void capture_note(const char *key, const char *value);
 void capture_count(int counter, uint64_t n);                  // any thread; counted whether or not a capture runs
+uint64_t capture_counter(int counter);                        // a counter's value now (the tests', and any reader of the run's numbers)
 void capture_gpu_pass(uint64_t seq, int pass, uint64_t ns);   // a GPU timestamp of a pass of present seq's frame
 
 // From the front end: nvnQueuePresentTexture after present seq was made, nvnQueueSubmitCommands after a submission.

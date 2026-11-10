@@ -378,6 +378,11 @@ void capture_count(int counter, uint64_t n) {
     __atomic_fetch_add(&g_counters[counter], n, __ATOMIC_RELAXED);
 }
 
+uint64_t capture_counter(int counter) {
+    if (counter < 0 || counter >= CAPTURE_COUNTERS) rt_fatal("capture_counter: counter %d", counter);
+    return __atomic_load_n(&g_counters[counter], __ATOMIC_RELAXED);
+}
+
 void capture_gpu_pass(uint64_t seq, int pass, uint64_t ns) {
     if (!capture_on()) return;
     plat_mutex_lock(&g_data);

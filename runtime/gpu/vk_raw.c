@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "oot2/capture.h"
 #include "oot2/gpu.h"
 #include "oot2/gpu_vk.h"
 #include "oot2/kernel.h"
@@ -592,18 +593,28 @@ static Out *out_take(uint32_t pages) {
     return o;
 }
 
-static void miss_log(const uint32_t *head, uint64_t value) {
-    uint32_t count = head[RAW_HEADER_MISS_COUNT], kept = count < RAW_MISS_ENTRIES ? count : RAW_MISS_ENTRIES;
-    static const char *const kinds[] = {"?", "load", "store", "atomic"};
-    static const char *const reasons[] = {"?", "outside the span", "no chunk", "no page"};
+// A submission's misses in the statistics: total counted by the helper over every stage of the submission, and the entries
+// of head (a header and its log, or NULL for none) as the newest ones. The total also goes to the capture's raw-access
+// counter, which tools/check_capture.py judges a run by: a run with a raw-access miss is not a proof run.
+static void miss_count(uint64_t total, uint64_t value, const uint32_t *head) {
+    uint32_t kept = head ? head[RAW_HEADER_MISS_COUNT] : 0;
+    if (kept > RAW_MISS_ENTRIES) kept = RAW_MISS_ENTRIES;
     plat_mutex_lock(&g_lock);
-    g_st.misses += count, g_st.miss_submissions++, g_st.last_miss_value = value, g_st.last_misses = kept;
+    g_st.misses += total, g_st.miss_submissions++, g_st.last_miss_value = value, g_st.last_misses = kept;
     for (uint32_t i = 0; i < kept; i++) {
         const uint32_t *e = head + RAW_MISS_LOG_WORD + i * RAW_MISS_ENTRY_WORDS;
         g_st.last_miss[i] = (RawMiss){(uint64_t)e[RAW_MISS_ADDRESS_HIGH] << 32 | e[RAW_MISS_ADDRESS_LOW],
                                       e[RAW_MISS_KIND], e[RAW_MISS_REASON]};
     }
     plat_mutex_unlock(&g_lock);
+    capture_count(CAPTURE_RAW_MISSES, total);
+}
+
+static void miss_log(const uint32_t *head, uint64_t value) {
+    uint32_t count = head[RAW_HEADER_MISS_COUNT], kept = count < RAW_MISS_ENTRIES ? count : RAW_MISS_ENTRIES;
+    static const char *const kinds[] = {"?", "load", "store", "atomic"};
+    static const char *const reasons[] = {"?", "outside the span", "no chunk", "no page"};
+    miss_count(count, value, head);
     rt_log("gfx: vulkan: raw path: submission %llu missed the page table %u times (a miss reads 0 and drops its write)",
            (ull)value, count);
     for (uint32_t i = 0; i < kept; i++) {

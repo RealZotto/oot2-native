@@ -66,6 +66,7 @@
 #include "volk.h"
 
 #include "oot2/backing.h"
+#include "oot2/capture.h"
 #include "oot2/gpu.h"
 #include "oot2/gpu_vk.h"
 #include "oot2/memory.h"
@@ -491,6 +492,7 @@ static void case_miss(const char *spv) {
     GpuVkRawStats s;
     gpu_vk_raw_stats(&s);
     CHECK(s.misses == 24 && s.miss_submissions == 1 && s.last_misses == 24);
+    CHECK(capture_counter(CAPTURE_RAW_MISSES) == 24);   // the capture's raw-access column holds them: the proof judge reads it
     int seen[4] = {0};
     for (uint32_t i = 0; i < s.last_misses; i++) {
         const RawMiss *m = &s.last_miss[i];
