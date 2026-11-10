@@ -175,7 +175,10 @@ static struct {
     const op_hdr *cur;                        // the record being replayed, NULL between records
     int movie_open;                           // the movie chain's stand-in (settings.h test_movie_blit): a chain is open
     uint32_t movie_src;                       // and the texture pool ID of the picture its first program stored
+    uint32_t movie_skips;                     // the dispatches skipped since it opened: how many, and the keys of the program
+    char movie_keep[26], movie_first[26], movie_last[26];   // that opened it and of the first and the last one skipped
 } F;
+_Static_assert(sizeof(((nvn_stage *)0)->key) == sizeof F.movie_keep, "a stage key fits the movie chain's notes");
 
 // What the frames in flight wrote (vkr_writes), a ring of FRAMES_KEPT by replayed frame (timeline values are shared with
 // the back end's own submissions, so a value modulo the ring would let two frames in flight share an entry).
@@ -1319,15 +1322,28 @@ static void movie_blit(const nvn_stage *cs) {
                src.width, src.height, (int)src.format, F.movie_src, dst.width, dst.height, (int)dst.format, dst_id);
 }
 
+// A chain that skipped dispatches and whose blit program never came in the submission would leave the picture stale or
+// garbage with nothing said (another movie that reuses the keep program, a last program the key file does not name), so
+// it is a named stop at the end of the submission (or at the next keep program). A keep alone, with nothing skipped,
+// leaves nothing stale.
+static void movie_unclosed(void) {
+    if (!F.movie_open || !F.movie_skips) return;
+    stop("test_movie_blit: the chain opened by program %s skipped %u dispatches (first %s, last %s) and no blit program came "
+         "in this submission, so the movie's picture would be stale", F.movie_keep, F.movie_skips, F.movie_first, F.movie_last);
+}
+
 // 1 when this dispatch is the stand-in's (skipped, or replaced by the resample), 0 when it runs as it always does: the
 // setting off, a program the file does not name, a program of the chain outside an open chain.
 static int movie_replaces(const nvn_stage *cs) {
     VkmbRole role = vkmb_role(cs->key);
     if (role == VKMB_NONE) return 0;
     if (role == VKMB_KEEP) {   // it runs, and its picture is the one resampled
+        movie_unclosed();   // a keep program again, with the chain it opened still waiting for its blit
         VkpStage st = replay_stage(cs);
         F.movie_src = stored_image(cs, binds_of(&st, SHD_CS), "first");
         F.movie_open = 1;
+        F.movie_skips = 0;
+        snprintf(F.movie_keep, sizeof F.movie_keep, "%s", cs->key);
         return 0;
     }
     if (!F.movie_open) return 0;
@@ -1337,6 +1353,8 @@ static int movie_replaces(const nvn_stage *cs) {
         return 1;
     }
     g_stats.movie_skipped++;
+    if (!F.movie_skips++) snprintf(F.movie_first, sizeof F.movie_first, "%s", cs->key);
+    snprintf(F.movie_last, sizeof F.movie_last, "%s", cs->key);
     movie_counted(1, 0);
     if (g_stats.movie_skipped == 1)
         rt_log("gfx: vulkan: movie blit: the dispatches of the chain between its first and its last are not run (the first "
@@ -1733,6 +1751,7 @@ uint64_t vkr_submit(const uint64_t *handles, int n) {
     full_barrier();   // the frame's work after every earlier submission's (D18)
     for (int i = 0; i < n; i++) walk(i, handles[i]);
     pass_end();
+    movie_unclosed();
     if (ops->frame_end) ops->frame_end(value);
     vkr_report_frame_end();   // after the frame's end: its events and reports follow the backing map's write-backs
     g_stats.frames++;

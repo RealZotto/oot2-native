@@ -842,6 +842,13 @@ class MovieBlitTest(ReplayBase):
             "two_stores": ("1 draws and dispatches: test_movie_blit: the chain's last program " + LAST_KEY +
                            " stores to more than one image"),
             "no_ops": "1 draws and dispatches: test_movie_blit needs ops that give the image of a texture ID",
+            # the chain skipped dispatches and its last program never came: the stop names the first program and the skips
+            "unclosed": ("1 draws and dispatches: test_movie_blit: the chain opened by program " + KEEP_KEY +
+                         " skipped 2 dispatches (first " + MID_RAW_KEY + ", last " + MID_IMG_KEY +
+                         ") and no blit program came in this submission"),
+            "rekeep": ("1 draws and dispatches: test_movie_blit: the chain opened by program " + KEEP_KEY +
+                       " skipped 1 dispatches (first " + MID_IMG_KEY + ", last " + MID_IMG_KEY +
+                       ") and no blit program came in this submission"),
         }
         for what, text in want.items():
             with self.subTest(stop=what):
@@ -891,6 +898,9 @@ class MovieBlitTest(ReplayBase):
                 self.assertEqual(len(fatal), 1, done.stderr)
                 self.assertTrue(fatal[0].startswith("FATAL: gfx: vulkan: test_movie_blit is on and "), fatal[0])
                 self.assertIn(tail, fatal[0])
+                if what in ("unset", "unreadable"):   # the two a saved setting meets before the menu: they say how to undo it
+                    self.assertTrue(fatal[0].endswith("set OOT2_TEST_MOVIE_BLIT=0 or remove the test_movie_blit line from the "
+                                                      "settings file (oot2.ini)"), fatal[0])
 
     def test_a_capture_of_a_run_with_the_setting_on_is_refused_by_the_judge_on_two_counts(self) -> None:
         with tempfile.TemporaryDirectory(prefix="oot2-vkreplay-movie-cap-", ignore_cleanup_errors=True) as tmp:

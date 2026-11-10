@@ -23,7 +23,6 @@
 #include "oot2/backing.h"
 #include "oot2/capture.h"
 #include "oot2/bindless.h"
-#include "oot2/capture.h"
 #include "oot2/gfx.h"
 #include "oot2/gpu.h"
 #include "oot2/gpu_vk.h"
@@ -40,7 +39,7 @@
 #include "oot2/vk_replay.h"
 #include "plat.h"
 
-#define CHECK(cond)                                                                                                   \
+#define CHECK(cond)                                                                                                    \
     do {                                                                                                               \
         if (!(cond)) {                                                                                                 \
             fprintf(stderr, "check failed at line %d: %s\n", __LINE__, #cond);                                         \
@@ -1651,12 +1650,16 @@ static void case_movie_chain(const char *folder) {
 
 // A chain that cannot be replaced stops by name, at the program that shows it: the first program storing to no image, the
 // first picture with no image behind it, an output that is no single 2D picture, an output that is the first picture's
-// own image, and ops that give no image of a texture ID.
+// own image, and ops that give no image of a texture ID. Two more stop at the end of a submission, or at the next first
+// program, where a chain that skipped dispatches never met its last program: "unclosed" (the first program, the two middle
+// ones, no last) and "rekeep" (the first program, a middle one, the first program again, then the last).
 static VkReplayOps g_ops_no_image_by_id;
 static void case_movie_stop(const char *what) {
     open_fakes();
     uint64_t first = 31, last = 33;
-    if (!strcmp(what, "no_store")) g_cs_keep_binds.img[0].write = 0;
+    int unclosed = !strcmp(what, "unclosed"), rekeep = !strcmp(what, "rekeep");
+    if (unclosed || rekeep) {
+    } else if (!strcmp(what, "no_store")) g_cs_keep_binds.img[0].write = 0;
     else if (!strcmp(what, "no_image")) first = 35;
     else if (!strcmp(what, "array")) last = 34;
     else if (!strcmp(what, "same")) last = 31;
@@ -1674,7 +1677,9 @@ static void case_movie_stop(const char *what) {
     PUT(r, OP_BIND_IMG, image_at(3, last));
     PUT(r, OP_BIND_IMG, image_at(4, 32));
     PUT(r, OP_BIND_IMG, image_at(5, 32));
-    go(r, &g_cs_keep), go(r, &g_cs_mid_img), go(r, &g_cs_last);
+    if (unclosed) go(r, &g_cs_keep), go(r, &g_cs_mid_raw), go(r, &g_cs_mid_img);
+    else if (rekeep) go(r, &g_cs_keep), go(r, &g_cs_mid_img), go(r, &g_cs_keep), go(r, &g_cs_last);
+    else go(r, &g_cs_keep), go(r, &g_cs_mid_img), go(r, &g_cs_last);
     uint64_t h = rec_end(r);
     vkr_submit(&h, 1);
     printf("submit returned\n");

@@ -17,6 +17,8 @@
 #define MAX_KEYS 64
 #define KEY_BYTES 25         // "0123456789abcdef.01234567": a stage key as the replay names it
 #define FILE_MAX (64u << 10)
+// What a fatal of the start-up says last: the setting can be saved in the settings file, and the game stops before its menu.
+#define SWITCH_OFF "; to switch it off, set OOT2_TEST_MOVIE_BLIT=0 or remove the test_movie_blit line from the settings file (oot2.ini)"
 
 static struct {
     char key[KEY_BYTES + 1];
@@ -106,9 +108,9 @@ static void load(void) {
     const char *path = getenv("OOT2_MOVIE_BLIT_KEYS");
     if (!path || !*path)
         rt_fatal("gfx: vulkan: test_movie_blit is on and OOT2_MOVIE_BLIT_KEYS is not set: it names the file of the movie "
-                 "chain's program keys, kept outside the repository (oot2/vk_movie_blit.h)");
+                 "chain's program keys, kept outside the repository (oot2/vk_movie_blit.h)" SWITCH_OFF);
     FILE *f = fopen(path, "rb");
-    if (!f) rt_fatal("gfx: vulkan: test_movie_blit is on and its key file %s cannot be opened", path);
+    if (!f) rt_fatal("gfx: vulkan: test_movie_blit is on and its key file %s cannot be opened" SWITCH_OFF, path);
     static char buf[FILE_MAX + 1];
     size_t n = fread(buf, 1, sizeof buf - 1, f);
     int failed = ferror(f), more = !failed && fgetc(f) != EOF;
