@@ -20,6 +20,11 @@ show:
   the first read of each texture is a row of the file;
 - read_released: a read of a released page is the named fault, and the instruments
   name the texture;
+- quiet, quiet_rewrite: with texheap_quiet a texture is selected only after that many presents without a CPU
+  write, a write inside the window moves its clock, and under the register trigger it is not dropped;
+- late_write: a texture written after it was registered is still resident when another page of it is read
+  (and the same case with the rule off stops on the named fault: the counter-run);
+- recommit: a write to a released page recommits it, the guest reads its bytes back and nothing stops;
 - frames: the pages the CPU wrote in each frame, and the pages the rule would
   select with no page range at all.
 
@@ -51,7 +56,8 @@ TEST_SOURCE = ROOT / "tests" / "runtime" / "texheap_test.c"
 HOST_SOURCE = ROOT / "tests" / "runtime" / "pages_host.c"
 END_SOURCE = ROOT / "tests" / "runtime" / "endmark.c"
 PAGEGEN_SOURCE = ROOT / "runtime" / "gpu" / "pagegen.c"   # the one reader of the write watch
-SWITCHES = ("OOT2_TEXHEAP", "OOT2_TEXHEAP_EVERY", "OOT2_TEXHEAP_TRIGGER", "OOT2_PAGE_RELEASE")
+SWITCHES = ("OOT2_TEXHEAP", "OOT2_TEXHEAP_EVERY", "OOT2_TEXHEAP_TRIGGER", "OOT2_TEXHEAP_QUIET",
+            "OOT2_PAGE_RELEASE")
 
 
 def read_file(folder: Path) -> dict[str, list[dict[str, str]]]:
@@ -103,12 +109,14 @@ class TexheapTest(unittest.TestCase):
         if hasattr(cls, "tmp"):
             cls.tmp.cleanup()
 
-    def run_case(self, level: str, case: str, texheap: bool = True, release: str | None = None, trigger: str | None = None):
+    def run_case(self, level: str, case: str, texheap: bool = True, release: str | None = None, trigger: str | None = None,
+                 quiet: str = "0"):
         env = {k: v for k, v in os.environ.items() if k not in SWITCHES}
         if texheap:
             env["OOT2_TEXHEAP"], env["OOT2_TEXHEAP_EVERY"] = "1", "1"
         if trigger:
             env["OOT2_TEXHEAP_TRIGGER"] = trigger
+        env["OOT2_TEXHEAP_QUIET"] = quiet   # the cases of the older rule want it off; the quiet cases say their own
         if release:
             env["OOT2_PAGE_RELEASE"] = release
         folder = Path(tempfile.mkdtemp(prefix=f"{case}-", dir=self.tmp.name))
@@ -193,6 +201,61 @@ class TexheapTest(unittest.TestCase):
                                               r"\(\d+ bytes, pool \d+\) at present \d+ in 0x[0-9a-f]+ \(main\+0x200\)")
                 self.assertEqual(len(read_file(folder)["read"]), 1)
                 self.assertEqual(read_file(folder)["end"][-1]["fields"][0], str(EXIT_FATAL))
+
+    def test_a_texture_is_selected_only_after_its_quiet_window(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, folder = self.passing(level, "quiet", release="release", quiet="3")
+                m = re.search(r"^selected (\d+) expected (\d+)$", done.stdout, re.M)
+                self.assertIsNotNone(m)
+                self.assertGreater(int(m[2]), 10)
+                self.assertEqual(m[1], m[2])
+                rows = read_file(folder)
+                header = {r["fields"][0]: r["fields"][1] for r in rows["header"]}
+                self.assertEqual(header["quiet"], "3")
+                samples = {int(r["seq"]): r for r in rows["sample"]}
+                for seq in (1, 2, 3):
+                    self.assertEqual(samples[seq]["selected_pages"], "0")
+                    self.assertEqual(samples[seq]["quiet_recs"], "3")   # T1, T2 and T5 wait
+                self.assertEqual(samples[4]["selected_pages"], m[2])
+                self.assertEqual(samples[4]["quiet_recs"], "0")
+
+    def test_a_write_inside_the_window_moves_the_clock_and_the_texture_stays_queued(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, _ = self.passing(level, "quiet_rewrite", release="release", trigger="register", quiet="3")
+                m = re.search(r"^released (\d+) expected (\d+)$", done.stdout, re.M)
+                self.assertIsNotNone(m)
+                self.assertEqual(m[1], m[2])
+
+    def test_a_texture_written_after_registration_is_not_released_under_the_rule(self) -> None:
+        # the shape of the run that stopped at present 3 on a texture written after it was registered
+        for level in LEVELS:
+            with self.subTest(level=level):
+                self.passing(level, "late_write", release="release", trigger="register", quiet="3")
+
+    def test_counter_run_without_the_rule_the_same_case_stops_on_the_texture(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, folder = self.run_case(level, "late_write", release="release", trigger="register", quiet="0")
+                if "skip late_write" in done.stdout:
+                    self.skipTest(done.stdout.strip())
+                self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+                self.assertIn('range "texheap" was released and a read of it is a fault', done.stderr)
+                self.assertRegex(done.stderr, r"texheap: guest code read a selected page of the texture of serial \d+ "
+                                              r"\(\d+ bytes, pool \d+\) at present 3")
+                self.assertEqual(len(read_file(folder)["read"]), 1)
+
+    def test_a_write_to_a_released_page_after_the_window_recommits_and_nothing_stops(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, folder = self.passing(level, "recommit", release="release", trigger="register", quiet="2")
+                m = re.search(r"^released (\d+) was (\d+) releases (\d+)$", done.stdout, re.M)
+                self.assertIsNotNone(m)
+                self.assertEqual(m[1], m[2])
+                self.assertEqual(int(m[3]), int(m[2]) + 1)
+                last = read_file(folder)["sample"][-1]
+                self.assertEqual((last["recommits"], last["guest_reads"], last["guest_writes"]), ("1", "0", "1"))
 
     def test_a_bind_of_a_held_queue_belongs_to_its_own_submission(self) -> None:
         # queue 1 is held at a wait before its bind; queue 2 binds another texture and is whole; the CPU releases queue 1,

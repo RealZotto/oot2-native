@@ -202,6 +202,7 @@ typedef enum RtSettingSource {
     X(texheap_trigger, DEBUG, ENUM, RESTART, 0, 0, 0, "bind|register",                                                 \
       "texheap only: when a texture's CPU-written pages are selected: bind, after a completed submission that binds it; "\
       "register, once its descriptor is registered, as a back end that uploads at registration would")                  \
+    X(texheap_quiet, DEBUG, INT, RESTART, 5, 0, 100000, NULL, "texheap only: presents without a CPU write to a texture before its pages are selected (0: at once)") \
     X(census_timer, DEBUG, BOOL, RESTART, 0, 0, 1, NULL,                                                              \
       "census mode only: time every host function call by its own thread CPU time (census-time.tsv); costs about 2 us a call") \
     X(census_probe, DEBUG, BOOL, RESTART, 0, 0, 1, NULL,                                                               \

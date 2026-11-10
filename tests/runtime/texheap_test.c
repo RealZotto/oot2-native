@@ -459,6 +459,93 @@ static void case_read_released(void) {
     printf("ok read_released\n");   // not reached
 }
 
+// OOT2_TEXHEAP_QUIET=3, bind trigger: a texture is selected only when the CPU has left it alone for 3 presents. The writes
+// are seen at present 1, so nothing is released at presents 1 to 3 and the pages go at present 4, not before.
+static void case_quiet(void) {
+    if (no_write_watch()) return (void)printf("skip quiet\n");
+    world();
+    write_cpu_textures();
+    bind_all();
+    RtPageStats s;
+    for (int i = 1; i <= 3; i++) {
+        present();
+        CHECK(!rt_pages_stats(0, &s));   // no selection, so not even a range
+    }
+    present();   // present 4: the writes were seen at 1
+    s = stats();
+    uint64_t want = t1_expected() + t5_pages();
+    printf("selected %llu expected %llu\n", (ull)s.released, (ull)want);
+    CHECK(s.released == want && s.recommits == 0);
+    printf("ok quiet\n");
+}
+
+// OOT2_TEXHEAP_QUIET=3, register trigger: a write at present 3 moves T5's clock and not T1's. T1 goes at present 4, T5 not
+// before present 6, and a texture that is rewritten while it waits is not dropped (nothing binds it again to bring it back).
+static void case_quiet_rewrite(void) {
+    if (no_write_watch()) return (void)printf("skip quiet_rewrite\n");
+    world();
+    write_cpu_textures();
+    present();   // 1
+    present();   // 2
+    host_write32(w.base + OFF_T5 + 0x1000, 0xCD);
+    present();   // 3: the write is seen
+    RtPageStats s;
+    CHECK(!rt_pages_stats(0, &s));
+    present();   // 4: T1 has been quiet since 1
+    CHECK(stats().released == t1_expected());
+    present();   // 5
+    CHECK(stats().released == t1_expected());
+    present();   // 6: T5 has been quiet since 3
+    s = stats();
+    printf("released %llu expected %llu\n", (ull)s.released, (ull)(t1_expected() + t5_pages()));
+    CHECK(s.released == t1_expected() + t5_pages() && s.recommits == 0);
+    printf("ok quiet_rewrite\n");
+}
+
+// The shape of a texture the game writes after registering it: filled, registered, one page written again at present 2, and
+// another page of it read at present 3. With the rule on (OOT2_TEXHEAP_QUIET=3) it is still resident, so the read gets the
+// bytes; with the rule off (0) the register trigger released it at present 1 and the read is the named fault.
+static void case_late_write(void) {
+    if (no_write_watch()) return (void)printf("skip late_write\n");
+    world();
+    write_cpu_textures();
+    present();   // 1
+    host_write32(w.base + OFF_T5 + 0x1000, 0xCD);
+    present();   // 2
+    present();   // 3
+    CHECK(gread(w.base + OFF_T5 + 0x2000) == 0xAB);   // not released: the clock is at 2
+    CHECK(gread(w.base + OFF_T5 + 0x1000) == 0xCD);
+    present();   // 4
+    present();   // 5: quiet since 2
+    RtPageStats s = stats();
+    CHECK(s.released == t1_expected() + t5_pages() && s.guest_reads == 0 && s.recommits == 0);
+    printf("ok late_write\n");
+}
+
+// A write to a released page after its window recommits it and the guest reads its own bytes back: counted, nothing stops.
+// The texture is queued again and goes once it has been quiet for the window.
+static void case_recommit(void) {
+    if (no_write_watch()) return (void)printf("skip recommit\n");
+    world();
+    write_cpu_textures();
+    for (int i = 0; i < 3; i++) present();   // quiet since 1, selected at 3
+    uint64_t was = stats().released;
+    CHECK(was == t1_expected() + t5_pages());
+    gwrite(w.base + 0x2000, 0x55);   // a page of T1, released
+    RtPageStats s = stats();
+    CHECK(s.recommits == 1 && s.guest_writes == 1 && s.released == was - 1);
+    CHECK(gread(w.base + 0x2000) == 0x55);
+    CHECK(stats().guest_reads == 0);
+    present();   // 4: the write is seen, T1 is inside its window again
+    present();   // 5
+    CHECK(stats().released == was - 1);
+    present();   // 6
+    s = stats();
+    printf("released %llu was %llu releases %llu\n", (ull)s.released, (ull)was, (ull)s.releases);
+    CHECK(s.released == was && s.releases == was + 1 && s.recommits == 1 && s.guest_reads == 0);
+    printf("ok recommit\n");
+}
+
 // Writes per frame, and what the rule would select with no page range at all (page_release off).
 static void case_frames(void) {
     if (no_write_watch()) return (void)printf("skip frames\n");
@@ -488,6 +575,10 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "count")) case_count();
     else if (!strcmp(cs, "read_released")) case_read_released();
     else if (!strcmp(cs, "frames")) case_frames();
+    else if (!strcmp(cs, "quiet")) case_quiet();
+    else if (!strcmp(cs, "quiet_rewrite")) case_quiet_rewrite();
+    else if (!strcmp(cs, "late_write")) case_late_write();
+    else if (!strcmp(cs, "recommit")) case_recommit();
     else if (!strcmp(cs, "held_bind")) case_held_bind();
     else if (!strcmp(cs, "held_pool")) case_held_pool();
     else if (!strcmp(cs, "held_complete")) case_held_complete();

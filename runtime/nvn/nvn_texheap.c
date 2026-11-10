@@ -45,6 +45,7 @@ typedef struct Chunk {
 
 typedef struct Rec {
     uint64_t mem, size, first_serial, serial, mark, bound_at, first_read_seq, first_write_seq;
+    uint64_t last_write;   // the present at which the CPU was last seen writing a page of this storage (0: never)
     uint64_t guest_reads, host_reads, guest_writes, host_writes;
     uint32_t pool, inits, binds, pages, cpu_pages, sel_pages, rewrites, recommits, b2t, t2b;
     uint32_t live;   // textures initialised at this storage now (more than one when two alias it)
@@ -67,7 +68,8 @@ static PlatMutex g_lock = PLAT_MUTEX_INIT;
 static int g_ready;
 static FILE *g_f;
 static char g_folder[512];
-static uint64_t g_t0, g_seq, g_every = 300;
+static uint64_t g_t0, g_seq, g_every = 300, g_quiet;   // g_quiet: texheap_quiet, presents without a CPU write before a texture is selected
+static int g_register;   // texheap_trigger=register
 static struct { uint64_t base, size; } g_reg[2];            // heap, alias reservations
 static uint64_t g_lo[2], g_hi[2];                           // the span of the pools' pages in each region
 static Chunk *g_chunk[2][MAX_CHUNKS];
@@ -267,6 +269,8 @@ static void ensure(void) {
     if ((g_reg[0].size >> CHUNK_SHIFT) >= MAX_CHUNKS || (g_reg[1].size >> CHUNK_SHIFT) >= MAX_CHUNKS)
         rt_fatal("texheap: a region is larger than the page table's %u chunks", MAX_CHUNKS);
     g_every = (uint64_t)rt_setting(RT_SET_texheap_every);
+    g_quiet = (uint64_t)rt_setting(RT_SET_texheap_quiet);
+    g_register = rt_setting(RT_SET_texheap_trigger) == 1;
     g_t0 = plat_now_ns();
     time_t wall = time(NULL);
     struct tm tm;
@@ -286,7 +290,8 @@ static void ensure(void) {
         fprintf(g_f, "oot2-texheap %d\n", FILE_FORMAT);
         const char *level = rt_pages_level() == RT_PAGES_RELEASING ? "release"
                             : rt_pages_level() == RT_PAGES_COUNTING ? "count" : "off";
-        fprintf(g_f, "header\tpage_release\t%s\nheader\tevery\t%llu\nheader\tpid\t%u\n", level, (ull)g_every, plat_pid());
+        fprintf(g_f, "header\tpage_release\t%s\nheader\tevery\t%llu\nheader\tquiet\t%llu\nheader\tpid\t%u\n", level, (ull)g_every,
+                (ull)g_quiet, plat_pid());
         fprintf(g_f, "columns\tframe\tseq\tpages\ttex_pages\tpool_pages\toutside\tpools_written\n");
         fprintf(g_f, "columns\tsample\tseq\tt_ms\theap_mapped\theap_committed\theap_resident\tprivate\tworking_set\tpools\t"
                      "pool_bytes\trecs\trec_bytes\tcpu_recs\tcpu_bytes\tgpu_recs\tgpu_bytes\tidle_recs\tidle_bytes\t"
@@ -294,7 +299,7 @@ static void ensure(void) {
                      "guest_reads\thost_reads\tguest_writes\thost_writes\tstale_touches\tb2t_copies\tb2t_bytes\t"
                      "t2b_copies\tpkg_inits\tpkg_bytes\tread_texels\tinval_calls\tinval_tex_calls\tinval_tex_bytes\t"
                      "flush_calls\tflush_tex_calls\tflush_tex_bytes\tpartial\tno_range\twhy_unbound\twhy_buffer\t"
-                     "why_shared\twhy_owner\tbind_ids\tbind_miss\tbind_dead\tb2t_nomatch\n");
+                     "why_shared\twhy_owner\tbind_ids\tbind_miss\tbind_dead\tb2t_nomatch\tquiet_recs\n");
         fprintf(g_f, "columns\tpool\tseq\tid\tclass\tflags\tsize\tmem\tcommitted\tresident\trecs\trec_bytes\tcpu_bytes\t"
                      "gpu_bytes\tidle_bytes\ttex_pages\twritten_pages\tselected_pages\teligible_pages\twindow_frames\t"
                      "window_pages\twindow_max\n");
@@ -302,9 +307,9 @@ static void ensure(void) {
         fprintf(g_f, "columns\tread\tseq\tserial\tsize\tpool\tpages\tguest\tfn\n");
         fflush(g_f);
     }
-    rt_log("texheap: the texture heap instruments are on (page_release %s, a sample every %llu presents)%s",
+    rt_log("texheap: the texture heap instruments are on (page_release %s, a sample every %llu presents, quiet %llu)%s",
            rt_pages_level() == RT_PAGES_RELEASING ? "release" : rt_pages_level() == RT_PAGES_COUNTING ? "count" : "off",
-           (ull)g_every, g_f ? "" : ", without a file");
+           (ull)g_every, (ull)g_quiet, g_f ? "" : ", without a file");
 }
 
 // ---------- pools
@@ -520,10 +525,17 @@ static void note_written(uint64_t page) {
     if (k->rec[i]) {
         Rec *r = rec_at(k->rec[i]);
         if (!was) r->cpu_pages++;
+        int fresh = r->last_write != g_cur;   // the first page of this texture seen written in this present
+        r->last_write = g_cur;
         // A write seen in the frame whose present follows the bind's completion is taken to come before the bind (the
         // upload is written, then used); a later one is a rewrite. At the frame's granularity a write after the bind in
         // the same frame is not told from one before it.
-        if (r->bound && r->live && r->bound_at < g_cur) r->bound = 0, r->rewrites++;
+        // With the quiet rule and the register trigger nothing binds the texture again, so it stays bound and waits: the
+        // write moved last_write, which is what select_rec waits on.
+        if (r->bound && r->live && r->bound_at < g_cur) {
+            r->rewrites += fresh;
+            if (!(g_quiet && g_register)) r->bound = 0;
+        }
     }
 }
 
@@ -627,7 +639,14 @@ static void cb_written(void *u, uint64_t page) {   // a write put a released pag
         if (k->rec[i]) {
             Rec *r = rec_at(k->rec[i]);
             r->recommits++;
-            if (r->bound && r->live) r->bound = 0, r->rewrites++;
+            r->last_write = g_cur;
+            if (r->bound && r->live) {
+                r->rewrites++;
+                // register trigger with the quiet rule: no bind will come, so the texture queues again and is selected once
+                // it has been quiet for g_quiet presents; otherwise it waits for its next completed bind
+                if (g_quiet && g_register) ready_add(k->rec[i]);
+                else r->bound = 0;
+            }
         }
     }
     plat_mutex_unlock(&g_lock);
@@ -669,9 +688,11 @@ static void select_run(Rec *r, uint32_t ir, int region, uint64_t s, uint64_t e) 
     (void)ir;
 }
 
-static void select_rec(uint32_t ir) {
+// Returns 1 when the texture must stay queued: it is bound but the CPU wrote it fewer than g_quiet presents ago.
+static int select_rec(uint32_t ir) {
     Rec *r = rec_at(ir);
-    if (!r->live || !r->bound || gfx_gpu_only((uintptr_t)r->mem) || g_nowatch) return;
+    if (!r->live || !r->bound || gfx_gpu_only((uintptr_t)r->mem) || g_nowatch) return 0;
+    if (g_quiet && r->last_write && g_cur - r->last_write < g_quiet) return 1;
     uint64_t lo = up(r->mem), hi = down(r->mem + r->size), start = 0;
     int region = 0;
     for (uint64_t x = lo; x < hi; x += PAGE) {
@@ -688,6 +709,7 @@ static void select_rec(uint32_t ir) {
         }
     }
     if (start) select_run(r, ir, region, start, hi);
+    return 0;
 }
 
 // ---------- the replay's side
@@ -912,7 +934,7 @@ static void sample(uint64_t seq) {
                           g_n.b2t_bytes, g_n.t2b_copies, g_n.pkg_inits, g_n.pkg_bytes, g_n.read_texels, g_n.inval_calls,
                           g_n.inval_tex_calls, g_n.inval_tex_bytes, g_n.flush_calls, g_n.flush_tex_calls,
                           g_n.flush_tex_bytes, g_n.partial, g_n.no_range, why[0], why[1], why[2], why[3], g_n.bind_ids,
-                          g_n.bind_miss, g_n.bind_dead, g_n.b2t_nomatch};
+                          g_n.bind_miss, g_n.bind_dead, g_n.b2t_nomatch, g_ready_n};
     row("sample");
     for (size_t i = 0; i < sizeof v / sizeof *v; i++) row("\t%llu", (ull)v[i]);
     row("\n");
@@ -951,12 +973,14 @@ void texheap_present(uint64_t seq) {
         (ull)g_fr.outside, (ull)g_fr.pools);
     memset(&g_fr, 0, sizeof g_fr);   // what the completions since the last present read counts in this frame, too
     g_frpools_n = 0;
+    size_t keep = 0;   // a texture still inside its quiet window stays queued for the next present
     for (size_t i = 0; i < g_ready_n; i++) {
-        Rec *r = rec_at(g_ready_recs[i]);
+        uint32_t ir = g_ready_recs[i];
+        Rec *r = rec_at(ir);
         r->queued = 0;
-        select_rec(g_ready_recs[i]);
+        if (select_rec(ir)) r->queued = 1, g_ready_recs[keep++] = ir;
     }
-    g_ready_n = 0;
+    g_ready_n = keep;
     if (seq == 1 || seq % g_every == 0) sample(seq);
     if (g_f) fflush(g_f);
     plat_mutex_unlock(&g_lock);

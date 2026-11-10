@@ -28,6 +28,15 @@
 // Selected pages are armed (page_release=count) or released (page_release=release) through rt_pages_*, one range for the
 // heap region and one for the alias region, made on the first selection. With page_release=off the module only counts the
 // pages it would have selected. A write to a page after its selection puts the texture back to unbound: the CPU rewrote it.
+// The quiet rule (setting texheap_quiet, OOT2_TEXHEAP_QUIET, presents, default 5; 0 is the rule above alone): a queued texture
+// is selected only when the CPU was last seen writing a page of its storage at least that many presents ago, so a texture
+// the game fills over several frames, or fills after registering it, waits until it has been left alone. Each write the
+// watch sees (and each recommit of a released page) moves the texture's last-write present; a texture inside its window
+// stays queued and is reconsidered at every later present (the sample column quiet_recs counts them). Under the bind
+// trigger a write after the bind still puts the texture back to unbound, as above. Under the register trigger nothing
+// binds a texture again, so with the rule on a rewritten or recommitted texture stays bound (or is queued again) and the
+// clock alone decides. The rule narrows the risk and cannot remove it: a guest read of a page that was released is still
+// the named fault, and only a write recommits.
 //
 // The frame. At each present, before anything else, the write watch over the span of the pools' pages is read through the
 // page generations (oot2/pagegen.h, the runtime's one reader of it, so a consumer of the same pages sees them too), once
@@ -44,7 +53,7 @@
 // The file. texheap-<UTC date>-<time>-<pid>.tsv in the game folder, numbers only, one record per line, tab separated, the
 // kind first; times are milliseconds since the first call. A reader ignores kinds it does not know.
 //   oot2-texheap 1
-//   header  key  value
+//   header  key  value        (page_release, every, quiet, pid)
 //   frame   seq pages tex_pages pool_pages outside pools_written   pages the CPU wrote in the frame that ended with present
 //                            seq: all, inside texture storage, inside a pool, outside every pool; pools that had any
 //   sample  seq t_ms  heap_mapped heap_committed heap_resident private working_set  pools pool_bytes
@@ -52,6 +61,7 @@
 //           eligible_pages selected_pages  arms releases recommits busy guest_reads host_reads guest_writes host_writes
 //           stale_touches  b2t_copies b2t_bytes t2b_copies pkg_inits pkg_bytes read_texels
 //           inval_calls inval_tex_calls inval_tex_bytes flush_calls flush_tex_calls flush_tex_bytes partial no_range
+//           why_unbound why_buffer why_shared why_owner bind_ids bind_miss bind_dead b2t_nomatch quiet_recs
 //                            the run so far. A record is a texture storage; cpu: a page of it was written by the CPU, or
 //                            packaged data was copied in; gpu: no CPU write and a render target, image or copy destination;
 //                            idle: neither. written_pages: pages of texture storage the CPU has written; eligible_pages:
