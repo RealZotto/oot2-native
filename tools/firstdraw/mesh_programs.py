@@ -91,8 +91,14 @@ def ipa(rd: int, attribute_byte: int) -> bytes:
 
 # ---- the programs ----------------------------------------------------------------------
 
-# The vertex outputs of the mesh stage, in attribute line order: the position, then generic location 0
-VERTEX_MAP = [[-1, c] for c in range(4)] + [[0, c] for c in range(4)]
+def vertex_map(colour: int = 4) -> list[list[int]]:
+    """The vertex outputs of the mesh stage, in attribute line order: the position, then the first `colour` components of generic
+    location 0 (all four unless a test leaves the last ones for the pixel stage to read as what the console reads from an unwritten
+    output)."""
+    return [[-1, c] for c in range(4)] + [[0, c] for c in range(colour)]
+
+
+VERTEX_MAP = vertex_map()
 LINE_BYTES = 0x80            # one line of 32 words for each written component
 
 PAYLOAD_X = 0x10             # the task's payload word that carries x (byte 16, after the number of mesh workgroups at byte 4)
@@ -102,11 +108,12 @@ COUNT_BANK_MESH_WORD = 0x14  # c[3][0x14]: the primitive count of a mesh workgro
 # Registers: R2 x, R3 j, R4 n, R5 the group count, R6 0.5, R7 y, R8 x + d, R9 d, R10 y + d, R12 1.0, R13 the primitive count, R14 and R15 indices
 
 
-def triangle(x0: int, x1: int, y0: int, y1: int, z: int, w: int) -> list[bytes]:
-    """ISBEWR of one triangle (x0, y0), (x1, y0), (x0, y1) into the attribute lines, with the colour (x0, y0, z, w): every register is a
-    register number. Line L is the L-th component of VERTEX_MAP, vertex v word v of the line."""
+def triangle(x0: int, x1: int, y0: int, y1: int, z: int, w: int, colour: int = 4) -> list[bytes]:
+    """ISBEWR of one triangle (x0, y0), (x1, y0), (x0, y1) into the attribute lines, with the colour (x0, y0, z, w), of which only the
+    first `colour` components are stored: every register is a register number. Line L is the L-th component of vertex_map(colour),
+    vertex v word v of the line."""
     lines = [(x0, x1, x0), (y0, y0, y1), (z, z, z), (w, w, w)]        # the position x, y, z, w of vertices 0, 1, 2
-    lines += [(x0, x0, x0), (y0, y0, y0), (z, z, z), (w, w, w)]       # the colour r, g, b, a
+    lines += [(x0, x0, x0), (y0, y0, y0), (z, z, z), (w, w, w)][:colour]   # the colour r, g, b, a
     return [isbewr(0xF8, line * LINE_BYTES + 4 * v, reg) for line, regs in enumerate(lines) for v, reg in enumerate(regs)]
 
 
@@ -123,42 +130,48 @@ def task_program() -> list[bytes]:
             isbewr(0xB8, 4, 5), isbewr(0xB8, PAYLOAD_X, 2), EXIT]
 
 
-def mesh_program() -> list[bytes]:
-    """x from the payload word, y = 0.5 + j / 32 for the mesh workgroup's own number j."""
+def mesh_program(colour: int = 4) -> list[bytes]:
+    """x from the payload word, y = 0.5 + j / 32 for the mesh workgroup's own number j; stores the first `colour` colour components."""
     code = [isberd(0x38, 2, PAYLOAD_X), isberd(0x78, 3, 0), mov_imm(6, HALF), imad_imm(7, 3, 1 << CELL_SHIFT, 6), mov_imm(9, LEG),
             imad_imm(8, 2, 1, 9), imad_imm(10, 7, 1, 9), mov_imm(12, ONE)]
-    return code + triangle(2, 8, 7, 10, 6, 12) + finish_mesh()
+    return code + triangle(2, 8, 7, 10, 6, 12, colour) + finish_mesh()
 
 
-def mesh_only_program(row: int) -> list[bytes]:
+def mesh_only_program(row: int, colour: int = 4) -> list[bytes]:
     """A mesh stage without a task: n is its own workgroup number, with the draw's first task, and the row is fixed."""
     code = [isberd(0x78, 4, 0), mov_imm(6, HALF), imad_imm(2, 4, 1 << CELL_SHIFT, 6), mov_imm(7, HALF + (row << CELL_SHIFT)),
             mov_imm(9, LEG), imad_imm(8, 2, 1, 9), imad_imm(10, 7, 1, 9), mov_imm(12, ONE)]
-    return code + triangle(2, 8, 7, 10, 6, 12) + finish_mesh()
+    return code + triangle(2, 8, 7, 10, 6, 12, colour) + finish_mesh()
 
 
-def pixel_program() -> bytes:
-    """The pixel program with its 0x80-byte header: generic attribute 0 interpolated in perspective in all four components, one render
-    target of four components, and IPA of the four components into R0..R3 (the target's components, in order)."""
+READS = [(0, c) for c in range(4)]   # the pixel program's inputs, one (location, component) for each of R0..R3
+
+
+def pixel_program(reads: list[tuple[int, int]] = READS) -> bytes:
+    """The pixel program with its 0x80-byte header: each of the four attributes `reads` names, a (generic location, component) for
+    each of R0..R3, interpolated in perspective, one render target of four components, and IPA of each into R0..R3 (the target's
+    components, in order). The default reads the four components of location 0."""
     header = bytearray(0x80)
     struct.pack_into("<I", header, 0, 2 | (5 << 10))                  # SphType 2 (pixel), ShaderType 5 (fragment)
-    header[6 * 4] = 0xAA                                              # imap vector 0: perspective in x, y, z and w
+    for location, component in reads:                                 # imap vector `location`: perspective in the components read
+        header[6 * 4 + location] |= 2 << (2 * component)
     struct.pack_into("<I", header, 18 * 4, 0xF)                       # omap: target 0, four components
-    return bytes(header) + b"".join(ipa(c, 0x80 + 4 * c) for c in range(4)) + EXIT
+    return bytes(header) + b"".join(ipa(r, 0x80 + 16 * location + 4 * component) for r, (location, component) in enumerate(reads)) + EXIT
 
 
 def code_bytes(instructions: list[bytes]) -> bytes:
     return b"".join(instructions)
 
 
-def mesh_fields(stage: str, payload: int = 256, max_vertices: int = 3, max_primitives: int = 1, has_task: bool = True) -> dict:
+def mesh_fields(stage: str, payload: int = 256, max_vertices: int = 3, max_primitives: int = 1, has_task: bool = True,
+                colour: int = 4) -> dict:
     """The fields of a task or mesh job as the splitter writes them (xlate/host/Job.cs): the thread group, the mesh object that gives the
     sizes and, for a mesh job, its output map."""
     mesh = {"kind": stage, "threads": 32, "payload": payload, "own_shared": False}
     fields = {"local": [32, 1, 1], "shared": 192, "stage_memory": [0, 16, 64, 128], "mesh": mesh}
     if stage == "ms":
         mesh.update(has_task=has_task, max_vertices=max_vertices, max_primitives=max_primitives)
-        fields["outputs"] = {"vertex": VERTEX_MAP, "primitive": []}
+        fields["outputs"] = {"vertex": vertex_map(colour), "primitive": []}
     return fields
 
 

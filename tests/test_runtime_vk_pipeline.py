@@ -6,16 +6,18 @@ D12 and D13, the pipeline builder), through tests/runtime/vk_pipeline_test.c, bu
 Three groups, by what they need:
 
 - Without a device (continuous integration runs them): the layout's tables against xlate/host/UniLayout.cs, the dynamic
-  state lists, the description reader (stage, fit, interface, refusals), the padding rule, SPIR-V declarations and the
-  outputs added to a module (structure checked here, and by spirv-val when the SDK has it), the required list of
+  state lists, the description reader (stage, fit, interface, refusals), the padding rule, the mesh link rule (the runs
+  of words a mesh stage leaves unwritten, by location, type and rate), SPIR-V declarations and the outputs added to a
+  vertex or mesh module (structure checked here, and by spirv-val when the SDK has it), the required list of
   capabilities, cache file headers judged for a device, and the store: a key the pack lacks, a job that did not
   translate, a stage of another kind and a module that does not fit are each a named fatal that prints the stage's shape.
 - On a device with every item of oot2/vk_required.h, with a synthetic pack of GLSL modules the test compiles (no game
   data): the layouts under validation, a pair linked for two attachment formats and drawn through the internal submit
   with the padded input reading (0, 0, 0, 1), the counter-run that leaves it unpadded (the validation layer reports
-  VUID-RuntimeSpirv-OpEntryPoint-08743), a compute dispatch, a pipeline asked for with a submission in flight (a named
-  fatal), the pipeline cache warm in a second process and dropped after a driver change, a stage's objects released and
-  made again, and eight threads asking for one pipeline.
+  VUID-RuntimeSpirv-OpEntryPoint-08743), a mesh stage with four pixel stages that read words it does not write, whose
+  padded libraries are made once for each pad set (one of them read per primitive), a compute dispatch, a pipeline asked
+  for with a submission in flight (a named fatal), the pipeline cache warm in a second process and dropped after a driver
+  change, a stage's objects released and made again, and eight threads asking for one pipeline.
 - On the player's own pack (the desktop, with OOT2_T60_PACK and OOT2_T60_WORK set; never in continuous integration): the
   pair the stage bindings work drew, built from the pack, against tools/firstdraw's own draw of the same modules; a sample of corpus
   pairs by the pipeline cost study's method, padded pairs included; compute pipelines; a second process warm from the cache; and the
@@ -136,6 +138,15 @@ def vertex_module(extra_caps: tuple[int, ...] = (), extensions: tuple[str, ...] 
     return module_words(body, 7 + 2 * entry_points)
 
 
+def bare_module() -> bytes:
+    """A module that declares no capability or extension (an unopened builder's empty required list refuses none of it) and is
+    SPIR-V 1.3 with a vertex entry point: the mesh rewrite refuses it by name, where a mesh module would go on to the driver."""
+    body = [inst(OP["memory_model"], 0, 1), inst(OP["entry_point"], 0, 3, *text_words("main")), inst(OP["void"], 1),
+            inst(OP["fn_type"], 2, 1), inst(OP["function"], 1, 3, 0, 2), inst(OP["label"], 4), inst(OP["ret"]),
+            inst(OP["fn_end"])]
+    return module_words(body, 5)
+
+
 def compute_module(variables: tuple[tuple[int, bool], ...] = ((64, False),), *, undeclared_type: bool = False) -> bytes:
     """A compute module (SPIR-V 1.3, local size 1) whose function returns at once, with one Workgroup variable for each
     (words, initialized): an array of that many 32-bit unsigned integers, its pointer type shared by every variable of the
@@ -166,6 +177,69 @@ def compute_module(variables: tuple[tuple[int, bool], ...] = ((64, False),), *, 
     return module_words(body, nxt + 1)
 
 
+SC_INPUT, SC_OUTPUT = 1, 3
+EXEC_MESH, EXEC_VERTEX = 5365, 0
+
+
+def mesh_module(*, vertices: int = 160, primitives: int = 128, threads: int = 32, outputs=((0, 0), (0, 1), (0, 2), (0, 3)),
+                primitive_outputs=(), sets: int = 1, own_index: bool = False, tail: str = "return", model: int = EXEC_MESH,
+                version: int = 0x00010400, modes: bool = True) -> bytes:
+    """A mesh module in the shape of the translator's (xlate MeshEmission): SPIR-V 1.4, one MeshEXT entry point of `threads`
+    invocations, the position and one float[vertices] for each (location, component) of `outputs` (per primitive, float[primitives]
+    decorated PerPrimitiveEXT, for `primitive_outputs`), the triangle indices, the local invocation id, and a main function that
+    calls OpSetMeshOutputsEXT `sets` times and returns. tail "phi" ends the first block in a conditional branch to a block that
+    holds a phi naming the first block, as the translator's epilogue could leave one; own_index declares LocalInvocationIndex."""
+    ids = iter(range(1, 1000))
+    void, fn_type, flt, u32, v4, boolean, c_vertices, c_primitives = (next(ids) for _ in range(8))
+    arr_v, ptr_arr_v, arr_pos, ptr_arr_pos, v3, arr_idx, ptr_arr_idx, ptr_in_v3 = (next(ids) for _ in range(8))
+    arr_p, ptr_arr_p, position, indices, local_id, main, entry, c_one = (next(ids) for _ in range(8))
+    variables = [(next(ids), loc, comp, False) for loc, comp in outputs]
+    variables += [(next(ids), loc, comp, True) for loc, comp in primitive_outputs]
+    index_var = next(ids) if own_index else None
+    ptr_in_u32 = next(ids) if own_index else None
+    cond, then, merge, phi = (next(ids) for _ in range(4))
+    bound = next(ids)
+    interface = [position, indices, local_id] + [v[0] for v in variables] + ([index_var] if own_index else [])
+    body = [inst(OP["capability"], 1), inst(OP["capability"], 5283), inst(OP["extension"], *text_words("SPV_EXT_mesh_shader")),
+            inst(OP["memory_model"], 0, 1), inst(OP["entry_point"], model, main, *text_words("main"), *interface)]
+    if modes:
+        body += [inst(OP["execution_mode"], main, 17, threads, 1, 1), inst(OP["execution_mode"], main, 26, vertices),
+                 inst(OP["execution_mode"], main, 5270, primitives), inst(OP["execution_mode"], main, 5298)]
+    body += [inst(OP["decorate"], position, 11, 0), inst(OP["decorate"], indices, 11, 5296), inst(OP["decorate"], local_id, 11, 27)]
+    for var, loc, comp, per_primitive in variables:
+        body += [inst(OP["decorate"], var, 30, loc), inst(OP["decorate"], var, 31, comp)]
+        if per_primitive:
+            body.append(inst(OP["decorate"], var, 5271))
+    if own_index:
+        body.append(inst(OP["decorate"], index_var, 11, 29))
+    body += [inst(OP["void"], void), inst(OP["fn_type"], fn_type, void), inst(OP["float"], flt, 32), inst(OP["int"], u32, 32, 0),
+             inst(OP["vector"], v4, flt, 4), inst(20, boolean), inst(OP["constant"], u32, c_vertices, vertices),
+             inst(OP["constant"], u32, c_primitives, primitives), inst(OP["constant"], u32, c_one, 1),
+             inst(OP["array"], arr_v, flt, c_vertices), inst(OP["pointer"], ptr_arr_v, SC_OUTPUT, arr_v),
+             inst(OP["array"], arr_pos, v4, c_vertices), inst(OP["pointer"], ptr_arr_pos, SC_OUTPUT, arr_pos),
+             inst(OP["vector"], v3, u32, 3), inst(OP["array"], arr_idx, v3, c_primitives),
+             inst(OP["pointer"], ptr_arr_idx, SC_OUTPUT, arr_idx), inst(OP["pointer"], ptr_in_v3, SC_INPUT, v3),
+             inst(OP["array"], arr_p, flt, c_primitives), inst(OP["pointer"], ptr_arr_p, SC_OUTPUT, arr_p),
+             inst(OP["variable"], ptr_arr_pos, position, SC_OUTPUT), inst(OP["variable"], ptr_arr_idx, indices, SC_OUTPUT),
+             inst(OP["variable"], ptr_in_v3, local_id, SC_INPUT)]
+    for var, _, _, per_primitive in variables:
+        body.append(inst(OP["variable"], ptr_arr_p if per_primitive else ptr_arr_v, var, SC_OUTPUT))
+    if own_index:
+        body += [inst(OP["pointer"], ptr_in_u32, SC_INPUT, u32), inst(OP["variable"], ptr_in_u32, index_var, SC_INPUT)]
+    if tail == "phi":
+        body.append(inst(41, boolean, cond))   # OpConstantTrue
+    body += [inst(OP["function"], void, main, 0, fn_type), inst(OP["label"], entry)]
+    body += [inst(5295, c_vertices, c_primitives) for _ in range(sets)]
+    if tail == "phi":
+        body += [inst(247, merge, 0), inst(250, cond, then, merge), inst(OP["label"], then), inst(249, merge),
+                 inst(OP["label"], merge), inst(245, u32, phi, c_one, entry, c_vertices, then)]
+    body += [inst(OP["ret"]), inst(OP["fn_end"])]
+    words = [SPIRV_MAGIC, version, 0, bound, 0]
+    for i in body:
+        words += i
+    return struct.pack(f"<{len(words)}I", *words)
+
+
 def parse_words(data: bytes) -> list[list[int]]:
     words = struct.unpack(f"<{len(data) // 4}I", data)
     out, i = [], 5
@@ -175,6 +249,81 @@ def parse_words(data: bytes) -> list[list[int]]:
         out.append(list(words[i:i + n]))
         i += n
     return out
+
+
+class MeshModule:
+    """A mesh module read back from its words, for the structure tests: its types, constants, variables, decorations, the entry
+    point's interface and the instructions of the function that calls OpSetMeshOutputsEXT."""
+
+    def __init__(self, data: bytes) -> None:
+        self.version = struct.unpack_from("<I", data, 4)[0]
+        self.type: dict[int, list[int]] = {}
+        self.const: dict[int, list[int]] = {}
+        self.var: dict[int, tuple[int, int]] = {}
+        self.decor: dict[int, dict[int, list[int]]] = {}
+        self.interface: list[int] = []
+        self.main: list[list[int]] = []
+        function: list[list[int]] = []
+        for i in parse_words(data):
+            op = i[0] & 0xffff
+            if op == OP["entry_point"]:
+                self.interface = i[3 + len(text_words("main")):]
+            elif op == OP["decorate"]:
+                self.decor.setdefault(i[1], {})[i[2]] = i[3:]
+            elif op in (20, 21, 22, 23, 28, 32):
+                self.type[i[1]] = i
+            elif op in (41, 43, 44, 46):
+                self.const[i[2]] = i
+            elif op == OP["variable"] and not function:
+                self.var[i[2]] = (i[1], i[3])
+            elif op == OP["function"]:
+                function = [i]
+            elif function:
+                function.append(i)
+                if op == OP["fn_end"]:
+                    if any((j[0] & 0xffff) == 5295 for j in function):
+                        self.main = function
+                    function = []
+
+    def array_of(self, var: int) -> tuple[int, str, int]:
+        """(length, scalar kind, components) of an Output array variable: float[160] is (160, "float", 1)."""
+        pointer = self.type[self.var[var][0]]            # OpTypePointer %id storage pointee
+        array = self.type[pointer[3]]                    # OpTypeArray %id element length
+        length = self.const[array[3]][3]
+        element = self.type[array[2]]                    # OpTypeVector %id component count, or a scalar
+        count = element[3] if element[0] & 0xffff == 23 else 1
+        scalar = self.type[element[2]] if count > 1 else element
+        kind = "float" if scalar[0] & 0xffff == 22 else "sint" if scalar[3] else "uint"   # OpTypeInt %id width signedness
+        return length, kind, count
+
+    def value(self, constant: int) -> list[int]:
+        """The 32-bit words a constant holds: one, or one for each component of a vector."""
+        c = self.const[constant]
+        op = c[0] & 0xffff
+        if op == 43:
+            return [c[3]]
+        if op == 44:
+            return [w for member in c[3:] for w in self.value(member)]
+        assert op == 46, f"constant {constant} is not a value the pads use"
+        t = self.type[c[1]]
+        return [0] * (t[3] if t[0] & 0xffff == 23 else 1)
+
+    def after_call(self) -> list[list[int]]:
+        """The instructions that follow OpSetMeshOutputsEXT in the function."""
+        at = next(n for n, i in enumerate(self.main) if (i[0] & 0xffff) == 5295)
+        return self.main[at + 1:]
+
+    def stores(self) -> dict[int, list[list[int]]]:
+        """For each variable, the words of every value stored to one of its elements, in order, in the whole function."""
+        chain: dict[int, int] = {}
+        out: dict[int, list[list[int]]] = {}
+        for i in self.main:
+            op = i[0] & 0xffff
+            if op == 65:
+                chain[i[2]] = i[3]
+            elif op == 62 and i[1] in chain:
+                out.setdefault(chain[i[1]], []).append(self.value(i[2]))
+        return out
 
 
 def describe(key: str, stage: str, module: bytes, *, inputs=(), outputs=(), fits=True, schema=cp.DESC_SCHEMA,
@@ -454,6 +603,39 @@ class MeshLinkTest(unittest.TestCase):
     def test_what_the_mesh_stage_does_not_write_is_listed(self) -> None:
         outs = [mesh_out(3, c) for c in (0, 1)]
         self.assertEqual(self.link(outs, [pixel_in(3), pixel_in(9, 1, 2, type_="uint32")]), "missing 2 3:2:2:0;9:2:1:2;")
+
+    def test_the_ranges_of_the_pair_that_stopped_the_run_are_listed_in_its_own_shapes(self) -> None:
+        # A mesh stage that writes some words of the locations its pixel stage reads whole: x, y and z of locations 1, 2 and 4,
+        # x of 3, x and y of 5 and 13 (n:3:1, n:1:3 and n:2:2 are the three shapes of the unwritten words), and all of 6.
+        written = {1: 3, 2: 3, 3: 1, 4: 3, 5: 2, 13: 2, 6: 4}
+        outs = [mesh_out(loc, c) for loc, n in written.items() for c in range(n)]
+        self.assertEqual(self.link(outs, [pixel_in(loc) for loc in written]),
+                         "missing 6 1:3:1:0;2:3:1:0;3:1:3:0;4:3:1:0;5:2:2:0;13:2:2:0;")
+
+    def test_the_ten_ranges_of_the_widest_stop_are_listed(self) -> None:
+        outs = [mesh_out(loc, c) for loc, c in SpirvTest.R5_WRITTEN]
+        ins = [pixel_in(loc) for loc in sorted({loc for loc, _ in SpirvTest.R5_WRITTEN})]
+        text = "".join(f"{part};" for part in SpirvTest.R5_PADS.split(","))
+        self.assertEqual(self.link(outs, ins), f"missing 10 {text}")
+
+    def test_a_location_the_mesh_stage_writes_nothing_of_is_one_run_of_its_words(self) -> None:
+        self.assertEqual(self.link([mesh_out(1, 0)], [pixel_in(9)]), "missing 1 9:0:4:0;")
+
+    def test_a_word_read_per_primitive_is_listed_with_its_rate_and_never_joins_a_per_vertex_run(self) -> None:
+        outs = [mesh_out(5, c) for c in range(2)]
+        ins = [pixel_in(5), pixel_in(6, 2, per_primitive=True), pixel_in(7, 2), pixel_in(7, 2, 2, per_primitive=True)]
+        # location 5 is read per vertex with its last two words unwritten; 6 is read per primitive whole; 7 is read per vertex
+        # in its first two words and per primitive in its last two, and the two runs are two variables
+        self.assertEqual(self.link(outs, ins), "missing 4 5:2:2:0;6:0:2:0:p;7:0:2:0;7:2:2:0:p;")
+
+    def test_a_run_never_mixes_two_types(self) -> None:
+        ins = [pixel_in(3, 2), pixel_in(3, 1, 2, type_="uint32"), pixel_in(3, 1, 3, type_="sint32")]
+        self.assertEqual(self.link([], ins), "missing 3 3:0:2:0;3:2:1:2;3:3:1:1;")
+
+    def test_a_word_to_pad_that_is_not_32_bits_wide_is_refused_by_name(self) -> None:
+        self.refused([mesh_out(2, 0)], [pixel_in(1, 4, type_="float64")], "pixel input 1 is 64 bits wide", "32-bit")
+        # a word the mesh stage writes is judged by the type rule alone
+        self.refused([mesh_out(1, 0)], [pixel_in(1, 1, type_="float64")], "type", "location 1")
 
     def test_a_rate_mismatch_is_refused_by_name(self) -> None:
         outs = [mesh_out(4, c, per_vertex=128, per_primitive=True) for c in range(4)]
@@ -848,6 +1030,189 @@ class SpirvTest(unittest.TestCase):
             done = subprocess.run([val, "--target-env", "vulkan1.3", str(self.dir / "out.spv")], capture_output=True, text=True)
             self.assertEqual(done.returncode, 0, f"{spec}: {done.stdout}{done.stderr}")
 
+    # ---- outputs added to a mesh module (oot2/spirv.h, spv_add_mesh_outputs)
+
+    # The pad set of a mesh stage shaped like the game's: 10 runs, in the shapes the r5 stops list (n:3:1, n:1:3), over a module
+    # whose outputs are the other words of those locations.
+    R5_WRITTEN = ((0, 0), (1, 0), (2, 0), (3, 0), (3, 1), (3, 2), (3, 3), (4, 0), (4, 1), (4, 2), (5, 0), (5, 1), (5, 2), (6, 0),
+                  (7, 0), (7, 1), (7, 2), (8, 0), (8, 1), (8, 2), (9, 0), (9, 1), (9, 2), (9, 3), (11, 0), (11, 1), (11, 2),
+                  (12, 0), (12, 1), (12, 2))
+    R5_PADS = "0:1:3:0,1:1:3:0,2:1:3:0,4:3:1:0,5:3:1:0,6:1:3:0,7:3:1:0,8:3:1:0,11:3:1:0,12:3:1:0"
+
+    def mesh_padded(self, spec: str, mod: bytes, *limits: int) -> MeshModule:
+        done = run("spvmeshpad", self.write("min.spv", mod), str(self.dir / "mout.spv"), spec, *map(str, limits))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertTrue(done.stdout.startswith("padded "), done.stdout)
+        return MeshModule((self.dir / "mout.spv").read_bytes())
+
+    def mesh_refused(self, spec: str, mod: bytes, *limits: int) -> str:
+        done = run("spvmeshpad", self.write("min.spv", mod), str(self.dir / "mout.spv"), spec, *map(str, limits))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertTrue(done.stdout.startswith("refused: "), done.stdout)
+        return done.stdout
+
+    @staticmethod
+    def word_values(component: int, components: int) -> list[int]:
+        """What an unwritten word reads: 1.0f's bits in a location's fourth component, zero in the others."""
+        return [0x3f800000 if component + c == 3 else 0 for c in range(components)]
+
+    def check_pads(self, spec: str, mod: bytes, *, vertices: int = 160, primitives: int = 128, threads: int = 32) -> MeshModule:
+        """spec padded onto mod: every run is an Output array of its rate's length of its scalar or vector, decorated with its
+        location (and component, and PerPrimitiveEXT), listed in the interface, and stored its value by every invocation's
+        share of the elements after OpSetMeshOutputsEXT, each store behind the test against the count the call passed."""
+        before, after = MeshModule(mod), self.mesh_padded(spec, mod)
+        runs = []
+        for part in spec.split(","):
+            fields = part.split(":")
+            runs.append((*map(int, fields[:4]), len(fields) > 4))
+        added = after.interface[len(before.interface):]
+        self.assertEqual(after.interface[:len(before.interface)], before.interface)
+        pads = added[:len(runs)]
+        call = next(i for i in after.main if (i[0] & 0xffff) == 5295)
+        at_call = next(n for n, i in enumerate(after.main) if (i[0] & 0xffff) == 5295)
+        stores = after.stores()
+        kinds = ("float", "sint", "uint")
+        for var, (location, component, components, type_, per_primitive) in zip(pads, runs):
+            count = primitives if per_primitive else vertices
+            self.assertEqual(after.var[var][1], SC_OUTPUT)
+            self.assertEqual(after.array_of(var), (count, kinds[type_], components), (location, component))
+            decor = after.decor[var]
+            self.assertEqual(decor[30], [location])
+            self.assertEqual(decor.get(31), [component] if component else None)
+            self.assertEqual(5271 in decor, per_primitive)
+            chunks = -(-count // threads)
+            self.assertEqual(stores[var], [self.word_values(component, components)] * chunks, (location, component))
+        # no store reaches an output before the call, and every chunk of elements is behind a test of its index against the
+        # count the call passed for its rate (the vertex count for a run read per vertex, the primitive count otherwise)
+        first_store = next(n for n, i in enumerate(after.main) if (i[0] & 0xffff) == 62)
+        self.assertGreater(first_store, at_call)
+        less_than = {i[2]: i[4] for i in after.main if (i[0] & 0xffff) == 176}   # OpULessThan: result id -> its limit operand
+        guards = [less_than[i[1]] for i in after.main if (i[0] & 0xffff) == 250 and i[1] in less_than]
+        vertex_chunks = -(-vertices // threads) if any(not r[4] for r in runs) else 0
+        primitive_chunks = -(-primitives // threads) if any(r[4] for r in runs) else 0
+        self.assertEqual((guards.count(call[1]), guards.count(call[2]), len(guards)),
+                         (vertex_chunks, primitive_chunks, vertex_chunks + primitive_chunks))
+        # a chunk after the first starts that many invocations on: the index of the chunk is the invocation index plus them
+        offsets = [after.value(i[4])[0] for i in after.main if (i[0] & 0xffff) == 128 and i[4] in after.const]
+        wanted = [first for count, chunks in ((vertices, vertex_chunks), (primitives, primitive_chunks)) if chunks
+                  for first in range(threads, count, threads)]
+        self.assertEqual(offsets, wanted)
+        return after
+
+    @staticmethod
+    def module_around(spec: str, **kw) -> bytes:
+        """A mesh module that writes, in each location a run of spec pads, the other words of that location (per primitive when
+        the run is): the stage the pad completes, as the game's are."""
+        padded, rate = set(), {}
+        for part in spec.split(","):
+            fields = part.split(":")
+            location, component, components = map(int, fields[:3])
+            padded |= {(location, c) for c in range(component, component + components)}
+            rate[location] = len(fields) > 4
+        own = lambda per_primitive: [(loc, c) for loc, p in rate.items() if p == per_primitive for c in range(4)
+                                     if (loc, c) not in padded]
+        return mesh_module(outputs=own(False), primitive_outputs=own(True), **kw)
+
+    def test_the_missing_words_become_output_arrays_over_the_vertices_stored_after_the_call(self) -> None:
+        spec = "1:3:1:0,2:2:2:0,3:1:3:0,4:0:4:2,6:0:3:0,7:3:1:1,8:0:2:1"
+        mod = self.module_around(spec, vertices=160)
+        after = self.check_pads(spec, mod)
+        self.assertEqual(len(after.interface) - len(MeshModule(mod).interface), 7 + 1)   # the seven runs and the invocation index
+        # the runs that hold no fourth component (a vec3 of floats at component 0, a vec2 of integers) read zeros: the null
+        # value of their type, where the others hold 1.0f's bits in their last word
+        self.assertEqual(len([c for c in after.const.values() if (c[0] & 0xffff) == 46]), 2)
+
+    def test_a_run_read_per_primitive_is_an_array_over_the_primitives(self) -> None:
+        spec = "5:2:2:0:p,6:3:1:0:p"
+        after = self.check_pads(spec, self.module_around(spec, primitives=128))
+        for var in after.interface[-3:-1]:
+            self.assertEqual(after.array_of(var)[0], 128)
+            self.assertIn(5271, after.decor[var])
+
+    def test_the_shapes_of_the_widest_stops_pad_and_pass_the_validator(self) -> None:
+        mod = self.module_around(self.R5_PADS, vertices=96, primitives=64)
+        after = self.check_pads(self.R5_PADS, mod, vertices=96, primitives=64)
+        self.assertEqual(len(after.interface) - len(MeshModule(mod).interface), 11)   # ten runs and the invocation index
+        val = self.spirv_val()
+        for spec in (self.R5_PADS, "1:3:1:0,2:3:1:0,3:1:3:0,4:3:1:0,5:2:2:0,13:2:2:0", "0:0:4:2,1:0:2:1,2:1:1:2",
+                     "5:2:2:0:p,6:3:1:0:p,7:0:4:0,8:1:3:0"):
+            self.mesh_padded(spec, self.module_around(spec))
+            done = subprocess.run([val, "--target-env", "vulkan1.3", str(self.dir / "mout.spv")], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, f"{spec}: {done.stdout}{done.stderr}")
+            whole = subprocess.run([val, "--target-env", "vulkan1.3", self.write("own.spv", self.module_around(spec))],
+                                   capture_output=True, text=True)
+            self.assertEqual(whole.returncode, 0, f"the module under {spec}: {whole.stdout}{whole.stderr}")
+
+    def test_a_module_that_has_no_invocation_index_is_given_one_and_one_that_has_one_keeps_it(self) -> None:
+        mod = mesh_module()
+        before, after = MeshModule(mod), self.mesh_padded("1:0:4:0", mod)
+        index = after.interface[-1]
+        self.assertEqual(after.decor[index][11], [29])    # BuiltIn LocalInvocationIndex
+        self.assertEqual(after.var[index][1], SC_INPUT)
+        self.assertEqual(len(after.interface), len(before.interface) + 2)
+        own = mesh_module(own_index=True)
+        before, after = MeshModule(own), self.mesh_padded("1:0:4:0", own)
+        self.assertEqual(len(after.interface), len(before.interface) + 1)
+        self.assertEqual(len([v for v, d in after.decor.items() if d.get(11) == [29]]), 1)
+        loads = [i for i in after.after_call() if (i[0] & 0xffff) == 61]
+        self.assertEqual([i[3] for i in loads], [before.interface[-1]])   # the module's own variable is the one read
+
+    def test_a_block_that_followed_the_call_keeps_its_phi_behind_the_new_blocks(self) -> None:
+        mod = mesh_module(tail="phi", vertices=96)
+        before, after = MeshModule(mod), self.mesh_padded("1:0:4:0", mod)
+        was = next(i for i in before.main if (i[0] & 0xffff) == 245)     # OpPhi %type %id %value %parent %value %parent
+        phi = next(i for i in after.main if (i[0] & 0xffff) == 245)
+        entry = before.main[1][1]                                        # the block that calls OpSetMeshOutputsEXT
+        self.assertEqual(was[4], entry)                                  # as translated the phi names that block
+        # the branch to the phi's block now ends the last of the new blocks: the nearest label before the original branch
+        # (the one on the constant true) is the block the phi has to name
+        branch = next(n for n, i in enumerate(after.main) if (i[0] & 0xffff) == 250 and (after.const.get(i[1], [0])[0] & 0xffff) == 41)
+        block = next(i[1] for i in reversed(after.main[:branch]) if (i[0] & 0xffff) == OP["label"])
+        self.assertNotEqual(block, entry)
+        self.assertEqual(phi[4], block)
+        self.assertEqual(phi[6], was[6])                                 # the other parent is untouched
+
+    def test_no_outputs_to_add_leaves_the_mesh_module_as_it_was(self) -> None:
+        mod = mesh_module()
+        done = run("spvmeshpad", self.write("min.spv", mod), str(self.dir / "mout.spv"), "")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual((self.dir / "mout.spv").read_bytes(), mod)
+
+    def test_what_cannot_be_added_to_a_mesh_module_is_refused_by_name(self) -> None:
+        cases = [
+            ("not a MeshEXT stage", "1:0:4:0", mesh_module(model=EXEC_VERTEX)),
+            ("SPIR-V 1.3", "1:0:4:0", mesh_module(version=0x00010300)),
+            ("never calls OpSetMeshOutputsEXT", "1:0:4:0", mesh_module(sets=0)),
+            ("calls OpSetMeshOutputsEXT 2 times", "1:0:4:0", mesh_module(sets=2)),
+            ("gives no LocalSize", "1:0:4:0", mesh_module(modes=False)),
+            ("unpaddable shape", "1:2:3:0", mesh_module()),
+            ("unpaddable shape", "1:0:5:0", mesh_module()),
+            ("unpaddable shape", "1:0:4:3", mesh_module()),
+            ("location 64 is past the 64", "64:0:4:0", mesh_module()),
+            ("not a SPIR-V module", "1:0:4:0", b"\0" * 40),
+        ]
+        words = list(struct.unpack(f"<{len(mesh_module()) // 4}I", mesh_module()))
+        at = 5
+        while words[at] & 0xffff != OP["entry_point"]:
+            at += words[at] >> 16
+        words[at:at] = words[at:at + (words[at] >> 16)]   # the entry point twice
+        cases.append(("2 entry points", "1:0:4:0", struct.pack(f"<{len(words)}I", *words)))
+        for needle, spec, mod in cases:
+            with self.subTest(needle=needle, spec=spec):
+                self.assertIn(needle, self.mesh_refused(spec, mod))
+
+    def test_the_devices_mesh_output_limits_hold_the_padded_module(self) -> None:
+        # 160 vertices, the position and ten locations of three words each: 11 slots of 16 bytes for 160 vertices, 28,160 bytes
+        mod = mesh_module(outputs=tuple((loc, c) for loc in range(10) for c in range(3)), vertices=160)
+        self.mesh_padded("0:3:1:0,1:3:1:0,9:3:1:0", mod, 28160, 44)          # words in locations it has: no new slot
+        self.assertIn("32768", self.mesh_refused("10:0:4:0,11:0:4:0,12:0:4:0", mod, 32768, 0))   # 14 slots, 35,840 bytes
+        self.mesh_padded("10:0:4:0", mod, 32768, 128)                                           # 12 slots, 30,720
+        self.assertIn("48 mesh output components", self.mesh_refused("10:0:4:0", mod, 0, 40))    # 12 slots is 48 components
+        self.mesh_padded("10:0:4:0", mod, 0, 48)
+        # a per-primitive pad is counted at the primitive count, apart from the vertex outputs
+        self.assertIn("bytes of mesh output memory", self.mesh_refused("10:0:4:0:p", mod, 28160, 0))
+        self.mesh_padded("10:0:4:0:p", mod, 28160 + 16 * 128, 0)
+
     # ---- workgroup memory zeroed (oot2/spirv.h, spv_zero_workgroup)
 
     def zeroed(self, mod: bytes) -> tuple[subprocess.CompletedProcess, list[list[int]], list[list[int]]]:
@@ -1157,7 +1522,7 @@ class NoDeviceBuilderTest(unittest.TestCase):
             cp.Entry("m.rate", mod, describe("m.rate", "ms", mod, outputs=[mesh_out(4, c, per_vertex=128, per_primitive=True)
                                                                          for c in range(4)])),
             cp.Entry("p.rate", mod, describe("p.rate", "ps", mod, inputs=[pixel_in(4)])),
-            cp.Entry("m.gap", mod, describe("m.gap", "ms", mod, outputs=wide)),
+            cp.Entry("m.gap", bare_module(), describe("m.gap", "ms", bare_module(), outputs=wide)),
             cp.Entry("p.gap", mod, describe("p.gap", "ps", mod, inputs=wide_in + [pixel_in(9, 1, 2, type_="uint32")])),
             cp.Entry("v.wide", mod, describe("v.wide", "vs", mod, outputs=[])),
             cp.Entry("p.wide", mod, describe("p.wide", "ps", mod, inputs=[io(0, type_="float64")])),
@@ -1185,11 +1550,14 @@ class NoDeviceBuilderTest(unittest.TestCase):
         self.assertIn("rate", text)
         self.assertIn("location 4", text)
 
-    def test_build_link_lists_what_a_mesh_stage_does_not_write_with_vertices_one_location_each(self) -> None:
-        # 160 vertices at location 63: the padding rule counts 160 locations from location 1 and cannot link this pair.
+    def test_build_link_pads_a_mesh_stage_with_the_words_its_pixel_stage_reads_and_it_does_not_write(self) -> None:
+        # 160 vertices at location 63: the padding rule counts 160 locations from location 1 and cannot link this pair. The mesh
+        # rule links it with one range missing, and build_link goes on to pad the mesh module. The module of this pack is not a
+        # mesh stage, which the rewrite refuses by name, so the fatal shows that the pair was padded and not stopped on.
         text = self.linked("ms", "m.gap", "p.gap")
-        self.assertIn("mesh stage m.gap does not write 1 interface ranges read by pixel stage p.gap", text)
+        self.assertIn("mesh stage m.gap cannot be padded with the outputs its pixel stage reads", text)
         self.assertIn("9:2:1:2;", text)
+        self.assertNotIn("does not write", text)
 
     def test_build_link_still_links_a_vertex_stage_by_padding(self) -> None:
         text = self.linked("vs", "v.wide", "p.wide")
@@ -1284,6 +1652,84 @@ def synthetic_pack(directory: Path) -> Path:
             kw = {"inputs": [io(0), io(1)], "outputs": [io(0)]}
         entries.append(cp.Entry(key, mod, describe(key, SYNTH_STAGE[name], mod, **kw)))
     return write_pack(directory / "synthetic.bin", entries)
+
+
+# One mesh stage that writes location 0 and three pixel stages: a and c read locations 0 and 1, b reads 0, 1 and 2.
+MESH_GLSL = {
+    "m.mesh": """#version 450
+#extension GL_EXT_mesh_shader : require
+layout(local_size_x = 32) in;
+layout(triangles, max_vertices = 3, max_primitives = 1) out;
+layout(location = 0) out vec4 a[];
+void main() {
+    SetMeshOutputsEXT(3, 1);
+    uint i = gl_LocalInvocationIndex;
+    if (i < 3u) {
+        gl_MeshVerticesEXT[i].gl_Position = vec4(float(i & 1u) * 2.0 - 1.0, float(i >> 1) * 2.0 - 1.0, 0.0, 1.0);
+        a[i] = vec4(1.0);
+    }
+    if (i == 0u) gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+}
+""",
+    "pa.frag": """#version 450
+layout(location = 0) in vec4 a;
+layout(location = 1) in vec4 b;
+layout(location = 0) out vec4 o;
+void main() { o = a + b; }
+""",
+    "pb.frag": """#version 450
+layout(location = 0) in vec4 a;
+layout(location = 1) in vec4 b;
+layout(location = 2) in vec4 c;
+layout(location = 0) out vec4 o;
+void main() { o = a + b + c; }
+""",
+    "pc.frag": """#version 450
+layout(location = 0) in vec4 a;
+layout(location = 1) in vec4 b;
+layout(location = 0) out vec4 o;
+void main() { o = a * b; }
+""",
+    # reads location 3 once for each primitive, which the mesh stage writes nothing of
+    "pd.frag": """#version 450
+#extension GL_EXT_mesh_shader : require
+layout(location = 0) in vec4 a;
+layout(location = 3) perprimitiveEXT in vec4 d;
+layout(location = 0) out vec4 o;
+void main() { o = a + d; }
+""",
+}
+MESH_KEYS = {"m.mesh": "5200000000000001.00000000", "pa.frag": "5200000000000002.00000000",
+             "pb.frag": "5200000000000003.00000000", "pc.frag": "5200000000000004.00000000",
+             "pd.frag": "5200000000000005.00000000"}
+
+
+def mesh_pack(directory: Path) -> Path:
+    """MESH_GLSL compiled by glslang with the build's flags, packed with descriptions that name each stage's interface: the mesh
+    stage writes the four words of location 0, one array over its three vertices each, as the translator declares them."""
+    from build_game import GLSLANG_FLAGS
+    program()
+    entries = []
+    for name, src in MESH_GLSL.items():
+        path = directory / name
+        path.write_text(src, encoding="utf-8")
+        spv = directory / (name + ".spv")
+        # SPIR-V 1.4, the translator's version: the later ones give the local size as ids (OpExecutionModeId), which a mesh
+        # module of the translator never does
+        done = subprocess.run([_build["glslang"], *GLSLANG_FLAGS, "--target-env", "spirv1.4", "-o", str(spv), str(path)],
+                              capture_output=True, text=True)
+        assert done.returncode == 0, f"glslang on {name}:\n{done.stdout}{done.stderr}"
+        mod = spv.read_bytes()
+        key = MESH_KEYS[name]
+        if name == "m.mesh":
+            desc = describe(key, "ms", mod, outputs=[mesh_out(0, c, per_vertex=3) for c in range(4)])
+        elif name == "pd.frag":
+            desc = describe(key, "ps", mod, inputs=[pixel_in(0), pixel_in(3, per_primitive=True)], outputs=[io(0)])
+        else:
+            desc = describe(key, "ps", mod, inputs=[pixel_in(loc) for loc in range(3 if name == "pb.frag" else 2)],
+                            outputs=[io(0)])
+        entries.append(cp.Entry(key, mod, desc))
+    return write_pack(directory / "meshpad.bin", entries)
 
 
 def require_gpu() -> bool:
@@ -1421,6 +1867,27 @@ class DeviceTest(DeviceTestCase):
 
     def test_eight_threads_asking_for_one_pipeline_make_it_once(self) -> None:
         self.assert_clean(self.gpu("synth_threads", str(self.pack)), "synth_threads")
+
+
+class MeshPadDeviceTest(DeviceTestCase):
+    """The pipelines of a mesh stage whose pixel stages read words it does not write, built by the builder on a device."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.mesh_pack = mesh_pack(cls.dir)
+
+    def test_the_padded_mesh_library_is_made_once_for_each_pad_set_whatever_the_pixel_stage_and_the_format(self) -> None:
+        done = self.gpu("synth_meshpad", str(self.mesh_pack))
+        self.assert_clean(done, "synth_meshpad")
+        s = self.stats(done.stdout, "meshpad")
+        # the shared vertex input library, the mesh library of each of the three pad sets (location 1; locations 1 and 2;
+        # location 3 read per primitive) and the fragment library of each of the four pixel stages, an output library for
+        # each of the two formats; five fast links (a and c, b and d in one format, a in the other): the pairs share the mesh
+        # module, a pad set where they have one and the output libraries, and the validation layer finds the per-primitive
+        # words of d in the mesh stage's outputs
+        self.assertEqual((s["libraries"], s["links"], s["padded"], s["resident"]), (10, 5, 3, 14), s)
+        print("\n" + done.stdout)
 
 
 # ---- on the player's own pack ------------------------------------------------------------

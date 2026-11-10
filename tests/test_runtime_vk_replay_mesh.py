@@ -84,7 +84,11 @@ def stage_artifact(work: Path, name: str, stage: str, code: bytes, max_vertices:
     return key, job
 
 
-def synthetic_programs(work: Path, max_vertices: int = 3) -> tuple[dict[str, tuple[str, Path, Path]], Path]:
+def synthetic_programs(work: Path, max_vertices: int = 3, colour: int = 4,
+                       reads: list[tuple[int, int]] | None = None) -> tuple[dict[str, tuple[str, Path, Path]], Path]:
+    """The task, mesh and pixel programs, translated into a pack. The mesh stage writes the first `colour` components of its colour
+    (location 0) and the pixel stage reads what `reads` names, a (location, component) for each of R0..R3 (the four components of
+    location 0 when None): with fewer than four colour components written the pixel stage reads words the mesh stage does not write."""
     work.mkdir(parents=True, exist_ok=True)
     xlate = translator_path()
     if xlate is None:
@@ -92,16 +96,16 @@ def synthetic_programs(work: Path, max_vertices: int = 3) -> tuple[dict[str, tup
 
     task = mp.task_program()
     task[3] = mp.mov_imm(5, 3)
-    mesh = mp.mesh_program()
+    mesh = mp.mesh_program(colour)
     mesh[-8:] = [mp.mov_imm(13, 1), mp.isbewr(0x88, 3, 13), mp.mov_imm(14, 1), mp.mov_imm(15, 2),
                  mp.isbewr(0x80, 4, 255), mp.isbewr(0x80, 5, 14), mp.isbewr(0x80, 6, 15), mp.EXIT]
     mesh_header = bytearray(0x80)
     mesh_header[0x35] = 0xF0
-    mesh_header[0x36] = 0x0F
+    mesh_header[0x36] = (1 << colour) - 1   # the output map: generic location 0, the first `colour` components
     programs = {
         "ts": bytes(0x80) + mp.code_bytes(task),
         "ms": bytes(mesh_header) + mp.code_bytes(mesh),
-        "ps": mp.pixel_program(),
+        "ps": mp.pixel_program(reads) if reads else mp.pixel_program(),
     }
 
     jobs = []
@@ -148,9 +152,9 @@ def write_draw(folder: Path, records: dict[str, tuple[str, Path, Path]], form: s
 
 
 def run_replay(exe: Path, draw: Path, out: Path, pack_path: Path,
-               validation: str) -> subprocess.CompletedProcess:
+               validation: str, *extra: str) -> subprocess.CompletedProcess:
     env = case_env({"OOT2_VK_VALIDATION": validation})
-    return subprocess.run([str(exe), "draw", str(draw), str(out), "--pack", str(pack_path)],
+    return subprocess.run([str(exe), "draw", str(draw), str(out), "--pack", str(pack_path), *extra],
                           capture_output=True, text=True, timeout=180, env=env)
 
 
@@ -261,6 +265,68 @@ class WideMeshReplayTest(MeshReplayTest):
     builder links as one location (shd_mesh_link); counted as 96 locations it would stop past the 64 it reads."""
 
     MAX_VERTICES = 96
+
+
+class PaddedMeshReplayTest(unittest.TestCase):
+    """A mesh stage that writes fewer words than its pixel stage reads: build_link adds the missing words to the mesh stage as
+    outputs holding what the console's next stage reads from an unwritten word, (0, 0, 0, 1) (spv_add_mesh_outputs), and the draw
+    is clean under validation. Both pairs write x and y of the colour at location 0 and read four words into R0..R3:
+      partial  the pixel stage reads z and w of location 0 too (the range 0:2:2, the shape most of the game's gaps have)
+      whole    it reads z and w of location 1, which the mesh stage writes nothing of (the range 1:0:4)
+    so the picture is (x, y, 0, 1) in both, where the unpadded link stopped by name."""
+
+    MAX_VERTICES = 3
+    PAIRS = {"partial": (2, None), "whole": (2, [(0, 0), (0, 1), (1, 2), (1, 3)])}
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.temp = tempfile.TemporaryDirectory(prefix="oot2-vkreplay-pad-", ignore_cleanup_errors=True)
+        atexit.register(cls.temp.cleanup)
+        cls.work = Path(cls.temp.name)
+        if translator_path() is None:
+            raise unittest.SkipTest("no oot2-xlate executable under build/xlate/publish (or OOT2_XLATE)")
+        cc = clang_or_skip()
+        include, glslang = vulkan_or_skip()
+        cls.exe = build_program(cc, include, glslang, SOURCE, cls.work / "build", levels=(LEVEL,))[LEVEL]
+        probe = subprocess.run([str(cls.exe), "probe"], capture_output=True, text=True, timeout=60,
+                               env=case_env({"OOT2_VK_VALIDATION": "off"}))
+        require_usable_vulkan(probe)
+        cls.pairs = {name: synthetic_programs(cls.work / name, cls.MAX_VERTICES, colour, reads)
+                     for name, (colour, reads) in cls.PAIRS.items()}
+
+    def draw(self, name: str, validation: str, *extra: str) -> tuple[subprocess.CompletedProcess, Path]:
+        records, pack_path = self.pairs[name]
+        folder = self.work / f"draw-{name}-{validation}{''.join(extra)}"
+        draw = write_draw(folder, records, "direct")
+        out = folder / "out.f32"
+        return run_replay(self.exe, draw, out, pack_path, validation, *extra), out
+
+    @staticmethod
+    def expected():
+        kind, rgba = replay_expected_image(md.Scenario("replay", "direct", 3, 4))
+        return kind, [None if colour is None else (colour[0], colour[1], 0.0, 1.0) for colour in rgba]
+
+    def test_the_words_the_mesh_stage_does_not_write_read_as_0_0_0_1(self) -> None:
+        for name in self.PAIRS:
+            for validation in VALIDATIONS:
+                done, out = self.draw(name, validation)
+                self.assertEqual(done.returncode, 0, f"{name}/{validation}:\n{done.stdout}\n{done.stderr}")
+                self.assertIn("ok vk_replay_draw", done.stdout)
+                self.assertRegex(done.stdout, r"validation errors 0 warnings 0")
+                got = list(struct.iter_unpack("<4f", out.read_bytes()))
+                compared = md.compare(got, self.expected())
+                self.assertGreater(compared["pixels"][md.COLOR], 0, f"{name}/{validation}: nothing to compare")
+                self.assertEqual(compared["mismatches"], 0, f"{name}/{validation}: {compared}")
+                self.assertTrue(compared["ran_ok"], f"{name}/{validation}: {compared}")
+
+    def test_counter_run_left_unpadded_the_validation_layer_reports_what_nothing_writes(self) -> None:
+        # vkp_unpad leaves the mesh stage as translated: the pixel stage reads words it has no output for
+        # (VUID-RuntimeSpirv-OpEntryPoint-08743), which the padded draws above do not
+        for name in self.PAIRS:
+            done, _ = self.draw(name, "on", "--unpad")
+            self.assertEqual(done.returncode, 0, f"{name}:\n{done.stdout}\n{done.stderr}")
+            self.assertNotRegex(done.stdout, r"validation errors 0 ", name)
+            self.assertIn("VUID-RuntimeSpirv-OpEntryPoint-08743", done.stdout + done.stderr, name)
 
 
 if __name__ == "__main__":

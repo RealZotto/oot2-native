@@ -151,10 +151,11 @@ typedef struct VkpFormats {     // the attachments a graphics pipeline draws int
     VkFormat depth, stencil;    // VK_FORMAT_UNDEFINED for none
 } VkpFormats;
 
-// The graphics pipeline of a vertex and a pixel stage drawing into these formats: the fast link of the vertex stage's
-// pre-rasterization library (padded with the outputs the pixel stage reads and it does not write, keyed by the
-// module and the pad set), the pixel stage's fragment library, the output library of the formats and the shared vertex
-// input library. Created once, then kept until a vkp_release of either stage or vkp_close.
+// The graphics pipeline of a vertex and a pixel stage (or of a mesh stage, with its task stage if it has one, and a pixel
+// stage) drawing into these formats: the fast link of the vertex or mesh stage's pre-rasterization library (padded with
+// the outputs the pixel stage reads and it does not write, keyed by the module and the pad set), the pixel stage's
+// fragment library, the output library of the formats and the shared vertex input library. Created once, then kept until a
+// vkp_release of either stage or vkp_close.
 VkPipeline vkp_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats);
 // The compute pipeline of a compute stage.
 VkPipeline vkp_compute(const VkpStage *cs);
@@ -191,8 +192,8 @@ typedef struct VkpWarm {
     uint32_t module_bytes;
 } VkpWarm;
 int vkp_warm(int what, const VkpStage *s, VkpWarm *out);
-// Tests only: while non-zero, a vertex module is linked as translated, with no padding (the counter-run of the padding
-// rule: the validation layer then reports VUID-RuntimeSpirv-OpEntryPoint-08743 for a pixel input nothing writes).
+// Tests only: while non-zero, a vertex or mesh module is linked as translated, with no padding (the counter-run of the
+// padding rules: the validation layer then reports VUID-RuntimeSpirv-OpEntryPoint-08743 for a pixel input nothing writes).
 extern int vkp_unpad;
 // Destroy every library and pipeline that was made from the stage with this key (for program_release, when no program
 // holds it). The caller guarantees that no submission in flight uses them.

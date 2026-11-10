@@ -14,6 +14,8 @@
 //   binds FILE                   a description's bindings parsed (shd_parse_binds), or the refusal
 //   spvdecl MODULE               the capabilities and extensions a module declares
 //   spvpad IN OUT SPEC           a module with outputs added (SPEC "location:component:components:type,...")
+//   spvmeshpad IN OUT SPEC [MAX_BYTES MAX_COMPONENTS]   a mesh module with outputs added and stored (a ":p" after a
+//                                run: read per primitive), held to the device's mesh output limits when they are given
 //   spvzero IN OUT               a module with its workgroup variables given the null initializer: how many, or why not
 //   capcheck MODULE [storage-image-indexing] [drop CAP]   a module judged against the capabilities of a device that has
 //                                every item (with the optional feature when the argument names it; a capability may be dropped)
@@ -30,6 +32,8 @@
 //   usable                       how many devices have every item (exit 3 when there is no loader or device)
 //   layouts                      the layouts are made, valid under validation, and destroyed
 //   synth_draw PACK [unpad]      a pair linked for two formats and drawn; the padded input reads (0, 0, 0, 1)
+//   synth_meshpad PACK           one mesh stage and four pixel stages (one reading a location once for each primitive) linked:
+//                                the padded mesh library is made once for each pad set, whatever the pixel stage and the format
 //   synth_compute PACK           a compute pipeline dispatched
 //   synth_zeroinit PACK          a compute module reads workgroup memory it never wrote, after a dispatch that filled the
 //                                device's workgroup memory with ones: it reads zeros
@@ -278,6 +282,38 @@ static void case_spvpad(const char *in, const char *out, const char *spec) {
     uint32_t *o = spv_add_outputs(w, n / 4, add, nadd, &words, why, sizeof why);
     if (!o) {
         printf("refused: %s\n", why);
+        return;
+    }
+    FILE *f = fopen(out, "wb");
+    CHECK(f && fwrite(o, 4, words, f) == words);
+    fclose(f);
+    printf("padded %zu words to %zu\n", n / 4, words);
+    free(o), free(w);
+}
+
+// spvmeshpad IN OUT SPEC [MAX_BYTES MAX_COMPONENTS]: SPEC is "location:component:components:type" for each output, with a
+// fifth ":p" for one read per primitive; the limits are the device's, 0 for none.
+static void case_spvmeshpad(const char *in, const char *out, const char *spec, uint32_t max_bytes, uint32_t max_components) {
+    size_t n;
+    uint32_t *w = read_all(in, &n);
+    SpvMeshOutput add[32];
+    uint32_t nadd = 0;
+    for (const char *p = spec; *p && nadd < 32;) {
+        unsigned l, c, k, t;
+        int used = 0;
+        CHECK(sscanf(p, "%u:%u:%u:%u%n", &l, &c, &k, &t, &used) == 4);
+        p += used;
+        unsigned per_primitive = 0;
+        if (p[0] == ':' && p[1] == 'p') per_primitive = 1, p += 2;
+        add[nadd++] = (SpvMeshOutput){l, c, k, t, per_primitive};
+        if (*p == ',') p++;
+    }
+    size_t words = 0;
+    char why[512];
+    uint32_t *o = spv_add_mesh_outputs(w, n / 4, add, nadd, max_bytes, max_components, &words, why, sizeof why);
+    if (!o) {
+        printf("refused: %s\n", why);
+        free(w);
         return;
     }
     FILE *f = fopen(out, "wb");
@@ -735,6 +771,34 @@ static void case_synth_draw(const char *pack, int unpad) {
     printf("ok synth_draw\n");
 }
 
+// One mesh stage that writes location 0 and four pixel stages (the pack of MESH_GLSL in the test): a and c read locations 0
+// and 1, b reads 0, 1 and 2 and d reads 0 and, once for each primitive, 3, so a and c have one pad set (location 1), b
+// another (locations 1 and 2) and d a third (location 3, per primitive). The libraries are keyed by the module and the pad
+// set: the mesh stage's padded library is made once for each pad set, whatever the pixel stage and the format, and each
+// pixel stage has its fragment library.
+#define MM_KEY "5200000000000001.00000000"
+#define MPA_KEY "5200000000000002.00000000"
+#define MPB_KEY "5200000000000003.00000000"
+#define MPC_KEY "5200000000000004.00000000"
+#define MPD_KEY "5200000000000005.00000000"   // reads location 3 once for each primitive
+
+static void case_synth_meshpad(const char *pack) {
+    open_all(pack, NULL);
+    nvn_stage shape = {.kind = NVN_STAGE_MS, .ctl_size = 0x57, .code_size = 0x1230, .inst_size = 0x1000};
+    snprintf(shape.key, sizeof shape.key, "%s", MM_KEY);
+    VkpStage m = {.key = MM_KEY, .shape = &shape}, a = {.key = MPA_KEY}, b = {.key = MPB_KEY}, c = {.key = MPC_KEY};
+    VkpStage d = {.key = MPD_KEY};
+    VkPipeline pa8 = vkp_graphics(&m, NULL, &a, &F8), pc8 = vkp_graphics(&m, NULL, &c, &F8);
+    VkPipeline pb8 = vkp_graphics(&m, NULL, &b, &F8), pa16 = vkp_graphics(&m, NULL, &a, &F16);
+    VkPipeline pd8 = vkp_graphics(&m, NULL, &d, &F8);
+    CHECK(pa8 && pc8 && pb8 && pa16 && pd8);
+    CHECK(pa8 != pc8 && pa8 != pb8 && pa8 != pa16 && pc8 != pb8 && pd8 != pa8);
+    CHECK(vkp_graphics(&m, NULL, &a, &F8) == pa8);   // the same pipeline again, made once
+    print_stats("meshpad");
+    close_and_report();
+    printf("ok synth_meshpad\n");
+}
+
 static void case_synth_compute(const char *pack) {
     open_all(pack, NULL);
     VkpStage cs = {.key = CS_KEY};
@@ -1169,6 +1233,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "binds") && argc >= 3) case_binds(argv[2]);
     else if (!strcmp(cs, "spvdecl") && argc >= 3) case_spvdecl(argv[2]);
     else if (!strcmp(cs, "spvpad") && argc >= 5) case_spvpad(argv[2], argv[3], argv[4]);
+    else if (!strcmp(cs, "spvmeshpad") && argc >= 5)
+        case_spvmeshpad(argv[2], argv[3], argv[4], argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 10) : 0,
+                        argc >= 7 ? (uint32_t)strtoul(argv[6], NULL, 10) : 0);
     else if (!strcmp(cs, "spvzero") && argc >= 4) case_spvzero(argv[2], argv[3]);
     else if (!strcmp(cs, "capcheck") && argc >= 3) case_capcheck(argv[2], argc - 3, argv + 3);
     else if (!strcmp(cs, "optional")) case_optional();
@@ -1190,6 +1257,7 @@ int main(int argc, char **argv) {
         if (!strcmp(cs, "layouts")) case_layouts();
         else if (!strcmp(cs, "synth_draw") && argc >= 3) case_synth_draw(argv[2], argc >= 4 && !strcmp(argv[3], "unpad"));
         else if (!strcmp(cs, "synth_compute") && argc >= 3) case_synth_compute(argv[2]);
+        else if (!strcmp(cs, "synth_meshpad") && argc >= 3) case_synth_meshpad(argv[2]);
         else if (!strcmp(cs, "synth_zeroinit") && argc >= 3) case_synth_zeroinit(argv[2]);
         else if (!strcmp(cs, "synth_inflight") && argc >= 3) case_synth_inflight(argv[2]);
         else if (!strcmp(cs, "synth_cache") && argc >= 5) case_synth_cache(argv[2], argv[3], argv[4]);

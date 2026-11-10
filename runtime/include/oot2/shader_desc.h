@@ -50,11 +50,13 @@ const char *shd_kind_name(int kind);   // "vs", "ps", "cs", "ts", "ms"; "?" for 
 // SHD_MAX_IO, is refused.
 int shd_parse(const char *json, size_t n, uint32_t schema, ShaderDesc *out, char *why, size_t cap);
 
-// A vertex output a pixel module reads and the vertex module does not write, as one variable of consecutive
-// components of one location.
+// An output a pixel module reads and the stage before it does not write, as one variable of consecutive components of
+// one location. per_primitive is 1 for words a mesh stage's pixel input reads once for each primitive and 0 for words
+// read for each vertex, which is every word of a vertex stage.
 typedef struct ShdPad {
     uint16_t location;
     uint8_t component, components, type;
+    uint8_t per_primitive;
 } ShdPad;
 
 // The padding a vertex module needs to be linked to a pixel module: every component word of a location the pixel
@@ -65,13 +67,15 @@ int shd_pad_set(const ShaderDesc *vs, const ShaderDesc *ps, ShdPad *out, int max
 // The rule a mesh module is linked to a pixel module by. Each mesh output is an array with one element per vertex (or,
 // marked per_primitive, per primitive) of a scalar or vector at its one location; each pixel input reads its words at
 // the rate it is marked with. Returns the runs of words the pixel module reads and the mesh module does not write, as
-// shd_pad_set does (a mesh module is never padded: the caller stops on any), or -1 with the reason in why: an entry
-// whose description does not give its array depth or rate (a description older than these members), a shape the
-// builder does not link (a mesh output that is not one array level around its element, a pixel input array over
-// locations the mesh module writes), a word written at one rate and read at the other ("rate"), a word read as another
-// type or width than it is written ("type"), a location past SHD_MAX_LOCATIONS, or more runs than max.
+// shd_pad_set does, each at the rate of the pixel input that reads it and never mixing two types or two rates (the
+// caller pads the mesh module with them, spv_add_mesh_outputs), or -1 with the reason in why: an entry whose description
+// does not give its array depth or rate (a description older than these members), a shape the builder does not link (a
+// mesh output that is not one array level around its element, a pixel input array over locations the mesh module
+// writes), a word written at one rate and read at the other ("rate"), a word read as another type or width than it is
+// written ("type"), a word to pad that is not 32 bits wide, a location past SHD_MAX_LOCATIONS, or more runs than max.
 int shd_mesh_link(const ShaderDesc *ms, const ShaderDesc *ps, ShdPad *missing, int max, char *why, size_t cap);
-// The canonical text of a pad set ("l:c:n:t;" per run, empty for none), which keys the padded library.
+// The canonical text of a pad set ("l:c:n:t;" per run, "l:c:n:t:p;" for a run read per primitive, empty for none),
+// which keys the padded library.
 void shd_pad_text(const ShdPad *pad, int n, char *out, size_t cap);
 
 // ---- bindings

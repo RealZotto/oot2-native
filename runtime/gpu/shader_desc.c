@@ -356,7 +356,7 @@ int shd_pad_set(const ShaderDesc *vs, const ShaderDesc *ps, ShdPad *out, int max
             int e = c + 1;
             while (e < 4 && (miss >> e & 1) && type[l][e] == type[l][c]) e++;
             if (n >= max) REFUSE("the pixel module reads more than %d vertex outputs the vertex module does not write", max);
-            out[n++] = (ShdPad){(uint16_t)l, (uint8_t)c, (uint8_t)(e - c), type[l][c]};
+            out[n++] = (ShdPad){(uint16_t)l, (uint8_t)c, (uint8_t)(e - c), type[l][c], 0};
             c = e;
         }
     }
@@ -384,9 +384,11 @@ static int first_word(uint8_t words) {
 int shd_mesh_link(const ShaderDesc *ms, const ShaderDesc *ps, ShdPad *missing, int max, char *why, size_t cap) {
     uint8_t vert[SHD_MAX_LOCATIONS] = {0}, prim[SHD_MAX_LOCATIONS] = {0}, need[SHD_MAX_LOCATIONS] = {0};
     uint8_t otype[SHD_MAX_LOCATIONS][4], obits[SHD_MAX_LOCATIONS][4], itype[SHD_MAX_LOCATIONS][4];
+    uint8_t irate[SHD_MAX_LOCATIONS][4];
     memset(otype, 0, sizeof otype);
     memset(obits, 0, sizeof obits);
     memset(itype, 0, sizeof itype);
+    memset(irate, 0, sizeof irate);
 #define REFUSE(...)                                                                                                    \
     do {                                                                                                               \
         if (why && cap) snprintf(why, cap, __VA_ARGS__);                                                               \
@@ -437,8 +439,10 @@ int shd_mesh_link(const ShaderDesc *ms, const ShaderDesc *ps, ShdPad *missing, i
                 if ((words & same) >> c & 1 && (otype[l][c] != in->type || obits[l][c] != in->bits))
                     REFUSE("type: pixel input at location %d component %d is %s%u, the mesh stage writes %s%u", l, c,
                            io_type_name(in->type), in->bits, io_type_name(otype[l][c]), obits[l][c]);
+            if ((words & ~(vert[l] | prim[l])) && in->bits != 32)
+                REFUSE("pixel input %d is %u bits wide: only 32-bit variables are padded", l, in->bits);
             for (int c = 0; c < 4; c++)
-                if (words >> c & 1) itype[l][c] = in->type;
+                if (words >> c & 1) itype[l][c] = in->type, irate[l][c] = in->per_primitive ? 1 : 0;
             need[l] |= words;
         }
     }
@@ -450,10 +454,12 @@ int shd_mesh_link(const ShaderDesc *ms, const ShaderDesc *ps, ShdPad *missing, i
                 c++;
                 continue;
             }
+            // a run is one variable: it never mixes two types or two rates (a pad is an array over vertices or over
+            // primitives, of one scalar type)
             int e = c + 1;
-            while (e < 4 && (miss >> e & 1) && itype[l][e] == itype[l][c]) e++;
+            while (e < 4 && (miss >> e & 1) && itype[l][e] == itype[l][c] && irate[l][e] == irate[l][c]) e++;
             if (n >= max) REFUSE("the pixel module reads more than %d ranges the mesh module does not write", max);
-            missing[n++] = (ShdPad){(uint16_t)l, (uint8_t)c, (uint8_t)(e - c), itype[l][c]};
+            missing[n++] = (ShdPad){(uint16_t)l, (uint8_t)c, (uint8_t)(e - c), itype[l][c], irate[l][c]};
             c = e;
         }
     }
@@ -466,8 +472,8 @@ void shd_pad_text(const ShdPad *pad, int n, char *out, size_t cap) {
     size_t at = 0;
     if (cap) out[0] = 0;
     for (int i = 0; i < n; i++) {
-        int w = snprintf(out + at, at < cap ? cap - at : 0, "%u:%u:%u:%u;", pad[i].location, pad[i].component,
-                         pad[i].components, pad[i].type);
+        int w = snprintf(out + at, at < cap ? cap - at : 0, pad[i].per_primitive ? "%u:%u:%u:%u:p;" : "%u:%u:%u:%u;",
+                         pad[i].location, pad[i].component, pad[i].components, pad[i].type);
         if (w < 0) break;
         at += (size_t)w;
     }

@@ -51,7 +51,7 @@
 #define PART_FRAGMENT VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT
 #define PART_OUTPUT VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT
 
-int vkp_unpad;   // tests only: leave the vertex modules as translated (the counter-run of the padding rule)
+int vkp_unpad;   // tests only: leave the vertex and mesh modules as translated (the counter-run of the padding rules)
 
 enum { K_LIBRARY, K_LINK, K_COMPUTE };
 
@@ -375,6 +375,8 @@ static void pipe_info(PipeInfo *p, VkGraphicsPipelineLibraryFlagsEXT part, VkSha
 typedef struct MeshCtx {
     const VkpStage *task, *mesh;
     const VkpModule *task_module, *mesh_module;
+    ShdPad pad[MAX_PADS];   // what the pixel stage reads and the mesh stage does not write (shd_mesh_link)
+    int npad;
     const int *late;
 } MeshCtx;
 
@@ -389,7 +391,29 @@ static VkPipeline build_mesh_library(void *c) {
         check_capabilities(x->task, x->task_module);
         task = make_module(x->task_module->code, x->task_module->bytes / 4);
     }
-    VkShaderModule mesh = make_module(x->mesh_module->code, x->mesh_module->bytes / 4);
+    const uint32_t *code = x->mesh_module->code;
+    size_t words = x->mesh_module->bytes / 4;
+    uint32_t *padded = NULL;
+    if (x->npad) {
+        // The mesh stage writes less than its pixel stage reads: it gets the missing words as outputs of the value the
+        // console's next stage reads from an unwritten one, (0, 0, 0, 1), as a vertex stage does. The device's mesh
+        // output limits hold the padded stage to what the translator held the program to.
+        SpvMeshOutput add[MAX_PADS];
+        for (int i = 0; i < x->npad; i++)
+            add[i] = (SpvMeshOutput){x->pad[i].location, x->pad[i].component, x->pad[i].components, x->pad[i].type,
+                                     x->pad[i].per_primitive};
+        char why[256], shape[256], ranges[MAX_PADS * 16 + 8];
+        padded = spv_add_mesh_outputs(code, words, add, (uint32_t)x->npad, gpu_vk.facts.mesh_props.maxMeshOutputMemorySize,
+                                      gpu_vk.facts.mesh_props.maxMeshOutputComponents, &words, why, sizeof why);
+        if (!padded) {
+            shape_text(x->mesh, shape, sizeof shape);
+            shd_pad_text(x->pad, x->npad, ranges, sizeof ranges);
+            rt_fatal("gfx: vulkan: mesh stage %s cannot be padded with the outputs its pixel stage reads "
+                     "(location:component:components:type %s): %s (%s)", x->mesh->key, ranges, why, shape);
+        }
+        code = padded;
+    }
+    VkShaderModule mesh = make_module(code, words);
     PipeInfo pi;
     pipe_info(&pi, PART_PRE_RASTER, NULL, NULL);
     uint32_t n = 0;
@@ -401,9 +425,11 @@ static VkPipeline build_mesh_library(void *c) {
                                                       .stage = VK_SHADER_STAGE_MESH_BIT_EXT, .module = mesh,
                                                       .pName = "main"};
     pi.gp.stageCount = n, pi.gp.pStages = pi.stage;
-    VkPipeline p = create_graphics(pi.gp, K_LIBRARY, LIB_SHADER, "vkCreateGraphicsPipelines (mesh pre-rasterization library)");
+    VkPipeline p = create_graphics(pi.gp, K_LIBRARY, LIB_SHADER | (padded ? LIB_PADDED : 0),
+                                   "vkCreateGraphicsPipelines (mesh pre-rasterization library)");
     if (task) vkDestroyShaderModule(gpu_vk.device, task, NULL);
     vkDestroyShaderModule(gpu_vk.device, mesh, NULL);
+    free(padded);
     return p;
 }
 
@@ -546,24 +572,21 @@ static VkPipeline build_link(void *c) {
         if (x->task) vkp_module(x->task, SHD_TS, &tm);
         vkp_module(x->vs, SHD_MS, &mm);
         vkp_module(x->ps, SHD_PS, &pm);
-        char why[256], md[66], td[66], pd[66], ft[96], ranges[MAX_PADS * 16 + 8];
-        ShdPad gaps[MAX_PADS];
-        int missing = shd_mesh_link(&mm.desc, &pm.desc, gaps, MAX_PADS, why, sizeof why);
-        if (missing < 0)
-            rt_fatal("gfx: vulkan: mesh stage %s cannot be linked to pixel stage %s: %s", x->vs->key, x->ps->key, why);
-        if (missing) {
-            shd_pad_text(gaps, missing, ranges, sizeof ranges);
-            rt_fatal("gfx: vulkan: mesh stage %s does not write %d interface ranges read by pixel stage %s "
-                     "(location:component:components:type %s)", x->vs->key, missing, x->ps->key, ranges);
-        }
-
+        char why[256], md[66], td[66], pd[66], ft[96], pads[MAX_PADS * 16 + 8];
         MeshCtx mx = {.task = x->task, .mesh = x->vs, .task_module = x->task ? &tm : NULL, .mesh_module = &mm,
                       .late = x->late};
+        mx.npad = shd_mesh_link(&mm.desc, &pm.desc, mx.pad, MAX_PADS, why, sizeof why);
+        if (mx.npad < 0)
+            rt_fatal("gfx: vulkan: mesh stage %s cannot be linked to pixel stage %s: %s", x->vs->key, x->ps->key, why);
+        // What the pixel stage reads and the mesh stage does not write is added to the mesh stage as outputs, as a vertex
+        // stage is padded, and the library is keyed by the pad set. vkp_unpad is the tests' counter-run of the rule.
+        if (vkp_unpad) mx.npad = 0;
+        shd_pad_text(mx.pad, mx.npad, pads, sizeof pads);
         cache_digest_text(x->vs, md, sizeof md);
         if (x->task) {
             cache_digest_text(x->task, td, sizeof td);
-            snprintf(x->vkey, sizeof x->vkey, "m|t:%s%s|m:%s%s", x->task->key, td, x->vs->key, md);
-        } else snprintf(x->vkey, sizeof x->vkey, "m|m:%s%s", x->vs->key, md);
+            snprintf(x->vkey, sizeof x->vkey, "m|t:%s%s|m:%s%s|%s", x->task->key, td, x->vs->key, md, pads);
+        } else snprintf(x->vkey, sizeof x->vkey, "m|m:%s%s|%s", x->vs->key, md, pads);
         cache_digest_text(x->ps, pd, sizeof pd);
         snprintf(x->pkey, sizeof x->pkey, "f|%s%s", x->ps->key, pd);
         formats_text(x->formats, ft, sizeof ft);

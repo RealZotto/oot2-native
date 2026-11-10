@@ -7,9 +7,12 @@
 //   vk_replay_draw probe
 //   vk_replay_draw draw DRAW OUT --pack PACK [--depth-out FILE] [--depth-mode near_is_minus_w|near_is_zero]
 //                  [--origin lower_left|upper_left] [--imports] [--no-snapshot] [--no-flip] [--rewrite-uniform] [--cold]
+//                  [--unpad]
 //
 // --cold leaves the program's pipeline unbuilt, so that the first draw is a miss: the replay's miss path (oot2/vk_miss.h)
 // drains, builds and resumes, and the image must be the one a prebuilt pipeline gives.
+// --unpad sets vkp_unpad: the counter-run of the padding rules, which leaves a vertex or mesh stage as translated, so that a
+// pixel input nothing writes reaches the validation layer (VUID-RuntimeSpirv-OpEntryPoint-08743).
 //
 // `probe` opens the Vulkan device and closes it again: "ok probe", or the named fatal of a machine that has none.
 //
@@ -172,13 +175,13 @@ typedef struct {
 typedef struct {
     const char *draw, *out, *out1, *pack, *depth_out;
     int depth_mode, origin;   // NVNdepthMode, NVNwindowOriginMode
-    int imports, no_snapshot, no_flip, rewrite, cold, no_features;
+    int imports, no_snapshot, no_flip, rewrite, cold, no_features, unpad;
 } Opts;
 
 static void usage(const char *why) {
     fprintf(stderr, "vk_replay_draw: %s\nusage: vk_replay_draw probe | draw DRAW OUT --pack PACK [--depth-out FILE] "
                     "[--depth-mode near_is_minus_w|near_is_zero] [--origin lower_left|upper_left] [--imports] "
-                    "[--no-snapshot] [--no-flip] [--rewrite-uniform]\n", why);
+                    "[--no-snapshot] [--no-flip] [--rewrite-uniform] [--unpad]\n", why);
     exit(2);
 }
 
@@ -954,9 +957,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-flip")) o.no_flip = 1;
         else if (!strcmp(argv[i], "--rewrite-uniform")) o.rewrite = 1;
         else if (!strcmp(argv[i], "--cold")) o.cold = 1;
+        else if (!strcmp(argv[i], "--unpad")) o.unpad = 1;
         else usage("unknown argument");
     }
     if (!o.pack) usage("--pack is needed");
+    vkp_unpad = o.unpad;
     run_draw(&o);
     return 0;
 }

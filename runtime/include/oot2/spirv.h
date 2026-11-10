@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The oot2-native contributors
 //
-// The two things the pipeline builder does to a translated SPIR-V module besides handing it to the driver
+// The things the pipeline builder does to a translated SPIR-V module besides handing it to the driver
 // (runtime/gpu/spirv.c, architecture D12 and D13): read what it declares (its capabilities and extensions, which the
-// device's required list has to give, the pipeline cost study and the pipeline builder), and add the vertex outputs a pixel module
-// reads and the vertex module does not write, set to what the console's next stage reads from an unwritten output,
-// (0, 0, 0, 1) (DKB Recomp's spirv_add_outputs does the same; this is a new implementation of the rule, see
-// THIRD_PARTY_NOTICES.md). Nothing here needs Vulkan.
+// device's required list has to give, the pipeline cost study and the pipeline builder), and add the vertex or mesh
+// outputs a pixel module reads and the stage before it does not write, set to what the console's next stage reads from an
+// unwritten output, (0, 0, 0, 1) (DKB Recomp's spirv_add_outputs does the same for a vertex module; this is a new
+// implementation of the rule, see THIRD_PARTY_NOTICES.md). Nothing here needs Vulkan.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -47,6 +47,32 @@ typedef struct SpvOutput {
 // the reason in why (not SPIR-V, no entry point or more than one, no annotations and no types, out of memory).
 uint32_t *spv_add_outputs(const uint32_t *words, size_t nwords, const SpvOutput *add, uint32_t nadd, size_t *out_words,
                           char *why, size_t cap);
+
+// One output to add to a mesh module: as SpvOutput, and per_primitive 1 when the pixel module reads the words once for
+// each primitive (its input is decorated PerPrimitiveEXT), 0 when it reads them for each vertex.
+typedef struct SpvMeshOutput {
+    uint32_t location, component, components, type;
+    uint32_t per_primitive;
+} SpvMeshOutput;
+
+// The mesh module with the outputs add[0..nadd) added and given the value the console's next stage reads from an
+// unwritten word, (0, 0, 0, 1) component by component (1.0f's bits for a location's fourth component, zero for the rest,
+// whatever the type), as spv_add_outputs does for a vertex module. A mesh output is an array over the stage's vertices
+// (OutputVertices) or primitives (OutputPrimitivesEXT) of a scalar or vector at its one location, and it may not be
+// written before OpSetMeshOutputsEXT, so an initializer would not do: the variables are declared, decorated (Location,
+// Component when it is not 0, PerPrimitiveEXT) and listed in the entry point's interface, and right after the module's one
+// OpSetMeshOutputsEXT every invocation stores the value to its share of the elements (LocalInvocationIndex, a built-in
+// the module is given when it has none): the vertices up to the declared count, the primitives below the primitive count
+// the module passes to OpSetMeshOutputsEXT, each store of a partial share behind its own bounds test. A module that has a
+// block after OpSetMeshOutputsEXT keeps it, now behind the new blocks. When max_bytes or max_components is not 0 the
+// padded module's mesh output use, by Vulkan's formula (every output location is four scalars of four bytes for the
+// vertex or primitive count rounded up to 32, the position built-in one such location), is held to it, as the translator
+// holds a program to the device's limits: past one the module is refused. Returns a malloc'd module of *out_words words,
+// or NULL with the reason in why (not SPIR-V 1.4 or later, not exactly one MeshEXT entry point, no OpSetMeshOutputsEXT
+// or more than one, a mode (LocalSize, OutputVertices, OutputPrimitivesEXT) missing, an unpaddable shape, a limit passed,
+// out of memory).
+uint32_t *spv_add_mesh_outputs(const uint32_t *words, size_t nwords, const SpvMeshOutput *add, uint32_t nadd,
+                               uint32_t max_bytes, uint32_t max_components, size_t *out_words, char *why, size_t cap);
 
 // The module with every Workgroup variable that has no initializer given the null value of its type. A translated
 // compute module can read workgroup words it never wrote (the title movie's last pass does: with those words zero its
