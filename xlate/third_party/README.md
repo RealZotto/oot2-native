@@ -255,13 +255,17 @@ Changes of this project:
   signed result takes 0 by a select where the source is NaN, and an unsigned
   one has its 0 from the clamp's lower bound, with no NaN test. There is no
   branch, and a value in range converts to what it did. The double source,
-  which no instruction of the console reaches, is as it was. On synthetic
-  modules that convert a computed value, the function has 4 instructions more
-  for a signed 32-bit integer (a load of the source, the clamp, a comparison,
-  a select), as many as before for an unsigned 32-bit and for a signed 16-bit
-  one, 1 fewer for a signed 8-bit one, 9 fewer for an unsigned 16-bit one and
-  10 fewer for an unsigned 8-bit one. No pass over the corpus was made with
-  this change.
+  which no instruction of the console reaches, is as it was. Rounding toward
+  zero no longer emits `Trunc`: the conversion rounds that way itself and the
+  clamp's bounds are whole numbers, so the clamped float truncates to what
+  the truncated float clamps to. On synthetic modules that convert a computed
+  value, the function has 4 instructions more for a signed 32-bit integer (a
+  load of the source, the clamp, a comparison, a select), as many as before
+  for an unsigned 32-bit and for a signed 16-bit one, 1 fewer for a signed
+  8-bit one, 9 fewer for an unsigned 16-bit one and 10 fewer for an unsigned
+  8-bit one; toward zero each has 1 fewer than that, so 3 more for a signed
+  32-bit integer and 1 fewer than before for an unsigned one. No pass over the
+  corpus was made with this change.
 - `CodeGen/Spirv/CoopHmma.cs` (new), `CodeGen/Spirv/SpirvGenerator.cs`,
   `Generate` and `GenerateCoopHmma`, `CodeGen/Spirv/CodeGenContext.cs`,
   `GetArgumentPointer`; `Translation/HelperFunctionManager.cs`,

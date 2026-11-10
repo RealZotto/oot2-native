@@ -32,7 +32,8 @@ range, the bounds themselves and an ordinary value. Those programs are pixel pro
 
 F2I does the same for every integer it can give (signed and unsigned, 32, 16 and 8 bits) from a single or a half: the
 rounded float is clamped to two floats inside the integer's range before the one conversion, so what is converted is
-always a number the integer holds. The largest float below 2^31 is 2^31 - 128 and the largest below 2^32 is 2^32 - 256,
+always a number the integer holds (toward zero, the float is clamped as it is and the conversion does the rounding: the
+bounds are whole numbers). The largest float below 2^31 is 2^31 - 128 and the largest below 2^32 is 2^32 - 256,
 so a 32-bit result takes its top value from a select on the source being above that float; the bounds of the smaller
 integers are floats themselves and need nothing after the conversion. NClamp gives its lower bound for a NaN, which is
 the 0 of an unsigned result; a signed one selects its 0.
@@ -806,7 +807,9 @@ class NanRulesTest(Harness):
         one conversion; then, for a 32-bit integer, a comparison of the source with the clamp's upper bound and a select
         of the integer's top value (no float is that value); then, for a signed integer, a NaN test and a select of 0 (a
         NaN lands on the clamp's lower bound, which is 0 only for an unsigned one). No integer clamp follows a 16-bit or
-        an 8-bit conversion, and none of them branches."""
+        an 8-bit conversion, and none of them branches. Toward zero has no rounding instruction: the conversion rounds
+        that way itself, and the clamp's bounds are whole numbers, so the clamped float truncates to what the truncated
+        float clamps to."""
         top, nan = [184, 169], [156, 169]       # OpFOrdLessThan, OpSelect; OpIsNan, OpSelect
         after = {"s32": top + nan, "u32": top, "s16": nan, "u16": [], "s8": nan, "u8": []}
         for key, signed, size, bits in F2I_FORMS:
@@ -815,7 +818,8 @@ class NanRulesTest(Harness):
                     ev = evaluate(self.module(f"f2i_{key}_{name}_shape", f2i(signed, size, rounding), store(OUT)), f32_bits(2.5))
                     shape = [GLSL[w[3]] if op == 12 else op for op, w in ev.body
                              if op in (12, 109, 110, 156, 169, 245, 250, 251) or 164 <= op <= 168 or 180 <= op <= 191]
-                    self.assertCountEqual(shape, [instruction, "NClamp", 110 if signed else 109] + after[key])
+                    rounds = [] if rounding == TOWARD_ZERO else [instruction]
+                    self.assertCountEqual(shape, rounds + ["NClamp", 110 if signed else 109] + after[key])
                     self.assertEqual(ev.stores, [f2i_rule(2.5, signed, bits, rounding)])
 
     def test_a_conversion_reading_the_unclamped_float_fails_whatever_is_selected_after_it(self):

@@ -252,7 +252,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
         //     on the same side of it, every float that large being a whole number, so the comparison reads the source and the rounded float keeps a single use;
         //   - NClamp gives its lower bound for a NaN: that is the 0 of an unsigned integer, and a signed one selects its 0.
         // So: unsigned 16 and 8 bits, a clamp; unsigned 32 bits, a clamp, a comparison and a select; signed 16 and 8 bits, a clamp, a NaN test and a select; signed 32 bits, both.
-        // No branch, and a value in range converts to what it did.
+        // No branch, and a value in range converts to what it did. Toward zero has no rounding instruction: OpConvertFToS and OpConvertFToU round toward zero themselves, and
+        // the clamp's bounds are whole numbers, so the clamped float truncates to exactly what the truncated float clamps to (a NaN is the lower bound either way).
         private static Operand FP32ToIntSaturated(EmitterContext context, Operand value, RoundMode2 roundingMode, bool signed, int bits)
         {
             Operand rounded = roundingMode switch
@@ -260,7 +261,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 RoundMode2.Round => context.FPRound(value),
                 RoundMode2.Floor => context.FPFloor(value),
                 RoundMode2.Ceil => context.FPCeiling(value),
-                _ => context.FPTruncate(value),
+                _ => value,
             };
 
             float low = signed ? -(float)(1L << (bits - 1)) : 0f;
