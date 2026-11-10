@@ -38,6 +38,7 @@ RUNTIME = ROOT / "runtime"
 TEST_SOURCE = ROOT / "tests" / "runtime" / "hid_replay_test.c"
 END_SOURCE = ROOT / "tests" / "runtime" / "endmark.c"
 TIMEOUT = 60
+MAX_PROBES = 1048576   # the cells one probe of a table may visit (runtime/hos/store.c)
 EXIT_FATAL = 70
 BUILD = bytes(range(1, 33))   # the build id of the synthetic main module
 BUTTONS = ["a", "b", "x", "y", "stickl", "stickr", "l", "r", "zl", "zr", "plus", "minus", "left", "up", "right", "down"]
@@ -64,22 +65,24 @@ def colliding(prefix: str, capacity: int, residue: int, n: int) -> list[str]:
 
 
 # ---- the synthetic store: the shapes of its tables, and the names and values they hold
-BOOL = fx.Shape(table=0x44, capacity=0x50, count=0x34, entries=0x3c, stride=0x15, value=0x0e, load="b")
-WORD = fx.Shape(table=0x94, capacity=0xa0, count=0x84, entries=0x8c, stride=0x34, value=0x28, shift=4, index=8, load="w")
-UINT = fx.Shape(table=0xf4, capacity=0x100, count=0xe4, entries=0xec, stride=0x22, value=0x14, load="w")
-FLOAT = fx.Shape(table=0x144, capacity=0x150, count=0x134, entries=0x13c, stride=0x30, value=0x24, load="s")
-STRING = fx.Shape(table=0x194, capacity=0x1a0, count=0x184, entries=0x18c, stride=0x54, value=0x20, load="x")
-DECOY = fx.Shape(table=0x1e4, capacity=0x1f0, count=0x1d4, entries=0x1dc, stride=0x42, value=0, load="x")
+# Arbitrary layouts: every displacement, entry size and cell shape below was drawn once at random for this file, with the
+# alignment the loads need and nothing else in common. The cells differ in size and in where the key and the entry number are.
+BOOL = fx.Shape(table=0x170, capacity=0x58, count=0x78, entries=0xc8, stride=0x91, value=0x84, shift=5, key=0x14, index=0x18, load="b")
+WORD = fx.Shape(table=0x160, capacity=0x30, count=0xf4, entries=0x150, stride=0x58, value=0x04, shift=5, key=0x08, index=0x04, load="w")
+UINT = fx.Shape(table=0x1d8, capacity=0x194, count=0x54, entries=0xa0, stride=0x124, value=0x10, shift=5, key=0x08, index=0x00, load="w")
+FLOAT = fx.Shape(table=0x28, capacity=0x34, count=0x11c, entries=0x40, stride=0xd0, value=0x2c, shift=6, key=0x28, index=0x3c, load="s")
+STRING = fx.Shape(table=0x70, capacity=0x6c, count=0x1b8, entries=0xb8, stride=0x114, value=0xa0, shift=4, key=0x00, index=0x0c, load="x")
+DECOY = fx.Shape(table=0x1a8, capacity=0x88, count=0x1a4, entries=0x168, stride=0xd4, value=0x88, shift=6, key=0x0c, index=0x14, load="x")
 T_BOOL, T_INT, T_UINT, T_FLOAT, T_STRING, T_DECOY = range(6)
 
 COLLIDERS = colliding("zz_flag_", 8, 7, 3)   # three names with one cell: the second wraps to the table's start
 LONG = "".join(chr(ord("a") + i % 26) for i in range(70))
 NAMES = {   # role -> (table, name)
     "bool.fa": (T_BOOL, COLLIDERS[0]), "bool.fb": (T_BOOL, COLLIDERS[1]), "bool.fc": (T_BOOL, COLLIDERS[2]),
-    "age": (T_BOOL, "zz_age_child"), "boss": (T_BOOL, "zz_boss_on"),
+    "age": (T_BOOL, "zz_age_flag"), "boss": (T_BOOL, "zz_boss_on"),
     "health": (T_INT, "zz_health"), "int.floor": (T_INT, "zz_floor"),
     "uint.coins": (T_UINT, "zz_coins"), "uint.keys": (T_UINT, "zz_keys"),
-    "float.speed": (T_FLOAT, "zz_speed"), "float.scale": (T_FLOAT, "zz_scale"),
+    "float.speed": (T_FLOAT, "zz_speed"), "float.scale": (T_FLOAT, "zz_scale"), "float.tenth": (T_FLOAT, "zz_tenth"),
     "scene": (T_STRING, "zz_scene"), "next_scene": (T_STRING, "zz_next"), "string.long": (T_STRING, "zz_long"),
     "bool.ghost": (T_BOOL, "zz_ghost"),   # in no table
 }
@@ -93,11 +96,11 @@ def kind_of(role: str) -> str:
 
 def make_store(base: int) -> fx.Store:
     tables = [
-        fx.Table(BOOL, 8, [(h(COLLIDERS[0]), 0), (h(COLLIDERS[1]), 1), (h(COLLIDERS[2]), 0), (h("zz_age_child"), 1),
+        fx.Table(BOOL, 8, [(h(COLLIDERS[0]), 0), (h(COLLIDERS[1]), 1), (h(COLLIDERS[2]), 0), (h("zz_age_flag"), 1),
                            (h("zz_boss_on"), 0), (h("zz_health"), 1)]),   # the name of an int is also in a table of another class
         fx.Table(WORD, 5, [(h("zz_rooms"), 0), (h("zz_floor"), -3), (h("zz_health"), 12)]),
         fx.Table(UINT, 3, [(h("zz_coins"), 4294967290), (h("zz_keys"), 2)]),
-        fx.Table(FLOAT, 3, [(h("zz_speed"), 1.5), (h("zz_scale"), -0.25)]),
+        fx.Table(FLOAT, 5, [(h("zz_speed"), 1.5), (h("zz_scale"), -0.25), (h("zz_tenth"), 0.1)]),
         fx.Table(STRING, 3, [(h("zz_scene"), "zz_field"), (h("zz_next"), ""), (h("zz_long"), LONG)], string_room=96),
         fx.Table(DECOY, 3, [(h("zz_array_one"), "zz_decoy")]),
     ]
@@ -106,10 +109,11 @@ def make_store(base: int) -> fx.Store:
 
 def description(store: fx.Store, roles: list[str] | None = None, build: bytes = BUILD, cell: int | None = None) -> str:
     """oot2-store.txt as the format documents it (tools/prepare/store.py), written without that module's writer."""
-    lines = ["oot2-store 1", f"build {build.hex()}", f"cell {store.CELL if cell is None else cell}"]
+    lines = ["oot2-store 2", f"build {build.hex()}", f"cell {store.CELL if cell is None else cell}"]
     for t in store.tables:
         s = t.shape
-        lines.append(f"module {s.table} {s.capacity} {s.count} {s.entries} {s.stride} {s.value} {s.load} {s.shift} {s.index}")
+        lines.append(f"module {s.table} {s.capacity} {s.count} {s.entries} {s.stride} {s.value} {s.load} {s.shift} {s.key} "
+                     f"{s.index}")
     for role in (NAMES if roles is None else roles):
         lines.append(f"role {role} {kind_of(role)} {h(NAMES[role][1]):08x}")
     return "\n".join(lines) + "\n"
@@ -199,7 +203,7 @@ class MarkerTest(unittest.TestCase):
     # ---- running
     def run_case(self, lines: str | bytes, script: Script, *, store: fx.Store | None = None, desc: str | None = None,
                  main: bool = True, build: bytes = BUILD, record: Path | None = None, extra_roles: list[str] | None = None,
-                 case: str = "run") -> tuple[subprocess.CompletedProcess, Path, Path]:
+                 case: str = "run", timeout: int = TIMEOUT) -> tuple[subprocess.CompletedProcess, Path, Path]:
         s = store or self.store
         folder = Path(tempfile.mkdtemp(prefix="run-", dir=self.tmp.name))
         (folder / "script.txt").write_text(script.text())
@@ -213,10 +217,10 @@ class MarkerTest(unittest.TestCase):
         if record is not None:
             env["OOT2_INPUT_RECORD"] = str(record)
         try:
-            done = subprocess.run([str(self.exe), case, str(folder)], capture_output=True, text=True, timeout=TIMEOUT,
+            done = subprocess.run([str(self.exe), case, str(folder)], capture_output=True, text=True, timeout=timeout,
                                   env=env)
         except subprocess.TimeoutExpired as e:
-            self.fail(f"the case ran past {TIMEOUT} s:\n{e.stdout or ''}{e.stderr or ''}")
+            self.fail(f"the case ran past {timeout} s:\n{e.stdout or ''}{e.stderr or ''}")
         return done, folder, tape
 
     def passes(self, lines: str | bytes, script: Script, **kwargs) -> tuple[list[tuple], Path]:
@@ -277,6 +281,13 @@ class MarkerTest(unittest.TestCase):
                 "when float.speed <= 1e0 for 1 y\nwhen float.scale >= -.25 for 1 l\n")
         self.check(text, Script().read(0, 1), [(0, 1, ["a", "b", "x", "l"])])
 
+    def test_a_decimal_is_compared_as_the_single_float_the_store_holds(self) -> None:
+        # 0.1 is not a single float: the store's value is the nearest one, and a line that writes 0.1 means that value
+        text = ("when float.tenth == 0.1 for 1 a\nwhen float.tenth <= 0.1 for 1 b\nwhen float.tenth >= 0.1 for 1 x\n"
+                "when float.tenth < 0.1 for 1 y\nwhen float.tenth > 0.1 for 1 l\nwhen float.tenth != 0.1 for 1 r\n"
+                "when float.tenth == 0.10000000149011612 for 1 zl\nwhen float.tenth > 0.09999999 for 1 zr\n")
+        self.check(text, Script().read(0, 1), [(0, 1, ["a", "b", "x", "zl", "zr"])])
+
     def test_bools_in_a_table_where_three_names_share_a_cell(self) -> None:
         text = ("when bool.fa == 0 for 1 a\nwhen bool.fb == 1 for 1 b\nwhen bool.fc == 0 for 1 x\n"
                 "when bool.fa == 1 for 1 y\nwhen bool.fb == false for 1 l\nwhen bool.fc == TRUE for 1 r\n"
@@ -306,6 +317,12 @@ class MarkerTest(unittest.TestCase):
 
     def test_a_value_that_is_true_at_the_first_read_fires_at_tick_zero(self) -> None:
         self.check("when age == 1 for 2 a\n", Script().read(0, 1, 2, 3), [(0, 2, ["a"])])
+
+    def test_a_marker_is_looked_at_once_per_tick_at_the_ticks_first_read(self) -> None:
+        # the value changes between two reads of tick 3: the second read gets the latched state, and the marker sees the
+        # new value at the first read of tick 4
+        script = Script().read(0, 1, 2, 3).poke(self.poke("health", 2)).read(3).read(4, 5, 6, 7)
+        self.check("when health <= 3 for 2 a\n", script, [(4, 2, ["a"])])
 
     def test_a_marker_fires_once(self) -> None:
         script = (Script().read(0, 1).poke(self.poke("health", 2)).read(2).poke(self.poke("health", 12)).read(3, 4)
@@ -383,6 +400,28 @@ class MarkerTest(unittest.TestCase):
         script = (Script().read(*range(0, 100)).poke(s.unbuild()).read(100).poke(s.build_again()).read(*range(101, 200)))
         self.passes("when bool.ghost == 1 for 1 a\n", script)
 
+    # A table of MAX_PROBES + 8 cells that holds no empty cell, in the heap (the test program builds it): every cell has a key
+    # that is not the one looked up, and the one looked up sits `at` cells past the start of its probe.
+    def full_table(self, hash_: int, at: int) -> str:
+        cells = MAX_PROBES + 8
+        size = 1 << BOOL.shift
+        first = 0x10000
+        other = bytearray(size)
+        other[BOOL.key:BOOL.key + 4] = (1).to_bytes(4, "little")
+        mine = bytearray(size)
+        mine[BOOL.key:BOOL.key + 4] = hash_.to_bytes(4, "little")   # entry number 0
+        s = self.store
+        return (s.table_into_heap(T_BOOL, first) + s.capacity_poke(T_BOOL, cells)
+                + f"F {first:x} {cells} {other.hex()}\n"
+                + f"F {first + ((hash_ % cells + at) % cells) * size:x} 1 {mine.hex()}\n")
+
+    def test_a_probe_visits_at_most_max_probes_cells(self) -> None:
+        ghost = h("zz_ghost")
+        text = "when bool.ghost == 0 for 1 a\n"   # entry 0 of the bool table holds 0
+        # a key that is the MAX_PROBES-th cell of the probe is found; one cell further is not looked at, so the value is absent
+        self.check(text, Script().poke(self.full_table(ghost, MAX_PROBES - 1)).read(0, 1), [(0, 1, ["a"])])
+        self.check(text, Script().poke(self.full_table(ghost, MAX_PROBES)).read(0, 1, 2, 3), [])
+
     def test_an_entry_numbered_past_the_count_is_absent(self) -> None:
         script = Script().poke(self.store.count_poke(T_BOOL, 0)).read(*range(0, 121))
         done, _, tape = self.run_case("when age == 1 for 1 a\n", script)
@@ -408,6 +447,25 @@ class MarkerTest(unittest.TestCase):
         script = Script().poke(s.poke(s.entry_off[(T_FLOAT, h("zz_speed"))] + FLOAT.value, nan)).read(0, 1)
         text = "when float.speed == 1.5 for 1 a\nwhen float.speed >= 0 for 1 b\nwhen float.speed <= 0 for 1 x\n"
         self.check(text, script, [])
+
+    def test_a_fault_while_a_marker_reads_the_store_stops_by_name_and_closes_the_record(self) -> None:
+        # the page the store lives on is given no access between two ticks, as the game's own call could: the read of the
+        # store faults while the replay holds its lock, and the stop hook that closes the record and writes the report must
+        # not wait for that lock. A hang is the failure: the run is given 20 s
+        record = Path(tempfile.mkdtemp(dir=self.tmp.name)) / "record.txt"
+        text = "at 0 for 3 a\nwhen bool.ghost == 1 for 1 b\n"
+        script = Script().read(0, 1, 2).poke(f"D {fx.DATA_OFF:x}\n").read(3, 4)
+        done, folder, tape = self.run_case(text, script, record=record, timeout=20)
+        self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+        fatal = [l for l in done.stderr.splitlines() if l.startswith("FATAL")]
+        self.assertEqual(len(fatal), 1, done.stderr)
+        self.assertIn("SetMemoryPermission protects it", fatal[0])
+        self.assertEqual(done.stdout.count("state "), 3, "the run stopped at the read of tick 3")
+        lines = [l for l in record.read_text().splitlines() if l and not l.startswith("#")]
+        self.assertEqual(lines, ["at 0 for 3 a"])
+        row = self.rows(folder, "input")   # the report was written by the stop hook, with the replay's row
+        self.assertEqual(len(row), 1, (folder / "census.tsv").read_text())
+        self.assertIn("0 of 1 markers fired", row[0][5])
 
     def test_a_stop_by_a_marker_closes_the_record(self) -> None:
         record = Path(tempfile.mkdtemp(dir=self.tmp.name)) / "record.txt"
@@ -475,11 +533,24 @@ class MarkerTest(unittest.TestCase):
     def test_a_malformed_description_stops_by_line(self) -> None:
         good = description(self.store)
         for key, text, what in [
-            ("header", "oot2-store 2\n" + good.split("\n", 1)[1], "is not a file of this format"),
+            ("header", "oot2-store 3\n" + good.split("\n", 1)[1], "is not a file of this format"),
+            ("format_1", "oot2-store 1\n" + good.split("\n", 1)[1], "is of format 1, which took the key to be at the start"),
+            ("no_key", good.replace(f" b {BOOL.shift} {BOOL.key} {BOOL.index}", f" b {BOOL.shift} {BOOL.index}"),
+             "line 4: not a line of the format"),
+            ("key_outside_the_cell", good.replace(f" b {BOOL.shift} {BOOL.key} ", f" b {BOOL.shift} {1 << BOOL.shift} "),
+             "line 4: a table whose cell cannot hold its key and entry number"),
+            ("key_on_the_entry_number", good.replace(f" b {BOOL.shift} {BOOL.key} {BOOL.index}",
+                                                     f" b {BOOL.shift} {BOOL.index} {BOOL.index}"),
+             "line 4: a table whose cell cannot hold its key and entry number"),
+            ("key_over_the_entry_number", good.replace(f" b {BOOL.shift} {BOOL.key} {BOOL.index}",
+                                                       f" b {BOOL.shift} {BOOL.index + 2} {BOOL.index}"),
+             "line 4: a table whose cell cannot hold its key and entry number"),
+            ("cell_larger_than_64", good.replace(f" b {BOOL.shift} ", " b 7 "), "line 4: a table line with a bad number"),
             ("line", good + "role age bool 12\n", "line %d: a role line that is not one" % (good.count("\n") + 1)),
             ("unknown", good + "table 1 2 3\n", "line %d: not a line of the format" % (good.count("\n") + 1)),
             ("number", good.replace("cell ", "cell x", 1), "line 3: not a line of the format"),
-            ("module", good.replace("module 68 80", "module 68 x", 1), "line 4: a table line with a bad number"),
+            ("module", good.replace(f"module {BOOL.table} {BOOL.capacity}", f"module {BOOL.table} x", 1),
+             "line 4: a table line with a bad number"),
             ("no_cell", good.replace("cell ", "cull ", 1), "line 3: not a line of the format"),
             ("cell_outside", good.replace(f"cell {self.store.CELL}", f"cell {fx.IMAGE}", 1), "outside the main module"),
         ]:

@@ -6,8 +6,8 @@ The game keeps everything its logic needs to remember in one global store of nam
 name). A value is found by a 32-bit hash of its name (MurmurHash3, seed 0) in an open-addressing table that belongs to its
 type, and the tables hang off one object that a global pointer cell leads to. This step finds that cell and the layout of
 the per-type tables by reading the player's own main module, and writes what the runtime needs to read one value from a
-running game: oot2-store.txt in the output folder. The runtime only ever reads the store (runtime/hos/store.c); the game's
-own setters queue their writes, so nothing here writes one.
+running game: oot2-store.txt in the output folder. The runtime only ever reads the store (runtime/hos/store.c); nothing
+here writes one.
 
 Off unless the player gives a names file (`oot2 prepare --names FILE`). The file is the player's own, kept outside the
 repository: a line `role = name` for each value the player wants to wait for. The role is ours (FIXED_ROLES, or
@@ -15,30 +15,36 @@ repository: a line `role = name` for each value the player wants to wait for. Th
 written to oot2-store.txt and to the state file, never the name. Nothing in the repository holds a game name, offset or
 hash.
 
-The structural match. No offset or name is known to this code. A lookup of a value is compiled inline, over a hundred
-times over, into the game's functions: it loads the store's object through the pointer cell, loads a table pointer and a
-capacity from the object, divides the key by the capacity to place the probe, finds the table cell, loads the entry
-number from the cell, checks it against the entry count, multiplies it by the entry size, adds the entry array, and reads
-the value from a fixed place in the entry. `find_store` follows that chain on every unsigned 32-bit division in the module
-(`udiv`) with a small symbolic executor over the machine code, and keeps the chains that complete. The pointer cell the
-most chains start from is the store's; every number of the layout is read from the instructions of those chains. Several
-chains of different tables start from the one object, one per type, and each gives one `Module` of the description. The
-match asks for at least MIN_CHAINS chains and for MARGIN times the next cell's, and otherwise refuses by name.
+The structural match. No offset or name is known to this code. A lookup of a value is compiled inline into many of the
+game's functions: it loads the store's object through the pointer cell, loads a table pointer and a capacity from the
+object, divides the key by the capacity to place the probe, finds the table cell, compares the cell's key with the one
+looked up, loads the entry number from the cell, checks it against the entry count, multiplies it by the entry size, adds
+the entry array, and reads the value from a fixed place in the entry. `find_store` follows that chain on every unsigned
+32-bit division in the module (`udiv`) with a small symbolic executor over the machine code, and keeps the chains that
+complete. The pointer cell the most chains start from is the store's. Every number of the layout is read from the
+instructions of those chains, the displacement of the key in a cell and that of the entry number in it included: the key's
+from the load whose result the probe compares with the value looked up (a load with a register for its offset has no
+displacement of its own and names the start of the cell), the entry number's from the load the entry count is compared
+with. A chain without such a compare of the cell's key is not a chain. Several chains of different tables start from the
+one object, one per type, and each gives one `Module` of the description. The match asks for at least MIN_CHAINS chains and
+for MARGIN times the next cell's, and otherwise refuses by name.
 
 oot2-store.txt (read by runtime/hos/store.c and by `parse_description`):
 
-    oot2-store 1
+    oot2-store 2
     build <64 hex digits>        the main module's build id, as the module header holds it
     cell <image offset>          the pointer cell, an offset in the main module's image
-    module <table> <capacity> <count> <entries> <stride> <value> <class> <shift> <index>
+    module <table> <capacity> <count> <entries> <stride> <value> <class> <shift> <key> <index>
     role <role> <kind> <8 hex digits>
 
 The cell holds the address of a variable, and the variable the address of the object (two reads). A `module` line gives
 displacements from the object, in decimal: a pointer to the table, the table's capacity (a 32-bit count of cells), the
 entry count (32-bit), a pointer to the entry array, the entry size, and the displacement of the value inside an entry,
 then the value's class (b byte, h half word, w word, x double word, s single float, d double float), the cell size as a
-shift (a cell is 1 << shift bytes, its key at 0), and the displacement of the entry number inside a cell. A `role` line
-gives the role, its kind (bool, int, uint, float, string) and the hash of its name. A line starting with # is a comment.
+shift (a cell is 1 << shift bytes, at most 64), and the displacement of the key and that of the entry number inside a cell
+(each a 32-bit word, the two not overlapping, both inside the cell). A `role` line gives the role, its kind (bool, int,
+uint, float, string) and the hash of its name. A line starting with # is a comment. Format 1 had no key displacement (it
+took the key to be at the start of the cell); a file of that format is refused by name, and `oot2 prepare` writes format 2.
 """
 
 from __future__ import annotations
@@ -58,7 +64,7 @@ from .runner import Context, PrepareError, Step, fingerprint
 TOOLS = Path(__file__).resolve().parent.parent
 
 FILE = "oot2-store.txt"
-FORMAT = 1
+FORMAT = 2
 EXEFS = "exefs"
 
 # The value kinds a role can have, and the classes of load that read each.
@@ -70,7 +76,7 @@ FIXED_ROLES = {
     "next_scene": "string",   # the scene a change has asked for
     "entrance": "string",     # the entrance a change has asked for
     "room": "int",
-    "age": "bool",            # the player's age, as the game keeps it: 1 for the younger
+    "age": "bool",            # a bool for the player's age
     "health": "int",
     "max_health": "int",
     "boss": "bool",           # a boss fight is on
@@ -114,11 +120,18 @@ class Module:
     value: int
     cls: str
     shift: int
+    key: int
     index: int
+
+    def valid(self) -> bool:
+        """The cell is 1 << shift bytes, at most 64, and holds a 32-bit key and a 32-bit entry number in two places."""
+        size = 1 << self.shift
+        return (0 <= self.shift <= 6 and self.key != self.index and 0 <= self.key <= size - 4
+                and 0 <= self.index <= size - 4 and (self.key + 4 <= self.index or self.index + 4 <= self.key))
 
     def fields(self) -> tuple:
         return (self.table, self.capacity, self.count, self.entries, self.stride, self.value, self.cls, self.shift,
-                self.index)
+                self.key, self.index)
 
 
 @dataclass(frozen=True)
@@ -221,7 +234,10 @@ def parse_names(raw: bytes) -> list[tuple[str, str, int]]:
 #   ("f4", cell, disp) / ("f8", cell, disp)   a 32-bit or 64-bit field of that object
 #   ("imm", n)                                a constant
 #   ("cellptr", cell, table, shift, cap)      a table cell: the table plus an index shifted left by `shift`
-#   ("idx", cell, table, shift, cap, index)   the entry number a table cell holds, `index` bytes into the cell
+#   ("idx", cell, table, shift, cap, disp)    the word a table cell holds `disp` bytes into the cell: the entry number once it
+#                                             is checked against the count, the key when it is compared with another value
+#   ("keyw", cell, table, disp)               a word loaded from the table with a register for the offset, so `disp` is 0: a
+#                                             cell's word at the start of the cell, the compiler having formed the offset
 #   ("prod", idx, n)                          an entry number times a constant
 #   ("entry", chain, off)                     the address of an entry plus `off`; chain = (cell, table, cap, shift, index,
 #                                             entries, n), n the entry size
@@ -295,7 +311,8 @@ def _exec(ins: _Ins, regs: dict, anchor: tuple) -> tuple | None:
     """Apply one instruction to the register map. Returns the Module a value load completes, when it does.
 
     anchor = (cell, capacity displacement, table displacements); regs["count"] is the displacement of the field the
-    entry number was last compared with.
+    entry number was last compared with, regs["key"] the displacement of the word of a table cell that was last compared
+    with something that is not a field of the object: the probe's test of the cell's key.
     """
     mn, ops = ins.mn, ins.ops
     dest = ops[0][1] if ops and ops[0][0] == "r" else None
@@ -311,7 +328,10 @@ def _exec(ins: _Ins, regs: dict, anchor: tuple) -> tuple | None:
         base, index, disp = ops[1][1], ops[1][2], ops[1][3]
         src = regs.get(base) if base is not None else None
         cls = _load_class(ins)
-        if index is None and src is not None:
+        if index is not None and src is not None and cls == "w":
+            if src[0] == "f8" and src[1] == anchor[0] and src[2] in anchor[2] and disp == 0:
+                val = ("keyw", src[1], src[2], 0)
+        elif index is None and src is not None:
             if src[0] == "page" and cls == "x":
                 val = ("cell", src[1] + disp)
             elif src[0] == "cell" and cls == "x" and disp == 0:
@@ -322,7 +342,11 @@ def _exec(ins: _Ins, regs: dict, anchor: tuple) -> tuple | None:
                 val = ("idx", src[1], src[2], src[3], src[4], disp)
             elif src[0] == "entry" and regs.get("count") is not None:
                 cell, table, cap, shift, idx, entries, n = src[1]
-                done = (cell, Module(table, cap, regs["count"], entries, n, src[2] + disp, cls, shift, idx))
+                key = regs.get("key")   # read from the compare that decided the probe's hit, not assumed to be at the cell's start
+                if key is not None:
+                    module = Module(table, cap, regs["count"], entries, n, src[2] + disp, cls, shift, key, idx)
+                    if module.valid():
+                        done = (cell, module)
     elif mn == "mov" and len(ops) == 2:
         val = ("imm", ops[1][1]) if ops[1][0] == "i" else value(1)
     elif mn in ("sxtw", "uxtw", "sxth", "uxth", "sxtb", "uxtb") and len(ops) == 2:
@@ -337,8 +361,12 @@ def _exec(ins: _Ins, regs: dict, anchor: tuple) -> tuple | None:
     elif mn in ("cmp", "subs") and len(ops) >= 2:
         a, b = (value(len(ops) - 2), value(len(ops) - 1))
         for x, y in ((a, b), (b, a)):
-            if x is not None and y is not None and x[0] == "idx" and y[0] == "f4" and y[1] == x[1]:
-                regs["count"] = y[2]
+            if x is not None and x[0] in ("idx", "keyw"):
+                if x[0] == "idx" and y is not None and y[0] == "f4" and y[1] == x[1]:
+                    regs["count"] = y[2]
+                elif ops[-2][0] == "r" and ops[-1][0] == "r" and (y is None or y[0] not in ("idx", "keyw")):
+                    # a word of a table cell against the value being looked up: the probe's test of the cell's key
+                    regs["key"] = x[5] if x[0] == "idx" else x[3]
     elif mn == "add" and len(ops) == 3 and ops[1][0] == "r" and ops[2][0] == "i":
         a = value(1)
         if a is not None and a[0] == "entry":
@@ -404,6 +432,7 @@ def _follow(at, regs: dict, site: int) -> set:
     anchor = (cell, cap[2], tables)
     start = dict(regs)
     start.pop("count", None)
+    start.pop("key", None)
     found: set = set()
     paths = [(site + 4, start, frozenset())]
     started = 0
@@ -515,8 +544,8 @@ def _more_tables(found: list[Module], orphans: collections.Counter) -> list[Modu
     tables found, and its table lies a whole number of tables further on, and the shape was met in MIN_ORPHANS functions."""
     if len(found) < 3:
         return []
-    arrangements = collections.Counter((m.capacity - m.table, m.entries - m.table, m.count - m.table, m.shift, m.index)
-                                       for m in found)
+    arrangements = collections.Counter((m.capacity - m.table, m.entries - m.table, m.count - m.table, m.shift, m.key,
+                                        m.index) for m in found)
     arrangement = max(arrangements.items(), key=lambda kv: (kv[1], kv[0]))[0]
     spacing = 0
     for m in found:
@@ -524,7 +553,7 @@ def _more_tables(found: list[Module], orphans: collections.Counter) -> list[Modu
     if spacing == 0:
         return []
     ours = [m for m in orphans if m.count - m.table == arrangement[2] and m.capacity - m.table == arrangement[0]
-            and m.entries - m.table == arrangement[1] and (m.shift, m.index) == arrangement[3:]
+            and m.entries - m.table == arrangement[1] and (m.shift, m.key, m.index) == arrangement[3:]
             and (m.table - found[0].table) % spacing == 0]
     return _dominant(collections.Counter({m: orphans[m] for m in ours if orphans[m] >= MIN_ORPHANS}),
                      {(m.table, m.cls) for m in found})
@@ -544,6 +573,9 @@ def parse_description(text: str) -> Description:
     """The inverse of render_description. ValueError, naming the line, for a file that is not one."""
     build, cell, modules, roles = None, None, [], []
     lines = text.splitlines()
+    if lines and lines[0].split() == ["oot2-store", "1"]:
+        raise ValueError("line 1: an oot2-store file of format 1, which assumed the key at the start of a cell and is no "
+                         "longer read; run `oot2 prepare --names FILE` again")
     if not lines or lines[0].split() != ["oot2-store", str(FORMAT)]:
         raise ValueError("line 1: not an oot2-store file of this format")
     for number, line in enumerate(lines[1:], 2):
@@ -555,9 +587,12 @@ def parse_description(text: str) -> Description:
                 build = words[1]
             elif words[0] == "cell" and len(words) == 2:
                 cell = int(words[1])
-            elif words[0] == "module" and len(words) == 10 and words[7] in "bhwxsd" and len(words[7]) == 1:
-                n = [int(x) for x in words[1:7]] + [words[7]] + [int(x) for x in words[8:10]]
-                modules.append(Module(*n))
+            elif words[0] == "module" and len(words) == 11 and words[7] in "bhwxsd" and len(words[7]) == 1:
+                n = [int(x) for x in words[1:7]] + [words[7]] + [int(x) for x in words[8:11]]
+                module = Module(*n)
+                if not module.valid():
+                    raise ValueError("a table whose cell cannot hold its key and entry number")
+                modules.append(module)
             elif words[0] == "role" and len(words) == 4 and words[2] in KINDS and re.fullmatch(r"[0-9a-f]{8}", words[3]):
                 roles.append(Role(words[1], words[2], int(words[3], 16)))
             else:
@@ -585,7 +620,7 @@ class Store(Step):
         return Path(ctx.options.names).resolve()
 
     def key(self, ctx: Context) -> str:
-        return fingerprint("store-1", self.names(ctx), Path(__file__))
+        return fingerprint("store-2", self.names(ctx), Path(__file__))
 
     def current(self, ctx: Context, record: dict) -> bool:
         path = ctx.dest / FILE

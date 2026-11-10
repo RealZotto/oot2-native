@@ -38,18 +38,22 @@ except ImportError:   # pragma: no cover
 TEXT = 0x4000   # room for the functions below
 CELL = 0x2100   # the address of the pointer cell in the synthetic code: the match reads it from the instructions
 OTHER_CELL = 0x2300
-BOOL = fx.Shape(table=0x40, capacity=0x4c, count=0x30, entries=0x38, stride=0x14, value=0x0d, load="b")
-WORD = fx.Shape(table=0x90, capacity=0x9c, count=0x80, entries=0x88, stride=0x30, value=0x24, shift=4, index=8, load="w")
-FLOAT = fx.Shape(table=0x130, capacity=0x13c, count=0x120, entries=0x128, stride=0x30, value=0x24, load="s")
-STRING = fx.Shape(table=0x180, capacity=0x18c, count=0x170, entries=0x178, stride=0x54, value=0x20, load="x")
+# Arbitrary layouts: every displacement, entry size, cell shape and the spacing of the tables below was drawn once at random for
+# this file, with the alignment the loads need and nothing else in common. Each table has a cell shape of its own, and the
+# key is at the start of the cell for one of them (loaded with a register for the offset) and elsewhere for the rest.
+BOOL = fx.Shape(table=0x118, capacity=0x2bc, count=0x1e8, entries=0x248, stride=0x10a, value=0x6d, shift=6, key=0xc, index=0x8, load="b")
+WORD = fx.Shape(table=0x138, capacity=0x10c, count=0x84, entries=0x2c0, stride=0xe4, value=0x2c, shift=5, key=0x18, index=0x8, load="w")
+FLOAT = fx.Shape(table=0x168, capacity=0x274, count=0x294, entries=0x90, stride=0x24, value=0x14, shift=5, key=0x0, index=0xc, load="s")
+STRING = fx.Shape(table=0x2e8, capacity=0xc0, count=0x250, entries=0x238, stride=0x5c, value=0x28, shift=4, key=0x4, index=0xc, load="x")
 
 
-def functions(shape: fx.Shape, copies: int, cell: int = CELL, flaw: str = "", start: int = fx.CODE_AT) -> tuple[list[int], int]:
+def functions(shape: fx.Shape, copies: int, cell: int = CELL, flaw: str = "", start: int = fx.CODE_AT,
+              key_form: str = "") -> tuple[list[int], int]:
     """`copies` functions that look a value up, back to back from `start`; the words and the address after them."""
     words: list[int] = []
     at = start
     for _ in range(copies):
-        body = fx.lookup(at, cell, shape, flaw=flaw)
+        body = fx.lookup(at, cell, shape, flaw=flaw, key_form=key_form)
         body += [fx.NOP] * (0x24 - len(body))
         words += body
         at += 4 * len(body)
@@ -129,26 +133,49 @@ class NamesTest(unittest.TestCase):
 
 class DescriptionTest(unittest.TestCase):
     def make(self) -> store.Description:
-        return store.Description("ab" * 32, 1234, (store.Module(64, 76, 48, 56, 20, 13, "b", 3, 4),
-                                                   store.Module(144, 156, 128, 136, 48, 36, "w", 4, 8)),
+        return store.Description("ab" * 32, 1234, tuple(self.modules()),
                                  (store.Role("age", "bool", 0xDEADBEEF), store.Role("uint.coins", "uint", 0x1234)))
+
+    def modules(self) -> list[store.Module]:
+        return [store.Module(s.table, s.capacity, s.count, s.entries, s.stride, s.value, s.load, s.shift, s.key, s.index)
+                for s in (BOOL, WORD)]
 
     def test_round_trip(self) -> None:
         d = self.make()
         text = store.render_description(d)
         self.assertEqual(store.parse_description(text), d)
-        self.assertEqual(text.splitlines()[0], "oot2-store 1")
+        self.assertEqual(text.splitlines()[0], "oot2-store 2")
         self.assertIn("role age bool deadbeef\n", text)
-        self.assertIn("module 64 76 48 56 20 13 b 3 4\n", text)
+        b = BOOL
+        self.assertIn(f"module {b.table} {b.capacity} {b.count} {b.entries} {b.stride} {b.value} b {b.shift} {b.key} {b.index}\n",
+                      text)
 
     def test_what_is_not_a_description(self) -> None:
         good = store.render_description(self.make())
-        for key, text in {"header": "oot2-store 2\n" + good.split("\n", 1)[1], "no_build": good.replace("build", "built"),
+        shape = f" b {BOOL.shift} {BOOL.key} {BOOL.index}"
+        self.assertIn(shape, good)
+        size = 1 << BOOL.shift
+        for key, text in {"header": "oot2-store 3\n" + good.split("\n", 1)[1], "no_build": good.replace("build", "built"),
                           "bad_kind": good.replace("bool", "bit"), "short_hash": good.replace("deadbeef", "dead"),
-                          "bad_class": good.replace(" b 3 4", " q 3 4"), "empty": ""}.items():
+                          "bad_class": good.replace(shape, f" q {BOOL.shift} {BOOL.key} {BOOL.index}"), "empty": "",
+                          "no_key": good.replace(shape, f" b {BOOL.shift} {BOOL.index}"),
+                          "key_outside_the_cell": good.replace(shape, f" b {BOOL.shift} {size} {BOOL.index}"),
+                          "key_over_the_edge": good.replace(shape, f" b {BOOL.shift} {size - 2} {BOOL.index}"),
+                          "index_outside_the_cell": good.replace(shape, f" b {BOOL.shift} {BOOL.key} {size}"),
+                          "key_on_the_entry_number": good.replace(shape, f" b {BOOL.shift} {BOOL.key} {BOOL.key}"),
+                          "key_overlaps_the_entry_number": good.replace(shape, f" b {BOOL.shift} {BOOL.key} {BOOL.key + 2}"),
+                          "cell_larger_than_64": good.replace(shape, f" b 7 {BOOL.key} {BOOL.index}")}.items():
             with self.subTest(key):
                 with self.assertRaises(ValueError):
                     store.parse_description(text)
+
+    def test_format_1_is_refused_by_name(self) -> None:
+        good = store.render_description(self.make())
+        old = "oot2-store 1\n" + good.split("\n", 1)[1]
+        with self.assertRaises(ValueError) as caught:
+            store.parse_description(old)
+        self.assertIn("format 1", str(caught.exception))
+        self.assertIn("line 1", str(caught.exception))
 
 
 @unittest.skipIf(capstone is None, "capstone is not installed")
@@ -159,81 +186,121 @@ class MatchTest(unittest.TestCase):
         self.assertEqual(cell, CELL)
         self.assertEqual(chains, 38)
         self.assertEqual(runner_up, 0)
-        want = [(s.table, s.capacity, s.count, s.entries, s.stride, s.value, s.load, s.shift, s.index)
+        want = [(s.table, s.capacity, s.count, s.entries, s.stride, s.value, s.load, s.shift, s.key, s.index)
                 for s in (BOOL, WORD, FLOAT, STRING)]
         self.assertEqual([m.fields() for m in modules], want)
 
+    def test_the_key_is_read_from_the_load_that_feeds_the_compare(self) -> None:
+        # the same table, the key in three places: with a displacement from the cell, with a register for the offset (the
+        # start of the cell), and with a displacement of 0
+        nonzero = fx.Shape(table=0x1d8, capacity=0x23c, count=0x1f0, entries=0x208, stride=0x6c, value=0x20, shift=5, key=0x14,
+                           index=0x4, load="w")
+        zero = fx.Shape(nonzero.table, nonzero.capacity, nonzero.count, nonzero.entries, nonzero.stride, nonzero.value,
+                        nonzero.shift, 0, 0x10, "w")
+        for shape, form, key in ((nonzero, "disp", 0x14), (zero, "reg", 0), (zero, "disp", 0)):
+            with self.subTest(form=form, key=key):
+                code = fx.assemble(functions(shape, store.MIN_CHAINS, CELL, "", key_form=form)[0])
+                _, modules, _, _ = find(code)
+                self.assertEqual([(m.key, m.index) for m in modules], [(key, shape.index)])
+
+    def test_the_key_of_each_table_is_read_for_that_table(self) -> None:
+        # two tables of one object whose cells differ in where the key is: neither is taken for the other's
+        a = fx.Shape(table=0x58, capacity=0x7c, count=0x60, entries=0x98, stride=0x31, value=0x0b, shift=4, key=0x8, index=0x0,
+                     load="b")
+        b = fx.Shape(table=0xd0, capacity=0xf4, count=0xe0, entries=0x110, stride=0x44, value=0x1c, shift=4, key=0x0, index=0xc,
+                     load="w")
+        _, modules, _, _ = find(blob((a, 12, CELL, ""), (b, 12, CELL, "")))
+        self.assertEqual([(m.table, m.key, m.index) for m in modules], [(a.table, 0x8, 0x0), (b.table, 0x0, 0xc)])
+
     def test_the_layout_most_chains_agree_on_wins(self) -> None:
-        other = fx.Shape(BOOL.table, BOOL.capacity, BOOL.count, BOOL.entries, 0x18, 0x12, load="b")
+        other = fx.Shape(BOOL.table, BOOL.capacity, BOOL.count, BOOL.entries, 0x71, 0x31, BOOL.shift, BOOL.key, BOOL.index, "b")
         _, modules, _, _ = find(blob((BOOL, 6, CELL, ""), (other, 2, CELL, ""), (WORD, 10, CELL, ""), (FLOAT, 10, CELL, "")))
         self.assertEqual(modules[0].fields()[4:6], (BOOL.stride, BOOL.value))
 
     def test_equal_layouts_give_the_smaller_whatever_the_order(self) -> None:
-        a = fx.Shape(BOOL.table, BOOL.capacity, BOOL.count, BOOL.entries, 0x18, 0x12, load="b")
-        b = fx.Shape(BOOL.table, BOOL.capacity, BOOL.count, BOOL.entries, 0x14, 0x0d, load="b")
-        c = fx.Shape(BOOL.table, BOOL.capacity, BOOL.count, BOOL.entries, 0x16, 0x03, load="b")
+        def variant(stride: int, value: int) -> fx.Shape:
+            return fx.Shape(BOOL.table, BOOL.capacity, BOOL.count, BOOL.entries, stride, value, BOOL.shift, BOOL.key, BOOL.index,
+                            "b")
+        a, b, c = variant(0xe1, 0x7f), variant(0x5a, 0x03), variant(0xd8, 0x67)
         for order in ((a, b, c), (c, b, a), (b, a, c), (b, c, a)):
             _, modules, _, _ = find(blob(*[(sh, 4, CELL, "") for sh in order], (WORD, 10, CELL, ""), (FLOAT, 10, CELL, "")))
-            self.assertEqual(modules[0].fields()[4:6], (0x14, 0x0d), "the layout that sorts first among equals")
+            self.assertEqual(modules[0].fields()[4:6], (0x5a, 0x03), "the layout that sorts first among equals")
 
     def test_a_table_read_two_ways_keeps_both_reads(self) -> None:
-        pointer = fx.Shape(STRING.table, STRING.capacity, STRING.count, STRING.entries, STRING.stride, 0x18, load="x")
-        length = fx.Shape(STRING.table, STRING.capacity, STRING.count, STRING.entries, STRING.stride, 0x20, load="w")
+        def read(value: int, load: str) -> fx.Shape:
+            return fx.Shape(STRING.table, STRING.capacity, STRING.count, STRING.entries, STRING.stride, value, STRING.shift,
+                            STRING.key, STRING.index, load)
+        pointer, length = read(STRING.value, "x"), read(0x4c, "w")
         _, modules, _, _ = find(blob((BOOL, 10, CELL, ""), (WORD, 10, CELL, ""), (pointer, 10, CELL, ""),
                                       (length, 10, CELL, "")))
         both = [m for m in modules if m.table == STRING.table]
-        self.assertEqual(sorted((m.cls, m.value) for m in both), [("w", 0x20), ("x", 0x18)])
+        self.assertEqual(sorted((m.cls, m.value) for m in both), [("w", 0x4c), ("x", STRING.value)])
 
     def test_a_cell_among_decoys(self) -> None:
         cell, _, chains, runner_up = find(blob((BOOL, 12, CELL, ""), (WORD, 12, CELL, ""), (BOOL, 3, OTHER_CELL, ""),
                                                 (WORD, 3, OTHER_CELL, "")))
         self.assertEqual((cell, chains, runner_up), (CELL, 24, 6))
 
-    def test_tables_only_a_handed_over_object_reaches(self) -> None:
-        # three tables through the cell, and a fourth that two functions are handed the object for: the same arrangement
-        # of fields, one table further on at the spacing of the others
-        t0 = fx.Shape(0x40, 0x4c, 0x30, 0x38, 0x14, 0x0d, load="b")
-        t1 = fx.Shape(0xa0, 0xac, 0x90, 0x98, 0x30, 0x24, load="w")
-        t2 = fx.Shape(0x100, 0x10c, 0xf0, 0xf8, 0x30, 0x24, load="s")
-        t3 = fx.Shape(0x160, 0x16c, 0x150, 0x158, 0x50, 0x18, load="x")
-        stray = fx.Shape(0x168, 0x174, 0x158, 0x160, 0x50, 0x18, load="x")   # off the spacing: not a table of the object
-        lonely = fx.Shape(0x1c0, 0x1cc, 0x1b0, 0x1b8, 0x50, 0x18, load="x")   # met once only
-        # each of these has the right spacing and is met three times, and differs in one field's place from the tables found
-        wrongs = [fx.Shape(0x220, 0x22c, 0x200, 0x208, 0x50, 0x18, load="x"),                # the count
-                  fx.Shape(0x280, 0x290, 0x270, 0x278, 0x50, 0x18, load="x"),                # the capacity
-                  fx.Shape(0x2e0, 0x2ec, 0x2d0, 0x2e8, 0x50, 0x18, load="x"),                # the entries
-                  fx.Shape(0x340, 0x34c, 0x330, 0x338, 0x50, 0x18, shift=4, load="x"),       # the size of a cell
-                  fx.Shape(0x3a0, 0x3ac, 0x390, 0x398, 0x50, 0x18, index=8, load="x")]       # the entry number's place
+    # The tables of one object share the arrangement of their own fields and sit a fixed distance apart (drawn at random)
+    SPACING, FIRST = 0xa8, 0x68
+    ARRANGEMENT = {"cap": 0x40, "count": 0x24, "entries": 0x30, "shift": 4, "key": 0x8, "index": 0x4}
+
+    def table_at(self, table: int, load: str, stride: int, value: int, **changes: int) -> fx.Shape:
+        a = {**self.ARRANGEMENT, **changes}
+        return fx.Shape(table=table, capacity=table + a["cap"], count=table + a["count"], entries=table + a["entries"],
+                        stride=stride, value=value, shift=a["shift"], key=a["key"], index=a["index"], load=load)
+
+    def handed_over(self, shapes: list[tuple[fx.Shape, int]], through_cell: list[tuple[fx.Shape, int]]) -> list[store.Module]:
         words: list[int] = []
         at = fx.CODE_AT
-        for shape, copies in ((t0, 10), (t1, 10), (t2, 10)):
+        for shape, copies in through_cell:
             more, at = functions(shape, copies, CELL, "", at)
             words += more
-        for shape, copies in [(t3, 2), (stray, 3), (lonely, 1)] + [(w, 3) for w in wrongs]:
+        for shape, copies in shapes:
             for _ in range(copies):
                 body = fx.lookup(at, CELL, shape, flaw="no_deref")   # the object is not got from the cell: it is handed over
                 body[3] = fx.NOP
                 body += [fx.NOP] * (0x24 - len(body))
                 words += body
                 at += 4 * len(body)
-        _, modules, _, _ = find(fx.assemble(words))
-        self.assertEqual(sorted(m.table for m in modules), [0x40, 0xa0, 0x100, 0x160])
+        return list(find(fx.assemble(words))[1])
+
+    def spaced(self, k: int) -> int:
+        return self.FIRST + k * self.SPACING
+
+    def test_tables_only_a_handed_over_object_reaches(self) -> None:
+        # three tables through the cell, and a fourth that two functions are handed the object for: the same arrangement
+        # of fields, one table further on at the spacing of the others
+        t0 = self.table_at(self.spaced(0), "b", 0xe5, 0x51)
+        t1 = self.table_at(self.spaced(1), "w", 0x48, 0x14)
+        t2 = self.table_at(self.spaced(2), "s", 0x118, 0x4c)
+        t3 = self.table_at(self.spaced(3), "x", 0x120, 0x38)
+        stray = self.table_at(self.spaced(3) + 0x98, "x", 0x44, 0x08)   # off the spacing: not a table of the object
+        lonely = self.table_at(self.spaced(4), "x", 0xe0, 0x90)         # met once only
+        # each of these has the right spacing and is met three times, and differs in one field's place from the tables found
+        changes = [{"count": 0x2c}, {"cap": 0x48}, {"entries": 0x38}, {"shift": 5}, {"key": 0xc}, {"key": 0x8, "index": 0xc}]
+        wrongs = [self.table_at(self.spaced(5 + n), "x", 0xc0, 0x70, **change) for n, change in enumerate(changes)]
+        modules = self.handed_over([(t3, 2), (stray, 3), (lonely, 1)] + [(w, 3) for w in wrongs],
+                                   [(t0, 10), (t1, 10), (t2, 10)])
+        self.assertEqual(sorted(m.table for m in modules), [t0.table, t1.table, t2.table, t3.table])
+
+    def test_the_place_of_the_key_is_part_of_the_arrangement(self) -> None:
+        # the same as the last, with only the key's place differing in the handed-over table: it is not the object's
+        t0 = self.table_at(self.spaced(0), "b", 0xe5, 0x51)
+        t1 = self.table_at(self.spaced(1), "w", 0x48, 0x14)
+        t2 = self.table_at(self.spaced(2), "s", 0x118, 0x4c)
+        same = self.table_at(self.spaced(3), "x", 0x120, 0x38)
+        other_key = self.table_at(self.spaced(3), "x", 0x120, 0x38, key=0xc)
+        found = [(t0, 10), (t1, 10), (t2, 10)]
+        self.assertEqual(len(self.handed_over([(same, 3)], found)), 4)
+        self.assertEqual(len(self.handed_over([(other_key, 3)], found)), 3)
 
     def test_two_tables_are_not_enough_to_place_a_third(self) -> None:
-        t0 = fx.Shape(0x40, 0x4c, 0x30, 0x38, 0x14, 0x0d, load="b")
-        t1 = fx.Shape(0xa0, 0xac, 0x90, 0x98, 0x30, 0x24, load="w")
-        t3 = fx.Shape(0x160, 0x16c, 0x150, 0x158, 0x50, 0x18, load="x")
-        words, at = functions(t0, 10, CELL, "")
-        more, at = functions(t1, 10, CELL, "", at)
-        words += more
-        for _ in range(3):
-            body = fx.lookup(at, CELL, t3, flaw="no_deref")
-            body[3] = fx.NOP
-            body += [fx.NOP] * (0x24 - len(body))
-            words += body
-            at += 4 * len(body)
-        _, modules, _, _ = find(fx.assemble(words))
-        self.assertEqual(sorted(m.table for m in modules), [0x40, 0xa0])
+        t0 = self.table_at(self.spaced(0), "b", 0xe5, 0x51)
+        t1 = self.table_at(self.spaced(1), "w", 0x48, 0x14)
+        t3 = self.table_at(self.spaced(3), "x", 0x120, 0x38)
+        modules = self.handed_over([(t3, 3)], [(t0, 10), (t1, 10)])
+        self.assertEqual(sorted(m.table for m in modules), [t0.table, t1.table])
 
     # one near miss each: a flaw in every function of an otherwise good set breaks the match
     def refused(self, flaw: str) -> None:
@@ -260,6 +327,9 @@ class MatchTest(unittest.TestCase):
 
     def test_near_miss_no_value_read(self) -> None:
         self.refused("no_load")
+
+    def test_near_miss_the_cells_key_is_never_compared(self) -> None:
+        self.refused("no_key")
 
     def test_the_good_set_is_found_by_the_same_calls(self) -> None:
         find(blob((BOOL, 12, CELL, ""), (WORD, 12, CELL, "")))

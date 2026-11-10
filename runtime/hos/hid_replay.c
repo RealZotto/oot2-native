@@ -67,6 +67,10 @@ typedef struct Marker {
 } Marker;
 
 static PlatMutex g_lock = PLAT_MUTEX_INIT;   // everything below that is written after start-up
+// Set while this thread is inside hid_replay_filter, holding g_lock. A stop raised there (a fault while a marker reads the
+// store) runs the stop hook on this very thread, and the hook closes the recorder and writes the report, which take g_lock:
+// the lock is not recursive, so they skip it when this is set (the same arrangement as gfx_null.c's g_locked_here).
+static _Thread_local int g_inside;
 static int g_started;
 static int g_replay_on, g_rec_on;   // written once by hid_replay_start, before any reader
 
@@ -309,7 +313,8 @@ static void parse_when(int line, char **p, Span *s) {
     }
     case STORE_FLOAT: {
         char *end = NULL;
-        m.fval = float_syntax(w) ? strtod(w, &end) : 0;
+        // the store holds a single float, which is widened to compare: the constant is rounded to a single float the same way
+        m.fval = float_syntax(w) ? (double)(float)strtod(w, &end) : 0;
         if (!end || *end) bad(line, "the value \"%s\" of %s is not a number", shown(w, buf), store_role_name(role));
         break;
     }
@@ -572,6 +577,7 @@ void hid_replay_filter(HidHostInput *in) {
     uint64_t now = rt_vsync_tick();
     char fatal[512] = "";
     plat_mutex_lock(&g_lock);
+    g_inside = 1;
     if (!g_anchored) {
         g_anchored = 1;
         g_base = now;
@@ -588,12 +594,14 @@ void hid_replay_filter(HidHostInput *in) {
         g_served++;
     }
     give(&g_lat, in);
+    g_inside = 0;
     plat_mutex_unlock(&g_lock);
     if (fatal[0]) rt_fatal("%s", fatal);   // after the lock: the stop hook closes the recorder under it
 }
 
 void hid_replay_finish(void) {
-    plat_mutex_lock(&g_lock);
+    int held = g_inside;   // a stop raised under the lock by this thread: it already holds it
+    if (!held) plat_mutex_lock(&g_lock);
     if (g_rec_on && !g_rec_closed) {
         g_rec_closed = 1;
         if (g_rec_open_run) emit(&g_run, g_run_start, g_run_last - g_run_start + 1);
@@ -604,12 +612,13 @@ void hid_replay_finish(void) {
         }
         g_rec_file = NULL;
     }
-    plat_mutex_unlock(&g_lock);
+    if (!held) plat_mutex_unlock(&g_lock);
 }
 
 void hid_replay_rows(HidReplayRowFn row, void *ctx) {
     char why[400];
-    plat_mutex_lock(&g_lock);
+    int held = g_inside;   // see hid_replay_finish
+    if (!held) plat_mutex_lock(&g_lock);
     if (g_replay_on) {
         if (g_anchored)
             snprintf(why, sizeof why,
@@ -632,7 +641,7 @@ void hid_replay_rows(HidReplayRowFn row, void *ctx) {
                  (unsigned long long)ticks, g_rec_closed ? "closed" : "still open", g_rec_failed ? "; a write failed" : "");
         row(ctx, "input-record", g_rec_path, "implemented", g_rec_lines, why);
     }
-    plat_mutex_unlock(&g_lock);
+    if (!held) plat_mutex_unlock(&g_lock);
 }
 
 // ---- start-up

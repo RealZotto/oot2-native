@@ -7,6 +7,7 @@ Everything here is made up by the tests: no number, name or hash comes from a ga
 
 from __future__ import annotations
 
+import random
 import struct
 from dataclasses import dataclass, field
 
@@ -52,6 +53,11 @@ def make_nso(code: bytes = b"", data: bytes = b"", build: bytes = bytes(32), tex
 def adrp(rd: int, pc: int, target: int) -> int:
     imm = ((target >> 12) - (pc >> 12)) & 0x1FFFFF
     return 0x90000000 | (imm & 3) << 29 | (imm >> 2) << 5 | rd
+
+
+def ldr_w_reg(rt: int, rn: int, rm: int) -> int:
+    """ldr wt, [xn, xm]: the offset is a register, so there is no displacement."""
+    return 0xB8606800 | rm << 16 | rn << 5 | rt
 
 
 def ldr_x(rt: int, rn: int, disp: int) -> int:
@@ -115,22 +121,26 @@ ZR = 31
 
 @dataclass(frozen=True)
 class Shape:
-    """The displacements one synthetic lookup uses, from the object."""
+    """The displacements one synthetic lookup uses, from the object, and the shape of a cell: 1 << shift bytes, a 32-bit key
+    `key` bytes in and a 32-bit entry number `index` bytes in. All of them are given, none has a default."""
     table: int
     capacity: int
     count: int
     entries: int
     stride: int
     value: int
-    shift: int = 3
-    index: int = 4
-    load: str = "b"   # b: ldrb, w: ldr w, s: ldr s, x: ldr x
+    shift: int
+    key: int
+    index: int
+    load: str   # b: ldrb, w: ldr w, s: ldr s, x: ldr x
 
 
-def lookup(fn_at: int, cell_addr: int, sh: Shape, *, flaw: str = "") -> list[int]:
-    """The words of one function that looks a value up the way the game's inline lookups do, then returns. `flaw` breaks one
+def lookup(fn_at: int, cell_addr: int, sh: Shape, *, flaw: str = "", key_form: str = "") -> list[int]:
+    """The words of one function that looks a value up in the shape the match reads, then returns. `flaw` breaks one
     thing: other_object (the divisor comes from another object), no_table, no_stride, no_count, no_deref, signed_div,
-    no_load. The probe's hit is a conditional branch to the block that reads the entry, as in compiled code."""
+    no_load, no_key (the cell's key is never compared). The probe's hit is a conditional branch to the block that reads
+    the entry. The key is loaded with a register for the offset (key_form "reg", the default when the key is at the start
+    of the cell) or with a displacement from the cell's address ("disp", the default otherwise)."""
     pc = fn_at
     words: list[int] = [PACIBSP]
     pc += 4
@@ -141,10 +151,19 @@ def lookup(fn_at: int, cell_addr: int, sh: Shape, *, flaw: str = "") -> list[int
     words.append(ldr_w(10, 0, sh.capacity) if flaw != "other_object" else ldr_w(10, 1, sh.capacity))
     words.append(udiv_w(11, 2, 10) if flaw != "signed_div" else sdiv_w(11, 2, 10))
     words.append(msub_w(11, 11, 10, 2))
+    if flaw != "no_key":
+        form = key_form or ("reg" if sh.key == 0 else "disp")
+        assert form == "disp" or sh.key == 0, "a register offset names the start of the cell"
+        words.append(add_lsl(13, ZR, 11, sh.shift))   # the offset of the cell in the table
+        if form == "reg":
+            words.append(ldr_w_reg(12, 9, 13))
+        else:
+            words += [add_lsl(14, 9, 13, 0), ldr_w(12, 14, sh.key)]
+        words.append(cmp_w(12, 2))   # the cell's key against the value looked up
     here = fn_at + 4 * len(words)
     block = here + 4 * 3   # the branch, a return, a nop: the entry block follows
     words += [beq(here, block), RET, NOP]
-    words.append(add_lsl(9, 9, 12, sh.shift))
+    words.append(add_lsl(9, 9, 11, sh.shift))
     words.append(ldr_w(10, 0, sh.count))
     words.append(ldr_x(11, 0, sh.entries))
     words.append(ldr_w(9, 9, sh.index))
@@ -177,6 +196,9 @@ class Table:
     string_room: int = 64
 
 
+FILLER_SEED = 0x7a31c9   # any number: the filler is the same in every run
+
+
 class Store:
     """The cell, the variable, the object, the tables and the entries, as bytes at known offsets of a main module whose base
     is `base`. Offsets are those of the image."""
@@ -184,6 +206,7 @@ class Store:
 
     def __init__(self, base: int, tables: list[Table]):
         self.base, self.tables = base, tables
+        self.filler = random.Random(FILLER_SEED)
         self.data = bytearray(DATA - 0x100)   # from DATA_OFF + 0x100
         self.at = DATA_OFF + 0x400            # next free offset for a table, an entry array or a string
         self.entry_off: dict[tuple[int, int], int] = {}   # (table index, hash) -> offset of the entry
@@ -203,6 +226,11 @@ class Store:
     def put(self, off: int, blob: bytes) -> None:
         self.data[off - DATA_OFF - 0x100:off - DATA_OFF - 0x100 + len(blob)] = blob
 
+    def noise(self, n: int) -> bytes:
+        """n bytes of filler, deterministic: whatever is read from a place that is not the one the description names is
+        filler, so a wrong displacement is caught whatever the value is."""
+        return bytes(self.filler.randrange(256) for _ in range(n))
+
     def put64(self, off: int, v: int) -> None:
         self.put(off, struct.pack("<Q", v))
 
@@ -218,7 +246,9 @@ class Store:
         cell_size = 1 << sh.shift
         table_off = self.alloc(t.capacity * cell_size)
         self.table_off[ti] = table_off
+        self.put(table_off, self.noise(t.capacity * cell_size))   # what a cell holds besides its key and entry number
         entries_off = self.alloc(max(1, len(t.entries)) * sh.stride)
+        self.put(entries_off, self.noise(max(1, len(t.entries)) * sh.stride))   # what an entry holds besides its value
         cells = [None] * t.capacity   # linear probing, as the game's table is probed
         for index, (h, value) in enumerate(t.entries):
             pos = h % t.capacity
@@ -233,14 +263,10 @@ class Store:
                 self.put(buf, value.encode() + b"\0")
                 self.put64(entry + sh.value, self.base + buf)
             else:
-                width = 1 if sh.load == "b" else 4
-                other = (not value) if sh.load == "b" else (value ^ 0x5A5A5A5A if sh.load == "w" else -value - 1.5)   # the copies either side differ
-                self.put(entry + sh.value - width, self.encode(sh, other))
-                self.put(entry + sh.value + width, self.encode(sh, other))
                 self.put(entry + sh.value, self.encode(sh, value))
         for pos, c in enumerate(cells):
+            self.put32(table_off + pos * cell_size + sh.key, c[0] if c is not None else 0)   # an empty cell has no key
             if c is not None:
-                self.put32(table_off + pos * cell_size, c[0])
                 self.put32(table_off + pos * cell_size + sh.index, c[1])
         self.put64(self.OBJ + sh.table, self.base + table_off)
         self.put32(self.OBJ + sh.capacity, t.capacity)
@@ -258,6 +284,10 @@ class Store:
 
     def set_string(self, ti: int, h: int, text: str) -> str:
         return self.poke(self.string_off[(ti, h)], text.encode() + b"\0")
+
+    def table_into_heap(self, ti: int, heap_off: int) -> str:
+        """The script line that points the object's table pointer at the heap, `heap_off` bytes in (the test program's W)."""
+        return f"W {self.OBJ + self.tables[ti].shape.table:x} {heap_off:x}\n"
 
     def unbuild(self) -> str:
         """The script line that makes the variable null again (the game has not built its store)."""

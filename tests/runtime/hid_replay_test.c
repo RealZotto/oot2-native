@@ -19,7 +19,15 @@
 //                             a store the input file's markers read can live in its data (oot2/store.h). A script line
 //                                 P OFFSET HEXBYTES
 //                             writes those bytes at OFFSET (hex) in the main module's image before the next line runs: how
-//                             the test changes the store while the game runs.
+//                             the test changes the store while the game runs. Three more script lines build what a
+//                             few bytes cannot:
+//                                 W OFFSET HEAPOFF   the guest address of the heap plus HEAPOFF, as a 64-bit word at OFFSET
+//                                                    of the main module (a pointer to a table that lives in the heap)
+//                                 F HEAPOFF COUNT HEX   COUNT times the bytes HEX (up to 64 bytes), from the heap plus
+//                                                    HEAPOFF (a table of many cells)
+//                                 D OFFSET           the page of the main module at OFFSET (hex, page aligned, in its data)
+//                                                    is given no access, as the game's SetMemoryPermission would: the next
+//                                                    read of the store from that page faults, and the runtime stops by name
 //   hid_replay_test run_then_fatal DIR   the same, ending in a fatal of the case's own instead of the report call
 //   hid_replay_test run_then_exit DIR    the same, ending in a stop with exit code 3 and no clean-up (TerminateProcess;
 //                                        _Exit elsewhere): a process killed from outside, which closes and flushes
@@ -111,7 +119,7 @@ static void boot(const char *folder) {
     rt_dispatch_init(mods, 1);
     Cpu h;
     memset(&h, 0, sizeof h);
-    h.x[1] = 16ull << 20;
+    h.x[1] = 64ull << 20;
     rt_svc(&h, 0x01, 0);   // SetHeapSize, from the host before the run
     CHECK(h.x[0] == 0);
     HEAP = h.x[1];
@@ -156,6 +164,37 @@ static int run(const char *dir, int fatal) {
                 CHECK(sscanf(hexbytes + 2 * i, "%2x", &b) == 1);
                 *(volatile uint8_t *)(uintptr_t)(MB + off + i) = (uint8_t)b;
             }
+            continue;
+        }
+        if (line[0] == 'W') {
+            unsigned long long off, at;
+            CHECK(sscanf(line, "W %llx %llx", &off, &at) == 2);
+            uint64_t v = HEAP + at;
+            memcpy((void *)(uintptr_t)(MB + off), &v, sizeof v);
+            continue;
+        }
+        if (line[0] == 'F') {
+            unsigned long long at, count;
+            char hex[160];
+            CHECK(sscanf(line, "F %llx %llu %159s", &at, &count, hex) == 3 && strlen(hex) % 2 == 0 && strlen(hex) <= 128);
+            uint8_t cell[64];
+            size_t n = strlen(hex) / 2;
+            for (size_t i = 0; i < n; i++) {
+                unsigned b;
+                CHECK(sscanf(hex + 2 * i, "%2x", &b) == 1);
+                cell[i] = (uint8_t)b;
+            }
+            for (unsigned long long i = 0; i < count; i++) memcpy((void *)(uintptr_t)(HEAP + at + n * i), cell, n);
+            continue;
+        }
+        if (line[0] == 'D') {
+            unsigned long long off;
+            CHECK(sscanf(line, "D %llx", &off) == 1);
+            Cpu p;
+            memset(&p, 0, sizeof p);
+            p.x[0] = MB + off, p.x[1] = 0x1000, p.x[2] = 0;   // SetMemoryPermission(addr, size, None)
+            rt_svc(&p, 0x02, 0);
+            CHECK(p.x[0] == 0);
             continue;
         }
         CHECK(sscanf(line, "%llu %llu %llx %d %d %d %d", &tick, &reads, &buttons, &lx, &ly, &rx, &ry) == 7);

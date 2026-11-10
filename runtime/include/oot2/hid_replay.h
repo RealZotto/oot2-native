@@ -54,8 +54,9 @@
 //              int, uint, float or string. Either case. No name of the game's is in this program or in this file.
 //     <op>     == != < <= > >=; a string takes only == and !=
 //     <value>  by the role's kind: a bool is 0, 1, true or false; an int is a whole number from -2147483648 to 2147483647,
-//              a uint one from 0 to 4294967295; a float a decimal number (sign, digits, point, exponent); a string one word
-//              of at most 63 characters, compared exactly with the store's string (cut at 63 characters)
+//              a uint one from 0 to 4294967295; a float a decimal number (sign, digits, point, exponent), rounded to a
+//              single float as the store holds one; a string one word of at most 63 characters, compared exactly with
+//              the store's string (cut at 63 characters)
 //     after    optional: whole ticks, 0 to 4294967295, from the tick the value was met to the first tick of the stretch
 //     for ...  the count and the held items are those of an `at` line
 // The value is looked at once per tick, at the tick's first read, from the first read of the file: the first tick at which

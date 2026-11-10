@@ -22,7 +22,7 @@
 #define MAX_PROBES 1048576u   // cells one probe may visit: a capacity read from memory the description does not fit is not trusted
 
 typedef struct Module {
-    uint32_t table, capacity, count, entries, stride, value, index;
+    uint32_t table, capacity, count, entries, stride, value, key, index;
     char cls;
     uint8_t shift;
 } Module;
@@ -102,25 +102,30 @@ int store_load(const char *path, char *why, size_t why_size) {
         p = next;
         if (nw == 0 || w[0][0] == '#') continue;
         if (!have_header) {
-            if (nw != 2 || strcmp(w[0], "oot2-store") || strcmp(w[1], "1"))
-                return fail(why, why_size, "the store description %s is not a file of this format (its first line is not `oot2-store 1`)", path);
+            if (nw == 2 && !strcmp(w[0], "oot2-store") && !strcmp(w[1], "1"))
+                return fail(why, why_size, "the store description %s is of format 1, which took the key to be at the start of a cell and is no longer read; run `oot2 prepare --names FILE` again", path);
+            if (nw != 2 || strcmp(w[0], "oot2-store") || strcmp(w[1], "2"))
+                return fail(why, why_size, "the store description %s is not a file of this format (its first line is not `oot2-store 2`)", path);
             have_header = 1;
             continue;
         }
-        uint64_t v[9];
+        uint64_t v[10];
         if (!strcmp(w[0], "build") && nw == 2 && hex_digits(w[1], 64, build)) {
             have_build = 1;
         } else if (!strcmp(w[0], "cell") && nw == 2 && number(w[1], UINT32_MAX, &cell_off)) {
             have_cell = 1;
-        } else if (!strcmp(w[0], "module") && nw == 10 && strlen(w[7]) == 1 && strchr("bhwxsd", w[7][0])) {
+        } else if (!strcmp(w[0], "module") && nw == 11 && strlen(w[7]) == 1 && strchr("bhwxsd", w[7][0])) {
             if (g_nmod == MAX_MODULES) return fail(why, why_size, "the store description %s, line %d: more than %d tables", path, line, MAX_MODULES);
             int ok = 1;
             for (int i = 0; i < 6; i++) ok &= number(w[1 + i], UINT32_MAX, &v[i]);
-            ok &= number(w[8], 6, &v[7]) && number(w[9], UINT32_MAX, &v[8]);
+            ok &= number(w[8], 6, &v[7]) && number(w[9], UINT32_MAX, &v[8]) && number(w[10], UINT32_MAX, &v[9]);
             if (!ok) return fail(why, why_size, "the store description %s, line %d: a table line with a bad number", path, line);
+            uint64_t cell_size = 1ull << v[7];   // a 32-bit key and a 32-bit entry number, in two places of the cell
+            if (v[8] + 4 > cell_size || v[9] + 4 > cell_size || (v[8] < v[9] ? v[8] + 4 > v[9] : v[9] + 4 > v[8]))
+                return fail(why, why_size, "the store description %s, line %d: a table whose cell cannot hold its key and entry number", path, line);
             g_mod[g_nmod++] = (Module){.table = (uint32_t)v[0], .capacity = (uint32_t)v[1], .count = (uint32_t)v[2],
                                        .entries = (uint32_t)v[3], .stride = (uint32_t)v[4], .value = (uint32_t)v[5],
-                                       .cls = w[7][0], .shift = (uint8_t)v[7], .index = (uint32_t)v[8]};
+                                       .cls = w[7][0], .shift = (uint8_t)v[7], .key = (uint32_t)v[8], .index = (uint32_t)v[9]};
         } else if (!strcmp(w[0], "role") && nw == 4) {
             int kind = -1;
             for (int i = 0; i < 5; i++)
@@ -167,7 +172,10 @@ int store_role(const char *name) {
 enum { G_OK, G_WAIT, G_BAD };
 
 // n bytes at a guest address, only if the runtime has them committed. An address that lies in no guest region is G_BAD, one
-// in a region that is not committed (or the null address) G_WAIT.
+// in a region that is not committed (or the null address) G_WAIT. The page map is read without a lock, so a page that is
+// decommitted between the check and the copy faults in the copy: the runtime's fault path then stops by name, and the
+// replay's stop path does not wait for the lock this thread holds (hid_replay.c, g_inside). The commit epoch
+// (oot2/memory.h) cannot close that window: it tells that the map has changed after the fact, not before the copy faults.
 static int guest(uint64_t addr, void *dst, size_t n) {
     if (addr == 0) return G_WAIT;
     int committed = 0;
@@ -216,9 +224,10 @@ static StoreRead lookup(Ctx *c, uint64_t obj, const Module *m, const Role *r, St
     GET(c, obj + m->entries, entries);
     uint32_t pos = r->hash % cap;
     int found = 0;
+    // at most one round of the table, and never more than MAX_PROBES cells: the capacity is read from memory
     for (uint32_t i = 0; i < cap && i < MAX_PROBES; i++) {
         cell = table + ((uint64_t)pos << m->shift);
-        GET(c, cell, key);
+        GET(c, cell + m->key, key);
         if (key == r->hash) {
             GET(c, cell + m->index, idx);
             found = 1;
