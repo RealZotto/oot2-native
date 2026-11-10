@@ -13,6 +13,8 @@ environment, as in a run of the game.
 - frames: a worker's 30 ms of CPU between acquire and present lands in the frame
   line of that present and not the next one; the submitting and presenting
   thread are named; the header, the title mark and the closing record.
+- gap: a worker that holds its virtual core for 30 ms without running shows in the "gap" line of its thread (core time
+  less CPU time over the frames, summed and the largest), which always equals what the frame lines give.
 - stop70, stop71, stop72, exitprocess, census73: the closing record is written
   on every stop path, with the exit code and its reason.
 - length: the run ends by itself at the capture's length, exit code 0; memory,
@@ -111,6 +113,50 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual((cap.end.code, cap.end.reason), (code, reason))
         self.assertTrue(path.read_bytes().endswith(b"\n"))
 
+    def assert_gaps_match_frames(self, path: Path, cap: cc.Capture) -> dict[int, tuple[int, int, int]]:
+        """The "gap" lines (handle entry frames sum_ns max_ns), one per thread and before the closing record, against the
+        same numbers worked out from the frame lines: per frame, the core time less the CPU time, 0 when negative."""
+        lines = [x.split("\t") for x in path.read_text().splitlines()]
+        kinds = [x[0] for x in lines]
+        gaps = [x for x in lines if x[0] == "gap"]
+        self.assertTrue(gaps)
+        self.assertLess(max(i for i, k in enumerate(kinds) if k == "gap"), kinds.index("end"))
+        got = {(int(x[1], 16), int(x[2], 16)): tuple(int(v) for v in x[3:6]) for x in gaps}
+        self.assertEqual(len(got), len(gaps))
+        want: dict[int, list[int]] = {}
+        for f in cap.frames:
+            for handle, (cpu, core) in f.threads.items():
+                gap = max(core - cpu, 0)
+                w = want.setdefault(handle, [0, 0, 0])
+                w[0] += 1
+                w[1] += gap
+                w[2] = max(w[2], gap)
+        self.assertEqual({h for h, _ in got}, set(want))
+        self.assertEqual({h for h in cap.threads}, set(want))
+        for (handle, entry), numbers in got.items():
+            self.assertEqual(entry, cap.threads[handle][0])
+            self.assertEqual(list(numbers), want[handle], hex(handle))
+        return {h: tuple(v) for h, v in want.items()}
+
+    def test_a_thread_that_holds_its_core_without_running_shows_in_its_gap_line(self) -> None:
+        for level in nvn.LEVELS:
+            with self.subTest(level=level):
+                done, folder = self.run_case(level, "gap", {"OOT2_CAPTURE_TITLE": "3"})
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("ok gap\n", done.stdout)
+                worker = int(re.search(r"^worker handle (0x[0-9a-f]+)$", done.stdout, re.M).group(1), 16)
+                path, cap = self.capture(folder)
+                self.assert_closed(path, cap, 0, "exit")
+                gaps = self.assert_gaps_match_frames(path, cap)
+                frames, total, largest = gaps[worker]
+                self.assertGreaterEqual(frames, 2)
+                self.assertGreaterEqual(largest, 20 * MS)    # a hold of 30 ms, in one frame
+                self.assertGreaterEqual(total, 2 * 20 * MS)  # two of them
+                for burn in (5, 8):   # the worker held its core in frames 4 and 7 (presents 5 and 8) and ran in neither
+                    cpu, core = cap.frames[burn - 1].threads[worker]
+                    self.assertEqual(cap.frames[burn - 1].seq, burn)
+                    self.assertGreaterEqual(core - cpu, 20 * MS)
+
     def test_a_threads_time_lands_in_the_frame_it_was_spent_in(self) -> None:
         for level in nvn.LEVELS:
             with self.subTest(level=level):
@@ -137,6 +183,7 @@ class CaptureTest(unittest.TestCase):
                     self.assertLess(cpu[quiet][0], 10 * MS, f"present {quiet}: {cpu}")
                 self.assertIn(worker, cap.threads)
                 self.assertIn(game, cap.threads)
+                self.assert_gaps_match_frames(path, cap)
                 h = cap.header
                 self.assertEqual((h["back_end"], h["census_mode"], h["title_mark_present"]), ("null", "0", "3"))
                 self.assertEqual(h["driver"], "none (null back end)")

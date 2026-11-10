@@ -13,6 +13,9 @@
 //           acquire and present of frames 4 and 7 (presents 5 and 8), and sleeps 5 ms at a time otherwise (a sleep of
 //           1 ms or less spins in the kernel and would burn CPU): the capture must put the burn in the frame lines of
 //           presents 5 and 8, not 6 and 9.
+// gap      as frames, but the worker holds its virtual core for 30 ms in frames 4 and 7 without running (a sleep of the host
+//           thread, which keeps the core): its core time is 30 ms and its CPU time near 0, so the "gap" line of the
+//           worker, the core time less the CPU time summed over the frames, shows the two holds.
 // stop70, stop71, stop72, exitprocess, census73
 //           three presents on the host's clock, then a fatal, a named fatal, a guest stop, ExitProcess, or the census
 //           frame limit: the closing record must still be the file's last line.
@@ -128,6 +131,7 @@ static void frame(Cpu *t, uint64_t k) {
 // ---- frames: the worker burns CPU on request, and sleeps otherwise
 #define FRAMES 10
 static uint64_t W_BURN, W_BURNED, W_DONE;   // atomic: the frame number + 1 to burn in, the last one burned, the end
+static int g_hold_core;                     // burn by holding the virtual core without running
 static void g_worker(Cpu *t) {
     printf("worker handle %#x\n", rt_kernel_current());
     while (!ld_acq(&W_DONE)) {
@@ -135,8 +139,10 @@ static void g_worker(Cpu *t) {
         if (want > ld_acq(&W_BURNED)) {
             uint64_t c0 = plat_thread_cpu_ns(NULL);
             volatile uint64_t x = 1;
-            while (plat_thread_cpu_ns(NULL) - c0 < 30 * MS)
-                for (int i = 0; i < 10000; i++) x = x * 6364136223846793005ull + 1;
+            if (g_hold_core) plat_sleep_ns(30 * MS);   // the core stays with this thread, which does not run
+            else
+                while (plat_thread_cpu_ns(NULL) - c0 < 30 * MS)
+                    for (int i = 0; i < 10000; i++) x = x * 6364136223846793005ull + 1;
             st_rel(&W_BURNED, want);
         } else {
             guest_sleep(t, 5 * MS);   // longer than the kernel's spin threshold (1 ms on Windows): a timer sleep, no CPU
@@ -400,7 +406,8 @@ int main(int argc, char **argv) {
     CHECK(plat_thread_start(watchdog, NULL, 1ull << 20));
     const char *cs = argv[1];
     g_folder = argv[2];
-    if (!strcmp(cs, "frames")) {
+    if (!strcmp(cs, "frames") || !strcmp(cs, "gap")) {
+        g_hold_core = !strcmp(cs, "gap");
         g_handshake = 1;
         objects(NULL, 1);
         CHECK(plat_thread_start(driver_frames, NULL, 1ull << 20));

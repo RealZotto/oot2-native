@@ -36,6 +36,13 @@
 //                                      frame is not zero (rt_kernel_thread_times; a thread missing from the line had
 //                                      none). The submitter's core time is the render thread's busy time.
 //   thread  handle entry priority      the first time a thread shows in a frame line
+//   gap     handle entry frames sum_ns max_ns
+//                                      one per thread, just before the closing record: over the frames the thread was
+//                                      listed in (frames), the time it held a virtual core without CPU time to run on,
+//                                      the core time less the CPU time of each frame (0 for a frame with more CPU than
+//                                      core), summed and its largest: a thread that waits holding its core shows
+//                                      here, and one that runs or gives its core up is near 0. The frame lines hold the
+//                                      same two numbers a frame at a time.
 //   shown   seq tick                   a shown tick the back end reported after the present line was written
 //   title   seq t skipped shader pipeline raw faults
 //                                      the title mark, with the counters below as they stood at it

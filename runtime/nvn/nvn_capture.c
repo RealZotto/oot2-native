@@ -63,6 +63,12 @@ static int g_nnotes;
 static uint32_t g_seen[MAX_SEEN];                 // g_frame
 static uint64_t g_seen_entry[MAX_SEEN];
 static int g_nseen;
+// Per thread, as g_seen: over the frames it was listed in, the time it held a core without a CPU to run on, core less CPU
+// (a frame with more CPU than core counts 0). Written with the frame lines, read for the "gap" lines at the end (g_data).
+typedef struct {
+    uint64_t frames, sum_ns, max_ns;
+} Gap;
+static Gap g_gap[MAX_SEEN];
 static RtThreadTime g_tt[MAX_THREADS];            // g_frame
 static uint64_t g_threads_over;                   // g_frame
 static uint64_t g_shown_slot[SHOWN_LAG];          // g_frame: slot seq % SHOWN_LAG holds seq once its shown tick is out
@@ -260,6 +266,11 @@ void capture_end(int code) {
     plat_mutex_lock(&g_data);
     if (g_lost) header_u("lost_bytes", g_lost);   // said before the end, which stays the last line
     if (over) header_u("frames_with_threads_unlisted", over);
+    for (int i = 0; i < g_nseen; i++) {   // before the end, which stays the last line
+        l_str(&g_l, "gap"), l_tab(&g_l), l_x(&g_l, g_seen[i]), l_tab(&g_l), l_x(&g_l, g_seen_entry[i]),
+            l_t(&g_l, g_gap[i].frames), l_t(&g_l, g_gap[i].sum_ns), l_t(&g_l, g_gap[i].max_ns);
+        append(&g_l);
+    }
     l_str(&g_l, "end"), l_tab(&g_l), l_i(&g_l, code), l_tab(&g_l), l_str(&g_l, reason(code)), l_t(&g_l, g_last_seq),
         l_t(&g_l, since(now)), l_t(&g_l, (uint64_t)fatal), l_counters(&g_l, c), l_mem(&g_l, &m), l_cost(&g_l);
     append(&g_l);
@@ -386,11 +397,14 @@ void capture_submit(void) {
 }
 
 // ---------- a present: the frame that ends with it
-static int seen(uint32_t h, uint64_t entry) {   // g_frame held
+// The index of the thread in the table of those seen, or -1 when the table is full; *fresh says it was added now.
+static int seen_at(uint32_t h, uint64_t entry, int *fresh) {   // g_frame and g_data held
     for (int i = 0; i < g_nseen; i++)
-        if (g_seen[i] == h && g_seen_entry[i] == entry) return 1;
-    if (g_nseen < MAX_SEEN) g_seen[g_nseen] = h, g_seen_entry[g_nseen++] = entry;
-    return 0;
+        if (g_seen[i] == h && g_seen_entry[i] == entry) return *fresh = 0, i;
+    *fresh = 1;
+    if (g_nseen == MAX_SEEN) return -1;
+    g_seen[g_nseen] = h, g_seen_entry[g_nseen] = entry;
+    return g_nseen++;
 }
 
 // The shown ticks the back end reported since the presents were written, for the last SHOWN_LAG presents before seq.
@@ -449,12 +463,19 @@ void capture_present(uint64_t seq) {
             frame_ns = now - g_prev_t;
         }
         g_have_prev = 1, g_prev_t = now, g_prev_due = r.due, g_last_seq = seq;
-        for (int i = 0; i < n; i++)
-            if ((g_tt[i].cpu_ns || g_tt[i].core_ns) && !seen(g_tt[i].handle, g_tt[i].entry)) {
+        for (int i = 0; i < n; i++) {
+            if (!g_tt[i].cpu_ns && !g_tt[i].core_ns) continue;
+            int fresh, k = seen_at(g_tt[i].handle, g_tt[i].entry, &fresh);
+            if (fresh) {
                 l_str(&g_l, "thread"), l_tab(&g_l), l_x(&g_l, g_tt[i].handle), l_tab(&g_l), l_x(&g_l, g_tt[i].entry),
                     l_tab(&g_l), l_i(&g_l, g_tt[i].priority);
                 append(&g_l);
             }
+            if (k < 0) continue;
+            uint64_t gap = g_tt[i].core_ns > g_tt[i].cpu_ns ? g_tt[i].core_ns - g_tt[i].cpu_ns : 0;
+            g_gap[k].frames++, g_gap[k].sum_ns += gap;
+            if (gap > g_gap[k].max_ns) g_gap[k].max_ns = gap;
+        }
         l_str(&g_l, "present"), l_t(&g_l, seq), l_t(&g_l, t), l_t(&g_l, r.due), l_t(&g_l, r.shown), l_tab(&g_l),
             l_i(&g_l, r.requested), l_tab(&g_l), l_i(&g_l, r.held), l_t(&g_l, frame_ns), l_t(&g_l, late);
         append(&g_l);
