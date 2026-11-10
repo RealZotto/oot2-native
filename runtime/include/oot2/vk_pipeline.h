@@ -134,8 +134,31 @@ VkpCacheState vkp_cache_state(void);
 // made with shaderZeroInitializeWorkgroupMemory), else 0. After vkp_open. The pipeline builder says it in its ready line.
 int vkp_zero_workgroup(void);
 // Write the cache to the path vkp_open was given, through a temporary file and a rename, so that an interrupted write
-// leaves the old file whole. 1, or 0 with the reason in why.
+// leaves the old file whole; the folder the file is in is made when it is not there. A Vulkan failure is reported in
+// why and never stops the run (this runs at the stop of a run too). 1, or 0 with the reason in why. It is refused by name
+// once vkp_cache_flush has swapped the cache for an empty one: what the cache holds then is only what was built since
+// that flush, and writing it would replace the whole file (the seed a builder was started from) with that part.
 int vkp_cache_save(char *why, size_t cap);
+
+// The game saves the cache it built by itself, so that the next run starts warm (the game folder's pipelines/pipeline.cache
+// is read at launch, gpu_vk_open_game): at every stop of the run (an exit through rt_run_stop_hook: a guest ExitProcess,
+// the window's close, every named stop with exits 70 to 73), and every `seconds` seconds for a run that is ended from
+// outside (the timer needs no stop). A save is made only when the cache grew since it was loaded or last saved, never
+// while another save runs, and a stop that finds the timer's save running waits for it. A save that fails or is refused is
+// logged by name and the run stops all the same. What it holds beyond prepare's own output: the task and mesh pipelines
+// and the padded vertex libraries, which are known only from play.
+//   OOT2_VK_CACHE_SAVE          on (the default) or off: no save at all, for a measurement of a cold start
+//   OOT2_VK_CACHE_SAVE_SECONDS  whole seconds from 0 to 86400, default 120; 0: no timer, saves at the stop only
+// A value outside these stops the start by name (gpu_vk_open_game).
+typedef struct VkpSaveSettings {
+    int enabled;
+    uint32_t seconds;
+} VkpSaveSettings;
+// The settings for these values of the two variables (NULL or "" for one not set): 1 with *out filled, or 0 with the
+// reason in why.
+int vkp_save_settings(const char *save, const char *seconds, VkpSaveSettings *out, char *why, size_t cap);
+// Start the saves above for the cache vkp_open was given a path for: once, after vkp_open. vkp_close ends the timer.
+void vkp_cache_autosave_start(const VkpSaveSettings *settings);
 // Write the cache's data to path (a temporary file and a rename), then replace the cache with an empty one, so that
 // each flush holds only what was built since the last: prepare's pipeline step keeps one such file per batch and merges
 // them at the end (a cache that grew by every flush would be written again and again). *bytes, when not NULL, is the

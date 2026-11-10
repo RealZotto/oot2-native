@@ -11,12 +11,14 @@
 // finds it being made waits for the thread making it, and one that finds nothing makes it with the lock released, so
 // builds run in parallel. Objects are not evicted: what stays resident is what callers ask for (the pipeline cost study:
 // 20,000 resident pipelines held 7.6 GB), and vkp_release lets a stage's objects go.
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
+#include <direct.h>
 #include <io.h>
 #include <windows.h>
 // 64-bit file offsets and a flush to the disk: a pipeline cache of a whole game passes 2 GiB, which a 32-bit `long`
@@ -25,6 +27,7 @@
 #define OFF_TELL _ftelli64
 #define SYNC_FILE(f) _commit(_fileno(f))
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #define OFF_SEEK fseeko
 #define OFF_TELL ftello
@@ -71,6 +74,7 @@ static struct {
     VkPipeline vi;                 // the vertex input interface library, the same for every pipeline
     VkpCacheState cache_state;
     char cache_path[512];
+    int flushed;                   // vkp_cache_flush swapped the cache for an empty one: a save would write a part of it
     VkcList caps;
     int zero_workgroup;            // the device was made with zero-initialized workgroup memory (an optional feature)
     PlatMutex lock;
@@ -900,6 +904,7 @@ static void *read_whole(const char *path, size_t *size) {
 static void cache_open(const char *path) {
     void *data = NULL;
     size_t size = 0;
+    uint64_t t0 = plat_now_ns();
     P.cache_state = VKP_CACHE_NONE;
     if (path) {
         snprintf(P.cache_path, sizeof P.cache_path, "%s", path);
@@ -924,21 +929,72 @@ static void cache_open(const char *path) {
                                     .pInitialData = data};
     GPU_VK_OK(vkCreatePipelineCache(gpu_vk.device, &ci, NULL, &P.cache), "vkCreatePipelineCache");
     free(data);
-    if (P.cache_state == VKP_CACHE_LOADED) rt_log("gfx: vulkan: the pipeline cache %s seeds %zu bytes", path, size);
+    // The load is the file read whole into memory and handed to the driver: what a launch pays for a big cache.
+    if (P.cache_state == VKP_CACHE_LOADED)
+        rt_log("gfx: vulkan: the pipeline cache %s seeds %zu bytes (loaded in %.0f ms)", path, size,
+               (double)(plat_now_ns() - t0) / 1e6);
+}
+
+// The folder a file is in, made when it is not there (one level: a junction's target is the caller's to have made).
+static void make_parent(const char *path) {
+    char dir[sizeof P.cache_path + 8];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *slash = NULL;
+    for (char *c = dir; *c; c++)
+        if (*c == '/' || *c == '\\') slash = c;
+    if (!slash || slash == dir) return;
+    *slash = 0;
+#ifdef _WIN32
+    (void)_mkdir(dir);
+#else
+    (void)mkdir(dir, 0777);
+#endif
+}
+
+// The cache's data into a buffer of its own. Another thread may be creating pipelines with the cache while this reads
+// it (the save at a stop, or the timer's), so the size asked for first can be outgrown by the second call, which then
+// says VK_INCOMPLETE and has written a part: the buffer is made larger than the size asked for, and a part is read again.
+// *size is the bytes read; NULL, with the reason in why, when the driver or the memory fails.
+static void *cache_data(VkPipelineCache cache, size_t *size, int fatal, char *why, size_t cap) {
+    for (int tries = 0; tries < 4; tries++) {
+        size_t asked = 0;
+        VkResult r = vkGetPipelineCacheData(gpu_vk.device, cache, &asked, NULL);
+        if (r != VK_SUCCESS) {
+            if (fatal) gpu_vk_failed(r, "vkGetPipelineCacheData");
+            if (why && cap) snprintf(why, cap, "vkGetPipelineCacheData failed: %s", gpu_vk_result_name(r));
+            return NULL;
+        }
+        size_t room = asked + asked / 16 + (1u << 20);
+        void *data = malloc(room);
+        if (!data) {
+            if (why && cap) snprintf(why, cap, "out of memory for %zu bytes of cache", room);
+            return NULL;
+        }
+        size_t got = room;
+        r = vkGetPipelineCacheData(gpu_vk.device, cache, &got, data);
+        if (r == VK_SUCCESS) {
+            *size = got;
+            return data;
+        }
+        free(data);
+        if (r != VK_INCOMPLETE) {
+            if (fatal) gpu_vk_failed(r, "vkGetPipelineCacheData");
+            if (why && cap) snprintf(why, cap, "vkGetPipelineCacheData failed: %s", gpu_vk_result_name(r));
+            return NULL;
+        }
+    }
+    if (why && cap) snprintf(why, cap, "the cache kept growing while it was read");
+    return NULL;
 }
 
 // The cache's data written to path through a temporary file and a rename, so that an interrupted write leaves the old
-// file whole; *bytes (when not NULL) is its size.
-static int cache_write(VkPipelineCache cache, const char *path, size_t *bytes, char *why, size_t cap) {
+// file whole; *bytes (when not NULL) is its size. A Vulkan failure is a named fatal when `fatal` (the builder's flush),
+// else it is the reason in why (a save, which also runs at a stop, where a second fatal would end the run before the
+// stop hook).
+static int cache_write(VkPipelineCache cache, const char *path, size_t *bytes, int fatal, char *why, size_t cap) {
     size_t size = 0;
-    GPU_VK_OK(vkGetPipelineCacheData(gpu_vk.device, cache, &size, NULL), "vkGetPipelineCacheData");
-    void *data = malloc(size ? size : 1);
-    if (!data) {
-        if (why && cap) snprintf(why, cap, "out of memory for %zu bytes of cache", size);
-        return 0;
-    }
-    VkResult r = vkGetPipelineCacheData(gpu_vk.device, cache, &size, data);
-    if (r != VK_SUCCESS && r != VK_INCOMPLETE) gpu_vk_failed(r, "vkGetPipelineCacheData");
+    void *data = cache_data(cache, &size, fatal, why, cap);
+    if (!data) return 0;
     char tmp[sizeof P.cache_path + 8];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
@@ -965,12 +1021,24 @@ static int cache_write(VkPipelineCache cache, const char *path, size_t *bytes, c
     return 1;
 }
 
+static size_t g_saved_bytes;   // what the cache held when it was loaded, or when it was last saved (the growth a save looks for)
+
 int vkp_cache_save(char *why, size_t cap) {
     if (!P.open || !P.cache_path[0]) {
         if (why && cap) snprintf(why, cap, "no pipeline cache file was named");
         return 0;
     }
-    return cache_write(P.cache, P.cache_path, NULL, why, cap);
+    if (__atomic_load_n(&P.flushed, __ATOMIC_ACQUIRE)) {
+        if (why && cap)
+            snprintf(why, cap, "the cache was flushed to a segment (vkp_cache_flush), so it holds only what was built since "
+                               "and a save would replace %s with that part", P.cache_path);
+        return 0;
+    }
+    make_parent(P.cache_path);
+    size_t bytes = 0;
+    if (!cache_write(P.cache, P.cache_path, &bytes, 0, why, cap)) return 0;
+    g_saved_bytes = bytes;
+    return 1;
 }
 
 int vkp_cache_flush(const char *path, size_t *bytes, char *why, size_t cap) {
@@ -982,14 +1050,162 @@ int vkp_cache_flush(const char *path, size_t *bytes, char *why, size_t cap) {
         if (why && cap) snprintf(why, cap, "the path %s is too long", path);
         return 0;
     }
-    if (!cache_write(P.cache, path, bytes, why, cap)) return 0;
-    // From here on the cache holds what is built after this call and nothing else: the next flush writes a delta.
+    if (!cache_write(P.cache, path, bytes, 1, why, cap)) return 0;
+    // From here on the cache holds what is built after this call and nothing else: the next flush writes a delta, and a
+    // save (vkp_cache_save) is refused, since it would write that delta over the whole file.
+    __atomic_store_n(&P.flushed, 1, __ATOMIC_RELEASE);
     VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     VkPipelineCache fresh;
     GPU_VK_OK(vkCreatePipelineCache(gpu_vk.device, &ci, NULL, &fresh), "vkCreatePipelineCache");
     vkDestroyPipelineCache(gpu_vk.device, P.cache, NULL);
     P.cache = fresh;
     return 1;
+}
+
+// ---------- the cache saves itself (oot2/vk_pipeline.h, "The game saves the cache it built by itself")
+
+#define SAVE_SECONDS_DEFAULT 120u
+#define SAVE_SECONDS_MAX 86400u
+#define STOP_WAIT_NS 20000000000ull   // a stop waits this long for the timer's save before it gives up on its own
+#define TIMER_STACK (1ull << 20)
+
+static struct {
+    int started, writer_added, stops;
+    uint64_t every_ns;           // the timer's period; 0: no timer
+    int saving;                  // one save at a time (atomic)
+    PlatMutex lock;              // the timer thread's wait
+    PlatCond cond;
+    int thread_stop, thread_running;
+} S = {.lock = PLAT_MUTEX_INIT, .cond = PLAT_COND_INIT};
+
+int vkp_save_settings(const char *save, const char *seconds, VkpSaveSettings *out, char *why, size_t cap) {
+    out->enabled = 1;
+    out->seconds = SAVE_SECONDS_DEFAULT;
+    if (save && *save) {
+        if (!strcmp(save, "off")) out->enabled = 0;
+        else if (strcmp(save, "on")) {
+            snprintf(why, cap, "OOT2_VK_CACHE_SAVE is \"%s\"; the values are on and off", save);
+            return 0;
+        }
+    }
+    if (seconds && *seconds) {
+        char *end;
+        errno = 0;
+        unsigned long v = strtoul(seconds, &end, 10);
+        if (*seconds < '0' || *seconds > '9' || *end || errno || v > SAVE_SECONDS_MAX) {
+            snprintf(why, cap, "OOT2_VK_CACHE_SAVE_SECONDS is \"%s\"; the values are whole seconds from 0 to %u (0: no timer)",
+                     seconds, SAVE_SECONDS_MAX);
+            return 0;
+        }
+        out->seconds = (uint32_t)v;
+    }
+    return 1;
+}
+
+// One save for `when` ("the stop (exit 70)", "the timer"). A stop is `stopping`: it waits for a save in progress, the timer
+// skips its round. Nothing here stops the run: every outcome is a log line, and only a save that wrote something or was
+// refused or failed says so (a round of the timer with nothing new is silent).
+static void autosave(const char *when, int stopping) {
+    if (!__atomic_load_n(&S.started, __ATOMIC_ACQUIRE) || !P.open || !P.cache_path[0]) return;
+    for (uint64_t waited = 0; __atomic_exchange_n(&S.saving, 1, __ATOMIC_ACQ_REL); waited += 10000000ull) {
+        if (!stopping) return;
+        if (waited >= STOP_WAIT_NS) {
+            rt_log("gfx: vulkan: the pipeline cache was not saved at %s: a save was still running after %.0f s", when,
+                   (double)STOP_WAIT_NS / 1e9);
+            return;
+        }
+        plat_sleep_ns(10000000ull);
+    }
+    uint64_t t0 = plat_now_ns();
+    char why[512] = "";
+    size_t now = 0, before = g_saved_bytes;
+    VkResult r = vkGetPipelineCacheData(gpu_vk.device, P.cache, &now, NULL);
+    if (__atomic_load_n(&P.flushed, __ATOMIC_ACQUIRE)) {
+        vkp_cache_save(why, sizeof why);   // refused by name
+        rt_log("gfx: vulkan: the pipeline cache was NOT saved at %s: %s", when, why);
+    } else if (r != VK_SUCCESS) {
+        rt_log("gfx: vulkan: the pipeline cache was NOT saved at %s: vkGetPipelineCacheData failed: %s", when,
+               gpu_vk_result_name(r));
+    } else if (now == g_saved_bytes) {
+        if (stopping)
+            rt_log("gfx: vulkan: the pipeline cache is not saved at %s: it holds %zu bytes, as when it was loaded or last saved",
+                   when, now);
+    } else if (vkp_cache_save(why, sizeof why)) {
+        rt_log("gfx: vulkan: the pipeline cache was saved to %s at %s: %zu bytes (%zu when loaded or last saved) in %.0f ms",
+               P.cache_path, when, g_saved_bytes, before, (double)(plat_now_ns() - t0) / 1e6);
+    } else {
+        rt_log("gfx: vulkan: the pipeline cache was NOT saved at %s: %s", when, why);
+    }
+    __atomic_store_n(&S.saving, 0, __ATOMIC_RELEASE);
+}
+
+static void stop_writer(int code, const char *line) {
+    (void)line;
+    if (!S.stops) return;
+    char when[64];
+    snprintf(when, sizeof when, "the stop (exit %d)", code);
+    autosave(when, 1);
+}
+
+static void timer_main(void *arg) {
+    (void)arg;
+    plat_mutex_lock(&S.lock);
+    uint64_t next = plat_now_ns() + S.every_ns;
+    while (!S.thread_stop) {
+        uint64_t now = plat_now_ns();
+        if (now < next) {
+            plat_cond_wait_ns(&S.cond, &S.lock, next - now);
+            continue;
+        }
+        plat_mutex_unlock(&S.lock);
+        autosave("the timer", 0);
+        plat_mutex_lock(&S.lock);
+        next = plat_now_ns() + S.every_ns;
+    }
+    S.thread_running = 0;
+    plat_cond_broadcast(&S.cond);
+    plat_mutex_unlock(&S.lock);
+}
+
+void vkp_cache_autosave_start(const VkpSaveSettings *settings) {
+    if (S.started || !P.open || !P.cache_path[0]) return;
+    if (!settings->enabled) {
+        rt_log("gfx: vulkan: OOT2_VK_CACHE_SAVE off: the pipeline cache is not saved");
+        return;
+    }
+    size_t base = 0;
+    if (vkGetPipelineCacheData(gpu_vk.device, P.cache, &base, NULL) == VK_SUCCESS) g_saved_bytes = base;
+    S.stops = 1;
+    S.every_ns = (uint64_t)settings->seconds * 1000000000ull;
+    if (!S.writer_added) {
+        rt_add_stop_writer(stop_writer);
+        S.writer_added = 1;
+    }
+    __atomic_store_n(&S.started, 1, __ATOMIC_RELEASE);
+    int timer = 0;
+    if (S.every_ns) {
+        S.thread_stop = 0;
+        S.thread_running = 1;
+        timer = plat_thread_start(timer_main, NULL, TIMER_STACK) != NULL;
+        if (!timer) {
+            S.thread_running = 0;
+            rt_log("gfx: vulkan: the pipeline cache's timer could not start a thread: it is saved at the stop only");
+        }
+    }
+    if (timer) rt_log("gfx: vulkan: the pipeline cache is saved to %s at every stop and every %u s", P.cache_path, settings->seconds);
+    else rt_log("gfx: vulkan: the pipeline cache is saved to %s at every stop", P.cache_path);
+}
+
+// vkp_close: the timer ends first (a save in progress is waited for), so that nothing reads a cache that is destroyed.
+static void autosave_end(void) {
+    plat_mutex_lock(&S.lock);
+    S.thread_stop = 1;
+    plat_cond_broadcast(&S.cond);
+    while (S.thread_running) plat_cond_wait(&S.cond, &S.lock);
+    plat_mutex_unlock(&S.lock);
+    S.stops = 0;
+    S.every_ns = 0;
+    __atomic_store_n(&S.started, 0, __ATOMIC_RELEASE);
 }
 
 VkpCacheState vkp_cache_state(void) { return P.cache_state; }
@@ -1001,6 +1217,8 @@ int vkp_zero_workgroup(void) { return P.zero_workgroup; }
 void vkp_open(const char *cache_path) {
     if (P.open) return;
     if (!gpu_vk.device) rt_fatal("gfx: vulkan: vkp_open before gpu_vk_open");
+    P.flushed = 0;
+    g_saved_bytes = 0;
     vkp_layouts_create(&P.lay);
     vkc_list(&gpu_vk.facts, &P.caps);
     Oot2VkFacts en;
@@ -1015,6 +1233,7 @@ void vkp_open(const char *cache_path) {
 
 void vkp_close(void) {
     if (!P.open) return;
+    autosave_end();
     gpu_sync_finish();
     for (uint32_t b = 0; b < BUCKETS; b++) {
         for (Obj *o = P.tab[b], *next; o; o = next) {
@@ -1033,12 +1252,15 @@ void vkp_close(void) {
     P.vi = VK_NULL_HANDLE, P.cache = VK_NULL_HANDLE;
     P.cache_path[0] = 0;
     P.cache_state = VKP_CACHE_NONE;
+    P.flushed = 0;
     P.open = 0;
 }
 
 // The prepared folder's files, under the names tools/prepare writes: the translate step's base pack, the ledger step's
 // variants pack and full-ledger-digest map (either may be absent for older prepared folders), and the pipelines step's
-// cache (absent when the step was skipped, which leaves every first use a miss, served by oot2/vk_miss.h).
+// cache (absent when the step was skipped, which leaves every first use a miss, served by oot2/vk_miss.h). The run then
+// saves the cache it built into the same file (vkp_cache_autosave_start), so a folder nothing prepared is warm from its
+// second run.
 void gpu_vk_open_game(const char *folder) {
     char base[600], variants[600], variant_map[600], cache[600], why[512];
     if (snprintf(base, sizeof base, "%s/shaders/shader-base.bin", folder) >= (int)sizeof base ||
@@ -1046,6 +1268,9 @@ void gpu_vk_open_game(const char *folder) {
         snprintf(variant_map, sizeof variant_map, "%s/shaders/shader-variant-map.bin", folder) >= (int)sizeof variant_map ||
         snprintf(cache, sizeof cache, "%s/pipelines/pipeline.cache", folder) >= (int)sizeof cache)
         rt_fatal("gfx: vulkan: the game folder's path is too long: %s", folder);
+    VkpSaveSettings save;
+    if (!vkp_save_settings(getenv("OOT2_VK_CACHE_SAVE"), getenv("OOT2_VK_CACHE_SAVE_SECONDS"), &save, why, sizeof why))
+        rt_fatal("gfx: vulkan: %s", why);
     FILE *f = fopen(variants, "rb");
     FILE *m = fopen(variant_map, "rb");
     if (f) fclose(f);
@@ -1057,6 +1282,7 @@ void gpu_vk_open_game(const char *folder) {
            f ? variants : "", m ? " with " : " (no variant map)", m ? variant_map : "",
            P.cache_state == VKP_CACHE_LOADED ? "seeded" :
            P.cache_state == VKP_CACHE_NONE ? "empty (no file)" : "empty (refused)");
+    vkp_cache_autosave_start(&save);
 }
 
 const VkpLayouts *vkp_layouts(void) { return &P.lay; }

@@ -26,6 +26,7 @@
 //   optional                     the required list's ids and count, and for facts without and with the optional features:
 //                                the items the device has, the features enabled and whether capability 5309 is allowed
 //   cachejudge                   cache file headers judged for a device
+//   savesettings                 OOT2_VK_CACHE_SAVE and OOT2_VK_CACHE_SAVE_SECONDS judged: the settings, or the refusal
 //   store BASE VARIANTS KEY KIND SHAPE   a stage looked up in a pack of packs (VARIANTS "-" for none)
 //   storeopen BASE VARIANTS      the packs opened: "ok" or the refusal
 //   devbinds BASE KEY N          N stage records of one key asked for their bindings through the replay's device ops
@@ -43,6 +44,12 @@
 //                                device's workgroup memory with ones: it reads zeros
 //   synth_inflight PACK          a pipeline asked for with a submission in flight: a named fatal
 //   synth_cache PACK FILE PHASE  cold (build and save), warm (build from the file) or tamper (a driver change)
+//   synth_save FOLDER MODE [more]   a game folder opened the way the game opens it (gpu_vk_open_game: FOLDER/shaders/shader-base.bin,
+//                                FOLDER/pipelines/pipeline.cache), the pipelines made, and the run ended by MODE: fatal (a
+//                                named stop, exit 70), exit (the guest's ExitProcess, exit 0), kill (no stop hook, as a
+//                                process killed from outside), timer (waits for the cache's own timer to write the file,
+//                                then ends without a stop hook) or flushed (the cache flushed to a segment as a builder
+//                                does, a save refused, then a named stop); "more" makes one more compute pipeline
 //   synth_release PACK           a stage's objects released and made again
 //   synth_threads PACK           eight threads ask for one pipeline: it is made once
 //   synth_absent PACK            a stage the pack lacks: a named fatal with its shape
@@ -928,6 +935,68 @@ static void case_synth_cache(const char *pack, const char *file, const char *pha
     printf("ok synth_cache\n");
 }
 
+static void case_savesettings(void) {
+    static const struct { const char *save, *seconds; } t[] = {
+        {NULL, NULL}, {"", ""}, {"on", "0"}, {"off", "5"}, {"on", "86400"}, {NULL, "1"}, {"maybe", NULL}, {"On", NULL},
+        {NULL, "86401"}, {NULL, "-1"}, {NULL, "12x"}, {NULL, "1.5"}, {NULL, " 5"}, {NULL, "99999999999999999999"}};
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
+        VkpSaveSettings s;
+        char why[256];
+        const char *a = t[i].save ? t[i].save : "(unset)", *b = t[i].seconds ? t[i].seconds : "(unset)";
+        if (vkp_save_settings(t[i].save, t[i].seconds, &s, why, sizeof why))
+            printf("save [%s] [%s]: enabled %d seconds %u\n", a, b, s.enabled, (unsigned)s.seconds);
+        else
+            printf("save [%s] [%s]: refused: %s\n", a, b, why);
+    }
+    printf("ok savesettings\n");
+}
+
+static int file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+static void case_synth_save(const char *folder, const char *mode, int more) {
+    gpu_vk_open();
+    gpu_vk_open_game(folder);
+    printf("cache_state %d\n", (int)vkp_cache_state());
+    VkpStage vs = {.key = VS_KEY}, ps = {.key = PS_KEY}, cs = {.key = CS_KEY}, cs2 = {.key = CS2_KEY};
+    CHECK(vkp_graphics(&vs, NULL, &ps, &F32) && vkp_graphics(&vs, NULL, &ps, &F16) && vkp_compute(&cs));
+    if (more) CHECK(vkp_compute(&cs2));
+    print_stats("save");
+    fflush(stdout);
+    char path[1024];
+    snprintf(path, sizeof path, "%s/pipelines/pipeline.cache", folder);
+    if (!strcmp(mode, "fatal")) {
+        rt_fatal("synth_save: a named stop");
+    } else if (!strcmp(mode, "exit")) {
+        rt_run_stop_hook(0, "");
+        plat_exit(0);
+    } else if (!strcmp(mode, "kill")) {
+        _Exit(0);
+    } else if (!strcmp(mode, "timer")) {
+        uint64_t t0 = plat_now_ns();
+        while (!file_exists(path) && plat_now_ns() - t0 < 30000000000ull) plat_sleep_ns(50000000ull);
+        printf("the cache file %s after %.1f s\n", file_exists(path) ? "was there" : "never came",
+               (double)(plat_now_ns() - t0) / 1e9);
+        fflush(stdout);
+        plat_exit(0);   // no stop hook: only the timer can have written the file
+    } else if (!strcmp(mode, "flushed")) {
+        char seg[1024], why[256] = "";
+        snprintf(seg, sizeof seg, "%s/segment.bin", folder);
+        size_t bytes = 0;
+        CHECK(vkp_cache_flush(seg, &bytes, why, sizeof why));
+        printf("flushed %zu bytes\n", bytes);
+        CHECK(!vkp_cache_save(why, sizeof why));
+        printf("save refused: %s\n", why);
+        fflush(stdout);
+        rt_fatal("synth_save: a named stop after a flush");
+    }
+    printf("unknown mode %s\n", mode);
+    exit(2);
+}
+
 static void case_synth_release(const char *pack) {
     open_all(pack, NULL);
     VkpStage vs = {.key = VS_KEY}, ps = {.key = PS_KEY};
@@ -1286,6 +1355,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "capcheck") && argc >= 3) case_capcheck(argv[2], argc - 3, argv + 3);
     else if (!strcmp(cs, "optional")) case_optional();
     else if (!strcmp(cs, "cachejudge")) case_cachejudge();
+    else if (!strcmp(cs, "savesettings")) case_savesettings();
     else if (!strcmp(cs, "store") && argc >= 7) case_store(argv[2], argv[3], argv[4], argv[5], argv[6]);
     else if (!strcmp(cs, "storemap") && argc >= 9)
         case_storemap(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8], argc > 9 ? argv[9] : "");
@@ -1307,6 +1377,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(cs, "synth_zeroinit") && argc >= 3) case_synth_zeroinit(argv[2]);
         else if (!strcmp(cs, "synth_inflight") && argc >= 3) case_synth_inflight(argv[2]);
         else if (!strcmp(cs, "synth_cache") && argc >= 5) case_synth_cache(argv[2], argv[3], argv[4]);
+        else if (!strcmp(cs, "synth_save") && argc >= 4) case_synth_save(argv[2], argv[3], argc >= 5 && !strcmp(argv[4], "more"));
         else if (!strcmp(cs, "synth_release") && argc >= 3) case_synth_release(argv[2]);
         else if (!strcmp(cs, "synth_threads") && argc >= 3) case_synth_threads(argv[2]);
         else if (!strcmp(cs, "synth_absent") && argc >= 3) case_synth_absent(argv[2]);
