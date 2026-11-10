@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "oot2/gpu.h"
+#include "oot2/kernel.h"
 #include "oot2/runtime.h"
 #include "plat.h"
 
@@ -117,9 +118,18 @@ void gpu_sync_stop(void) {
 }
 
 uint64_t gpu_sync_begin(void) {
+    int token = 0;
     plat_mutex_lock(&g_lock);
     if (!g_running) rt_fatal("gpu: a submission while the completion thread is not running");
-    while (g_gate_busy) plat_cond_wait(&g_gate_free, &g_lock);
+    if (g_gate_busy) {
+        // The submission that holds the gate may be waiting for a virtual core (the recorder's begin gives its own up while
+        // it waits for an older frame, and takes one again before it goes on): a guest thread that waited here with its
+        // core would keep that core from it for ever. So it waits without one, and takes one again once the gate is its.
+        plat_mutex_unlock(&g_lock);
+        token = rt_kernel_block_begin();
+        plat_mutex_lock(&g_lock);
+        while (g_gate_busy) plat_cond_wait(&g_gate_free, &g_lock);
+    }
     g_gate_busy = 1;
     Sub *s = g_free;
     if (s) g_free = s->next;
@@ -131,6 +141,7 @@ uint64_t gpu_sync_begin(void) {
     s->value = value;
     s->n = 0;
     __atomic_store_n(&g_open, s, __ATOMIC_RELEASE);
+    rt_kernel_block_end(token);   // the submission is open before the core is waited for
     return value;
 }
 

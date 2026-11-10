@@ -7,10 +7,10 @@
 // frame's command buffer and submits it on the timeline (oot2/gpu_vk.h). The replay's thread time is then the walk of
 // the ops and the packing, which the pipeline cost study measured at a third less than recording itself.
 //
-// A frame is one submission: vkrec_begin waits until fewer than `frames` (2: section 6.1) frames are between their
+// A frame is one submission: vkrec_begin waits until fewer than `frames` (2 unless the setting frames_in_flight says more: section 6.1) frames are between their
 // begin and the device's completion, then takes the submission gate and the next timeline value (the fence value the
 // replay hands the guest), the vkrec_* calls write the frame's packets, and vkrec_end hands the frame over and returns at
-// once; the recorder submits it and opens the gate. So a third frame's begin waits for the first to be done, and any
+// once; the recorder submits it and opens the gate. So (with 2) a third frame's begin waits for the first to be done, and any
 // other submission (gpu_vk_begin from another thread) waits behind the frame being replayed, as before. Between the two
 // calls the replaying thread makes no other submission. The frame's main command buffer (gpu_vk_cmd, from a pool of its
 // own) is the recorder's alone; the replaying thread records the frame's prologue and epilogue itself (gpu_vk_prologue,
@@ -135,9 +135,13 @@ typedef struct VkRecSubmit {
 // gpu_vk_begin, gpu_vk_cmd and gpu_vk_end, with the breadcrumbs on when the device has its checkpoints on.
 void vkrec_submit_device(VkRecSubmit *out);
 
+// The most frames in flight vkrec_open takes. The tables of breadcrumbs are one more than this, and each keeps the chunks
+// its largest frame needed (4,096 records of 32 bytes each) once made, so a deeper window costs memory only as frames grow.
+#define VKREC_MAX_FRAMES 8u
+
 typedef struct VkRecOpen {
     size_t ring_bytes;              // GPU_RING_BYTES when 0; a test makes the ring small so that it wraps
-    uint32_t frames;                // frames in flight, 2 when 0 (1 to 4)
+    uint32_t frames;                // frames in flight, the setting frames_in_flight when 0 (default 2; 1 to VKREC_MAX_FRAMES)
     const VkRecCalls *calls;        // NULL: vkrec_calls_device
     const VkRecSubmit *submit;      // NULL: vkrec_submit_device
 } VkRecOpen;
@@ -151,9 +155,9 @@ void vkrec_close(void);
 int vkrec_is_open(void);
 
 // ---- the replay's side
-// Wait for a free frame (a frame two before this one is done), then begin a frame of kind GPU_VK_REPLAY or
-// GPU_VK_INTERNAL: take the submission gate and the next value, and return it. The caller has given its virtual core up
-// for the wait (D7).
+// Wait for a free frame (the frame `frames` before this one is done), then begin a frame of kind GPU_VK_REPLAY or
+// GPU_VK_INTERNAL: take the submission gate and the next value, and return it. A guest thread gives its virtual core up
+// for the wait (D7), inside the call; any other thread has none to give.
 uint64_t vkrec_begin(int kind);
 // Queue fn(arg, value) for the completion thread, after the device reached the frame's value (gpu_vk_effect).
 void vkrec_effect(GpuEffect fn, void *arg);
@@ -226,7 +230,7 @@ typedef struct VkRecFrame {
     uint32_t packets;
     uint64_t bytes;                  // of packets, headers included
     uint64_t gate_wait_ns;           // vkrec_begin waiting for the submission gate: the frame before not yet submitted
-    uint64_t slot_wait_ns;           // then waiting for the frame two before to be done
+    uint64_t slot_wait_ns;           // then waiting for the frame `frames` before to be done (and for a core again)
     uint64_t ring_wait_ns;           // the replaying thread waiting for room in the ring
     uint64_t replay_ns;              // vkrec_begin returned to vkrec_end returned, less the ring wait: the replaying thread's
     uint64_t replay_cpu_ns;          // thread time of the same stretch (the replaying thread's own, set by vkrec_end)
@@ -273,6 +277,6 @@ void vkrec_exec(const VkRecExec *x, uint32_t op, const void *payload);   // a na
 // Tests only: while non-zero, the breadcrumb of a draw is numbered one past its record (the counter-run of the numbering:
 // a marker that names the wrong draw).
 extern int vkrec_crumb_skew;
-// Tests only: while non-zero, vkrec_begin does not wait for the frame two before it (the counter-run of the limit on
-// frames in flight: a third frame let through).
+// Tests only: while non-zero, vkrec_begin does not wait for the frame `frames` before it (the counter-run of the limit on
+// frames in flight: one more frame let through).
 extern int vkrec_no_limit;

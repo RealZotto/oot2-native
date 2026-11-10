@@ -95,6 +95,10 @@ typedef enum RtSettingSource {
 #define RT_SETTINGS(X)                                                                                                 \
     X(gfx, GRAPHICS, ENUM, RESTART, 0, 0, 0, "null|vulkan",                                                            \
       "the graphics back end: null draws nothing and runs every test; vulkan draws on the GPU")                      \
+    X(frames_in_flight, GRAPHICS, INT, RESTART, 2, 1, 8, NULL,                                                         \
+      "the Vulkan back end's frames in flight: a frame begins once the frame this many before it is done, effects "    \
+      "included, so a larger number lets the next heavy frame begin while the last one's effects run, at the price of "\
+      "a longer delay before a frame's results reach the guest; 2 is the default")                                     \
     X(hold_ticks, PACING, INT, LIVE, 0, 0, 999999, NULL,                                                               \
       "experiment E2: hold every present for this many ticks of the 60 Hz clock, whatever the game asks for; 0 is off") \
     X(hold_placement, PACING, ENUM, LIVE, 0, 0, 0, "sync|acquire",                                                    \

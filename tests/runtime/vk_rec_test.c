@@ -14,6 +14,15 @@
 //   pack_pnext         a structure with a pNext chain: a named fatal
 //   frame_order        two threads begin and end 600 frames: values in order, no frame's packets inside another's
 //   frame_limit        a third frame waits for the first to be done
+//   window WHICH       a window of 2 (default), 7, 8 (the most) or the variable OOT2_FRAMES_IN_FLIGHT (setting) frames
+//                      in flight: each begin finds the frame `frames` before done and its results in its buffer, never an
+//                      older frame's; the window fills to exactly `frames`; every table of breadcrumbs of a frame in
+//                      flight is its own; a guest wait on a frame reads that frame's results
+//   frames_over        more frames than the most: a named fatal
+//   frames_range       the setting frames_in_flight: 1 to the most, 2 by default
+//   frames_setting     the value the store gives (a variable out of the range ends the process by name)
+//   core_wait          a guest thread's wait for an older frame gives its virtual core up (two threads, one core)
+//   core_gate          so does a guest thread that waits for the gate behind it
 //   breadcrumbs        every draw's marker names its own record; a frame's records are gone once it is reused
 //   breadcrumbs_off    no marker, no record
 //   marker_text        the report's words for a marker
@@ -32,11 +41,16 @@
 
 #include "volk.h"
 
+#include "endmark.h"
+#include "layout.h"
 #include "oot2/gpu.h"
 #include "oot2/gpu_ring.h"
 #include "oot2/gpu_vk.h"
+#include "oot2/kernel.h"
+#include "oot2/memory.h"
 #include "oot2/nvn_program.h"
 #include "oot2/runtime.h"
+#include "oot2/settings.h"
 #include "oot2/vk_pipeline.h"
 #include "oot2/vk_rec.h"
 #include "plat.h"
@@ -913,9 +927,10 @@ static void case_breadcrumbs(void) {
     uint32_t nrows;
     rows = vkrec_frames(&nrows);
     CHECK(nrows == 1 && rows[0].draws == CRUMB_DRAWS);
-    // The frames go on: frame v's table is reused `frames + 1` frames later, and no marker names it then.
+    // The frames go on: frame v's table is reused when the ring of tables comes round, VKREC_MAX_FRAMES + 1 frames later
+    // (never sooner than `frames + 1`), and no marker names it then.
     uint64_t later;
-    for (int f = 0; f < 6; f++) {
+    for (uint32_t f = 0; f < VKREC_MAX_FRAMES + 1; f++) {
         counter_raise(gpu_sync_handed());
         send_crumb_frame(&later);
     }
@@ -969,6 +984,294 @@ static void case_marker_text(void) {
     CHECK(strlen(small) < sizeof small);
     printf("ok marker_text %s\n", want);
     close_fake();
+}
+
+// ---------- the window of frames in flight
+// The guest's view of a frame's results with a window of `frames` frames. The guest keeps frames + 1 result buffers, and
+// the effects of frame v, which run on the completion thread before v is done, fill buffer v % (frames + 1) with v: a
+// buffer is replaced by the frame frames + 1 later, which the window does not let begin before the first has been read.
+// The device completes frame s only once frame s + frames - 1 has begun, so the window is as full as it can be, and it
+// hurries when the guest waits for a frame. Checked at every begin: the frame `frames` before is done and its buffer
+// holds it, never an older frame's; no more than `frames` frames in flight, and `frames` of them at the deepest; every
+// frame in flight, and the one just done, still has a breadcrumb table that is its own; a table is reused at the distance
+// of the ring. And after a wait on a frame's value the guest reads that frame's results.
+#define WIN_FRAMES 45
+#define WIN_DRAWS 2
+static uint64_t g_win_f;                      // the frames in flight the case expects
+static uint64_t g_win_buf[VKREC_MAX_FRAMES + 1];
+static uint64_t g_win_begun, g_win_ask, g_win_end, g_win_stalled;   // atomic
+static uint64_t g_win_values[WIN_FRAMES];
+static nvn_stage g_win_stage[WIN_FRAMES];
+static uint64_t g_win_deepest, g_win_waits, g_win_reuses;
+
+static uint64_t ld_acq(const uint64_t *p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
+static void st_rel(uint64_t *p, uint64_t v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
+
+static void win_effect(void *arg, uint64_t value) {
+    CHECK((uint64_t)(uintptr_t)arg == value && gpu_sync_done() == value - 1);
+    st_rel(&g_win_buf[value % (g_win_f + 1)], value);
+}
+static void VKAPI_CALL win_draw(VkCommandBuffer cb, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    (void)cb, (void)a, (void)b, (void)c, (void)d;
+}
+static void win_device(void *arg) {
+    (void)arg;
+    uint64_t moved = plat_now_ns();
+    for (;;) {
+        uint64_t issued = gpu_sync_issued(), now = counter_now(), begun = ld_acq(&g_win_begun);
+        uint64_t target = begun >= g_win_f ? begun - g_win_f + 1 : 0, ask = ld_acq(&g_win_ask);
+        if (ask > target) target = ask;
+        if (ld_acq(&g_win_end)) target = issued;
+        if (target > issued) target = issued;
+        if (now < target) {
+            counter_raise(target);
+            moved = plat_now_ns();
+        } else if (ld_acq(&g_win_end) && now == issued && gpu_sync_done() == now) {
+            break;
+        } else if (plat_now_ns() - moved > 5000000000ull && !ld_acq(&g_win_end)) {
+            st_rel(&g_win_stalled, 1);   // a narrower window than the case expects: the guest waits for a frame the
+            st_rel(&g_win_end, 1);       // device would only complete later; let it go and say so
+        } else {
+            plat_sleep_ns(50000ull);
+        }
+    }
+    ended();
+}
+// Frame n has begun: the frames in flight and the one just done each have a table that is their own.
+static void win_check_tables(uint64_t n) {
+    for (uint64_t j = n >= g_win_f ? n - g_win_f : 0; j <= n; j++)
+        for (uint32_t k = 1; k <= WIN_DRAWS; k++) {
+            VkRecCrumb crumb;
+            uint64_t value = 0;
+            CHECK(vkrec_crumb(GPU_VK_DRAW_MARKER(g_win_values[j], k), &crumb, &value, NULL));
+            CHECK(value == g_win_values[j] && crumb.id[0] == &g_win_stage[j]);
+        }
+    if (n >= VKREC_MAX_FRAMES + 1) {   // the ring has come round: no marker names the frame that had this frame's table
+        VkRecCrumb crumb;
+        CHECK(!vkrec_crumb(GPU_VK_DRAW_MARKER(g_win_values[n - (VKREC_MAX_FRAMES + 1)], 1), &crumb, NULL, NULL));
+        g_win_reuses++;
+    }
+}
+// which: a number of frames given to vkrec_open, "default" (none given, no setting: 2) or "setting" (none given, the
+// variable OOT2_FRAMES_IN_FLIGHT says)
+static void case_window(const char *which) {
+    uint32_t open_frames = 0;
+    if (!strcmp(which, "default")) g_win_f = 2;
+    else if (!strcmp(which, "setting")) g_win_f = (uint64_t)atoi(getenv("OOT2_FRAMES_IN_FLIGHT"));
+    else g_win_f = open_frames = (uint32_t)atoi(which);
+    CHECK(g_win_f >= 1 && g_win_f <= VKREC_MAX_FRAMES);
+    for (int i = 0; i < WIN_FRAMES; i++) {
+        g_win_stage[i].kind = NVN_STAGE_VS;
+        snprintf(g_win_stage[i].key, sizeof g_win_stage[i].key, "%016x.%08x", 0xD000u + (unsigned)i, 7u);
+    }
+    begin_fake();
+    g_calls.Draw = win_draw;
+    open_now(1u << 20, open_frames, 1);
+    CHECK(plat_thread_start(win_device, NULL, 1 << 20));
+    uint64_t rng = 0x1234567ull + g_win_f;
+    for (uint64_t n = 0; n < WIN_FRAMES; n++) {
+        uint64_t v = vkrec_begin(GPU_VK_REPLAY);
+        CHECK(v == n + 1);
+        g_win_values[n] = v;
+        uint64_t done = gpu_sync_done();
+        CHECK(v - done <= g_win_f);                              // no more frames in flight than the window
+        if (v - done > g_win_deepest) g_win_deepest = v - done;
+        if (n >= g_win_f) {
+            uint64_t w = g_win_values[n - g_win_f];
+            CHECK(done >= w);                                    // the frame `frames` before is done ...
+            CHECK(ld_acq(&g_win_buf[w % (g_win_f + 1)]) == w);   // ... and its results are in its buffer, not an older frame's
+        }
+        vkrec_effect(win_effect, (void *)(uintptr_t)v);
+        for (int d = 0; d < WIN_DRAWS; d++) {
+            vkrec_stages(&g_win_stage[n], NULL, NULL);
+            vkrec_Draw(3, 1, 0, 0);
+        }
+        win_check_tables(n);
+        CHECK(vkrec_end(NULL, 0) == v);
+        st_rel(&g_win_begun, n + 1);
+        if (n >= 3 * g_win_f && n % 5 == 0) {   // the guest waits for one of the last `frames` frames and reads its results
+            uint64_t w = g_win_values[n - next_random(&rng) % g_win_f];
+            st_rel(&g_win_ask, w);
+            CHECK(gpu_sync_wait(w, 20000000000ull));
+            st_rel(&g_win_ask, 0);
+            CHECK(ld_acq(&g_win_buf[w % (g_win_f + 1)]) == w);
+            g_win_waits++;
+        }
+        CHECK(!ld_acq(&g_win_stalled));
+    }
+    vkrec_idle();
+    st_rel(&g_win_end, 1);
+    join(1);
+    CHECK(!ld_acq(&g_win_stalled));
+    close_fake();
+    CHECK(g_win_deepest == g_win_f);   // the window was full at some begin, and never fuller
+    CHECK(g_win_reuses > 0 && g_win_waits > 0);
+    printf("ok window frames %llu begun %d deepest %llu waits %llu table reuses %llu\n", (unsigned long long)g_win_f,
+           WIN_FRAMES, (unsigned long long)g_win_deepest, (unsigned long long)g_win_waits,
+           (unsigned long long)g_win_reuses);
+}
+
+// ---------- the range of the window
+// vkrec_open takes 1 to VKREC_MAX_FRAMES frames and stops by name on more; the setting's row says the same range and
+// the default of today.
+static void case_frames_over(void) {
+    begin_fake();
+    open_now(1u << 20, VKREC_MAX_FRAMES + 1, 0);
+    printf("a window of %u frames was accepted\n", VKREC_MAX_FRAMES + 1);
+}
+static void case_frames_range(void) {
+    int id = rt_setting_find("frames_in_flight");
+    CHECK(id >= 0);
+    const RtSettingRow *r = rt_setting_row((RtSettingId)id);
+    CHECK(r->type == RT_SETTING_INT && r->def == 2 && r->min == 1 && r->max == VKREC_MAX_FRAMES);
+    CHECK(rt_setting(RT_SET_frames_in_flight) == r->def);   // no variable, no file: today's window
+    printf("ok frames_range %lld %lld %lld\n", (long long)r->min, (long long)r->def, (long long)r->max);
+}
+// the variable is read through the store, which refuses a value outside the row's range by name (exit code 2)
+static void case_frames_setting(void) {
+    printf("ok frames_setting %lld\n", (long long)rt_setting(RT_SET_frames_in_flight));
+}
+
+// ---------- guest threads: the virtual core in the waits
+// Two guest threads on one virtual core, written by hand as host functions in the lifter's shape. The main thread begins
+// a third frame that has to wait for the first to be done; the other thread, of worse priority, can run only when the main
+// thread has given the core up, and it is what lets the wait end (core_wait), or it submits behind the frame that holds the
+// gate and must not keep the core from the thread that holds it (core_gate). A wait that keeps its core hangs the case,
+// which its watchdog ends with exit code 3.
+#define GMB MOD_MAIN_BASE
+#define GFN(i) (GMB + 0x100ull * (i))   // the guest address of guest function i
+#define GPC (GMB + 0x4000)              // the guest pc the guest threads' SVCs report
+enum { FN_MAIN_WAIT, FN_MAIN_GATE, FN_RAISE, FN_GATE, FN_END };
+enum { GSTACK = 0x100000 };
+static uint64_t g_core_heap;
+static uint64_t g_core_steps[8], g_core_nsteps, g_core_at_gate;   // atomic
+
+static void core_step(uint64_t what) {
+    uint64_t i = __atomic_fetch_add(&g_core_nsteps, 1, __ATOMIC_SEQ_CST);
+    CHECK(i < 8);
+    __atomic_store_n(&g_core_steps[i], what, __ATOMIC_RELEASE);
+}
+static inline uint64_t gsv(Cpu *t, uint32_t imm, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+    t->x[0] = a0, t->x[1] = a1, t->x[2] = a2, t->x[3] = a3;
+    rt_svc(t, imm, GPC);
+    return t->x[0];
+}
+// A thread of worse priority than the main thread (44), on the main thread's core, started and joined by it.
+static uint32_t gstart(Cpu *t, int fn) {
+    t->x[1] = GFN(fn), t->x[2] = 0, t->x[3] = g_core_heap + GSTACK + 0x10000, t->x[4] = 50, t->x[5] = 0;
+    rt_svc(t, 0x08, GPC);   // CreateThread
+    CHECK(t->x[0] == 0);
+    uint32_t h = (uint32_t)t->x[1];
+    CHECK(gsv(t, 0x09, h, 0, 0, 0) == 0);   // StartThread
+    return h;
+}
+static void gjoin(Cpu *t, uint32_t h) {
+    *(volatile uint32_t *)(uintptr_t)g_core_heap = h;
+    CHECK(gsv(t, 0x18, 0, g_core_heap, 1, ~0ull) == 0);   // WaitSynchronization: the thread ended
+    CHECK(gsv(t, 0x16, h, 0, 0, 0) == 0);                 // CloseHandle
+}
+static void gexit(Cpu *t) { gsv(t, 0x0A, 0, 0, 0, 0); }
+
+// Two frames in, the device has finished neither.
+static void core_two_frames(void) {
+    CHECK(vkrec_begin(GPU_VK_REPLAY) == 1);
+    vkrec_Draw(3, 1, 0, 0);
+    vkrec_end(NULL, 0);
+    CHECK(vkrec_begin(GPU_VK_REPLAY) == 2);
+    vkrec_Draw(3, 1, 0, 0);
+    vkrec_end(NULL, 0);
+    vkrec_idle();
+    CHECK(counter_now() == 0 && gpu_sync_done() == 0);
+}
+static void g_main_wait(Cpu *t) {
+    core_two_frames();
+    uint32_t h = gstart(t, FN_RAISE);
+    core_step(1);
+    uint64_t v = vkrec_begin(GPU_VK_REPLAY);   // waits for frame 1 to be done
+    core_step(3);
+    CHECK(v == 3 && gpu_sync_done() >= 1);
+    vkrec_Draw(3, 1, 0, 0);
+    vkrec_end(NULL, 0);
+    gjoin(t, h);
+    gexit(t);
+}
+// The device reaches frame 1 once this thread has run, which it can only do on the core the main thread gave up.
+static void g_raise(Cpu *t) {
+    core_step(2);
+    counter_raise(1);
+    gexit(t);
+}
+static void g_main_gate(Cpu *t) {
+    core_two_frames();
+    uint32_t h = gstart(t, FN_GATE);
+    core_step(1);
+    uint64_t v = vkrec_begin(GPU_VK_REPLAY);   // holds the gate while it waits for frame 1
+    core_step(3);
+    CHECK(v == 3 && gpu_sync_done() >= 1);
+    vkrec_Draw(3, 1, 0, 0);
+    vkrec_end(NULL, 0);                        // the recorder submits it and opens the gate
+    gjoin(t, h);
+    gexit(t);
+}
+// A submission of the back end's own (a present, an upload) from another thread: it waits for the gate, which is the
+// main thread's until its frame is submitted.
+static void g_gate(Cpu *t) {
+    core_step(2);
+    __atomic_store_n(&g_core_at_gate, 1, __ATOMIC_RELEASE);
+    CHECK(gpu_sync_begin() == 4);
+    core_step(4);
+    gpu_sync_end();
+    gexit(t);
+}
+static void gate_device(void *arg) {   // the device reaches frame 1 once the other thread waits at the gate
+    (void)arg;
+    while (!__atomic_load_n(&g_core_at_gate, __ATOMIC_ACQUIRE)) plat_sleep_ns(100000ull);
+    plat_sleep_ns(100000000ull);
+    counter_raise(1);
+}
+static const GuestFn g_core_fns[FN_END + 1] = {g_main_wait, g_main_gate, g_raise, g_gate, NULL};
+static uint64_t g_core_addrs[FN_END + 1];
+static void core_guest_end(Cpu *t) { (void)t; }
+
+static void core_watchdog(void *arg) {
+    (void)arg;
+    plat_sleep_ns(15000000000ull);
+    fprintf(stderr, "hung: the wait kept the virtual core (steps %llu)\n", (unsigned long long)g_core_nsteps);
+    _Exit(3);
+}
+static void case_core(int gate) {
+    CHECK(plat_thread_start(core_watchdog, NULL, 1 << 20));
+    RtMemConfig m = {.pool_size = 1ull << 30, .heap_region_size = 512ull << 20, .alias_region_size = 1ull << 30,
+                     .stack_region_size = 256ull << 20, .system_resource_size = 1ull << 20};
+    rt_mem_init(&m);
+    RtKernelConfig k = {.core_mask = 0x1, .highest_priority = 28, .lowest_priority = 59, .main_priority = 44,
+                        .main_core = 0, .main_stack_size = 0x100000, .handle_table_size = 512,
+                        .program_id = 0x0100000000001000ull, .is_application = 1, .no_async_preempt = 1};
+    rt_kernel_init(&k);
+    static GuestFn fns[FN_END + 1];
+    memcpy(fns, g_core_fns, sizeof fns);
+    fns[FN_END] = core_guest_end;
+    for (int i = 0; i <= FN_END; i++) g_core_addrs[i] = GFN(i);
+    static RtModule mods[1];
+    mods[0] = (RtModule){"main", GMB, MOD_MAIN_SIZE, g_core_addrs, fns, (uint64_t)FN_END + 1, TEST_END};
+    rt_dispatch_init(mods, 1);
+    Cpu h;
+    memset(&h, 0, sizeof h);
+    h.x[1] = 64ull << 20;
+    rt_svc(&h, 0x01, 0);   // SetHeapSize, from the host before the run
+    CHECK(h.x[0] == 0);
+    g_core_heap = h.x[1];
+    begin_fake();
+    open_now(1u << 20, 2, 0);
+    if (gate) CHECK(plat_thread_start(gate_device, NULL, 1 << 20));
+    rt_kernel_run(GFN(gate ? FN_MAIN_GATE : FN_MAIN_WAIT), 0);
+    uint64_t want[4] = {1, 2, 3, 4};
+    uint64_t n = gate ? 4 : 3;
+    CHECK(__atomic_load_n(&g_core_nsteps, __ATOMIC_ACQUIRE) == n);
+    for (uint64_t i = 0; i < n; i++) CHECK(g_core_steps[i] == want[i]);   // the other thread ran while the main one waited
+    close_fake();
+    printf("ok %s steps %llu %llu %llu\n", gate ? "core_gate" : "core_wait", (unsigned long long)g_core_steps[0],
+           (unsigned long long)g_core_steps[1], (unsigned long long)g_core_steps[2]);
 }
 
 // ---------- the device
@@ -1652,6 +1955,12 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "pack_pnext")) case_pack_pnext();
     else if (!strcmp(cs, "frame_order")) case_frame_order();
     else if (!strcmp(cs, "frame_limit")) case_frame_limit();
+    else if (!strcmp(cs, "window") && args >= 3) case_window(argv[2]);
+    else if (!strcmp(cs, "frames_over")) case_frames_over();
+    else if (!strcmp(cs, "frames_range")) case_frames_range();
+    else if (!strcmp(cs, "frames_setting")) case_frames_setting();
+    else if (!strcmp(cs, "core_wait")) case_core(0);
+    else if (!strcmp(cs, "core_gate")) case_core(1);
     else if (!strcmp(cs, "breadcrumbs")) case_breadcrumbs();
     else if (!strcmp(cs, "breadcrumbs_off")) case_breadcrumbs_off();
     else if (!strcmp(cs, "marker_text")) case_marker_text();

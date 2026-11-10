@@ -35,6 +35,7 @@ from test_runtime_gpu import (EXIT_FATAL, ROOT, build_program, case_env, clang_o
 import build_game  # noqa: E402
 
 TEST_SOURCE = ROOT / "tests" / "runtime" / "vk_rec_test.c"
+END_SOURCE = ROOT / "tests" / "runtime" / "endmark.c"   # linked after the test: the end of its lifted code (guest threads)
 LEVELS = ("-O1", "-O2")
 EXIT_NO_DEVICE = 3
 
@@ -68,7 +69,8 @@ class RecorderBase(unittest.TestCase):
         cc = clang_or_skip()
         cls.include, cls.glslang = vulkan_or_skip()
         cls.tmp = tempfile.TemporaryDirectory(prefix="oot2-vkrec-", ignore_cleanup_errors=True)
-        cls.exes = build_program(cc, cls.include, cls.glslang, TEST_SOURCE, Path(cls.tmp.name), levels=cls.levels)
+        cls.exes = build_program(cc, cls.include, cls.glslang, TEST_SOURCE, Path(cls.tmp.name), levels=cls.levels,
+                                 extra_sources=(END_SOURCE,))
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -135,6 +137,47 @@ class RingAndPacketTest(RecorderBase):
     def test_a_third_frame_waits_for_the_first(self) -> None:
         self.passes("frame_limit")
 
+    def test_the_guest_reads_its_own_frames_results_with_a_window_of_2_7_and_8_frames(self) -> None:
+        for which, frames in (("default", 2), ("2", 2), ("7", 7), ("8", 8)):
+            line = [x for x in self.passes("window", which) if x.startswith("ok window")][0]
+            print("\n" + line)
+            self.assertRegex(line, rf"^ok window frames {frames} begun 45 deepest {frames} waits [1-9]\d* table reuses [1-9]\d*$")
+
+    def test_the_window_follows_the_setting_and_says_so_when_it_is_not_the_default(self) -> None:
+        for level in self.levels:
+            done = self.run_case(level, "window", "setting", env={"OOT2_FRAMES_IN_FLIGHT": "7"})
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("ok window frames 7 ", done.stdout)
+            self.assertIn("recorder: 7 frames in flight (the default is 2)", done.stderr)
+            done = self.run_case(level, "window", "default")
+            self.assertNotIn("frames in flight (the default", done.stderr)
+
+    def test_a_window_of_more_than_the_most_is_a_named_fatal(self) -> None:
+        for level in self.levels:
+            done = self.run_case(level, "frames_over")
+            self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+            self.assertTrue(any("the recorder allows 8 frames in flight at most, not 9" in x for x in fatal_lines(done.stderr)),
+                            done.stderr)
+
+    def test_the_setting_is_1_to_8_and_2_by_default_and_refuses_what_is_outside(self) -> None:
+        print("\n" + [x for x in self.passes("frames_range") if x.startswith("ok frames_range")][0])
+        for value in ("0", "9", "-1", "two"):
+            for level in self.levels:
+                done = self.run_case(level, "frames_setting", env={"OOT2_FRAMES_IN_FLIGHT": value})
+                self.assertEqual(done.returncode, 2, f"{value}: {done.stdout}{done.stderr}")
+                self.assertIn("OOT2_FRAMES_IN_FLIGHT", done.stderr)
+                self.assertNotIn("ok frames_setting", done.stdout)
+        for value in ("1", "8"):
+            done = self.run_case("-O2", "frames_setting", env={"OOT2_FRAMES_IN_FLIGHT": value})
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn(f"ok frames_setting {value}\n", done.stdout)
+
+    def test_a_guest_thread_gives_its_core_up_while_a_frame_waits_for_an_older_one(self) -> None:
+        self.passes("core_wait")
+
+    def test_a_guest_thread_waiting_for_the_gate_behind_such_a_frame_gives_its_core_up_too(self) -> None:
+        self.passes("core_gate")
+
     def test_breadcrumbs_name_their_own_draw(self) -> None:
         print("\n" + [x for x in self.passes("breadcrumbs") if x.startswith("ok breadcrumbs")][0])
 
@@ -150,6 +193,10 @@ class RingAndPacketTest(RecorderBase):
 
     def test_counter_run_a_third_frame_let_through(self) -> None:
         self.counter_run("frame_limit", "nolimit")
+
+    def test_counter_run_a_deep_window_let_through_reads_an_older_frame(self) -> None:
+        for frames in ("7", "8"):
+            self.counter_run("window", "nolimit", frames)
 
     def test_counter_run_a_breadcrumb_naming_the_wrong_draw(self) -> None:
         self.counter_run("breadcrumbs", "skew")

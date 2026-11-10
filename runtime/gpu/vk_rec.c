@@ -4,18 +4,19 @@
 // The recorder thread, its frames and the breadcrumbs (oot2/vk_rec.h); the packets are vk_rec_pack.c and the ring is
 // gpu_ring.c.
 //
-// A frame is a submission. vkrec_begin (the replaying thread) waits until the frame `frames` before it is done, takes the
-// submission gate and the next value through the submit hooks, and puts a FRAME_BEGIN packet; the commands follow as
-// packets; vkrec_end puts FRAME_END and returns. The recorder thread reads packets in order: FRAME_BEGIN gets the frame's
+// A frame is a submission. vkrec_begin (the replaying thread) waits until the frame `frames` before it is done (with its
+// virtual core given up, if it is a guest thread), takes the submission gate and the next value through the submit hooks,
+// and puts a FRAME_BEGIN packet; the commands follow as packets; vkrec_end puts FRAME_END and returns. The recorder thread reads packets in order: FRAME_BEGIN gets the frame's
 // command buffer (begun, with the checkpoint of its start), every command packet becomes its call, FRAME_END ends the
 // command buffer and submits it, which also opens the gate. So the gate is held by the frame from the replay's first
 // call to the recorder's submit, and a second thread that submits waits for it, as for any submission.
 //
 // Breadcrumbs. A draw's number and stage record are written by the replaying thread into a table of the frame (chunks of
 // records made as the frame grows, kept for good), the packet carries the number, and the recorder sets the checkpoint
-// GPU_VK_DRAW_MARKER(value, n) right before the call. A table is named by its frame's value and is reused `frames` + 1
-// frames later, when the device has finished with it: a checkpoint can only name a frame that is not done, and a marker
-// whose value no table holds any more is reported as the draw number alone.
+// GPU_VK_DRAW_MARKER(value, n) right before the call. A table is named by its frame's value and is reused when the ring of
+// MAX_FRAMES + 1 tables comes round, which is `frames` + 1 frames later at the soonest, when the device has finished with
+// it: a checkpoint can only name a frame that is not done, and a marker whose value no table holds any more is reported
+// as the draw number alone.
 //
 // Design as in DKB Recomp's runtime/vk_rec.c at 9d8fa02 (GPL-3.0-or-later; there after Savage Wind Recomp #189 and LAS
 // Recomp runtime/nvn/vulkan/record.c, MIT, Copyright (c) 2026 Peiikai): the replay thread packs, a recorder thread makes
@@ -28,14 +29,17 @@
 #include <string.h>
 
 #include "oot2/gpu_vk.h"
+#include "oot2/kernel.h"
 #include "oot2/nvn_program.h"
 #include "oot2/runtime.h"
+#include "oot2/settings.h"
 #include "oot2/vk_rec.h"
 #include "plat.h"
 
 #define CRUMB_CHUNK 4096u
 #define CRUMB_CHUNKS ((GPU_VK_DRAW_MAX + CRUMB_CHUNK) / CRUMB_CHUNK)
-#define MAX_FRAMES 4u
+#define MAX_FRAMES VKREC_MAX_FRAMES
+#define DEFAULT_FRAMES 2u   // the default of the setting frames_in_flight (oot2/settings.h)
 #define SLOTS (MAX_FRAMES + 1)
 #define RECORDER_STACK (8ull << 20)   // reserved, committed as the driver's calls grow it
 #define POLL_NS 50000000ull   // the recorder looks at its stop flag this often when idle
@@ -212,7 +216,7 @@ void vkrec_submit_device(VkRecSubmit *out) {
 
 void vkrec_open(const VkRecOpen *o) {
     if (G.open) rt_fatal("gfx: vulkan: the recorder is opened twice");
-    uint32_t frames = o && o->frames ? o->frames : 2;
+    uint32_t frames = o && o->frames ? o->frames : (uint32_t)rt_setting(RT_SET_frames_in_flight);
     if (frames > MAX_FRAMES) rt_fatal("gfx: vulkan: the recorder allows %u frames in flight at most, not %u", MAX_FRAMES, frames);
     memset(&G, 0, sizeof G);
     G.frames = frames;
@@ -223,6 +227,7 @@ void vkrec_open(const VkRecOpen *o) {
     if (o && o->submit) G.submit = *o->submit;
     else vkrec_submit_device(&G.submit);
     G.open = 1;
+    if (frames != DEFAULT_FRAMES) rt_log("gfx: vulkan: recorder: %u frames in flight (the default is %u)", frames, DEFAULT_FRAMES);
     G.thread = plat_thread_start(recorder_main, NULL, RECORDER_STACK);
     if (!G.thread) rt_fatal("gfx: vulkan: cannot start the recorder thread");
 }
@@ -261,14 +266,21 @@ uint64_t vkrec_begin(int kind) {
     if (!G.open) rt_fatal("gfx: vulkan: a frame before the recorder is open");
     if (t_frame) rt_fatal("gfx: vulkan: recorder: a frame is begun inside a frame");
     // The gate first: everything below it is the replaying side's own state, which a frame hands to the next one only
-    // through the gate. The wait for the frame two before is made holding it, and cannot deadlock: the gate is ours only
-    // once the recorder has submitted the frame before, so the frame two before is submitted too.
+    // through the gate. The wait for the frame `frames` before is made holding it, and cannot deadlock: the gate is ours
+    // only once the recorder has submitted the frame before, so the frame `frames` before is submitted too.
     uint64_t g0 = plat_now_ns();
     uint64_t value = G.submit.begin(kind);   // held until the recorder has submitted this frame
     uint64_t gate_wait = plat_now_ns() - g0, waited = 0;
     if (G.started >= G.frames && !vkrec_no_limit) {
-        uint64_t t0 = plat_now_ns();
-        gpu_sync_wait(G.values[(G.started - G.frames) % MAX_FRAMES], UINT64_MAX);
+        uint64_t t0 = plat_now_ns(), older = G.values[(G.started - G.frames) % MAX_FRAMES];
+        if (older > gpu_sync_done()) {
+            // A guest thread gives its virtual core up for the wait, as for every wait on the host (D7): the wait ends when
+            // the device and the completion thread are through, which no guest thread has a part in. A thread that is
+            // none (a test's, the start-up's) holds no core, and the pair is then nothing.
+            int token = rt_kernel_block_begin();
+            gpu_sync_wait(older, UINT64_MAX);
+            rt_kernel_block_end(token);
+        }
         waited = plat_now_ns() - t0;
     }
     uint64_t seq = G.started++;
