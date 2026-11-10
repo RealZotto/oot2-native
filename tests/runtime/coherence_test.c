@@ -54,6 +54,11 @@
 //   raw_grow_head_import, raw_grow_tail_import   an import the growth overlaps goes, but the mirror takes only the bind's
 //                pages and copies only those in; the import's other pages (128 KiB at the head, 16 MiB at the tail) get
 //                an import again
+//   raw_diag_hull, raw_diag_dry, raw_diag_birth   the stop of a bind over a mirror that an import the submission bound
+//                abuts prints the straddle dump before it: the hull of what each resolve reached in the import and the
+//                mirror, the birth of every backing near the bind, the binds of the submission in order (before and after
+//                its raw-access begin), the growth's guards each evaluated on its own, and a digest of the map that the
+//                evaluation leaves as it was; the stop's own text is the one raw_grow_bound_import pins
 //   raw_sync_wait   a mirror the CPU wrote is brought current for a raw-access submission after the older one in flight
 //   raw_sync_nowait the same with only a GPU-current page stamped since: no wait, nothing is copied over the older stores
 //   raw_promote, raw_promote_small, raw_promote_wait, raw_promote_cap   an import a raw-access submission binds a range larger than a
@@ -1921,6 +1926,73 @@ static void case_replace_written(void) {
     printf("returned\n");
 }
 
+// ---------- the dump that precedes the stop of a bind over a mirror an earlier bind of the submission reached
+// An import abuts the start of a mirror (as in raw_grow_head_import). The submission binds the mirror (once before its
+// raw-access begin, once after) and the import (a small bind far from the pages the growth would take), then a bind across
+// both takes pages of each: the mirror cannot grow over the pages of an import the submission bound, so it stops by name
+// as before, and the log before the stop says what the stop was made of. Driven by tests/test_runtime_coherence.py, which
+// reads the key=value line printed here against the dump.
+static void diag_scene(const char *name) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 8 * MiB;
+    pool(p - 1 * MiB, 16 * MiB);
+    cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(p - 0x20000, 0x20000, 0xBBBBBBBBu);   // committed below the mirror since: an import at the begin
+    uint64_t v = sub_begin();
+    resolve(p + 0x3000, 4, v);   // the mirror, before the submission's raw-access begin
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    CHECK(s.mirrors == 1 && s.imports == 1 && s.import_bytes == 0x20000);
+    resolve(p + 0x100, 4, v);
+    resolve(p - 0x10000, 4, v);   // the import, far from the pages the growth would take
+    printf("%s: p=%#llx v0=%llu v=%llu bind_addr=%#llx bind_size=%#llx\n", name, (ull)p, (ull)v0, (ull)v,
+           (ull)(p - 0x1800), (ull)0x5800);
+    resolve(p - 0x1800, 0x5800, v);   // pages [p - 0x2000, p + 0x4000): across the import and the mirror
+    printf("returned\n");
+}
+
+static void case_raw_diag_hull(void) { diag_scene("raw_diag_hull"); }
+static void case_raw_diag_dry(void) { diag_scene("raw_diag_dry"); }
+
+// The birth of the backings the dump lists: a mirror a promotion made (P), one a bind made and a later bind cut (T), one
+// grown in place (M) and the import that was re-made beside it, then the stop.
+static void case_raw_diag_birth(void) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 8 * MiB, T = p + 0x80000, P = p + 0x100000;
+    pool(p - 1 * MiB, 16 * MiB);
+    CHECK((p - 0x20000) / BACKING_IMPORT_WINDOW == (P + 0x20000) / BACKING_IMPORT_WINDOW);   // one cell
+    cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
+    cpu_fill(T, 256 * KiB, 0xCCCCCCCCu);
+    cpu_fill(P, 128 * KiB, 0xDDDDDDDDu);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR && resolve(T, 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(p - 0x20000, 0x20000, 0xBBBBBBBBu);
+    uint64_t v1 = sub_begin();
+    backing_raw_begin(v1);
+    CHECK(resolve(P, 128 * KiB, v1).kind == BACKING_IMPORT);   // larger than a uniform's: hot
+    sub_end(v1);
+    gpu_run(v1, NULL);
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);   // the promotion
+    CHECK(stats().raw_promoted == 1);
+    resolve(T + 0x3F000, 0x20000, v);   // starts in the last page of T's mirror: it keeps its start
+    resolve(p + 0x3E00, 0xC00, v);
+    CHECK(resolve(p - 0x1800, 0x5800, v).kind == BACKING_MIRROR);   // the mirror of p grows over two pages
+    resolve(p - 0x10000, 4, v);
+    printf("raw_diag_birth: p=%#llx T=%#llx P=%#llx v0=%llu v1=%llu v=%llu\n", (ull)p, (ull)T, (ull)P, (ull)v0,
+           (ull)v1, (ull)v);
+    resolve(p - 0x2800, 0x1000, v);   // across the import's new end and the mirror's new start
+    printf("returned\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc != 2) {
@@ -1952,6 +2024,8 @@ int main(int argc, char **argv) {
         {"raw_grow_untracked", case_raw_grow_untracked},
         {"raw_grow_over_total", case_raw_grow_over_total}, {"raw_grow_head_import", case_raw_grow_head_import},
         {"raw_grow_tail_import", case_raw_grow_tail_import}, {"raw_grow_cap", case_raw_grow_cap},
+        {"raw_diag_hull", case_raw_diag_hull}, {"raw_diag_dry", case_raw_diag_dry},
+        {"raw_diag_birth", case_raw_diag_birth},
     };
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++)
         if (!strcmp(argv[1], cases[i].name)) {

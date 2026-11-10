@@ -293,5 +293,6 @@ typedef struct BackingStats {
     uint64_t raw_fill_imports, raw_fill_bytes, raw_fill_extents;       // what those passes made
     uint64_t raw_waits;                                                // mirror copies that waited for raw stores
     uint64_t raw_promoted, raw_promote_bytes;                          // imports given a mirror at a raw-access begin
+    uint64_t raw_straddle_stops;                                       // raw-access stops whose dump was printed (beside)
 } BackingStats;
 void backing_stats(BackingStats *out);

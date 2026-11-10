@@ -60,7 +60,14 @@ FAILING = {
                                 "[0x30000, 0x40000)",
     "raw_grow_untracked": "the mirror cannot grow over them: the write watch does not cover [",
     "raw_grow_cap": "KiB, more than the 1024 KiB one growth may add",
+    # The same stop with its dump before it (test_the_stop_of_a_straddling_bind_prints_what_it_is_made_of).
+    "raw_diag_hull": "which this submission bound, lies on the pages it would add",
+    "raw_diag_dry": "which this submission bound, lies on the pages it would add",
+    "raw_diag_birth": "which this submission bound, lies on the pages it would add",
 }
+
+# The dump's lines, as the log writes them: one prefix, the text after it.
+DUMP = "[rt] gfx: vulkan: backing map: straddle dump: "
 
 # Where rt_mem_written may appear outside comments: its declaration, its definition, and its one caller.
 WRITE_WATCH_FILES = {"runtime/include/oot2/memory.h", "runtime/core/memory.c", "runtime/gpu/pagegen.c"}
@@ -74,6 +81,20 @@ def code_mentions(path: Path, name: str) -> list[int]:
         if re.search(rf"\b{name}\b", code):
             found.append(n)
     return found
+
+
+def dump_lines(stderr: str) -> list[str]:
+    return [line[len(DUMP):] for line in stderr.splitlines() if line.startswith(DUMP)]
+
+
+def printed(stdout: str, case: str) -> dict[str, int]:
+    """The key=value line the case printed before its stop, numbers read as the case wrote them (0x... or decimal)."""
+    line = next(line for line in stdout.splitlines() if line.startswith(case + ":"))
+    return {key: int(value, 0) for key, value in re.findall(r"(\w+)=(0x[0-9a-f]+|\d+)", line)}
+
+
+def hx(n: int) -> str:
+    return f"{n:#x}"
 
 
 class WriteWatchOwnerTest(unittest.TestCase):
@@ -141,6 +162,105 @@ class CoherenceTest(unittest.TestCase):
                     fatal = fatal_lines(done.stderr)
                     self.assertEqual(len(fatal), 1, done.stderr)
                     self.assertIn(text, fatal[0])
+
+    def stop_with_dump(self, level: str, case: str) -> tuple[subprocess.CompletedProcess, list[str]]:
+        done = self.run_case(level, case)
+        self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+        self.assertNotIn("returned", done.stdout)
+        fatal = fatal_lines(done.stderr)
+        self.assertEqual(len(fatal), 1, done.stderr)   # the dump is log lines: the stop is still the one FATAL
+        self.assertIn(FAILING[case], fatal[0])
+        lines = dump_lines(done.stderr)
+        self.assertTrue(lines, done.stderr)
+        last = done.stderr.splitlines().index(DUMP + lines[-1])
+        self.assertTrue(done.stderr.splitlines()[last + 1].startswith("FATAL"), done.stderr)   # nothing between
+        return done, lines
+
+    def backing_line(self, lines: list[str], kind: str, lo: int, hi: int) -> str:
+        found = [line for line in lines if line.startswith(f"backing {kind} [{hx(lo)}, {hx(hi)}) ")]
+        self.assertEqual(len(found), 1, (kind, hx(lo), hx(hi), lines))
+        return found[0]
+
+    def test_the_stop_of_a_straddling_bind_prints_what_it_is_made_of(self) -> None:
+        """The hull of what the submission resolved in the import and in the mirror, the binds in order with their phase."""
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, lines = self.stop_with_dump(level, "raw_diag_hull")
+                k = printed(done.stdout, "raw_diag_hull")
+                p, v, v0 = k["p"], k["v"], k["v0"]
+                imp = self.backing_line(lines, "import", p - 0x20000, p)
+                self.assertIn(f"res (value {v}, [{hx(p - 0x10000)}, {hx(p - 0x10000 + 4)}), n 1) born fill_pool for {v} ", imp)
+                mirror = self.backing_line(lines, "mirror", p, p + 0x40000)
+                self.assertIn(f"res (value {v}, [{hx(p + 0x100)}, {hx(p + 0x3004)}), n 2) born bind for {v0} "
+                              f"was [{hx(p)}, {hx(p + 0x40000)})", mirror)
+                self.assertEqual(sum("<- the mirror the bind reaches" in line for line in lines), 1)
+                bind = [line for line in lines if line.startswith("bind [")]
+                self.assertEqual(len(bind), 1, lines)
+                self.assertIn(f"bind [{hx(k['bind_addr'])}, {hx(k['bind_addr'] + k['bind_size'])}) pages "
+                              f"[{hx(p - 0x2000)}, {hx(p + 0x4000)}) ", bind[0])
+                self.assertTrue(lines[0].startswith(f"growth refused in submission {v} "), lines[0])
+                head = next(i for i, line in enumerate(lines) if line.startswith(f"the binds of submission {v},"))
+                ring = []
+                for line in lines[head + 1:]:
+                    if line.startswith("the last "):
+                        break
+                    ring.append(line)
+                want = [f"submission {v} before_begin hit mirror addr {hx(p + 0x3000)} size 0x4 ",
+                        f"submission {v} after_begin hit mirror addr {hx(p + 0x100)} size 0x4 ",
+                        f"submission {v} after_begin hit import addr {hx(p - 0x10000)} size 0x4 ",
+                        f"submission {v} after_begin miss none addr {hx(k['bind_addr'])} size {hx(k['bind_size'])} "]
+                self.assertEqual(len(ring), len(want), ring)
+                for line, text in zip(ring, want):
+                    self.assertIn(text, line)
+                self.assertIn(f"stop 1 of this run follows", lines[-1])
+
+    def test_the_dry_evaluation_of_the_growth_leaves_the_map_as_it_was(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, lines = self.stop_with_dump(level, "raw_diag_dry")
+                k = printed(done.stdout, "raw_diag_dry")
+                p, v = k["p"], k["v"]
+                left = [line for line in lines if line.startswith("the dry evaluation left the map ")]
+                self.assertEqual(len(left), 1, lines)
+                match = re.fullmatch(r"the dry evaluation left the map unchanged \(digest (0x[0-9a-f]+) before, "
+                                     r"(0x[0-9a-f]+) after\)", left[0])
+                self.assertTrue(match, left[0])
+                self.assertEqual(match.group(1), match.group(2))
+                guards = {}
+                for line in lines:
+                    m = re.match(r"guard (G\d\w?): (passes|refuses)(?:: (.*))?$", line)
+                    if m:
+                        guards.setdefault(m.group(1), []).append((m.group(2), m.group(3) or ""))
+                self.assertEqual(sorted(guards), ["G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G8", "G9"])
+                for tag in guards:
+                    verdict = [d[0] for d in guards[tag]]
+                    self.assertEqual(verdict, ["refuses"] if tag == "G4" else ["passes"], (tag, guards[tag]))
+                self.assertEqual(guards["G4"][0][1],
+                                 f"the import [{hx(p - 0x20000)}, {hx(p)}) used_by {v} written 0 hull "
+                                 f"[{hx(p - 0x10000)}, {hx(p - 0x10000 + 4)}) hull_on_added_pages no hull_on_bind no")
+
+    def test_the_dump_says_where_each_backing_came_from(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, lines = self.stop_with_dump(level, "raw_diag_birth")
+                k = printed(done.stdout, "raw_diag_birth")
+                p, T, P, v0, v1, v = k["p"], k["T"], k["P"], k["v0"], k["v1"], k["v"]
+                self.assertIn(f"born grow for {v} was [{hx(p)}, {hx(p + 0x40000)})",
+                              self.backing_line(lines, "mirror", p - 0x2000, p + 0x40000))
+                self.assertIn(f"born fill_pool for {v} ", self.backing_line(lines, "import", p - 0x20000, p - 0x2000))
+                self.assertIn(f"born beside_front for {v} was [{hx(T)}, {hx(T + 0x40000)})",
+                              self.backing_line(lines, "mirror", T, T + 0x3F000))
+                promoted = self.backing_line(lines, "mirror", P, P + 0x20000)
+                self.assertIn(f"born promote for {v} was [{hx(P)}, {hx(P + 0x20000)})", promoted)
+                # nothing resolved it: the hull is empty, as a new backing's is (a low end above the high end)
+                self.assertIn("res (value 0, empty (lo 0xffffffffffffffff, hi 0), n 0)", promoted)
+                # how each bind of the submission was served: the cut one made an import, the grown one grew the mirror
+                ring = [line for line in lines if line.startswith("ring ") and f"submission {v} " in line]
+                self.assertTrue(any(f"made import addr {hx(T + 0x3F000)} size 0x20000 " in line for line in ring), ring)
+                self.assertTrue(any(f"grew mirror addr {hx(p - 0x1800)} size 0x5800 " in line for line in ring), ring)
+                head = next(i for i, line in enumerate(lines) if line.startswith("the last "))
+                self.assertEqual(lines[head], f"the last 1 binds of the raw-access submission before it ({v1})")
+                self.assertIn(f"submission {v1} after_begin hit import addr {hx(P)} size 0x20000 ", lines[head + 1])
 
 
 if __name__ == "__main__":
