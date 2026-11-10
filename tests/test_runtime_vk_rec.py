@@ -207,6 +207,12 @@ class RingAndPacketTest(RecorderBase):
         for frames in ("7", "8"):
             self.counter_run("window", "nolimit", frames)
 
+    def test_counter_run_a_window_narrower_than_the_device_expects_is_a_stall_and_is_detected(self) -> None:
+        for frames in ("2", "7"):
+            done = self.run_case("-O2", "window", frames, "--mutant", "narrow", timeout=90)
+            self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertNotIn("ok window", done.stdout)
+
     def test_counter_run_a_breadcrumb_naming_the_wrong_draw(self) -> None:
         self.counter_run("breadcrumbs", "skew")
 

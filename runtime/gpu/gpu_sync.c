@@ -129,6 +129,8 @@ uint64_t gpu_sync_begin(void) {
         // core: another guest thread on that core that blocked on the lock with its core held would keep the core from it
         // in rt_kernel_block_end, and the gate would stay shut. So a lock held across a submission is taken by guest threads
         // with rt_kernel_lock (kernel_lock.h): the texel copies' (vk_image.c) and the capture's (vk_capture.c).
+        // The cost of waiting without a core: the gate can be held by a thread that has no virtual core, and a core that
+        // priority keeps busy with other threads can keep the holder from one, so the gate stays shut while they run.
         plat_mutex_unlock(&g_lock);
         token = rt_kernel_block_begin();
         plat_mutex_lock(&g_lock);

@@ -35,7 +35,8 @@
 //   dev_loss FOLDER DIR an injected loss: the report names the last draw by its stages
 //   dev_timing FOLDER  the submitting thread's and the recorder's time per frame, ring and direct, 300 frames after 30
 // --mutant NAME: overwrite (a ring that does not wait for room), nolimit (a third frame let through), skew (a marker one
-// draw past its record). The check of the case must then fail, which the driver requires.
+// draw past its record), narrow (the window case opens the recorder with one frame fewer than the device expects: the stall
+// detector must fire). The check of the case must then fail, which the driver requires.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1002,6 +1003,13 @@ static void case_marker_text(void) {
 static uint64_t g_win_f;                      // the frames in flight the case expects
 static uint64_t g_win_buf[VKREC_MAX_FRAMES + 1];
 static uint64_t g_win_begun, g_win_ask, g_win_end, g_win_stalled;   // atomic
+static uint64_t g_win_progress;               // atomic: bumped by the guest each time it moves on (a frame begun, ended, waited for)
+static int g_win_narrow;                      // the mutant: the recorder is opened with one frame fewer than the case expects
+// The stall detector counts poll rounds in which nothing moved: the device's own counter, the frames begun, the frame asked
+// for and the guest's progress counter all stayed as they were. Each round sleeps, so a guest that can run does run between
+// rounds; a machine so loaded that it runs the guest slowly runs this thread slowly too, and the rounds it needs take
+// longer, where a wall-clock limit would fail it. Only a guest that stays where it is for this many rounds is stalled.
+#define WIN_STALL_ROUNDS 3000
 static uint64_t g_win_values[WIN_FRAMES];
 static nvn_stage g_win_stage[WIN_FRAMES];
 static uint64_t g_win_deepest, g_win_waits, g_win_reuses;
@@ -1018,7 +1026,7 @@ static void VKAPI_CALL win_draw(VkCommandBuffer cb, uint32_t a, uint32_t b, uint
 }
 static void win_device(void *arg) {
     (void)arg;
-    uint64_t moved = plat_now_ns();
+    uint64_t idle = 0, seen[4] = {~0ull, ~0ull, ~0ull, ~0ull};
     for (;;) {
         uint64_t issued = gpu_sync_issued(), now = counter_now(), begun = ld_acq(&g_win_begun);
         uint64_t target = begun >= g_win_f ? begun - g_win_f + 1 : 0, ask = ld_acq(&g_win_ask);
@@ -1027,15 +1035,19 @@ static void win_device(void *arg) {
         if (target > issued) target = issued;
         if (now < target) {
             counter_raise(target);
-            moved = plat_now_ns();
-        } else if (ld_acq(&g_win_end) && now == issued && gpu_sync_done() == now) {
-            break;
-        } else if (plat_now_ns() - moved > 5000000000ull && !ld_acq(&g_win_end)) {
+            idle = 0;
+            continue;
+        }
+        if (ld_acq(&g_win_end) && now == issued && gpu_sync_done() == now) break;
+        uint64_t cur[4] = {issued, begun, ask, ld_acq(&g_win_progress)};
+        if (memcmp(seen, cur, sizeof cur)) {
+            memcpy(seen, cur, sizeof cur);
+            idle = 0;
+        } else if (++idle >= WIN_STALL_ROUNDS && !ld_acq(&g_win_end)) {
             st_rel(&g_win_stalled, 1);   // a narrower window than the case expects: the guest waits for a frame the
             st_rel(&g_win_end, 1);       // device would only complete later; let it go and say so
-        } else {
-            plat_sleep_ns(50000ull);
         }
+        plat_sleep_ns(50000ull);
     }
     ended();
 }
@@ -1062,6 +1074,10 @@ static void case_window(const char *which) {
     else if (!strcmp(which, "setting")) g_win_f = (uint64_t)atoi(getenv("OOT2_FRAMES_IN_FLIGHT"));
     else g_win_f = open_frames = (uint32_t)atoi(which);
     CHECK(g_win_f >= 1 && g_win_f <= VKREC_MAX_FRAMES);
+    if (g_win_narrow) {
+        CHECK(open_frames >= 2);
+        open_frames--;
+    }
     for (int i = 0; i < WIN_FRAMES; i++) {
         g_win_stage[i].kind = NVN_STAGE_VS;
         snprintf(g_win_stage[i].key, sizeof g_win_stage[i].key, "%016x.%08x", 0xD000u + (unsigned)i, 7u);
@@ -1074,6 +1090,7 @@ static void case_window(const char *which) {
     for (uint64_t n = 0; n < WIN_FRAMES; n++) {
         uint64_t v = vkrec_begin(GPU_VK_REPLAY);
         CHECK(v == n + 1);
+        __atomic_add_fetch(&g_win_progress, 1, __ATOMIC_ACQ_REL);
         g_win_values[n] = v;
         uint64_t done = gpu_sync_done();
         CHECK(v - done <= g_win_f);                              // no more frames in flight than the window
@@ -1091,11 +1108,13 @@ static void case_window(const char *which) {
         win_check_tables(n);
         CHECK(vkrec_end(NULL, 0) == v);
         st_rel(&g_win_begun, n + 1);
+        __atomic_add_fetch(&g_win_progress, 1, __ATOMIC_ACQ_REL);
         if (n >= 3 * g_win_f && n % 5 == 0) {   // the guest waits for one of the last `frames` frames and reads its results
             uint64_t w = g_win_values[n - next_random(&rng) % g_win_f];
             st_rel(&g_win_ask, w);
             CHECK(gpu_sync_wait(w, 20000000000ull));
             st_rel(&g_win_ask, 0);
+            __atomic_add_fetch(&g_win_progress, 1, __ATOMIC_ACQ_REL);
             CHECK(ld_acq(&g_win_buf[w % (g_win_f + 1)]) == w);
             g_win_waits++;
         }
@@ -1988,6 +2007,7 @@ int main(int argc, char **argv) {
         if (!strcmp(m, "overwrite")) gpu_ring_overwrite = 1;
         else if (!strcmp(m, "nolimit")) vkrec_no_limit = 1;
         else if (!strcmp(m, "skew")) vkrec_crumb_skew = 1;
+        else if (!strcmp(m, "narrow")) g_win_narrow = 1;
         else {
             fprintf(stderr, "unknown mutant %s\n", m);
             return 2;
