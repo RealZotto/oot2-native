@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "oot2/capture.h"
+#include "oot2/gfx.h"
 #include "oot2/gpu_vk.h"
 #include "oot2/ledger.h"
 #include "oot2/mesh_abi.h"
@@ -29,6 +30,7 @@
 #include "oot2/shader_desc.h"
 #include "oot2/vk_format.h"
 #include "oot2/vk_gpu_time.h"
+#include "oot2/vk_movie_blit.h"
 #include "oot2/vk_nvn.h"
 #include "oot2/vk_rec.h"
 #include "oot2/vk_replay.h"
@@ -171,6 +173,8 @@ static struct {
     const char *pass_vs, *pass_fs;
     int noting;                               // a dispatch is gathering the buffers its gpu timing mark names
     const op_hdr *cur;                        // the record being replayed, NULL between records
+    int movie_open;                           // the movie chain's stand-in (settings.h test_movie_blit): a chain is open
+    uint32_t movie_src;                       // and the texture pool ID of the picture its first program stored
 } F;
 
 // What the frames in flight wrote (vkr_writes), a ring of FRAMES_KEPT by replayed frame (timeline values are shared with
@@ -192,7 +196,8 @@ void vkr_stats(VkrStats *out) {
     *out = g_stats;
     // Every draw and dispatch record is replayed, skipped by name or not made because rendering was off: what is left is
     // GPU work lost (the Hookshot survey: Hookshot's dark characters and bare foliage were work lost at start), 0 by contract.
-    uint64_t accounted = g_stats.draws + g_stats.dispatches + g_stats.render_off + g_stats.skipped + g_stats.collected;
+    uint64_t accounted = g_stats.draws + g_stats.dispatches + g_stats.render_off + g_stats.skipped + g_stats.collected +
+                         g_stats.movie_skipped + g_stats.movie_blits;
     out->lost = g_stats.draw_ops > accounted ? g_stats.draw_ops - accounted : accounted - g_stats.draw_ops;
 }
 
@@ -1249,6 +1254,96 @@ static void op_draw_mesh(const p_draw_mesh *d, uint64_t indirect) {
         vkrec_DrawMeshTasksEXT((uint32_t)d->count, 1, 1);
 }
 
+// ---------- the movie chain's stand-in (settings.h test_movie_blit, oot2/vk_movie_blit.h)
+// A TEST switch that changes the picture of every movie; never set in a proof run. The chain's programs are named by the
+// person's own key file. The chain's first dispatch runs as it always does, and the replay remembers the image it stores
+// to; the dispatches between it and the chain's last are not run; and the last is replaced by a resample of the remembered
+// picture into the image the last one stores to, which is where its output would have been. A skipped dispatch asks for
+// nothing (no pipeline, no page table, no buffer of the backing map), so a frame whose chain is skipped is no raw-access
+// frame, builds none of the chain's pipelines, and has nothing of the chain to write back.
+
+// The texture pool ID of the one storage image a program of the chain stores to; a named stop when it stores to none or to
+// several, so that a key file that names a program of another kind is found at the first chain and not by its picture.
+static uint32_t stored_image(const nvn_stage *cs, const ShaderBinds *b, const char *role) {
+    uint32_t id = UINT32_MAX;
+    for (uint32_t i = 0; i < b->nimg; i++) {
+        const ShdImg *m = &b->img[i];
+        if (!m->write) continue;
+        if (m->c2_slot < 0 || m->c2_slot >= IMG_SLOTS) stop("test_movie_blit: stage %s stores to image slot %d", cs->key, m->c2_slot);
+        if (id != UINT32_MAX) stop("test_movie_blit: the chain's %s program %s stores to more than one image", role, cs->key);
+        id = nvn_handle_texture_id(S.img[ST_CS][m->c2_slot]);
+    }
+    if (id == UINT32_MAX) stop("test_movie_blit: the chain's %s program %s stores to no image", role, cs->key);
+    return id;
+}
+
+static void movie_counted(uint64_t skipped, uint64_t blits) {
+    nvn_census_note_movie_blit(skipped, blits);
+    capture_count(CAPTURE_SKIPPED_DRAWS, skipped + blits);   // so that the proof judge fails the capture on its own counter
+    if (g_stats.movie_skipped + g_stats.movie_blits == 1)
+        rt_log("gfx: vulkan: MOVIE BLIT (test_movie_blit is on): the movie's enhancement chain is replaced by a resample of "
+               "its first picture. This run is NOT a proof run and the pictures of the movies are not the console's");
+}
+
+static void movie_blit(const nvn_stage *cs) {
+    VkpStage st = replay_stage(cs);
+    uint32_t dst_id = stored_image(cs, binds_of(&st, SHD_CS), "last");
+    if (!F.ops->image_by_id) stop("test_movie_blit needs ops that give the image of a texture ID, and these give none");
+    VkrImage src, dst;
+    uint64_t storage = 0, bytes = 0;
+    if (!F.ops->image_by_id(F.movie_src, F.value, &src, NULL, NULL))
+        stop("test_movie_blit: no image stands on the chain's first picture (texture ID %u)", F.movie_src);
+    if (!F.ops->image_by_id(dst_id, F.value, &dst, &storage, &bytes))
+        stop("test_movie_blit: no image stands on the output of stage %s (texture ID %u)", cs->key, dst_id);
+    if (src.image == dst.image) stop("test_movie_blit: the chain's first picture and its output are one image");
+    for (int i = 0; i < 2; i++) {
+        const VkrImage *m = i ? &dst : &src;
+        if (m->type != VK_IMAGE_TYPE_2D || m->aspect != VK_IMAGE_ASPECT_COLOR_BIT || m->samples > 1 || m->layers != 1 ||
+            m->levels != 1 || !m->width || !m->height)
+            stop("test_movie_blit: the chain's %s image is not a single 2D colour image of one level (%ux%u, %u levels, %u "
+                 "layers, %u samples)", i ? "output" : "first picture", m->width, m->height, m->levels, m->layers, m->samples);
+    }
+    vkr_xfer_begin();   // the render pass ends and a full barrier follows the first dispatch's stores
+    VkImageBlit rg = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}};
+    rg.srcOffsets[1] = (VkOffset3D){(int32_t)src.width, (int32_t)src.height, 1};
+    rg.dstOffsets[1] = (VkOffset3D){(int32_t)dst.width, (int32_t)dst.height, 1};
+    vkrec_BlitImage(src.image, dst.image, &rg, VK_FILTER_LINEAR);
+    vkr_xfer_end();
+    if (bytes) vkr_wrote(storage, bytes, 1, F.draws + 1);   // as the dispatch's own stores would have been declared
+    F.draws++, g_stats.movie_blits++;
+    if (vkgt_enabled) vkgt_mark(VKGT_XFER, "movie_blit", 0, 0, 0);
+    movie_counted(0, 1);
+    if (g_stats.movie_blits == 1)
+        rt_log("gfx: vulkan: movie blit: the chain's last dispatch (stage %s) is replaced by a linear resample of the first "
+               "one's picture, %ux%u (Vulkan format %d, texture ID %u) into %ux%u (format %d, texture ID %u)", cs->key,
+               src.width, src.height, (int)src.format, F.movie_src, dst.width, dst.height, (int)dst.format, dst_id);
+}
+
+// 1 when this dispatch is the stand-in's (skipped, or replaced by the resample), 0 when it runs as it always does: the
+// setting off, a program the file does not name, a program of the chain outside an open chain.
+static int movie_replaces(const nvn_stage *cs) {
+    VkmbRole role = vkmb_role(cs->key);
+    if (role == VKMB_NONE) return 0;
+    if (role == VKMB_KEEP) {   // it runs, and its picture is the one resampled
+        VkpStage st = replay_stage(cs);
+        F.movie_src = stored_image(cs, binds_of(&st, SHD_CS), "first");
+        F.movie_open = 1;
+        return 0;
+    }
+    if (!F.movie_open) return 0;
+    if (role == VKMB_BLIT) {
+        movie_blit(cs);
+        F.movie_open = 0;
+        return 1;
+    }
+    g_stats.movie_skipped++;
+    movie_counted(1, 0);
+    if (g_stats.movie_skipped == 1)
+        rt_log("gfx: vulkan: movie blit: the dispatches of the chain between its first and its last are not run (the first "
+               "is stage %s; logged once, the census counts them)", cs->key);
+    return 1;
+}
+
 // ---------- dispatches
 // ind: the GPU address of the group counts of an indirect dispatch (0: direct, groups). The counts go into the driver bank
 // c[0] too, and the CPU cannot say what they will be: they may be the output of earlier work of this submission, or of a
@@ -1262,6 +1357,7 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     }
     const nvn_stage *cs = P.id[ST_CS];
     if (!cs) stop("a dispatch with no compute stage bound");
+    if (movie_replaces(cs)) return;   // the movie chain's stand-in, a test switch: 0 at once when the setting is off
     VkpStage cst = replay_stage(cs);
     const ShaderBinds *b = binds_of(&cst, SHD_CS);
     pass_end();

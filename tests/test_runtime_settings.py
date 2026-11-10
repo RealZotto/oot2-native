@@ -188,6 +188,23 @@ class SettingsTest(unittest.TestCase):
         for done in self.passes("show", OOT2_COLLECT_VARIANTS="1"):
             self.assertEqual(keys_of(done.stdout)["collect_variants"], ("1", "environment", "OOT2_COLLECT_VARIANTS"))
 
+    def test_test_movie_blit_is_a_test_switch_that_is_off_by_default_and_says_it_changes_the_picture(self) -> None:
+        done = self.passes("table")[0]
+        rows = {line.split("\t")[0]: line.split("\t") for line in done.stdout.splitlines() if "\t" in line}
+        key, group, kind, apply, default, low, high, names, env, what = rows["test_movie_blit"]
+        self.assertEqual((group, kind, apply, default, low, high, env),
+                         ("debug", "bool", "restart", "0", "0", "1", "OOT2_TEST_MOVIE_BLIT"))
+        self.assertIn("TEST switch", what)
+        self.assertIn("CHANGES THE PICTURE", what)
+        self.assertIn("never set in a proof run", what)
+        self.assertIn("OOT2_MOVIE_BLIT_KEYS", what)   # the chain's programs come from a file of the player's own
+        self.assertNotIn("OOT2_MOVIE_BLIT_KEYS", {row[8] for row in rows.values()})   # a key file is not a setting
+        for done in self.passes("show"):
+            self.assertEqual(keys_of(done.stdout)["test_movie_blit"], ("0", "default", "the default"))
+        for done in self.passes("show", OOT2_TEST_MOVIE_BLIT="1"):
+            self.assertEqual(keys_of(done.stdout)["test_movie_blit"], ("1", "environment", "OOT2_TEST_MOVIE_BLIT"))
+        self.refused("show", OOT2_TEST_MOVIE_BLIT="2")   # a value the key does not take is refused by name
+
     # ---- the layers
     def test_command_line_then_environment_then_file_then_default_for_a_key_of_each_type(self) -> None:
         # key, its default, then the file's, the environment's and the command line's value

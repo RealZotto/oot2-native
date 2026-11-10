@@ -111,12 +111,13 @@ class TransferTest(vp.DeviceTestCase):
             cls.addClassCleanup(patch.stop)
         cls.head_pack = vp.synthetic_pack(cls.head_dir)
 
-    def xfer(self, case: str, *args: str, validation: str = "sync") -> subprocess.CompletedProcess:
+    def xfer(self, case: str, *args: str, validation: str = "sync",
+             env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         return subprocess.run([str(exe()), case, *args], capture_output=True, text=True, timeout=300,
-                              env=case_env({"OOT2_VK_VALIDATION": validation}))
+                              env=case_env({"OOT2_VK_VALIDATION": validation, **(env or {})}))
 
-    def clean(self, case: str, *args: str) -> str:
-        done = self.xfer(case, *args)
+    def clean(self, case: str, *args: str, env: dict[str, str] | None = None) -> str:
+        done = self.xfer(case, *args, env=env)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr[-3000:])
         self.assertIn(f"ok {case}", done.stdout)
         self.assertIn("validation errors 0 warnings 0", done.stdout, done.stderr[-3000:])
@@ -183,6 +184,23 @@ class TransferTest(vp.DeviceTestCase):
                 self.assertIn("after 100 more submissions: placed 0, arena 0 texels wrong", out)
                 self.assertIn("partial store into a texture the CPU wrote: 0 of 16384 texels wrong", out)
                 print("\n" + out)
+
+    def test_the_movie_chain_stand_in_resamples_the_first_picture_into_the_last_ones_output_on_a_device(self) -> None:
+        # settings.h test_movie_blit: the first program stores a 192x192 gradient, the middle one (in no pack) is skipped, and
+        # the last (in no pack) is replaced by a linear blit into a 256x256 texture, which a copy then reads back
+        with tempfile.TemporaryDirectory(prefix="oot2-vkxfer-movie-", ignore_cleanup_errors=True) as tmp:
+            keys = Path(tmp) / "keys.txt"
+            keys.write_text(f"keep {IMG_KEY}\nskip 5100000000000007.00000000\nblit 5100000000000008.00000000\n",
+                            encoding="utf-8")
+            env = {"OOT2_TEST_MOVIE_BLIT": "1", "OOT2_MOVIE_BLIT_KEYS": str(keys)}
+            out = self.clean("movie_blit", "--pack", str(self.head_pack), env=env)
+            self.assertIn("resampled picture: 0 of 65536 texels differ from the gradient by more than 1.5", out)
+            self.assertIn("dispatches made 1, skipped 1, resampled 1, lost 0, raw binds 0", out)
+            print("\n" + out)
+            # the counter-run: without the switch the replay builds the middle program's pipeline, which no pack holds
+            done = self.xfer("movie_blit", "--pack", str(self.head_pack), env={"OOT2_TEST_MOVIE_BLIT": "0"})
+            self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr[-3000:])
+            self.assertNotIn("ok movie_blit", done.stdout)
 
     def test_a_texture_over_cpu_visible_memory_keeps_its_texels_when_the_cpu_writes_the_pages_behind_it(self) -> None:
         for mode in ("mirror", "imports"):

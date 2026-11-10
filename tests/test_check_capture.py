@@ -38,14 +38,18 @@ GIB = 1 << 30
 
 def synth(*, segments=((30, 60.0), (60, 60.0), (5, 60.0)), title_segment: int | None = 1, misses=(),
           memory=None, end_code: int = 0, end_reason: str = "exit", closing: bool = True, census: bool = False,
-          collect: bool | None = None, header_drop=(), extra=()) -> str:
+          collect: bool | None = None, header_drop=(), extra=(), test_movie_blit: str | None = None) -> str:
     """A capture as text. segments: (seconds, fps) one after the other from t = 0; the title mark is the first present
     of segments[title_segment]. collect: None leaves the collect_variants header key out (a capture of an older
-    writer), else writes it as 1 or 0. misses: (counter index, seconds) pairs, each adding one. memory(t_ns) -> (working set,
-    private) for the sample at t (default 2 and 3 GiB). extra: lines put before the closing record."""
+    writer), else writes it as 1 or 0. test_movie_blit: the header key of that test switch ("0", or "1 (...)"), left
+    out when None (a capture of a build without the switch). misses: (counter index, seconds) pairs, each adding one.
+    memory(t_ns) -> (working set, private) for the sample at t (default 2 and 3 GiB). extra: lines put before the
+    closing record."""
     head = {"format": "1", "back_end": "null", "driver": "none (null back end)", "display_mode": "none (null back end)",
             "implicit_vulkan_layers": "none (null back end)", "ram_total": str(16 * GIB),
             "ram_available": str(9 * GIB), "census_mode": "1" if census else "0", "title_mark_present": "0"}
+    if test_movie_blit is not None:
+        head["test_movie_blit"] = test_movie_blit
     presents: list[tuple[int, int]] = []   # (seq, t)
     t_seg = 0
     title_seq = title_t = None
@@ -175,6 +179,21 @@ class CheckerTest(unittest.TestCase):
         # its skipped draws fail the counter as well, so both name it
         v = self.verdict(synth(collect=True, misses=[(cc.COUNTERS.index("skipped draws"), 5)]))
         self.assertEqual(set(self.failed(v)), {"judged run", "skipped draws"})
+
+    def test_a_run_with_a_test_switch_on_is_refused_whatever_else_it_did(self) -> None:
+        # a run that never reached a movie and missed nothing: only the header says that it had the switch on
+        v = self.verdict(synth(test_movie_blit="1 (a test switch that changes the pictures of the movies: not a proof run)"))
+        self.assertEqual(set(self.failed(v)), {"test settings"})
+        self.assertIn("on: test_movie_blit = 1 (a test switch", self.failed(v)["test settings"])
+        self.assertFalse(v.passed)
+        # the counterparts: the key at 0, and a capture of a build that has no such switch, pass
+        self.assertTrue(self.verdict(synth(test_movie_blit="0")).passed)
+        self.assertTrue(self.verdict(synth()).passed)
+        # the exit code of the tool is the verdict's
+        for text, code, shown in ((synth(test_movie_blit="1 (x)"), 1, True), (synth(test_movie_blit="0"), 0, False)):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(cc.main([str(self.write(text))]), code)
+            self.assertEqual("FAIL test settings: on: test_movie_blit = 1 (x)" in out.getvalue(), shown, out.getvalue())
 
     def test_a_working_set_over_5_gib_at_60_s_fails(self) -> None:
         def at_60(over: int):

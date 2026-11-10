@@ -206,7 +206,12 @@ typedef enum RtSettingSource {
       "DEVELOPMENT switch for collecting variants, never set in a proof run: the Vulkan replay skips a draw that stops "  \
       "on an answer the ledger can fix (a vertex attribute of another scalar type than the module's input), after "      \
       "writing its ledger row, and goes on; any other stop still stops. The skipped draws are not drawn, so the run is " \
-      "counted and logged as a collection run; oot2 prepare then writes all the variants at once")
+      "counted and logged as a collection run; oot2 prepare then writes all the variants at once") \
+    X(test_movie_blit, DEBUG, BOOL, RESTART, 0, 0, 1, NULL,                                                            \
+      "TEST switch that CHANGES THE PICTURE, never set in a proof run: the Vulkan replay does not run the movie's "     \
+      "enhancement chain between its first and last dispatch and resamples the first dispatch's picture into the "      \
+      "last one's output instead, so the opening plays at the game's pace; the chain's programs are named by the file " \
+      "OOT2_MOVIE_BLIT_KEYS, kept outside the repository. A run with it on is logged, counted and listed as not a proof run")
 
 typedef enum RtSettingId {
 #define RT_SETTING_ID(key, group, type, apply, def, min, max, names, what) RT_SET_##key,

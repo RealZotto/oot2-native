@@ -27,6 +27,7 @@
 #include "oot2/vk_bindless.h"
 #include "oot2/vk_gpu_time.h"
 #include "oot2/vk_miss.h"
+#include "oot2/vk_movie_blit.h"
 #include "oot2/vk_present.h"
 #include "oot2/vk_raw.h"
 #include "oot2/vk_rec.h"
@@ -445,6 +446,7 @@ void gpu_vk_open(void) {
     gpu_vk_mirror_policy();
     vkb_open();
     vkgt_open();   // the GPU timing of the replayed frames, when OOT2_VK_GPU_TIMING names a file (oot2/vk_gpu_time.h)
+    vkmb_open();   // the movie chain's stand-in, when the test switch test_movie_blit is on (oot2/vk_movie_blit.h)
     vkw_open();   // the window's surface, the menu's pipeline and the present thread, when a window was asked for
     g_open = 1;
     plat_mutex_unlock(&g_open_lock);

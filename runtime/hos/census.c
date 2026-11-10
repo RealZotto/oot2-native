@@ -23,6 +23,7 @@
 #include "oot2/ledger.h"
 #include "oot2/nvn_pace.h"
 #include "oot2/runtime.h"
+#include "oot2/settings.h"
 #include "plat.h"
 
 #define MAX_SERVICES 64
@@ -121,6 +122,13 @@ static void write_rows(FILE *f, int code, const char *line) {
     if (ledger_collected())
         fprintf(f, "#collect-variants: NOT A PROOF RUN: %llu draws were skipped, not drawn, to collect shader variants\n",
                 (unsigned long long)ledger_collected());
+    if (rt_setting(RT_SET_test_movie_blit)) {   // a test switch that changes the picture (settings.h), whatever the totals
+        uint64_t skipped, blits;
+        nvn_census_movie_blit(&skipped, &blits);
+        fprintf(f, "#test-movie-blit: NOT A PROOF RUN: the movie chain's dispatches were not run (%llu) or replaced by a "
+                   "resample (%llu); the pictures of the movies are not the console's\n", (unsigned long long)skipped,
+                (unsigned long long)blits);
+    }
     fprintf(f, "kind\tkey\tstatus\tcalls\tfirst_at\twhy\n");
     for (uint32_t imm = 0; imm <= 0xFF; imm++) {
         uint64_t n = rt_svc_calls(imm);
@@ -202,6 +210,13 @@ static int write_files(int code, const char *line) {
         rt_log("COLLECTION RUN, NOT A PROOF RUN: %llu draws were skipped, not drawn, over %llu distinct stage and answer "
                "pairs (collect_variants); the ledger holds their rows, so oot2 prepare writes the variants",
                (unsigned long long)ledger_collected(), (unsigned long long)ledger_collected_kinds());
+    if (code >= 0 && rt_setting(RT_SET_test_movie_blit)) {
+        uint64_t skipped, blits;
+        nvn_census_movie_blit(&skipped, &blits);
+        rt_log("TEST RUN, NOT A PROOF RUN: test_movie_blit was on; %llu dispatches of the movie chain were not run and %llu "
+               "were replaced by a resample, so the pictures of the movies are not the console's", (unsigned long long)skipped,
+               (unsigned long long)blits);
+    }
     if (rt_census_on()) {
         snprintf(path, sizeof path, "%s/census-nvn.tsv", hos_game_folder());
         f = fopen(path, "wb");

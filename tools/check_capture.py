@@ -21,6 +21,11 @@ The conditions:
   (collect_variants, which skips draws), and the header names
   the back end, the driver, the display mode, the implicit Vulkan layers and
   the available RAM;
+- no test setting is on: a header key such as test_movie_blit (a switch that
+  replaces the movies' enhancement chain by a resample, so changes their
+  pictures) must be 0, or absent from a capture of a build without it. A run
+  with it on also counts every dispatch it did not run into the skipped draws,
+  which fail on their own;
 - no named fatal: the run ended with exit code 0;
 - the title mark was reached, and the capture goes on for the whole window,
   60 s of host time from the mark;
@@ -54,6 +59,8 @@ MAX_WORKING_SET = 5 << 30           # "working set at most 5 GiB ... at 60 s"
 MAX_PRIVATE = 6 << 30               # "private commit at most 6 GiB at 60 s"
 FATAL_CODES = {70: "fatal", 71: "named fatal (unimplemented)", 72: "guest stop", 73: "census frame limit"}
 COUNTERS = ("skipped draws", "shader misses", "pipeline misses", "raw-access misses", "device faults")
+# Header keys of the test switches that change a picture (settings.h): a run with one on is no proof run.
+TEST_SETTINGS = ("test_movie_blit",)
 REQUIRED_HEADER = ("back_end", "driver", "display_mode", "implicit_vulkan_layers", "ram_available", "census_mode",
                    "title_mark_present")
 
@@ -267,6 +274,12 @@ def check(cap: Capture) -> Verdict:
     collect = cap.header.get("collect_variants", "0") != "0"
     mode = "census mode" if census else "collect_variants (draws skipped to collect shader variants)" if collect else "default mode"
     cond("judged run", not census and not collect, mode, "not census mode, not collect_variants")
+    # A test switch that changes a picture (settings.h): its header key is "0", or "1 (...)"; a capture without the key
+    # comes from a build that had no such switch.
+    tests_on = [k for k in TEST_SETTINGS if cap.header.get(k, "0").split(" ")[0] != "0"]
+    cond("test settings", not tests_on,
+         "on: " + ", ".join(f"{k} = {cap.header[k]}" for k in tests_on) if tests_on else "none on",
+         "none on (a test switch changes the picture; a capture of such a run is no proof)")
     missing = [k for k in REQUIRED_HEADER if k not in cap.header]
     cond("header", not missing, "complete" if not missing else "lacks " + ", ".join(missing), ", ".join(REQUIRED_HEADER))
 

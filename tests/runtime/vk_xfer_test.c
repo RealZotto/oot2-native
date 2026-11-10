@@ -333,9 +333,11 @@ static void case_textures(int imports, int gated) {
 }
 
 // ---------- the stages of the synthetic pack and what they bind
-static nvn_stage g_vs, g_ps, g_cs, g_head, g_img;
-static ShaderBinds g_vs_binds, g_ps_binds, g_cs_binds, g_head_binds, g_img_binds;
+static nvn_stage g_vs, g_ps, g_cs, g_head, g_img, g_mid, g_last;
+static ShaderBinds g_vs_binds, g_ps_binds, g_cs_binds, g_head_binds, g_img_binds, g_last_binds;
 static VkReplayOps g_ops;
+#define MID_KEY "5100000000000007.00000000"    // the movie_blit case's middle program: in no pack, never built
+#define LAST_KEY "5100000000000008.00000000"   // and its last one, which stores to the image at c2 slot 4 and is never built
 
 static void stage(nvn_stage *s, const char *key, int kind) {
     memset(s, 0, sizeof *s);
@@ -348,7 +350,7 @@ static void cbuf(ShaderBinds *b, uint8_t slot, uint16_t binding) { b->cb[b->ncb+
 static const ShaderBinds *my_binds(const VkpStage *stage) {
     const nvn_stage *s = stage->shape;
     return s == &g_vs ? &g_vs_binds : s == &g_ps ? &g_ps_binds : s == &g_cs ? &g_cs_binds : s == &g_head ? &g_head_binds
-           : s == &g_img ? &g_img_binds : vkr_device_ops()->binds(stage);
+           : s == &g_img ? &g_img_binds : s == &g_last ? &g_last_binds : vkr_device_ops()->binds(stage);
 }
 
 // After setup: the pack opened, the stages and their bindings made (the pack's modules, tests/test_runtime_vk_pipeline.py:
@@ -386,6 +388,9 @@ static void open_pack(const char *pack) {
     memset(im, 0, sizeof *im);
     im->kind = SHD_CS, im->fits = 1, im->local_size[0] = im->local_size[1] = 8, im->local_size[2] = 1;
     im->img[im->nimg++] = (ShdImg){.set = 1, .write = 1, .view = BV_2D, .binding = 25, .c2_slot = 3};
+    stage(&g_mid, MID_KEY, NVN_STAGE_CS), stage(&g_last, LAST_KEY, NVN_STAGE_CS);   // the movie_blit case's
+    g_last_binds = g_img_binds;
+    g_last_binds.img[0].c2_slot = 4;
     g_ops = *vkr_device_ops();
     g_ops.binds = my_binds;
     vkr_set_ops(&g_ops);
@@ -635,6 +640,66 @@ static void case_storage_image(int imports, const char *pack) {
     finish_and_report("storage_image");
 }
 
+// ---------- movie_blit: the movie chain's stand-in on a device (settings.h test_movie_blit)
+// The driver sets OOT2_TEST_MOVIE_BLIT=1 and OOT2_MOVIE_BLIT_KEYS (a file that names IMG_KEY as the chain's first program,
+// MID_KEY as a middle one and LAST_KEY as its last). The first program stores (x, y, 0, 255) to the texel (x, y) of texture 5,
+// 192x192 and placed in the GPU's pool; the middle and the last programs are in no pack, so the replay would stop on their
+// pipelines if it built them. The middle one is skipped and the last one replaced by a linear blit of texture 5 into texture 6,
+// 256x256 in CPU-visible storage (an arena image), which a copy then reads back: each texel is the gradient resampled, the
+// picture a third wider and higher (the ratio of the real chain's input and output).
+#define BLIT_SRC 192
+#define BLIT_DST 256
+static int blit_wrong(uint64_t at) {
+    int bad = 0, worst = 0;
+    for (uint32_t y = 0; y < BLIT_DST; y++)
+        for (uint32_t x = 0; x < BLIT_DST; x++) {
+            const uint8_t *px = (const uint8_t *)(uintptr_t)(at + 4 * ((uint64_t)y * BLIT_DST + x));
+            float u = ((float)x + 0.5f) * BLIT_SRC / BLIT_DST - 0.5f, v = ((float)y + 0.5f) * BLIT_SRC / BLIT_DST - 0.5f;
+            u = u < 0 ? 0 : u, v = v < 0 ? 0 : v;   // the edge is held
+            float dr = (float)px[0] - u, dg = (float)px[1] - v;
+            dr = dr < 0 ? -dr : dr, dg = dg < 0 ? -dg : dg;
+            if (dr > worst) worst = (int)dr;
+            if (dg > worst) worst = (int)dg;
+            bad += dr > 1.5f || dg > 1.5f || px[2] != 0 || px[3] != 0xFF;
+        }
+    printf("resampled picture: %d of %d texels differ from the gradient by more than 1.5 (largest difference %d)\n", bad,
+           BLIT_DST * BLIT_DST, worst);
+    return bad;
+}
+
+static void case_movie_blit(const char *pack) {
+    setup(0, 0);
+    open_pack(pack);
+    VkpStage cs = {.key = IMG_KEY};
+    CHECK(vkp_compute(&cs));
+    const uint64_t src_at = G + 0x40000, dst_at = P + 0x200000, out = P + 0x300000;
+    const tex_t src = tex_at(src_at, NVN_FORMAT_RGBA8, BLIT_SRC, BLIT_SRC), dst = tex_at(dst_at, NVN_FORMAT_RGBA8, BLIT_DST, BLIT_DST);
+    dpool_ref pool = k_pool;
+    bindless_texture_register(&pool, 5, &src, NULL);
+    bindless_texture_register(&pool, 6, &dst, NULL);
+    const nvn_tex_rec cd = trec(dst_at, NVN_FORMAT_RGBA8, BLIT_DST, BLIT_DST);
+    Rec *r = rec_begin();
+    PUT(r, OP_SET_TEX_POOL, (p_set_pool){.pool = k_pool});
+    PUT(r, OP_BIND_IMG, (p_bind_handles){.stage = 5, .first = 3, .n = 1, .h = {5}});
+    PUT(r, OP_BIND_IMG, (p_bind_handles){.stage = 5, .first = 4, .n = 1, .h = {6}});
+    PUT(r, OP_BIND_PROGRAM, program_of(&g_img));
+    PUT(r, OP_DISPATCH, (p_dispatch){BLIT_SRC / 8, BLIT_SRC / 8, 1, 0});
+    PUT(r, OP_BIND_PROGRAM, program_of(&g_mid));
+    PUT(r, OP_DISPATCH, (p_dispatch){8, 1, 1, 0});
+    PUT(r, OP_BIND_PROGRAM, program_of(&g_last));
+    PUT(r, OP_DISPATCH, (p_dispatch){BLIT_DST / 8, BLIT_DST / 8, 1, 0});
+    PUT(r, OP_COPY_T2B, (p_copy_b2t){.addr = out, .tex = cd, .r = region(0, 0, BLIT_DST, BLIT_DST)});
+    wait_done(submit(r));
+    int bad = blit_wrong(out);
+    VkrStats st;
+    vkr_stats(&st);
+    printf("dispatches made %llu, skipped %llu, resampled %llu, lost %llu, raw binds %llu\n", (ull)st.dispatches,
+           (ull)st.movie_skipped, (ull)st.movie_blits, (ull)st.lost, (ull)st.raw_binds);
+    CHECK(bad == 0);
+    CHECK(st.dispatches == 1 && st.movie_skipped == 1 && st.movie_blits == 1 && st.lost == 0 && st.raw_binds == 0);
+    finish_and_report("movie_blit");
+}
+
 // ---------- a texture over memory the CPU can see
 // A game maps a virtual pool in the GPU window over CPU-visible memory (the title movie's planes are such textures). The
 // backing map keeps that memory as a mirror or an import, never as an extent, so the texture's image gets memory of its own
@@ -790,6 +855,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "head") && pack) case_head(imports, gated, pack);
     else if (!strcmp(cs, "storage") && pack) case_storage(imports, gated, pack);
     else if (!strcmp(cs, "storage_image") && pack) case_storage_image(imports, pack);
+    else if (!strcmp(cs, "movie_blit") && pack) case_movie_blit(pack);
     else if (!strcmp(cs, "virtual_texture")) case_virtual_texture(imports);
     else if (!strcmp(cs, "cpu_target")) case_cpu_target(imports);
     else {

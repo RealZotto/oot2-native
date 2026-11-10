@@ -197,6 +197,26 @@ class CaptureTest(unittest.TestCase):
                 v = cc.check(cap)
                 self.assertEqual(next(c for c in v.conditions if c.name == "pipeline misses").value, "1")
 
+    def test_a_run_with_a_test_switch_on_says_so_in_the_header_and_the_judge_refuses_it(self) -> None:
+        # test_movie_blit changes the pictures of the movies (settings.h): the header names it even for a run that never
+        # reached a movie, so a capture of such a run can never pass as a proof
+        for level in nvn.LEVELS:
+            for on in (True, False):
+                with self.subTest(level=level, on=on):
+                    env = {"OOT2_CAPTURE_TITLE": "3"}
+                    if on:
+                        env["OOT2_TEST_MOVIE_BLIT"] = "1"
+                    done, folder = self.run_case(level, "frames", env)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    path, cap = self.capture(folder)
+                    self.assert_closed(path, cap, 0, "exit")
+                    header = cap.header["test_movie_blit"]
+                    self.assertEqual(header.startswith("1 ("), on, header)
+                    self.assertEqual(header == "0", not on, header)
+                    judged = {c.name: c for c in cc.check(cap).conditions}
+                    self.assertEqual(judged["test settings"].ok, not on, judged["test settings"])
+                    self.assertTrue(judged["judged run"].ok)   # a different condition: census mode is another thing
+
     def test_without_the_switch_nothing_is_written_and_no_frame_is_marked(self) -> None:
         for level in nvn.LEVELS:
             with self.subTest(level=level):

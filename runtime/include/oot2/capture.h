@@ -59,6 +59,10 @@
 //                                      A file without it was cut short and fails the check.
 // Readers ignore header keys and record kinds they do not know, so later tickets add to the header (the settings in
 // force) and to the records without a new version.
+// The header key test_movie_blit is "0", or "1 (...)" when the run had the test switch of that name on (settings.h): a
+// switch that replaces the movies' enhancement chain by a resample and so changes their pictures. The proof judge fails a
+// capture whose value is not 0, and the Vulkan replay counts every dispatch it did not run or replaced into the skipped
+// draws below, so a capture of such a run fails on its own counter too.
 //
 // The writer. capture_present, on the presenting guest thread, marks the frame boundary (rt_kernel_frame: the capture
 // is its only caller while it runs), reads every thread's time for the frame that just ended, and appends its lines to

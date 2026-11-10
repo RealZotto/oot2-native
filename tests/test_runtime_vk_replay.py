@@ -712,6 +712,207 @@ class ComputeTest(ReplayBase):
         self.assertEqual(len(set(bank_offsets)), 4)
 
 
+KEEP_KEY, MID_RAW_KEY, MID_IMG_KEY, LAST_KEY = (f"00000000000000e{i}.00000001" for i in (1, 2, 3, 4))
+MOVIE_KEYS = (f"# a synthetic chain: the keys are the test's own\nkeep {KEEP_KEY}\nskip {MID_RAW_KEY}   # the page table\n"
+              f"skip {MID_IMG_KEY}\n\nblit {LAST_KEY}\n")
+# the blit of texture ID 31's image (192x108) into ID 33's (256x144), linear
+BLIT_PACKET = ("BlitImage 0x201f->0x2021 filter=1 src aspect=0x1 level=0 layers=0+1 0,0,0..192,108,1 "
+               "dst aspect=0x1 level=0 layers=0+1 0,0,0..256,144,1")
+MOVIE_SWITCH = "OOT2_TEST_MOVIE_BLIT"
+MOVIE_FILE = "OOT2_MOVIE_BLIT_KEYS"
+
+
+def ops_by_frame(out: str) -> list[list[str]]:
+    """The ops lines of each frame, split at "op frame_begin"."""
+    frames: list[list[str]] = []
+    for line in (line for line in out.splitlines() if line.startswith("op ")):
+        if line == "op frame_begin":
+            frames.append([])
+        else:
+            frames[-1].append(line)
+    return frames
+
+
+class MovieBlitTest(ReplayBase):
+    """The movie chain's stand-in (settings.h test_movie_blit, oot2/vk_movie_blit.h): a test switch that changes the picture,
+    off by default. The programs are synthetic; their keys are in a file of the test's own, as the player's would be."""
+
+    last_stderr = ""
+
+    def movie(self, *args: str, on: bool = True, keys: str | bytes | None = MOVIE_KEYS, folder: Path | None = None,
+              env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        full = case_env()
+        full.pop(MOVIE_SWITCH, None)
+        full.pop(MOVIE_FILE, None)
+        with tempfile.TemporaryDirectory(prefix="oot2-vkreplay-movie-", ignore_cleanup_errors=True) as tmp:
+            if on:
+                full[MOVIE_SWITCH] = "1"
+            if keys is not None:
+                path = Path(tmp) / "keys.txt"
+                path.write_bytes(keys.encode("utf-8") if isinstance(keys, str) else keys)
+                full[MOVIE_FILE] = str(path)
+            full.update(env or {})
+            more = [str(folder)] if folder else []
+            return subprocess.run([str(self.exe), *args, *more], capture_output=True, text=True, timeout=60, env=full)
+
+    def chain(self, **kw) -> str:
+        done = self.movie("movie_chain", **kw)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("ok movie_chain", done.stdout)
+        self.assertEqual(fatal_lines(done.stderr), [])
+        self.last_stderr = done.stderr
+        return done.stdout
+
+    def test_with_the_setting_on_the_chain_runs_its_first_program_and_resamples_its_picture_into_the_last_ones_output(self) -> None:
+        out = self.chain()
+        ops = ops_by_frame(out)
+        self.assertEqual(len(ops), 4)
+        # frame 1: the first program and the plain dispatch run; the two middle ones and the last are not made
+        compute = [line for line in ops[0] if line.startswith("op compute ")]
+        self.assertEqual(compute, [f"op compute {KEEP_KEY}", f"op compute {CS_KEY}"])
+        self.assertFalse([line for line in ops[0] if line.startswith("op raw ")], ops[0])   # no page table: no raw frame
+        f = frame(out, 1)
+        self.assertEqual([p for p in f if p.startswith("Dispatch")], ["Dispatch 1 1 1", "Dispatch 1 1 1"])
+        self.assertEqual([p for p in f if p.startswith("BlitImage")], [BLIT_PACKET])
+        barrier = "PipelineBarrier2 full=1"
+        at = f.index(BLIT_PACKET)
+        # a transfer's barriers: one after the first program's stores, one before whatever reads the output
+        self.assertEqual((f[at - 1], f[at + 1]), (barrier, barrier), f[at - 2:at + 3])
+        self.assertLess(f.index("Dispatch 1 1 1"), at)   # the first program's dispatch comes before the resample
+        # the images it asked for: the picture first, then the output, whose storage is declared written once, as the last
+        # program's own stores would have been
+        wanted = [line for line in ops[0] if line.startswith(("op image_by_id ", "op wrote "))]
+        self.assertEqual(wanted, ["op image_by_id id 31 frame 1", "op image_by_id id 33 frame 1",
+                                  "op wrote V+0x50000 0x4000 frame 1"])
+        # the later frames have no first program before their middle and last ones (frame 2), or no last one (frame 3), or
+        # come after a chain that was never closed (frame 4): they run as they always do
+        self.assertEqual([line for line in ops[1] if line.startswith("op compute ")],
+                         [f"op compute {k}" for k in (MID_RAW_KEY, MID_IMG_KEY, LAST_KEY)])
+        self.assertEqual([line for line in ops[1] if line.startswith("op raw ")], ["op raw frame 2"])
+        self.assertEqual([line for line in ops[2] if line.startswith("op compute ")], [f"op compute {KEEP_KEY}"])
+        self.assertEqual([line for line in ops[3] if line.startswith("op compute ")], [f"op compute {MID_RAW_KEY}"])
+        self.assertEqual([line for line in ops[3] if line.startswith("op raw ")], ["op raw frame 4"])
+        self.assertEqual([p for p in frame(out, 2) if p.startswith(("Dispatch", "BlitImage"))], ["Dispatch 1 1 1"] * 3)
+        # the accounting: ten dispatch records, seven made, two skipped, one resampled, none lost; the census has the same
+        self.assertIn("stats chain draw_ops 10 dispatches 7 movie_skipped 2 movie_blits 1 lost 0 raw_binds 2", out)
+        self.assertIn("census chain skipped 2 blits 1", out)
+
+    def test_it_is_loud_the_first_time_and_says_the_run_is_no_proof(self) -> None:
+        self.chain()
+        err = self.last_stderr
+        self.assertEqual(err.count("MOVIE BLIT (test_movie_blit is on)"), 1, err)
+        self.assertIn("NOT a proof run", err)
+        self.assertIn("test_movie_blit: 1 keep, 2 skip and 1 blit program keys read from ", err)
+        skipped = [line for line in err.splitlines() if "are not run (the first is stage" in line]
+        self.assertEqual(len(skipped), 1, err)   # once, not for each of the dispatches
+        self.assertIn(f"stage {MID_RAW_KEY};", skipped[0])
+        blit = [line for line in err.splitlines() if "movie blit: the chain's last dispatch" in line]
+        self.assertEqual(len(blit), 1, err)
+        self.assertIn(f"(stage {LAST_KEY})", blit[0])
+        self.assertIn("192x108 (Vulkan format 37, texture ID 31) into 256x144 (format 37, texture ID 33)", blit[0])
+
+    def test_with_the_setting_off_every_program_runs_and_the_key_file_is_not_read(self) -> None:
+        out = self.chain(on=False, keys=None, env={MOVIE_FILE: "no-such-file.txt"})
+        ops = ops_by_frame(out)
+        self.assertEqual([len([x for x in f if x.startswith("op compute ")]) for f in ops], [5, 3, 1, 1])
+        self.assertEqual([line for line in ops[0] if line.startswith("op raw ")], ["op raw frame 1"])
+        self.assertNotIn("BlitImage", out)
+        self.assertNotIn("image_by_id", out)
+        self.assertIn("stats chain draw_ops 10 dispatches 10 movie_skipped 0 movie_blits 0 lost 0 raw_binds 3", out)
+        self.assertIn("census chain skipped 0 blits 0", out)
+        self.assertNotIn("movie blit", self.last_stderr.lower())
+        self.assertNotIn("program keys read", self.last_stderr)
+
+    def test_a_key_file_that_names_none_of_the_programs_leaves_the_run_as_it_is_with_the_setting_off(self) -> None:
+        other = "keep 00000000000000f1.00000001\nskip 00000000000000f2.00000001\nblit 00000000000000f3.00000001\n"
+        off = self.chain(on=False, keys=None)
+        on = self.chain(keys=other)
+        self.assertEqual(on, off)   # the ops, the packets and the counters, line for line
+        self.assertIn("program keys read from", self.last_stderr)   # only its start-up line is new
+
+    def test_a_chain_that_cannot_be_replaced_stops_by_name_at_the_program_that_shows_it(self) -> None:
+        prefix = "FATAL: gfx: vulkan: replay of submission 1, after "
+        want = {
+            "no_store": ("0 draws and dispatches: test_movie_blit: the chain's first program " + KEEP_KEY +
+                         " stores to no image"),
+            "no_image": "1 draws and dispatches: test_movie_blit: no image stands on the chain's first picture (texture ID 35)",
+            "array": ("1 draws and dispatches: test_movie_blit: the chain's output image is not a single 2D colour image of one "
+                      "level (192x108, 1 levels, 2 layers, 1 samples)"),
+            "same": "1 draws and dispatches: test_movie_blit: the chain's first picture and its output are one image",
+            "two_stores": ("1 draws and dispatches: test_movie_blit: the chain's last program " + LAST_KEY +
+                           " stores to more than one image"),
+            "no_ops": "1 draws and dispatches: test_movie_blit needs ops that give the image of a texture ID",
+        }
+        for what, text in want.items():
+            with self.subTest(stop=what):
+                done = self.movie("movie_stop", what)
+                self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+                self.assertNotIn("returned", done.stdout)
+                fatal = fatal_lines(done.stderr)
+                self.assertEqual(len(fatal), 1, done.stderr)
+                self.assertTrue(fatal[0].startswith(prefix + text), fatal[0])
+
+    def test_a_mistake_in_the_setting_or_the_key_file_is_a_named_fatal_at_start_up(self) -> None:
+        good = f"keep {KEEP_KEY}\nblit {LAST_KEY}\n"
+        done = self.movie("movie_open", keys=good)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("TEST SWITCH test_movie_blit IS ON", done.stderr)
+        self.assertIn("NOT a proof run", done.stderr)
+        self.assertIn("1 keep, 0 skip and 1 blit program keys read from", done.stderr)
+        done = self.movie("movie_open", on=False, keys="not a key file\n")   # off: nothing is read and nothing said
+        self.assertEqual((done.returncode, done.stderr), (0, ""), done.stdout + done.stderr)
+        key2 = "00000000000000e5.00000001"
+        missing = str(Path(tempfile.gettempdir()) / "oot2-no-such-keys-file.txt")
+        # (name, the file's content, the environment, what the fatal says after the setting's own first words)
+        cases = [
+            ("unset", None, {}, "OOT2_MOVIE_BLIT_KEYS is not set"),
+            ("unreadable", None, {MOVIE_FILE: missing}, f"its key file {missing} cannot be opened"),
+            ("role", f"keeper {KEEP_KEY}\n", {}, ", line 1: \"keeper\" is not a role (keep, skip or blit)"),
+            ("no key", "keep\n", {}, ", line 1: \"keep\" has no key after it"),
+            ("short key", "keep 00000000000000e1\n", {}, ", line 1: \"00000000000000e1\" is not a stage key"),
+            ("upper case", f"keep {KEEP_KEY.upper()}\n", {}, f", line 1: \"{KEEP_KEY.upper()}\" is not a stage key"),
+            ("extra", f"keep {KEEP_KEY} {LAST_KEY}\n", {}, ", line 1: more than a role and a key"),
+            ("twice", f"keep {KEEP_KEY}\nskip {key2}\nskip {key2}\nblit {LAST_KEY}\n", {},
+             f", line 3: the key {key2} is named twice"),
+            ("two roles", f"keep {KEEP_KEY}\nblit {KEEP_KEY}\n", {},
+             f", line 2: the key {KEEP_KEY} is in two roles (keep and blit)"),
+            ("no blit", f"keep {KEEP_KEY}\nskip {key2}\n", {}, ": it needs a keep line and a blit line (it has 1 and 0)"),
+            ("no keep", f"blit {LAST_KEY}\n", {}, ": it needs a keep line and a blit line (it has 0 and 1)"),
+            ("too many", "".join(f"skip {i:016x}.00000001\n" for i in range(65)), {}, ", line 65: more than 64 keys"),
+            ("nul", (good + "\0").encode("utf-8"), {}, ": it holds a NUL byte"),
+            ("long", "# " + "x" * 70000 + "\n", {}, ": it is longer than 65536 bytes"),
+        ]
+        for what, keys, env, tail in cases:
+            with self.subTest(file=what):
+                done = self.movie("movie_open", keys=keys, env=env)
+                self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+                self.assertNotIn("ok movie_open", done.stdout)
+                fatal = fatal_lines(done.stderr)
+                self.assertEqual(len(fatal), 1, done.stderr)
+                self.assertTrue(fatal[0].startswith("FATAL: gfx: vulkan: test_movie_blit is on and "), fatal[0])
+                self.assertIn(tail, fatal[0])
+
+    def test_a_capture_of_a_run_with_the_setting_on_is_refused_by_the_judge_on_two_counts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="oot2-vkreplay-movie-cap-", ignore_cleanup_errors=True) as tmp:
+            self.chain(folder=Path(tmp), env={"OOT2_CAPTURE": "1"})
+            cap = cc.parse(next(Path(tmp).glob("capture-*.tsv")))
+        self.assertTrue(cap.header["test_movie_blit"].startswith("1 ("), cap.header["test_movie_blit"])
+        self.assertEqual(cap.end.counters[0], 3)   # two skipped dispatches and the resample: the skipped draws
+        failing = {c.name: c.value for c in cc.check(cap).conditions if not c.ok}
+        self.assertIn("test settings", failing)
+        self.assertIn("test_movie_blit = 1 (", failing["test settings"])
+        self.assertTrue(failing["skipped draws"].startswith("3"), failing)
+
+    def test_a_capture_of_a_run_with_it_off_has_neither_count_against_it(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="oot2-vkreplay-movie-cap-off-", ignore_cleanup_errors=True) as tmp:
+            self.chain(on=False, keys=None, folder=Path(tmp), env={"OOT2_CAPTURE": "1"})
+            cap = cc.parse(next(Path(tmp).glob("capture-*.tsv")))
+        self.assertEqual(cap.header["test_movie_blit"], "0")
+        self.assertEqual(cap.end.counters[0], 0)
+        ok = {c.name for c in cc.check(cap).conditions if c.ok}
+        self.assertTrue({"test settings", "skipped draws"} <= ok)
+
+
 REPORTS = [
     "event 8",
     "samples 10 70 0",

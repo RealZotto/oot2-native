@@ -17,6 +17,7 @@
 #include "oot2/memory.h"
 #include "oot2/nvn_order.h"
 #include "oot2/nvn_pace.h"
+#include "oot2/settings.h"
 #include "plat.h"
 
 #define WINDOW 60            // presents per window
@@ -391,7 +392,27 @@ void nvn_census_stats(NvnStatRow emit, void *ctx) {
                  (ull)ledger_collected_kinds());
         emit(ctx, "collected-draws", ledger_collected(), why);
     }
+    if (rt_setting(RT_SET_test_movie_blit)) {   // a test switch that changes the picture (settings.h): the row is made whenever it is on
+        uint64_t skipped, blits;
+        nvn_census_movie_blit(&skipped, &blits);
+        snprintf(why, sizeof why, "NOT A PROOF RUN: test_movie_blit is on; the movie chain's dispatches not run %llu, replaced by "
+                 "a resample %llu", (ull)skipped, (ull)blits);
+        emit(ctx, "test-movie-blit", skipped + blits, why);
+    }
     emit(ctx, "presents", nvn_present_count(), "nvnQueuePresentTexture calls that reached the back end");
+}
+
+// ---- the movie chain's stand-in (settings.h test_movie_blit): what the Vulkan replay did not run or replaced
+static uint64_t g_movie_skipped, g_movie_blits;   // atomic
+
+void nvn_census_note_movie_blit(uint64_t skipped, uint64_t blits) {
+    if (skipped) __atomic_fetch_add(&g_movie_skipped, skipped, __ATOMIC_RELAXED);
+    if (blits) __atomic_fetch_add(&g_movie_blits, blits, __ATOMIC_RELAXED);
+}
+
+void nvn_census_movie_blit(uint64_t *skipped, uint64_t *blits) {
+    *skipped = __atomic_load_n(&g_movie_skipped, __ATOMIC_RELAXED);
+    *blits = __atomic_load_n(&g_movie_blits, __ATOMIC_RELAXED);
 }
 
 static void rows(FILE *f, const char *phase, uint64_t frames, const uint64_t *now, const uint64_t *before, int n) {

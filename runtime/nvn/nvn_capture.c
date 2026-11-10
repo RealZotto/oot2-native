@@ -327,6 +327,9 @@ void capture_start(const char *folder) {
     if (pages == UINT64_MAX) header("pages_output_counter_state", "unreadable on this machine; written as -1");
     header_u("census_mode", (uint64_t)rt_census_on());
     header_u("collect_variants", (uint64_t)(rt_setting(RT_SET_collect_variants) != 0));   // a development run, not a proof
+    // A test switch that changes the picture (settings.h): the proof judge refuses a capture whose run had it on, even a run
+    // that never reached a movie.
+    header("test_movie_blit", rt_setting(RT_SET_test_movie_blit) ? "1 (a test switch that changes the pictures of the movies: not a proof run)" : "0");
     header_u("title_mark_present", g_title_seq);
     header("title_mark_rule", "a present count from the first present (OOT2_CAPTURE_TITLE)");
     header("length_seconds", secs);

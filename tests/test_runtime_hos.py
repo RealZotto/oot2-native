@@ -223,6 +223,31 @@ class HosTest(unittest.TestCase):
                                               r"\S*census-nvn\.tsv$")
                 self.assertTrue((folder / "census-nvn.tsv").read_text(encoding="utf-8").startswith("#census-mode"))
 
+    def test_a_run_with_the_movie_blit_switch_on_is_marked_in_its_census_and_at_its_end(self) -> None:
+        # test_movie_blit changes the pictures of the movies (settings.h): the census file starts with a banner and carries a
+        # row, and the end of the run says so, whatever the totals; a run with the switch off has none of the three
+        for level in LEVELS:
+            with self.subTest(level=level, on=True):
+                done, folder = self.run_case(level, "movie", OOT2_TEST_MOVIE_BLIT="1")
+                self.assertEqual(done.returncode, EXIT_UNIMPLEMENTED, done.stdout + done.stderr)
+                census = (folder / "census.tsv").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(census[0], "#test-movie-blit: NOT A PROOF RUN: the movie chain's dispatches were not run (0) "
+                                            "or replaced by a resample (0); the pictures of the movies are not the console's")
+                self.assertEqual(census[1], "kind\tkey\tstatus\tcalls\tfirst_at\twhy")
+                row = [line for line in census if line.startswith("nvn-stat\ttest-movie-blit\t")]
+                self.assertEqual(len(row), 1, census)
+                self.assertIn("NOT A PROOF RUN: test_movie_blit is on; the movie chain's dispatches not run 0, replaced by a "
+                              "resample 0", row[0])
+                self.assertEqual(done.stderr.count("TEST RUN, NOT A PROOF RUN: test_movie_blit was on; 0 dispatches of the "
+                                                   "movie chain were not run and 0 were replaced by a resample"), 1, done.stderr)
+            with self.subTest(level=level, on=False):
+                done, folder = self.run_case(level, "movie", OOT2_TEST_MOVIE_BLIT="0")
+                self.assertEqual(done.returncode, EXIT_UNIMPLEMENTED, done.stdout + done.stderr)
+                census = (folder / "census.tsv").read_text(encoding="utf-8")
+                self.assertTrue(census.startswith("kind\tkey\tstatus\tcalls\tfirst_at\twhy\n"), census[:100])
+                self.assertNotIn("test-movie-blit", census)
+                self.assertNotIn("NOT A PROOF RUN", done.stderr)
+
     def test_a_memory_fault_names_the_guest_function_and_the_threads_frames(self) -> None:
         for level in LEVELS:
             with self.subTest(level=level):

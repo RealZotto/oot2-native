@@ -210,6 +210,12 @@ void nvn_census_write(FILE *f);
 // waitevents, waitclasses, pools, pools-cpu, pools-cpu-no-access, pools-physical, pools-virtual and presents (nvn_census.c).
 typedef void (*NvnStatRow)(void *ctx, const char *key, uint64_t count, const char *why);
 void nvn_census_stats(NvnStatRow emit, void *ctx);
+// The movie chain's stand-in (settings.h test_movie_blit, a test switch that changes the picture): the Vulkan replay adds
+// here the dispatches of the chain it did not run and those it replaced by a resample, and the census reads the totals, so
+// that the census and the end of the run say the run is not a proof run. The census row and banner are made whenever the
+// setting is on, whatever the totals.
+void nvn_census_note_movie_blit(uint64_t skipped, uint64_t blits);
+void nvn_census_movie_blit(uint64_t *skipped, uint64_t *blits);
 
 // ---- command recordings (runtime/nvn/nvn_cmd.c, architecture D11)
 // QueueSubmitCommands' work on the front end's side: every handle must be a live recording (a named stop otherwise),

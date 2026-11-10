@@ -23,6 +23,8 @@
 #include "oot2/backing.h"
 #include "oot2/capture.h"
 #include "oot2/bindless.h"
+#include "oot2/capture.h"
+#include "oot2/gfx.h"
 #include "oot2/gpu.h"
 #include "oot2/gpu_vk.h"
 #include "oot2/ledger.h"
@@ -33,11 +35,12 @@
 #include "oot2/nvn_tex.h"
 #include "oot2/runtime.h"
 #include "oot2/shader_desc.h"
+#include "oot2/vk_movie_blit.h"
 #include "oot2/vk_rec.h"
 #include "oot2/vk_replay.h"
 #include "plat.h"
 
-#define CHECK(cond)                                                                                                    \
+#define CHECK(cond)                                                                                                   \
     do {                                                                                                               \
         if (!(cond)) {                                                                                                 \
             fprintf(stderr, "check failed at line %d: %s\n", __LINE__, #cond);                                         \
@@ -100,6 +103,11 @@ static void lput(Log *l, const char *fmt, ...) {
 static nvn_stage g_vs, g_ps, g_cs, g_ts, g_ms, g_mps, g_vs_raw, g_cs_raw, g_cs_img;
 static ShaderBinds g_vs_binds, g_ps_binds, g_cs_binds, g_ts_binds, g_ms_binds, g_mps_binds, g_vs_raw_binds,
     g_cs_raw_binds, g_cs_img_binds;
+// The movie chain's four roles (settings.h test_movie_blit; synthetic keys, the key file is the driver's): the first
+// program, which stores a picture; a middle one that reaches memory through the page table; a middle one that stores an
+// image; and the last, which stores the output.
+static nvn_stage g_cs_keep, g_cs_mid_raw, g_cs_mid_img, g_cs_last;
+static ShaderBinds g_cs_keep_binds, g_cs_mid_raw_binds, g_cs_mid_img_binds, g_cs_last_binds;
 
 static void stage(nvn_stage *s, const char *key, int kind, uint32_t c1_at, uint32_t c1_end) {
     memset(s, 0, sizeof *s);
@@ -165,6 +173,22 @@ static void make_stages(void) {
     g_cs_img.ctl[0xA9] = 2, g_cs_img.ctl[0xB1] = 3, g_cs_img.ctl[0xB2] = 2;
     g_cs_img_binds = g_cs_binds;
     g_cs_img_binds.img[g_cs_img_binds.nimg++] = (ShdImg){.set = 1, .write = 1, .view = BV_2D, .binding = 25, .c2_slot = 2};
+
+    // the movie chain's four programs, each of g_cs's layout: the first stores image slot 2, the middle ones the page table
+    // and image slot 4, the last image slot 3
+    static const char *const chain_keys[4] = {"00000000000000e1.00000001", "00000000000000e2.00000001",
+                                              "00000000000000e3.00000001", "00000000000000e4.00000001"};
+    nvn_stage *chain[4] = {&g_cs_keep, &g_cs_mid_raw, &g_cs_mid_img, &g_cs_last};
+    ShaderBinds *chain_binds[4] = {&g_cs_keep_binds, &g_cs_mid_raw_binds, &g_cs_mid_img_binds, &g_cs_last_binds};
+    for (int i = 0; i < 4; i++) {
+        stage(chain[i], chain_keys[i], NVN_STAGE_CS, 0, 0);
+        chain[i]->ctl[0xA9] = 2, chain[i]->ctl[0xB1] = 3, chain[i]->ctl[0xB2] = 2;
+        *chain_binds[i] = g_cs_binds;
+    }
+    g_cs_keep_binds.img[g_cs_keep_binds.nimg++] = (ShdImg){.set = 1, .write = 1, .view = BV_2D, .binding = 25, .c2_slot = 2};
+    g_cs_mid_raw_binds.raw = 1;
+    g_cs_mid_img_binds.img[g_cs_mid_img_binds.nimg++] = (ShdImg){.set = 1, .write = 1, .view = BV_2D, .binding = 25, .c2_slot = 4};
+    g_cs_last_binds.img[g_cs_last_binds.nimg++] = (ShdImg){.set = 1, .write = 1, .view = BV_2D, .binding = 25, .c2_slot = 3};
 }
 
 // ---------- the stand-in ops
@@ -192,7 +216,9 @@ static const ShaderBinds *op_binds(const VkpStage *stage) {
     const nvn_stage *s = stage->shape;
     return s == &g_vs ? &g_vs_binds : s == &g_ps ? &g_ps_binds : s == &g_cs ? &g_cs_binds
            : s == &g_ts ? &g_ts_binds : s == &g_ms ? &g_ms_binds : s == &g_mps ? &g_mps_binds
-           : s == &g_vs_raw ? &g_vs_raw_binds : s == &g_cs_raw ? &g_cs_raw_binds : s == &g_cs_img ? &g_cs_img_binds : NULL;
+           : s == &g_vs_raw ? &g_vs_raw_binds : s == &g_cs_raw ? &g_cs_raw_binds : s == &g_cs_img ? &g_cs_img_binds
+           : s == &g_cs_keep ? &g_cs_keep_binds : s == &g_cs_mid_raw ? &g_cs_mid_raw_binds
+           : s == &g_cs_mid_img ? &g_cs_mid_img_binds : s == &g_cs_last ? &g_cs_last_binds : NULL;
 }
 static int g_log_resolves;   // a case that checks the order of the resolves against the raw path's begin sets it
 static void op_resolve(uint64_t addr, uint64_t size, uint64_t value, BackingRef *out) {
@@ -264,9 +290,26 @@ static VkImageView op_storage_image(uint32_t id, int type, uint64_t value, uint6
     CHECK(type == BV_2D);
     lput(&g_ops, "op storage_image id %u frame %llu\n", id, (ull)value);
     *storage = *bytes = 0;
-    if (id != 9 && id != 10) return VK_NULL_HANDLE;
-    if (id == 9) *storage = STORE_AT, *bytes = STORE_BYTES;
+    if (id != 9 && id != 10 && (id < 31 || id > 35)) return VK_NULL_HANDLE;   // 31 to 35: the movie chain's images
+    if (id == 9 || id == 33) *storage = STORE_AT, *bytes = STORE_BYTES;
     return (VkImageView)(uintptr_t)(0x5D00 + id);
+}
+// The images of the movie chain's textures, for the blit: 31 the first program's picture and 32 a middle program's (192x108,
+// arena images); 33 the last program's output (256x144, placed in its storage like ID 9); 34 an array of two layers (not a
+// picture a blit takes); 35 a texture with a view but no image. Any other ID has no texture.
+static int op_image_by_id(uint32_t id, uint64_t value, VkrImage *out, uint64_t *storage, uint64_t *bytes) {
+    lput(&g_ops, "op image_by_id id %u frame %llu\n", id, (ull)value);
+    memset(out, 0, sizeof *out);
+    if (storage) *storage = 0;
+    if (bytes) *bytes = 0;
+    if (id < 31 || id > 34) return 0;
+    out->image = (VkImage)(uintptr_t)(0x2000 + id);
+    out->type = VK_IMAGE_TYPE_2D, out->aspect = out->all_aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+    out->format = VK_FORMAT_R8G8B8A8_UNORM;
+    out->width = id == 33 ? 256 : 192, out->height = id == 33 ? 144 : 108;
+    out->depth = 1, out->layers = id == 34 ? 2 : 1, out->levels = 1, out->samples = 1;
+    if (id == 33 && storage && bytes) *storage = STORE_AT, *bytes = STORE_BYTES;
+    return 1;
 }
 static void *op_scratch(uint64_t value, uint32_t bytes, uint32_t align, VkBuffer *buffer, VkDeviceSize *offset) {
     (void)value;
@@ -309,7 +352,7 @@ static const VkReplayOps g_fake_ops = {
     .graphics_layout = (VkPipelineLayout)(uintptr_t)0x6100, .compute_layout = (VkPipelineLayout)(uintptr_t)0x6200,
     .binds = op_binds, .resolve = op_resolve, .gpu_wrote = op_gpu_wrote, .target = op_target, .image = op_image,
     .acquire = op_acquire,
-    .image_slot = op_image_slot, .storage_image = op_storage_image, .scratch = op_scratch,
+    .image_slot = op_image_slot, .storage_image = op_storage_image, .image_by_id = op_image_by_id, .scratch = op_scratch,
     .buffer_address = op_buffer_address, .task_set = op_task_set, .raw = op_raw,
     .frame_begin = op_frame_begin,
     .frame_end = op_frame_end, .queries = op_queries, .query_results = op_query_results, .cpu_reads = op_cpu_reads};
@@ -1546,6 +1589,103 @@ static void case_collect_other_stop(const char *folder) {
     printf("submit returned\n");
 }
 
+// ---------- the movie chain's stand-in (settings.h test_movie_blit, oot2/vk_movie_blit.h)
+// The driver sets OOT2_TEST_MOVIE_BLIT and OOT2_MOVIE_BLIT_KEYS (a file that names the four programs above) or leaves them
+// out. The chain's images: slot 2 holds texture ID 31 (the first program's picture), slot 4 ID 32 (a middle program's),
+// slot 3 ID 33 (the last program's output).
+static p_bind_program program_of(nvn_stage *s) {
+    p_bind_program p = program(1);
+    p.id[0] = s;
+    return p;
+}
+static p_bind_handles image_at(int slot, uint64_t id) { return (p_bind_handles){.stage = 5, .first = slot, .n = 1, .h = {id}}; }
+static void chain_images(Rec *r) {
+    PUT(r, OP_BIND_IMG, image_at(2, 31));
+    PUT(r, OP_BIND_IMG, image_at(4, 32));
+    PUT(r, OP_BIND_IMG, image_at(3, 33));
+}
+static void go(Rec *r, nvn_stage *s) {
+    PUT(r, OP_BIND_PROGRAM, program_of(s));
+    PUT(r, OP_DISPATCH, (p_dispatch){1, 1, 1, 0});
+}
+static void movie_stats(const char *label) {
+    VkrStats st;
+    vkr_stats(&st);
+    printf("stats %s draw_ops %llu dispatches %llu movie_skipped %llu movie_blits %llu lost %llu raw_binds %llu\n", label,
+           (ull)st.draw_ops, (ull)st.dispatches, (ull)st.movie_skipped, (ull)st.movie_blits, (ull)st.lost,
+           (ull)st.raw_binds);
+    uint64_t skipped, blits;
+    nvn_census_movie_blit(&skipped, &blits);   // what the census reads
+    printf("census %s skipped %llu blits %llu\n", label, (ull)skipped, (ull)blits);
+}
+
+// Four frames. 1: the whole chain, and a plain dispatch after it. 2: the chain's middle and last programs with no first
+// one before them. 3: the first alone. 4: a middle program in a frame of its own after a chain that never closed. A chain
+// is open from the first program to the last of one frame, so only frame 1's middle programs are skipped and only its last
+// is replaced; the rest of the frames run as they always do.
+static void case_movie_chain(const char *folder) {
+    if (folder) capture_start(folder);   // with OOT2_CAPTURE=1: the capture's header, counters and closing record
+    open_fakes();
+    Rec *r = rec_begin(0);
+    chain_images(r);
+    go(r, &g_cs_keep), go(r, &g_cs_mid_raw), go(r, &g_cs_mid_img), go(r, &g_cs_last), go(r, &g_cs);
+    uint64_t h = rec_end(r);
+    vkr_submit(&h, 1);
+    r = rec_begin(1);
+    go(r, &g_cs_mid_raw), go(r, &g_cs_mid_img), go(r, &g_cs_last);
+    h = rec_end(r);
+    vkr_submit(&h, 1);
+    r = rec_begin(0);
+    go(r, &g_cs_keep);
+    h = rec_end(r);
+    vkr_submit(&h, 1);
+    r = rec_begin(1);
+    go(r, &g_cs_mid_raw);
+    h = rec_end(r);
+    vkr_submit(&h, 1);
+    movie_stats("chain");
+    close_fakes();
+    if (folder) capture_end(0);
+    printf("ok movie_chain\n");
+}
+
+// A chain that cannot be replaced stops by name, at the program that shows it: the first program storing to no image, the
+// first picture with no image behind it, an output that is no single 2D picture, an output that is the first picture's
+// own image, and ops that give no image of a texture ID.
+static VkReplayOps g_ops_no_image_by_id;
+static void case_movie_stop(const char *what) {
+    open_fakes();
+    uint64_t first = 31, last = 33;
+    if (!strcmp(what, "no_store")) g_cs_keep_binds.img[0].write = 0;
+    else if (!strcmp(what, "no_image")) first = 35;
+    else if (!strcmp(what, "array")) last = 34;
+    else if (!strcmp(what, "same")) last = 31;
+    else if (!strcmp(what, "two_stores")) g_cs_last_binds.img[g_cs_last_binds.nimg++] = (ShdImg){.set = 1, .write = 1, .view = BV_2D, .binding = 26, .c2_slot = 5};
+    else if (!strcmp(what, "no_ops")) {
+        g_ops_no_image_by_id = g_fake_ops;
+        g_ops_no_image_by_id.image_by_id = NULL;
+        vkr_set_ops(&g_ops_no_image_by_id);
+    } else {
+        fprintf(stderr, "unknown stop %s\n", what);
+        exit(2);
+    }
+    Rec *r = rec_begin(0);
+    PUT(r, OP_BIND_IMG, image_at(2, first));
+    PUT(r, OP_BIND_IMG, image_at(3, last));
+    PUT(r, OP_BIND_IMG, image_at(4, 32));
+    PUT(r, OP_BIND_IMG, image_at(5, 32));
+    go(r, &g_cs_keep), go(r, &g_cs_mid_img), go(r, &g_cs_last);
+    uint64_t h = rec_end(r);
+    vkr_submit(&h, 1);
+    printf("submit returned\n");
+}
+
+// The device's open (gpu_vk_open) reads the key file at once when the setting is on, and says so.
+static void case_movie_open(void) {
+    vkmb_open();
+    printf("ok movie_open\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
@@ -1582,6 +1722,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "compute")) case_compute();
     else if (!strcmp(cs, "raw_first")) case_raw_first();
     else if (!strcmp(cs, "storage_image")) case_storage_image();
+    else if (!strcmp(cs, "movie_chain")) case_movie_chain(argc >= 3 ? argv[2] : NULL);
+    else if (!strcmp(cs, "movie_stop") && argc >= 3) case_movie_stop(argv[2]);
+    else if (!strcmp(cs, "movie_open")) case_movie_open();
     else if (!strcmp(cs, "storage_stop") && argc >= 3) case_storage_stop(argv[2]);
     else if (!strcmp(cs, "conflict_read_first")) case_conflict(0);
     else if (!strcmp(cs, "conflict_write_first")) case_conflict(1);

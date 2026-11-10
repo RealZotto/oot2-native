@@ -139,6 +139,10 @@ typedef struct VkReplayOps {
     // and *bytes: the texture's storage, for the written ranges, when its image is placed in it (0 bytes otherwise: an
     // arena image holds the stores itself). NULL: a storage image stops by name.
     VkImageView (*storage_image)(uint32_t id, int type, uint64_t value, uint64_t *storage, uint64_t *bytes);
+    // The image the texture registered at pool ID `id` stands on, for a copy in the frame `value` (the image a storage view
+    // of that ID is made over); 0 when nothing is registered there or no image stands on it. *storage and *bytes as
+    // storage_image gives them; either may be NULL. NULL: the movie blit (settings.h test_movie_blit) stops by name.
+    int (*image_by_id)(uint32_t id, uint64_t value, VkrImage *out, uint64_t *storage, uint64_t *bytes);
     // `bytes` of host-visible memory the device reads, for the frame `value` (freed once it is done): the pointer, and
     // the buffer and offset that bind it. Offsets are aligned to `align`.
     void *(*scratch)(uint64_t value, uint32_t bytes, uint32_t align, VkBuffer *buffer, VkDeviceSize *offset);
@@ -227,6 +231,10 @@ typedef struct VkrStats {
     uint64_t raw_binds;                            // draws and dispatches with a raw-access stage (D15)
     uint64_t full_rate;                             // shading rate images and rate modes the game set, replayed at full
                                                     // rate (vk_replay.c full_rate)
+    // The movie chain's stand-in (settings.h test_movie_blit, a test switch that changes the picture; both 0 in every run
+    // but a test one): dispatches of the chain not run, and dispatches replaced by a resample. Both are in the accounting
+    // above, so none is reported as lost, and both are counted into the capture's skipped draws.
+    uint64_t movie_skipped, movie_blits;
 } VkrStats;
 void vkr_stats(VkrStats *out);
 

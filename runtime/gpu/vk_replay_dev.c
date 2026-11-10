@@ -131,6 +131,23 @@ static int dev_image(const nvn_tex_rec *t, uint64_t value, VkrImage *out) {
     return 1;
 }
 
+// The image a texture pool ID's texture stands on, for the movie blit (settings.h test_movie_blit): the image the storage view
+// of that ID is made over, with the storage range its stores are declared over when the image is placed in it.
+static int dev_image_by_id(uint32_t id, uint64_t value, VkrImage *out, uint64_t *storage, uint64_t *bytes) {
+    tex_t t;
+    view_t v;
+    if (!bindless_texture_entry(id, &t, &v)) return 0;
+    nvn_tex_rec rec;
+    memset(&rec, 0, sizeof rec);
+    rec.tex = t, rec.view = v, rec.present = 1, rec.has_view = 1;
+    if (!dev_image(&rec, value, out)) return 0;
+    VkbImage *img = vkb_image_get(&t);
+    int placed = img && vkb_image_placed(img);
+    if (storage) *storage = placed ? (uint64_t)(uintptr_t)t.mem : 0;
+    if (bytes) *bytes = placed ? t.L.size : 0;
+    return 1;
+}
+
 // ---------- the bindless tables, recorded into the frame's prologue
 static VkDescriptorSet dev_acquire(uint64_t value, const dpool_ref *textures, const dpool_ref *samplers) {
     return vkb_acquire(gpu_vk_prologue(), value, textures, samplers);
@@ -350,7 +367,7 @@ const VkReplayOps *vkr_device_ops(void) {
                               .resolve = backing_resolve, .gpu_wrote = backing_gpu_wrote, .target = dev_target,
                               .image = dev_image,
                               .acquire = dev_acquire, .image_slot = dev_image_slot,
-                              .storage_image = dev_storage_image, .scratch = dev_scratch,
+                              .storage_image = dev_storage_image, .image_by_id = dev_image_by_id, .scratch = dev_scratch,
                               .buffer_address = dev_buffer_address, .task_set = dev_task_set,
                               .raw = gpu_vk_raw_begin, .frame_begin = dev_frame_begin, .frame_end = dev_frame_end,
                               .queries = dev_queries, .query_results = dev_query_results, .cpu_reads = dev_cpu_reads};
