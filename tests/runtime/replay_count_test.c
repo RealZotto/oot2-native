@@ -14,6 +14,8 @@
 //   series     a series of values (RcSeries): a window prints their count, sum, median, 90th percentile and largest and starts
 //              the next; a window with more than RC_SERIES_CAP values prints the newest and says how many it dropped; a
 //              raw value is printed as it is
+//   hook_race  seven threads register a hook each at once while lines print: none is lost, none is called through a
+//              half-made slot
 //   hook       the present hook is called at every present, with the counters off as well
 #include <stdio.h>
 #include <stdlib.h>
@@ -157,6 +159,22 @@ static void case_hook(void) {
     printf("hook calls %llu\n", (unsigned long long)g_hook_calls);
 }
 
+// Seven threads register a hook each at the same moment while another thread prints lines: every hook is registered once
+// and every group is in the exit line (a registration that lost its slot to another thread would be missing).
+#define RACERS 7
+static int g_go, g_done;
+#define RACER(n)                                                                                                           static void racer_hook##n(RcLine *l) { rc_group(l, "racer" #n), rc_put(l, "racer" #n "_value", 1); }                    static void racer_##n(void *arg) {                                                                                          (void)arg;                                                                                                             while (!__atomic_load_n(&g_go, __ATOMIC_ACQUIRE)) {}                                                                   rc_hook(racer_hook##n);                                                                                                __atomic_fetch_add(&g_done, 1, __ATOMIC_ACQ_REL);                                                                  }
+RACER(0) RACER(1) RACER(2) RACER(3) RACER(4) RACER(5) RACER(6)
+static void case_hook_race(void) {
+    rc_enable(600);
+    void (*fns[RACERS])(void *) = {racer_0, racer_1, racer_2, racer_3, racer_4, racer_5, racer_6};
+    for (int i = 0; i < RACERS; i++) CHECK(plat_thread_start(fns[i], NULL, 1 << 20));
+    plat_sleep_ns(20000000ull);   // all seven are spinning on the start
+    __atomic_store_n(&g_go, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&g_done, __ATOMIC_ACQUIRE) < RACERS) rc_print("window", 1);   // lines while they register
+    rc_print("exit", 2);
+}
+
 static void case_stop(void) {
     rc_enable(600);
     RC_ADD(RC_SUB_N, 9);
@@ -178,6 +196,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "stop")) case_stop();
     else if (!strcmp(cs, "series")) case_series();
     else if (!strcmp(cs, "hook")) case_hook();
+    else if (!strcmp(cs, "hook_race")) case_hook_race();
     else {
         fprintf(stderr, "unknown case %s\n", cs);
         return 2;

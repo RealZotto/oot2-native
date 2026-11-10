@@ -53,7 +53,8 @@ static int formats_equal(const VkpFormats *a, const VkpFormats *b) {
 static void report(RcLine *l);
 
 void vkrc_submit_begin(void) {
-    rc_hook(report);
+    static int hooked;   // the replay thread's alone
+    if (!hooked) hooked = 1, rc_hook(report);
     memset(seen, 0, sizeof seen);
     nseen = 0;
     prev.have = 0;
@@ -180,23 +181,30 @@ static void report(RcLine *l) {
     // decided against drawing, the waits the work before them did not satisfy (all, and the first of each call site in
     // each frame), the reports into memory the CPU cannot see, the sampler approximations, the texture regions uploaded as
     // zeros, and the textures that got no image.
-    VkrReportStats r;
-    vkr_report_stats(&r);
+    // The line prints at a stop, from the thread that stopped, and at every window, from the present thread. A thread
+    // that stops inside a locked section (vkt_upload names its fatals under the texture lock) would wait for itself on
+    // a lock here, and the present thread would wait behind a texture readback, so these four are read with a try: a
+    // busy lock leaves its values out of the line and sets its bit in silent_unavailable (1 reports, 2 textures, 4
+    // texture sync, 8 images). A key left out keeps its baseline, so the next window line shows the change over both.
+    VkrReportStats r = {0};
     VkbStats bs;
     vkb_stats(&bs);
-    VktStats ts;
-    vkt_stats(&ts);
-    TexSyncStats xs;
-    texsync_stats(&xs);
-    VkbImageStats is;
-    vkb_image_stats(&is);
+    VktStats ts = {0};
+    TexSyncStats xs = {0};
+    VkbImageStats is = {0};
+    int have_r = vkr_report_stats_try(&r), have_t = vkt_stats_try(&ts), have_x = texsync_stats_try(&xs);
+    int have_i = vkb_image_stats_try(&is);
     rc_group(l, "silent");
+    rc_put_raw(l, "silent_unavailable", (uint64_t)(!have_r | !have_t << 1 | !have_x << 2 | !have_i << 3));
     rc_put(l, "vkr_render_off_enable", s.render_off_enable), rc_put(l, "vkr_render_off_cond", s.render_off_cond);
     rc_put(l, "vkr_clears_off", s.clears_off);
-    rc_put(l, "rep_conditions", r.conditions), rc_put(l, "rep_conditions_false", r.conditions_false);
-    rc_put(l, "rep_waits", r.waits), rc_put(l, "rep_waits_unsatisfied", r.waits_unsatisfied);
-    rc_put(l, "rep_waits_unsat_first_per_site_frame", r.waits_unsat_first), rc_put(l, "rep_reports_dropped", r.dropped);
+    if (have_r) {
+        rc_put(l, "rep_conditions", r.conditions), rc_put(l, "rep_conditions_false", r.conditions_false);
+        rc_put(l, "rep_waits", r.waits), rc_put(l, "rep_waits_unsatisfied", r.waits_unsatisfied);
+        rc_put(l, "rep_waits_unsat_first_per_site_frame", r.waits_unsat_first), rc_put(l, "rep_reports_dropped", r.dropped);
+    }
     rc_put(l, "bind_wrap_approx", bs.wrap_approx), rc_put(l, "bind_border_approx", bs.border_approx);
-    rc_put(l, "tex_zero_regions_uploaded", ts.zero_regions), rc_put(l, "texsync_zero_regions", xs.zero_regions);
-    rc_put(l, "img_skipped_cpu", is.skipped_cpu), rc_put(l, "img_skipped_format", is.skipped_format);
+    if (have_t) rc_put(l, "tex_zero_regions_uploaded", ts.zero_regions);
+    if (have_x) rc_put(l, "texsync_zero_regions", xs.zero_regions);
+    if (have_i) rc_put(l, "img_skipped_cpu", is.skipped_cpu), rc_put(l, "img_skipped_format", is.skipped_format);
 }

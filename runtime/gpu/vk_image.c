@@ -934,3 +934,10 @@ void vkb_image_stats(VkbImageStats *out) {
     *out = g_st;
     plat_mutex_unlock(&g_mu);
 }
+
+int vkb_image_stats_try(VkbImageStats *out) {   // 0 when the lock is busy (the counters' lines never wait for it)
+    if (!plat_mutex_trylock(&g_mu)) return 0;
+    *out = g_st;
+    plat_mutex_unlock(&g_mu);
+    return 1;
+}

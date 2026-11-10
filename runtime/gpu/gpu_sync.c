@@ -86,7 +86,8 @@ static void completion(void *arg) {
             uint64_t effect_t0 = RC_ON() ? plat_now_ns() : 0;
             for (int i = 0; i < s->n; i++) s->effects[i].fn(s->effects[i].arg, s->value);
             if (effect_t0) {
-                rc_hook(effect_report);
+                static int hooked;   // the completion thread's alone
+                if (!hooked) hooked = 1, rc_hook(effect_report);
                 rc_series_add(&s_effect, plat_now_ns() - effect_t0);
             }
             plat_mutex_lock(&g_lock);

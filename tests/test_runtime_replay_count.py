@@ -150,8 +150,8 @@ class CountersTest(unittest.TestCase):
         self.assertEqual([(x["kind"], x["present"]) for x in series], [("window", "10"), ("window", "20"), ("window", "30"),
                                                                        ("exit", "33")])
 
-        def stats(x: dict) -> tuple:
-            return tuple(int(x[f"sample_{k}"]) for k in ("n", "sum", "p50", "p90", "max"))
+        def stats(x: dict, tail: str = "") -> tuple:
+            return tuple(int(x[f"sample{tail}_{k}"]) for k in ("n", "sum", "p50", "p90", "max"))
         self.assertEqual(stats(series[0]), (10, 55, 5, 9, 10))          # the median of 1..10 is the 5th, the 90th the 9th
         self.assertEqual(stats(series[1]), (3, 600, 200, 300, 300))
         cap = 16384
@@ -159,13 +159,29 @@ class CountersTest(unittest.TestCase):
         self.assertEqual(stats(series[2]), (cap, sum(newest), 6 + (cap - 1) // 2, 6 + (cap * 9 + 9) // 10 - 1, cap + 5))
         self.assertEqual(series[2]["sample_dropped"], "5")
         self.assertNotIn("sample_dropped", series[0])
-        self.assertEqual(stats(series[3]), (1, 4, 4, 4, 4))              # the exit: since the last window line
+        # the exit line: the stretch since the last window line under its own names, the whole run under _total_
+        self.assertEqual(stats(series[3], "_since_window"), (1, 4, 4, 4, 4))
+        for window in series[:3]:                                        # window lines carry no exit key
+            self.assertNotIn("sample_total_n", window)
+            self.assertNotIn("sample_since_window_n", window)
+        self.assertNotIn("sample_n", series[3])
+        everything = 55 + 600 + sum(range(1, cap + 6)) + 4              # a value that fell out of a window is in the total
+        self.assertEqual([int(series[3][f"sample_total_{k}"]) for k in ("n", "sum", "max")],
+                         [10 + 3 + (cap + 5) + 1, everything, cap + 5])
         for x in series:                                                 # a series with no value prints zeros
-            self.assertEqual([x[f"none_{k}"] for k in ("n", "sum", "p50", "p90", "max")], ["0"] * 5)
+            tail = "_since_window" if x["kind"] == "exit" else ""
+            self.assertEqual([x[f"none{tail}_{k}"] for k in ("n", "sum", "p50", "p90", "max")], ["0"] * 5)
             self.assertEqual(x["raw_value"], "77")                       # a raw value is printed as it is, never as a change
+        self.assertEqual([series[3][f"none_total_{k}"] for k in ("n", "sum", "max")], ["0"] * 3)
 
     def test_the_present_hook_is_called_at_every_present_with_the_counters_off(self) -> None:
         self.assertIn("hook calls 5", self.passing("hook").stdout)
+
+    def test_hooks_registered_by_several_threads_at_once_are_all_kept(self) -> None:
+        for attempt in range(40):   # a lost slot needs two registrations to meet: many short runs
+            lines = rc_lines(self.passing("hook_race").stderr)
+            exit_groups = {x["group"] for x in lines if x["kind"] == "exit"}
+            self.assertEqual({f"racer{i}" for i in range(7)} - exit_groups, set(), f"attempt {attempt}")
 
     def test_a_stop_prints_the_exit_line(self) -> None:
         done = self.run_case("stop")

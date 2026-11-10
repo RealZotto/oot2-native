@@ -158,17 +158,59 @@ class RingAndPacketTest(RecorderBase):
         ft, comp = groups["frametime"], groups["completion"]
         for name in ("gate_wait", "slot_wait", "ring_wait", "replay", "replay_cpu", "record", "record_cpu"):
             key = f"tm_{name}_ns"
-            self.assertEqual(ft[key + "_n"], 2, key)                       # two frames
-            self.assertLessEqual(ft[key + "_p50"], ft[key + "_p90"], key)
-            self.assertLessEqual(ft[key + "_p90"], ft[key + "_max"], key)
-            self.assertLessEqual(ft[key + "_max"], ft[key + "_sum"], key)
-        self.assertGreater(ft["tm_replay_ns_sum"], 0)
-        self.assertGreater(ft["tm_record_ns_sum"], 0)
-        self.assertEqual(comp["tm_effect_ns_n"], 2)                         # one value, one measure
-        self.assertGreaterEqual(comp["tm_effect_ns_max"], 25_000_000)       # the slow effect
-        self.assertGreaterEqual(comp["tm_effect_ns_sum"], 25_000_000)
+            # the exit line prints the whole run as _total_* and the stretch since the last window line as _since_window_*
+            self.assertEqual(ft[key + "_total_n"], 2, key)                 # two frames
+            self.assertEqual(ft[key + "_since_window_n"], 2, key)          # no window line came before
+            self.assertEqual(ft[key + "_total_sum"], ft[key + "_since_window_sum"], key)
+            self.assertLessEqual(ft[key + "_since_window_p50"], ft[key + "_since_window_p90"], key)
+            self.assertLessEqual(ft[key + "_since_window_p90"], ft[key + "_since_window_max"], key)
+            self.assertLessEqual(ft[key + "_since_window_max"], ft[key + "_since_window_sum"], key)
+            self.assertEqual(ft[key + "_total_max"], ft[key + "_since_window_max"], key)
+            self.assertNotIn(key + "_n", ft)                               # the plain keys are the window lines'
+        self.assertGreater(ft["tm_replay_ns_total_sum"], 0)
+        self.assertGreater(ft["tm_record_ns_total_sum"], 0)
+        self.assertEqual(comp["tm_effect_ns_total_n"], 2)                   # one value, one measure
+        self.assertGreaterEqual(comp["tm_effect_ns_total_max"], 25_000_000)  # the slow effect
+        self.assertGreaterEqual(comp["tm_effect_ns_total_sum"], 25_000_000)
         self.assertEqual(groups["time"]["t_fence_wait_n"], 1)
         self.assertEqual(groups["time"]["t_finish_n"], 1)
+
+    @staticmethod
+    def exit_groups(stderr: str) -> dict:
+        groups: dict = {}
+        for x in stderr.splitlines():
+            m = re.match(r"\[rt\] rc kind=exit group=(\w+) .*", x)
+            if m:
+                groups.setdefault(m.group(1), {}).update({k: int(v) for k, v in re.findall(r" (\w+)=(\d+)", x)})
+        return groups
+
+    def test_each_field_of_a_frame_lands_in_its_own_series(self) -> None:
+        done = self.run_case(self.levels[0], "counted_map", env={"OOT2_REPLAY_COUNTERS": "1"})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        ft = self.exit_groups(done.stderr)["frametime"]
+        want = {"gate_wait": 1000001, "slot_wait": 2000002, "ring_wait": 3000003, "replay": 4000004, "replay_cpu": 5000005,
+                "record": 6000006, "record_cpu": 7000007}
+        for name, value in want.items():
+            self.assertEqual(ft[f"tm_{name}_ns_total_sum"], value, name)
+            self.assertEqual(ft[f"tm_{name}_ns_total_max"], value, name)
+            self.assertEqual(ft[f"tm_{name}_ns_total_n"], 1, name)
+
+    def test_a_late_device_is_the_slot_wait_and_a_sleeping_replay_thread_is_wall_time_without_cpu(self) -> None:
+        done = self.run_case(self.levels[0], "counted_split", env={"OOT2_REPLAY_COUNTERS": "1"})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        ft = self.exit_groups(done.stderr)["frametime"]
+
+        def total(name: str) -> int:
+            return ft[f"tm_{name}_ns_total_sum"]
+        self.assertEqual(ft["tm_slot_wait_ns_total_n"], 3)
+        self.assertGreaterEqual(total("slot_wait"), 70_000_000)         # the device was 80 ms late for the first frame
+        self.assertLess(total("slot_wait"), 5_000_000_000)
+        self.assertLess(total("gate_wait"), 30_000_000)                 # nothing held the gate or filled the ring
+        self.assertLess(total("ring_wait"), 30_000_000)
+        self.assertGreaterEqual(total("replay"), 35_000_000)            # the 40 ms sleep inside the frame, less the ring wait
+        self.assertLess(total("replay_cpu"), total("replay") // 2)      # a sleeping thread spends wall time, not CPU time
+        self.assertLess(total("slot_wait"), total("replay") + 1_000_000_000)
+        self.assertLessEqual(total("record_cpu"), total("record") + 5_000_000)
 
     def test_the_replay_counters_off_leave_the_frames_alone(self) -> None:
         done = self.run_case(self.levels[0], "frame_order", env={"OOT2_REPLAY_COUNTERS": "0"})

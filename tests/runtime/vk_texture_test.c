@@ -58,6 +58,7 @@
 #include "oot2/gpu_vk.h"
 #include "oot2/memory.h"
 #include "oot2/pagegen.h"
+#include "oot2/replay_count.h"
 #include "oot2/runtime.h"
 #include "oot2/texmem.h"
 #include "oot2/vk_bindless.h"
@@ -1082,6 +1083,23 @@ static void case_stop(int depth) {
     printf("returned\n");
 }
 
+// A stop raised inside vkt_upload, under the texture lock, with the replay counters on: the exit line (a stop writer, run by
+// the thread that stopped) must not wait for that lock.
+void vkrc_submit_begin(void);   // vk_replay_count.c: registers the replay's line groups
+static void case_stop_counted(void) {
+    setup(64 * MiB, 1024 * MiB);
+    rc_enable(600);
+    vkrc_submit_begin();
+    Spec s = {NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8, 0, 64, 64, 1, 1, 0};
+    uint64_t storage = (g_heap + 4 * MiB + 0xFFFF) & ~0xFFFFull;
+    tex_t t = tex_of(storage, &s);
+    t.d.target = NVN_TEXTURE_TARGET_BUFFER;   // a kind the upload cannot serve: it names it and stops, holding the lock
+    VktState st;
+    memset(&st, 0, sizeof st);
+    vkt_upload(&t.d, storage, VK_NULL_HANDLE, VK_IMAGE_ASPECT_COLOR_BIT, &st, 1, 0);
+    printf("returned\n");
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: vk_texture_test <untile|anchor|upload|rewrite|caps|caps_full>\n");
@@ -1104,6 +1122,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "views")) case_views();
     else if (!strcmp(argv[1], "targets")) case_targets();
     else if (!strcmp(argv[1], "depth_stop")) case_stop(1);
+    else if (!strcmp(argv[1], "stop_counted")) case_stop_counted();
     else {
         fprintf(stderr, "unknown case %s\n", argv[1]);
         return 2;

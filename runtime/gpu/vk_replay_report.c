@@ -122,6 +122,13 @@ void vkr_report_stats(VkrReportStats *out) {
     plat_mutex_unlock(&g_lock);
 }
 
+int vkr_report_stats_try(VkrReportStats *out) {   // 0 when the lock is busy (the counters' lines never wait for it)
+    if (!plat_mutex_trylock(&g_lock)) return 0;
+    *out = g_st;
+    plat_mutex_unlock(&g_lock);
+    return 1;
+}
+
 static void push(Entry e) {
     if (R.n == R.cap) {
         uint32_t cap = R.cap ? 2 * R.cap : 64;

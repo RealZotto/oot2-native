@@ -262,3 +262,4 @@ typedef struct VkrReportStats {
                                             // counts every one; only the first of each site is ever logged)
 } VkrReportStats;
 void vkr_report_stats(VkrReportStats *out);
+int vkr_report_stats_try(VkrReportStats *out);   // 0 when the lock is busy (the counters' lines never wait for it)

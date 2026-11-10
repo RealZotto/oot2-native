@@ -900,6 +900,40 @@ static void case_counted_waits(void) {
     rc_print("exit", 0);
 }
 
+// Which cause lands in which series. The third frame waits 80 ms for the first on a late device (the slot wait; the gate and
+// the ring are free), then its replaying thread sleeps 40 ms inside the frame (wall time with no CPU time).
+static void case_counted_split(void) {
+    rc_enable(600);
+    open_fake(1u << 20, 2, 0);
+    for (int i = 0; i < 2; i++) {
+        vkrec_begin(GPU_VK_REPLAY);
+        vkrec_Draw(3, 1, 0, 0);
+        vkrec_end(NULL, 0);
+    }
+    vkrec_idle();
+    g_late_value = 1, g_late_ns = 80000000ull;
+    CHECK(plat_thread_start(late_device, NULL, 1 << 20));
+    vkrec_begin(GPU_VK_REPLAY);
+    plat_sleep_ns(40000000ull);
+    vkrec_Draw(3, 1, 0, 0);
+    vkrec_end(NULL, 0);
+    join(1);
+    close_fake();
+    printf("ok counted_split\n");
+    rc_print("exit", 0);
+}
+
+// The feeds' field-to-series mapping, with a distinct value in every field and no recorder at all.
+static void case_counted_map(void) {
+    rc_enable(600);
+    VkRecFrame row = {.gate_wait_ns = 1000001, .slot_wait_ns = 2000002, .ring_wait_ns = 3000003, .replay_ns = 4000004,
+                      .replay_cpu_ns = 5000005};
+    vkrec_count_replay(&row);
+    vkrec_count_record(6000006, 7000007);
+    printf("ok counted_map\n");
+    rc_print("exit", 0);
+}
+
 // ---------- breadcrumbs
 #define CRUMB_DRAWS 50
 static nvn_stage g_vs[CRUMB_DRAWS], g_ps[CRUMB_DRAWS], g_ts[CRUMB_DRAWS];
@@ -2070,6 +2104,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "frame_order")) case_frame_order();
     else if (!strcmp(cs, "frame_limit")) case_frame_limit();
     else if (!strcmp(cs, "counted_waits")) case_counted_waits();
+    else if (!strcmp(cs, "counted_split")) case_counted_split();
+    else if (!strcmp(cs, "counted_map")) case_counted_map();
     else if (!strcmp(cs, "window") && args >= 3) case_window(argv[2]);
     else if (!strcmp(cs, "frames_over")) case_frames_over();
     else if (!strcmp(cs, "frames_range")) case_frames_range();

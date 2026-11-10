@@ -104,6 +104,13 @@ void texsync_stats(TexSyncStats *out) {
     plat_mutex_unlock(&g_mu);
 }
 
+int texsync_stats_try(TexSyncStats *out) {   // 0 when the lock is busy (the counters' lines never wait for it)
+    if (!plat_mutex_trylock(&g_mu)) return 0;
+    *out = g_st;
+    plat_mutex_unlock(&g_mu);
+    return 1;
+}
+
 void texsync_reset_stats(void) {
     plat_mutex_lock(&g_mu);
     memset(&g_st, 0, sizeof g_st);

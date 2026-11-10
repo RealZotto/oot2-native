@@ -6,7 +6,7 @@
 // "on") prints one line group every 600 presents, a number from 2 up is the window in presents, and 0 or unset is off.
 // A run that ends, normally or by a stop, prints the totals once more. Lines go to the log (stderr) as
 //   [rt] rc kind=window|exit group=<name> present=<n> presents=<window> key=value key=value ...
-// every value an unsigned integer, window lines the change over the window, exit lines the whole run.
+// every value an unsigned integer, window lines the change over the window, exit lines the whole run (a series, below, prints both on the exit line).
 //
 // A counter is a plain increment in the calling thread's own block (no atomic, no lock on the path); the blocks are summed
 // when a line is printed, so a line read while a thread is counting may be a few increments behind. With the counters off
@@ -97,7 +97,7 @@ const char *rc_name(int id);
 // A line group. A hook adds its own values to a line; each value is a cumulative count, the line prints its change over
 // the window or the whole value at the exit.
 typedef void (*RcHook)(RcLine *l);
-void rc_hook(RcHook h);   // once per function
+void rc_hook(RcHook h);   // once per function; any thread, at any time
 void rc_group(RcLine *l, const char *name);
 void rc_put(RcLine *l, const char *key, uint64_t cumulative);
 
@@ -105,8 +105,10 @@ void rc_put(RcLine *l, const char *key, uint64_t cumulative);
 // and largest. The writer adds with rc_series_add (a plain store and a release of the count; the values of a window are
 // kept up to RC_SERIES_CAP, a window with more prints the newest and says how many it dropped), the line group's hook
 // prints with rc_series_put and starts the next window. A value is printed as it is (not as a change over cumulative
-// values): <name>_n, _sum, _p50, _p90, _max and, only when a window overflowed, _dropped. A line printed at the exit
-// shows the values since the last window line.
+// values): <name>_n, _sum, _p50, _p90, _max and, only when a window overflowed, _dropped. The line printed at the exit
+// has whole-run counters beside it, so it prints this series as the whole run's <name>_total_n, _total_sum and _total_max,
+// and the stretch since the last window line (the only values kept) as <name>_since_window_n, _sum, _p50, _p90, _max
+// (and _dropped). A reader dividing a series by another counter of the exit line uses the _total_ keys.
 #define RC_SERIES_CAP 16384u
 typedef struct RcSeries {
     const char *name;
@@ -114,6 +116,8 @@ typedef struct RcSeries {
     uint64_t n;         // values added so far (atomic), the next one goes to slot n % RC_SERIES_CAP
     uint64_t read;      // values taken by lines so far (the printing thread's)
     uint64_t dropped;   // values that fell out of a window unread (the printing thread's)
+    uint64_t total_sum; // every value added, for the exit line (the writer's; atomic)
+    uint64_t total_max; // the largest of them (the writer's; atomic)
 } RcSeries;
 #define RC_SERIES(var, label) static RcSeries var = {.name = (label)}
 void rc_series_add(RcSeries *s, uint64_t v);

@@ -60,3 +60,4 @@ typedef struct VktStats {
     uint64_t astc_regions, astc_blocks, astc_bytes;   // regions decoded from ASTC, their blocks, and the RGBA8 bytes written for them
 } VktStats;
 void vkt_stats(VktStats *out);
+int vkt_stats_try(VktStats *out);   // 0 when the lock is busy (the counters' lines never wait for it)

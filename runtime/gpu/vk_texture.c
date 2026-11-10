@@ -483,3 +483,12 @@ void vkt_stats(VktStats *out) {
     *out = g.st;
     plat_mutex_unlock(&g_mu);
 }
+
+// For the counters' lines (they print at a stop, from the thread that stopped, which may hold this lock inside vkt_upload,
+// and from the present thread, which must not wait behind a readback): 0 and *out untouched when the lock is busy.
+int vkt_stats_try(VktStats *out) {
+    if (!plat_mutex_trylock(&g_mu)) return 0;
+    *out = g.st;
+    plat_mutex_unlock(&g_mu);
+    return 1;
+}

@@ -109,3 +109,4 @@ typedef struct VkbImageStats {
     VkfImgTable cls;                           // the live images in the arena or with memory of their own, by class
 } VkbImageStats;
 void vkb_image_stats(VkbImageStats *out);
+int vkb_image_stats_try(VkbImageStats *out);   // 0 when the lock is busy (the counters' lines never wait for it)

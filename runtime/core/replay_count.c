@@ -71,6 +71,7 @@ static struct {
 static int g_nhook_prev;
 static RcHook g_hooks[8];
 static int g_nhooks;
+static PlatMutex g_hook_mu = PLAT_MUTEX_INIT;
 
 static void line_open(RcLine *l) {
     l->n = (size_t)snprintf(l->buf, sizeof l->buf, "rc kind=%s group=%s present=%llu presents=%llu", l->kind, l->group,
@@ -135,6 +136,9 @@ void rc_series_add(RcSeries *s, uint64_t v) {
     }
     uint64_t n = __atomic_load_n(&s->n, __ATOMIC_RELAXED);
     s->v[n % RC_SERIES_CAP] = v;
+    // the whole run's sum and largest, stored before the release of the count that the exit line reads them behind
+    __atomic_store_n(&s->total_sum, s->total_sum + v, __ATOMIC_RELAXED);
+    if (v > s->total_max) __atomic_store_n(&s->total_max, v, __ATOMIC_RELAXED);
     __atomic_store_n(&s->n, n + 1, __ATOMIC_RELEASE);
 }
 
@@ -153,19 +157,32 @@ void rc_series_put(RcLine *l, RcSeries *s) {
     }
     free(copy);
     s->read = end, s->dropped = 0;
-    char key[64];
-    snprintf(key, sizeof key, "%s_n", s->name), put_value(l, key, count);
-    snprintf(key, sizeof key, "%s_sum", s->name), put_value(l, key, sum);
-    snprintf(key, sizeof key, "%s_p50", s->name), put_value(l, key, p50);
-    snprintf(key, sizeof key, "%s_p90", s->name), put_value(l, key, p90);
-    snprintf(key, sizeof key, "%s_max", s->name), put_value(l, key, max);
-    if (dropped) snprintf(key, sizeof key, "%s_dropped", s->name), put_value(l, key, dropped);
+    char key[96];
+    // The exit line holds whole-run counters everywhere else, so it prints the whole run's count, sum and largest as
+    // _total_*, and the stretch since the last window line (the only one the values are kept for) as _since_window_*.
+    const char *tail = "";
+    if (!l->window) {
+        tail = "_since_window";
+        snprintf(key, sizeof key, "%s_total_n", s->name), put_value(l, key, end);
+        snprintf(key, sizeof key, "%s_total_sum", s->name), put_value(l, key, __atomic_load_n(&s->total_sum, __ATOMIC_RELAXED));
+        snprintf(key, sizeof key, "%s_total_max", s->name), put_value(l, key, __atomic_load_n(&s->total_max, __ATOMIC_RELAXED));
+    }
+    snprintf(key, sizeof key, "%s%s_n", s->name, tail), put_value(l, key, count);
+    snprintf(key, sizeof key, "%s%s_sum", s->name, tail), put_value(l, key, sum);
+    snprintf(key, sizeof key, "%s%s_p50", s->name, tail), put_value(l, key, p50);
+    snprintf(key, sizeof key, "%s%s_p90", s->name, tail), put_value(l, key, p90);
+    snprintf(key, sizeof key, "%s%s_max", s->name, tail), put_value(l, key, max);
+    if (dropped) snprintf(key, sizeof key, "%s%s_dropped", s->name, tail), put_value(l, key, dropped);
 }
 
+// Hooks are registered by the replay, recorder and completion threads while the present thread may be printing: the list
+// is taken under its own lock (never held while a hook runs or anything else is waited for), and a line works on a copy.
 void rc_hook(RcHook h) {
-    for (int i = 0; i < g_nhooks; i++)
-        if (g_hooks[i] == h) return;
-    if (g_nhooks < (int)(sizeof g_hooks / sizeof g_hooks[0])) g_hooks[g_nhooks++] = h;
+    plat_mutex_lock(&g_hook_mu);
+    int have = 0;
+    for (int i = 0; i < g_nhooks && !have; i++) have = g_hooks[i] == h;
+    if (!have && g_nhooks < (int)(sizeof g_hooks / sizeof g_hooks[0])) g_hooks[g_nhooks++] = h;
+    plat_mutex_unlock(&g_hook_mu);
 }
 
 static const char *group_of(int id) {
@@ -208,9 +225,12 @@ void rc_print(const char *kind, uint64_t present) {
     put_value(l, "rc_threads", (uint64_t)(__atomic_load_n(&g_nblk, __ATOMIC_RELAXED) > RC_BLOCKS
                                               ? RC_BLOCKS : __atomic_load_n(&g_nblk, __ATOMIC_RELAXED)));
     put_value(l, "rc_threads_sharing_a_block", (uint64_t)__atomic_load_n(&g_shared, __ATOMIC_RELAXED));
-    for (int i = 0; i < g_nhooks; i++) {
-        g_hooks[i](l);
-    }
+    RcHook hooks[sizeof g_hooks / sizeof g_hooks[0]];
+    plat_mutex_lock(&g_hook_mu);
+    int nhooks = g_nhooks;
+    memcpy(hooks, g_hooks, sizeof g_hooks);
+    plat_mutex_unlock(&g_hook_mu);
+    for (int i = 0; i < nhooks; i++) hooks[i](l);
     line_flush(l);
     if (l->window) g_window_start = present;
     free(l);

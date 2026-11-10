@@ -51,4 +51,5 @@ typedef struct TexSyncStats {
     uint64_t unchanged;                // uses that found nothing stale
 } TexSyncStats;
 void texsync_stats(TexSyncStats *out);
+int texsync_stats_try(TexSyncStats *out);   // 0 when the lock is busy (the counters' lines never wait for it)
 void texsync_reset_stats(void);

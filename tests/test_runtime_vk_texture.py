@@ -189,6 +189,25 @@ class DeviceTest(unittest.TestCase):
                 self.assertEqual(len(lines), 1, done.stderr[-3000:])
                 self.assertIn(text, lines[0])
 
+    def test_a_stop_under_the_texture_lock_still_prints_the_counters_and_exits(self) -> None:
+        # The counters' exit line reads the texture statistics; a stop raised inside the upload holds that lock, and a line
+        # that waited for it would never let the process leave (the case then times out instead of exiting 70).
+        try:
+            done = self.device("stop_counted", {"OOT2_REPLAY_COUNTERS": "1"}, timeout=120)
+        except subprocess.TimeoutExpired:
+            self.fail("the process never left: the exit line waits for a lock the stopping thread holds")
+        self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr[-3000:])
+        self.assertNotIn("returned", done.stdout)
+        lines = fatal_lines(done.stderr)
+        self.assertEqual(len(lines), 1, done.stderr[-3000:])
+        self.assertIn("cannot be uploaded", lines[0])
+        silent = [x for x in done.stderr.splitlines() if x.startswith("[rt] rc kind=exit group=silent ")]
+        self.assertEqual(len(silent), 1, done.stderr[-3000:])
+        self.assertIn(" silent_unavailable=2", silent[0])        # the texture group, named as not read
+        self.assertNotIn("tex_zero_regions_uploaded", silent[0])
+        self.assertIn(" rep_conditions=", silent[0])             # the groups that could be read are there
+        self.assertTrue(any(x.startswith("[rt] rc kind=exit group=threads ") for x in done.stderr.splitlines()))
+
     def test_a_full_arena_stops_by_name(self) -> None:
         done = self.device("caps_full")
         self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr[-3000:])
