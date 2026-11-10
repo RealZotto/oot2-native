@@ -19,6 +19,7 @@
 #include "oot2/boot.h"
 #include "oot2/gfx.h"
 #include "oot2/kernel.h"
+#include "oot2/ledger.h"
 #include "oot2/memory.h"
 #include "plat.h"
 #include "av1_fake.h"   // runtime/hos links the AV1 service; the fake stands for the decoder
@@ -236,7 +237,8 @@ static void boot(const char *folder) {
         CHECK((g_movie = rt_hostfn_bind(MOVIE_SYMBOL)) != 0);
         g_fake_refuse_open = 1;   // a build with no dav1d kit
     }
-    if (!strcmp(g_case, "nvn") || !strcmp(g_case, "nvn_census") || !strcmp(g_case, "census_files"))
+    if (!strcmp(g_case, "nvn") || !strcmp(g_case, "nvn_census") || !strcmp(g_case, "census_files") ||
+        !strcmp(g_case, "collect_note") || !strcmp(g_case, "collect_none"))
         nvn_procs_register();   // as main.c does, before the layer
     hos_init(folder, NULL, 0);
     static const uint64_t addrs[] = {G(1), G(2), G(3), G(4)};
@@ -511,6 +513,28 @@ int main(int argc, char **argv) {
             CHECK(t[0] != '#');   // no census-mode mark in a default run
             FILE *f = fopen(path, "rb");
             CHECK(f == NULL);     // and no calls-per-frame file
+        }
+    } else if (!strcmp(g_case, "collect_note") || !strcmp(g_case, "collect_none")) {
+        // A collection run (settings.h collect_variants) says so in census.tsv, and only then: three draws noted over two
+        // distinct (stage, answer) pairs give the banner and the collected-draws row; none noted gives neither.
+        boot(dir);
+        const int collected = !strcmp(g_case, "collect_note");
+        if (collected) {
+            int first = 0;
+            CHECK(ledger_collect_note("vs.a", "another scalar type", &first) == 1 && first == 1);
+            CHECK(ledger_collect_note("vs.b", "another scalar type", &first) == 2 && first == 1);
+            CHECK(ledger_collect_note("vs.a", "another scalar type", &first) == 3 && first == 0);
+        }
+        hos_census_write("the case ended");
+        const char *t = read_census(dir);
+        const char *banner = "#collect-variants: NOT A PROOF RUN: 3 draws were skipped, not drawn, to collect shader variants\n";
+        if (collected) {
+            CHECK(!strncmp(t, banner, strlen(banner)));   // first line of a default run
+            CHECK(strstr(t, "\nnvn-stat\tcollected-draws\timplemented\t3\t\tNOT A PROOF RUN: 3 draws were skipped, not "
+                            "drawn, for collection (collect_variants), over 2 distinct stage and answer pairs; their ledger "
+                            "rows are written\n"));
+        } else {
+            CHECK(!strstr(t, "collect-variants") && !strstr(t, "collected-draws") && !strstr(t, "NOT A PROOF RUN"));
         }
     } else if (!strcmp(g_case, "census_end")) {
         // a census-mode run ends with its own exit code after the census has its stop row

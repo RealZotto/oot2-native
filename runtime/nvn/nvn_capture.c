@@ -20,6 +20,7 @@
 #include "oot2/kernel.h"
 #include "oot2/nvn_pace.h"
 #include "oot2/runtime.h"
+#include "oot2/settings.h"
 #include "plat.h"
 
 #define FORMAT 1
@@ -325,6 +326,7 @@ void capture_start(const char *folder) {
     header("pages_output_counter", plat_pages_output_name());
     if (pages == UINT64_MAX) header("pages_output_counter_state", "unreadable on this machine; written as -1");
     header_u("census_mode", (uint64_t)rt_census_on());
+    header_u("collect_variants", (uint64_t)(rt_setting(RT_SET_collect_variants) != 0));   // a development run, not a proof
     header_u("title_mark_present", g_title_seq);
     header("title_mark_rule", "a present count from the first present (OOT2_CAPTURE_TITLE)");
     header("length_seconds", secs);

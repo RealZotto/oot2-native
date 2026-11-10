@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "oot2/capture.h"
 #include "oot2/gpu_vk.h"
 #include "oot2/ledger.h"
 #include "oot2/mesh_abi.h"
@@ -249,9 +250,10 @@ void vkr_stop(const char *fmt, ...) {
 // would show one stop a run, and a run of the route is long while the ledger step is short. Under the setting such a
 // stop writes the draw's ledger row first, as vkr_stop does, counts the draw, logs the pair of stage and answer once,
 // and abandons that draw only: the replay goes on with the next record. The draw is not drawn, so the picture is wrong
-// and the run says so in its log and in the census. Without the setting, or outside a draw or a dispatch, it is
-// vkr_stop with the same message, so every other stop and the default run are as they were.
-static jmp_buf *g_skip;   // the draw or dispatch being replayed under collection, else NULL (the replay is one thread)
+// and the run says so in its log, in the census and in the capture (the skipped-draw counter and a header mark, so
+// the proof judge refuses it). Without the setting, or outside a draw, it is vkr_stop with the same message, so every
+// other stop and the default run are as they were. Only a draw reaches it: the vertex input is a graphics state.
+static jmp_buf *g_skip;   // the draw being replayed under collection, else NULL (the replay is one thread)
 
 static int collecting(void) { return rt_setting(RT_SET_collect_variants) != 0; }
 
@@ -268,6 +270,7 @@ __attribute__((noreturn, format(printf, 2, 3))) static void stop_answer(const ch
     int first = 0;
     uint64_t n = ledger_collect_note(stage, line, &first);
     g_stats.collected++;
+    capture_count(CAPTURE_SKIPPED_DRAWS, 1);   // the proof judge fails on a skipped draw: a collection run cannot pass it
     if (n == 1)
         rt_log("gfx: vulkan: COLLECTING VARIANTS (collect_variants is on): a draw that stops on an answer the ledger can "
                "fix is skipped, not drawn, after its ledger row is written. This run is NOT a proof run and its picture "
@@ -1418,8 +1421,9 @@ static void geometry_mode(int32_t mode) {
 
 static void record_op(const op_hdr *r);
 
-// One record. Under collection a draw or a dispatch is replayed with a way out: a stop on an answer the ledger can fix
-// (stop_answer) lands here after the draw's rows were made, and the next record is replayed as if this one were not.
+// One record. Under collection a draw is replayed with a way out (a dispatch passes through the same wrapper, but no
+// stop_answer call is made in one): a stop on an answer the ledger can fix (stop_answer) lands here after the draw's
+// rows were made, and the next record is replayed as if this one were not.
 static void record(const op_hdr *r) {
     if (!makes_rows(r->op) || !collecting()) {
         record_op(r);

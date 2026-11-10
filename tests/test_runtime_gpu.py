@@ -106,10 +106,11 @@ def build_program(cc: str, include: Path, glslang: str, source: Path, out: Path,
 
 
 def case_env(env: dict[str, str] | None = None) -> dict[str, str]:
-    """This process's environment less census mode, the back-end choice and the Vulkan settings (each opt-in per case),
+    """This process's environment less census mode, the back-end choice, the Vulkan settings and the development switch
+    collect_variants (each opt-in per case),
     with third-party implicit Vulkan layers kept out (overlays and recorders flood the messenger), plus env."""
     full = {k: v for k, v in os.environ.items()
-            if not k.startswith(("OOT2_CENSUS", "OOT2_VK_")) and k != "OOT2_GFX"}
+            if not k.startswith(("OOT2_CENSUS", "OOT2_VK_")) and k not in ("OOT2_GFX", "OOT2_COLLECT_VARIANTS")}
     full["VK_LOADER_LAYERS_DISABLE"] = "~implicit~"
     full.update(env or {})
     return full

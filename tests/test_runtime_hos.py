@@ -187,6 +187,28 @@ class HosTest(unittest.TestCase):
                 self.assertFalse((folder / "census-nvn.tsv").exists())
                 self.assertNotIn("census mode", done.stderr)
 
+    def test_a_collection_run_says_so_in_its_census_and_its_end_line_and_a_run_with_nothing_collected_does_not(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level, collected=True):
+                done, folder = self.run_case(level, "collect_note")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("ok collect_note", done.stdout)
+                census = (folder / "census.tsv").read_text(encoding="utf-8")
+                self.assertTrue(census.startswith("#collect-variants: NOT A PROOF RUN: 3 draws were skipped, not drawn, to "
+                                                  "collect shader variants\n"), census[:120])
+                self.assertEqual(census.count("\nnvn-stat\tcollected-draws\timplemented\t3\t"), 1, census)
+                self.assertRegex(done.stderr, r"(?m)^\[rt\] COLLECTION RUN, NOT A PROOF RUN: 3 draws were skipped, not drawn, "
+                                              r"over 2 distinct stage and answer pairs \(collect_variants\); the ledger holds "
+                                              r"their rows, so oot2 prepare writes the variants$")
+            with self.subTest(level=level, collected=False):
+                done, folder = self.run_case(level, "collect_none")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("ok collect_none", done.stdout)
+                census = (folder / "census.tsv").read_text(encoding="utf-8")
+                for text in (census, done.stderr):
+                    for banner in ("collect-variants", "collected-draws", "NOT A PROOF RUN", "COLLECTION RUN"):
+                        self.assertNotIn(banner, text)
+
     def test_a_census_mode_run_ends_with_its_own_exit_code_and_its_census(self) -> None:
         for level in LEVELS:
             with self.subTest(level=level):

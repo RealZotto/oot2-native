@@ -17,7 +17,8 @@ The conditions:
 - the closing record is the file's last line: a capture without it was cut
   short (the run was killed, or crashed past the stop path) and fails, whatever
   the rest says;
-- the run is a judged run: not census mode (OOT2_CENSUS), and the header names
+- the run is a judged run: not census mode (OOT2_CENSUS), not a collection run
+  (collect_variants, which skips draws), and the header names
   the back end, the driver, the display mode, the implicit Vulkan layers and
   the available RAM;
 - no named fatal: the run ended with exit code 0;
@@ -261,7 +262,11 @@ def check(cap: Capture) -> Verdict:
         cond("closing record", False, why, "the last line")
 
     census = cap.header.get("census_mode", "0") != "0"
-    cond("judged run", not census, "census mode" if census else "default mode", "not census mode")
+    # collect_variants (a development switch): the run skipped draws that stop on an answer, so its picture is wrong.
+    # The skipped-draw counter fails it too; the mark names why, and a capture without the key is not a collection run.
+    collect = cap.header.get("collect_variants", "0") != "0"
+    mode = "census mode" if census else "collect_variants (draws skipped to collect shader variants)" if collect else "default mode"
+    cond("judged run", not census and not collect, mode, "not census mode, not collect_variants")
     missing = [k for k in REQUIRED_HEADER if k not in cap.header]
     cond("header", not missing, "complete" if not missing else "lacks " + ", ".join(missing), ", ".join(REQUIRED_HEADER))
 

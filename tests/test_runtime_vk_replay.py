@@ -51,6 +51,8 @@ from pathlib import Path
 from test_runtime_gpu import (EXIT_FATAL, ROOT, build_program, case_env, clang_or_skip, fatal_lines,  # sets the path of tools/
                               vulkan_or_skip)
 
+import check_capture as cc  # noqa: E402  (tools/ is on the path since test_runtime_gpu was imported)
+
 TEST_SOURCE = ROOT / "tests" / "runtime" / "vk_replay_test.c"
 LEVEL = "-O2"
 
@@ -433,6 +435,26 @@ class GraphicsTest(ReplayBase):
             self.assertEqual(len(skipped), 2, done.stderr)
             self.assertIn(f"stage {VS_KEY}", skipped[0])
             self.assertIn("is of another scalar type than the module's input", skipped[0])
+
+    def test_a_collection_run_counts_its_skipped_draws_in_the_capture_and_the_proof_judge_refuses_it(self) -> None:
+        for on in (True, False):
+            with self.subTest(collect_variants=on), tempfile.TemporaryDirectory(prefix="oot2-vkreplay-capture-") as folder:
+                env = case_env({"OOT2_CAPTURE": "1", **({"OOT2_COLLECT_VARIANTS": "1"} if on else {})})
+                done = subprocess.run([str(self.exe), "attr_collect", folder], capture_output=True, text=True,
+                                      timeout=60, env=env)
+                files = sorted(Path(folder).glob("capture-*.tsv"))
+                self.assertEqual(len(files), 1, done.stdout + done.stderr)
+                cap = cc.parse(files[0])
+                self.assertEqual(cap.header["collect_variants"], "1" if on else "0")
+                if not on:   # the first draw stops by name: the stop path closes the capture, no draw counted
+                    self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+                    self.assertEqual(cap.end.counters[cc.COUNTERS.index("skipped draws")], 0)
+                    continue
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                # the three skipped draws are the capture's skipped draws, and the judge fails the run twice over
+                self.assertEqual(cap.end.counters[cc.COUNTERS.index("skipped draws")], 3)
+                failed = {c.name for c in cc.check(cap).conditions if not c.ok}
+                self.assertLessEqual({"judged run", "skipped draws"}, failed)
 
     def test_with_collect_variants_off_the_first_draw_that_stops_on_its_answers_stops_by_name(self) -> None:
         with tempfile.TemporaryDirectory(prefix="oot2-vkreplay-collect-off-") as folder:

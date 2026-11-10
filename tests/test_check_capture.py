@@ -38,9 +38,10 @@ GIB = 1 << 30
 
 def synth(*, segments=((30, 60.0), (60, 60.0), (5, 60.0)), title_segment: int | None = 1, misses=(),
           memory=None, end_code: int = 0, end_reason: str = "exit", closing: bool = True, census: bool = False,
-          header_drop=(), extra=()) -> str:
+          collect: bool | None = None, header_drop=(), extra=()) -> str:
     """A capture as text. segments: (seconds, fps) one after the other from t = 0; the title mark is the first present
-    of segments[title_segment]. misses: (counter index, seconds) pairs, each adding one. memory(t_ns) -> (working set,
+    of segments[title_segment]. collect: None leaves the collect_variants header key out (a capture of an older
+    writer), else writes it as 1 or 0. misses: (counter index, seconds) pairs, each adding one. memory(t_ns) -> (working set,
     private) for the sample at t (default 2 and 3 GiB). extra: lines put before the closing record."""
     head = {"format": "1", "back_end": "null", "driver": "none (null back end)", "display_mode": "none (null back end)",
             "implicit_vulkan_layers": "none (null back end)", "ram_total": str(16 * GIB),
@@ -59,6 +60,8 @@ def synth(*, segments=((30, 60.0), (60, 60.0), (5, 60.0)), title_segment: int | 
         t_seg += secs * S
     if title_seq is not None:
         head["title_mark_present"] = str(title_seq)
+    if collect is not None:
+        head["collect_variants"] = "1" if collect else "0"
     for k in header_drop:
         head.pop(k)
     mem = memory or (lambda t: (2 * GIB, 3 * GIB))
@@ -160,6 +163,18 @@ class CheckerTest(unittest.TestCase):
     def test_a_census_mode_run_is_not_a_judged_run(self) -> None:
         v = self.verdict(synth(census=True, end_code=73, end_reason="census-limit"))
         self.assertEqual(set(self.failed(v)), {"judged run", "named fatals"})
+
+    def test_a_collection_run_is_not_a_judged_run(self) -> None:
+        # collect_variants skips draws that stop on a ledger answer: the picture is wrong, the run is no proof. The
+        # mark alone fails it, whatever the counters say; with the key at 0 or absent the same run passes.
+        v = self.verdict(synth(collect=True))
+        self.assertEqual(set(self.failed(v)), {"judged run"})
+        self.assertIn("collect_variants", self.failed(v)["judged run"])
+        self.assertTrue(self.verdict(synth(collect=False)).passed)
+        self.assertTrue(self.verdict(synth()).passed)
+        # its skipped draws fail the counter as well, so both name it
+        v = self.verdict(synth(collect=True, misses=[(cc.COUNTERS.index("skipped draws"), 5)]))
+        self.assertEqual(set(self.failed(v)), {"judged run", "skipped draws"})
 
     def test_a_working_set_over_5_gib_at_60_s_fails(self) -> None:
         def at_60(over: int):

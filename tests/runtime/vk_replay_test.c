@@ -21,6 +21,7 @@
 #include "volk.h"
 
 #include "oot2/backing.h"
+#include "oot2/capture.h"
 #include "oot2/bindless.h"
 #include "oot2/gpu.h"
 #include "oot2/gpu_vk.h"
@@ -1493,9 +1494,12 @@ static void bind_attr0(Rec *r, int format) {
 // Collection (settings.h collect_variants, the driver sets OOT2_COLLECT_VARIANTS or not): draws whose attribute 0 is
 // another scalar type than the module's float input. With the setting on, the unsigned one, the signed one and the
 // unsigned one again are skipped (the ledger holds a vertex row for each answer, the third being the same stop as the
-// first), and the float one after them is drawn; with it off the first stops by name, as it always did.
+// first), and the float one after them is drawn; with it off the first stops by name, as it always did. With
+// OOT2_CAPTURE=1 the run writes a capture into the folder, whose skipped-draw counter and collect_variants mark the
+// proof judge reads (tools/check_capture.py).
 static void case_attr_collect(const char *folder) {
     open_fakes();
+    capture_start(folder);
     ledger_set_folder(folder);
     ledger_flush_on_stop();
     Rec *r = rec_begin(0);
@@ -1522,6 +1526,7 @@ static void case_attr_collect(const char *folder) {
     printf("stats draws %llu collected %llu lost %llu ledger_collected %llu kinds %llu vs_rows %llu\n", (ull)st.draws,
            (ull)st.collected, (ull)st.lost, (ull)ledger_collected(), (ull)ledger_collected_kinds(), (ull)vs_rows);
     close_fakes();
+    if (capture_on()) capture_end(0);
     printf("ok attr_collect\n");
 }
 
