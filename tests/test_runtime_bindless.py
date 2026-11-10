@@ -367,6 +367,30 @@ class TablesTest(unittest.TestCase):
         ):
             self.assertIn(line, done.stdout)
 
+    def test_two_registrations_of_the_remade_pool_share_one_new_view(self) -> None:
+        done = run("remade_shared")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(fatal_lines(done.stderr), [])
+        self.assertIn("two registrations of the remade pool share one new view and neither stands on the finalized pool's",
+                      done.stdout)
+        self.assertIn("ok remade_shared", done.stdout)
+
+    def test_storage_gone_covers_exactly_lo_up_to_hi(self) -> None:
+        done = run("gone_edges")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(fatal_lines(done.stderr), [])
+        self.assertIn("storage gone [lo, hi): the entries at lo and hi - 1 show the placeholder, "
+                      "those at lo - 1 and hi keep their views", done.stdout)
+        self.assertIn("ok gone_edges", done.stdout)
+
+    def test_a_registration_racing_the_finalize_makes_no_view_until_the_range_is_settled(self) -> None:
+        done = run("gone_window")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(fatal_lines(done.stderr), [])
+        self.assertIn("a registration between gone and settled took the placeholder and made no view; "
+                      "after settled it made one", done.stdout)
+        self.assertIn("ok gone_window", done.stdout)
+
     def test_a_texture_past_the_games_part_of_the_array_is_a_named_fatal(self) -> None:
         done = run("id_fatal")
         self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)

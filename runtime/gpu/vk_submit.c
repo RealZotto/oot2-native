@@ -213,6 +213,7 @@ static void vk_pool_fini(pool_t *p) {
     uint64_t lo = (uint64_t)(uintptr_t)p->mem;
     bindless_storage_gone(lo, lo + p->size);
     vkb_image_pool_gone(lo, lo + p->size);
+    bindless_storage_settled(lo, lo + p->size);
     backing_pool_fini(p);
 }
 static int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {

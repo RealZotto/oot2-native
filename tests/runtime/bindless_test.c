@@ -534,6 +534,7 @@ static void case_remade(void) {
 
     // the pool [0x1000000, 0x1800000) is finalized and remade at the same address
     bindless_storage_gone(0x1000000, 0x1800000);
+    bindless_storage_settled(0x1000000, 0x1800000);
     tex_t ta2 = tex_at(0x1000000, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
     int made = fk.views_made;
     bindless_texture_register(&pool, 5, &ta2, NULL);
@@ -558,6 +559,83 @@ static void case_remade(void) {
     for (int i = 0; i < 8; i++) acq(NULL, NULL);
     CHECK(fk.views_freed == 2);
     printf("the two views of the finalized pool were freed after the submission that could read them\n");
+    bindless_close();
+}
+
+// Two registrations of the remade pool over one storage and description share ONE new view (the fix takes the finalized
+// pool's views out of the hash, not the sharing itself), and neither stands on the old one.
+static void case_remade_shared(void) {
+    const dpool_ref pool = {0x100000, 1000, 0}, spool_ref = {0x200000, FAKE_SAMPLERS, 0};
+    fake_open();
+    tex_t ta = tex_at(0x1000000, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+    bindless_texture_register(&pool, 5, &ta, NULL);
+    bindless_texture_register(&pool, 6, &ta, NULL);
+    CHECK(fk.views_made == 1);
+    void *s1 = acq(&pool, &spool_ref);   // pending from here on
+    void *old = ((FakeSet *)s1)->img[5];
+    CHECK(old && ((FakeSet *)s1)->img[6] == old);
+    bindless_storage_gone(0x1000000, 0x1800000);
+    bindless_storage_settled(0x1000000, 0x1800000);
+    tex_t ta2 = tex_at(0x1000000, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+    tex_t ta3 = tex_at(0x1000000, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+    bindless_texture_register(&pool, 8, &ta2, NULL);
+    bindless_texture_register(&pool, 9, &ta3, NULL);
+    CHECK(fk.views_made == 2);   // one view for both, made after the pool went
+    void *s2 = acq(NULL, NULL);
+    CHECK(s2 != s1);
+    CHECK(shows(s2, 5) == 0 && shows(s2, 6) == 0);   // the finalized pool's entries show the placeholder
+    CHECK(shows(s2, 8) == 0x1000000 && shows(s2, 9) == 0x1000000);
+    CHECK(((FakeSet *)s2)->img[8] == ((FakeSet *)s2)->img[9] && ((FakeSet *)s2)->img[8] != old);
+    printf("two registrations of the remade pool share one new view and neither stands on the finalized pool's\n");
+    bindless_close();
+}
+
+// The extent of bindless_storage_gone is [lo, hi): an entry at lo and at hi - 1 goes back to the placeholder, one at lo - 1
+// and at hi keeps its view.
+static void case_gone_edges(void) {
+    const dpool_ref pool = {0x100000, 1000, 0}, spool_ref = {0x200000, FAKE_SAMPLERS, 0};
+    const uint64_t lo = 0x1000000, hi = 0x1800000;
+    fake_open();
+    tex_t below = tex_at(lo - 1, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+    tex_t first = tex_at(lo, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+    tex_t last = tex_at(hi - 1, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+    tex_t above = tex_at(hi, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+    bindless_texture_register(&pool, 1, &below, NULL);
+    bindless_texture_register(&pool, 2, &first, NULL);
+    bindless_texture_register(&pool, 3, &last, NULL);
+    bindless_texture_register(&pool, 4, &above, NULL);
+    void *s1 = acq(&pool, &spool_ref);
+    CHECK(shows(s1, 1) == lo - 1 && shows(s1, 2) == lo && shows(s1, 3) == hi - 1 && shows(s1, 4) == hi);
+    bindless_storage_gone(lo, hi);
+    bindless_storage_settled(lo, hi);
+    void *s2 = acq(NULL, NULL);
+    CHECK(shows(s2, 1) == lo - 1 && shows(s2, 2) == 0 && shows(s2, 3) == 0 && shows(s2, 4) == hi);
+    printf("storage gone [lo, hi): the entries at lo and hi - 1 show the placeholder, those at lo - 1 and hi keep their views\n");
+    bindless_close();
+}
+
+// Between bindless_storage_gone and bindless_storage_settled (the host's own pool_gone runs in between, under another lock) a
+// registration over the range makes no view, the host could find the pool's image by storage; once settled it does.
+static void case_gone_window(void) {
+    const dpool_ref pool = {0x100000, 1000, 0}, spool_ref = {0x200000, FAKE_SAMPLERS, 0};
+    fake_open();
+    tex_t gone = tex_at(0x1000000, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+    tex_t kept = tex_at(0x2000000, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+    bindless_texture_register(&pool, 5, &gone, NULL);
+    acq(&pool, &spool_ref);
+    bindless_storage_gone(0x1000000, 0x1800000);
+    int made = fk.views_made;
+    bindless_texture_register(&pool, 6, &gone, NULL);   // racing the finalize
+    bindless_texture_register(&pool, 7, &kept, NULL);   // another pool: unaffected
+    CHECK(fk.views_made == made + 1);
+    void *s2 = acq(NULL, NULL);
+    CHECK(shows(s2, 5) == 0 && shows(s2, 6) == 0 && shows(s2, 7) == 0x2000000);
+    bindless_storage_settled(0x1000000, 0x1800000);
+    bindless_texture_register(&pool, 6, &gone, NULL);   // the remade pool's texture
+    CHECK(fk.views_made == made + 2);
+    void *s3 = acq(NULL, NULL);
+    CHECK(shows(s3, 6) == 0x1000000 && shows(s3, 5) == 0);
+    printf("a registration between gone and settled took the placeholder and made no view; after settled it made one\n");
     bindless_close();
 }
 
@@ -965,6 +1043,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "tables")) case_tables();
     else if (!strcmp(cs, "demand")) case_demand(), printf("ok demand\n");
     else if (!strcmp(cs, "remade")) case_remade();
+    else if (!strcmp(cs, "remade_shared")) case_remade_shared();
+    else if (!strcmp(cs, "gone_edges")) case_gone_edges();
+    else if (!strcmp(cs, "gone_window")) case_gone_window();
     else if (!strcmp(cs, "id_fatal")) case_id_fatal();
     else if (!strcmp(cs, "game_ids")) case_game_ids(argc, argv);
     else if (!strcmp(cs, "game_range")) case_game_range();

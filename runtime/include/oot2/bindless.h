@@ -129,7 +129,11 @@ void bindless_texture_release(const tex_t *t);
 // view over it is shared with a registration made later: a pool remade at the same address registers textures at the same
 // storage with the same description, which must stand on new images, not on the finalized pool's (whose memory is freed
 // while a copy may still show the old view).
+// The range stays closed until bindless_storage_settled: a registration or a bind over it takes the placeholder, so that
+// the host cannot make a view of an image of the pool while the host's own pool_gone has not yet run. Every call is
+// followed by a settled call for the same range, once the host's images of the pool can no longer be found.
 void bindless_storage_gone(uint64_t lo, uint64_t hi);
+void bindless_storage_settled(uint64_t lo, uint64_t hi);
 
 // ---- the replay's side: one submission at a time (the caller holds the back end's submission lock)
 // The copy for the submission that will signal `value`, brought up to date for the texture pool and the sampler pool the

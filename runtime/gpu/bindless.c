@@ -80,6 +80,8 @@ typedef struct Batch {
     int n;
 } Batch;
 
+#define MAX_GOING 16
+
 static struct {
     int open;
     BindlessOps ops;
@@ -100,6 +102,9 @@ static struct {
     Second *sec;
     uint32_t *sec_free;
     uint32_t nsec_free;
+    // Storage ranges whose pool is being finalized: bindless_storage_gone has run and bindless_storage_settled has not.
+    struct { uint64_t lo, hi; } going[MAX_GOING];
+    int ngoing;
     BindlessStats st;
 } g;
 static PlatMutex g_mu = PLAT_MUTEX_INIT;
@@ -194,6 +199,10 @@ static void hash_detach_storage(uint64_t lo, uint64_t hi) {
 // The shared view of (t, v) as `type`; NULL when the host makes none. No reference is taken. demand: the replay binds the
 // texture now, so a host that made no view at registration (view_make) is asked again with view_demand.
 static Res *view_get(const tex_t *t, const view_t *v, int type, int demand) {
+    // Over storage whose pool is being finalized the host may still find the pool's image: no view is made or found.
+    uint64_t at = (uint64_t)(uintptr_t)t->mem;
+    for (int i = 0; i < g.ngoing; i++)
+        if (at >= g.going[i].lo && at < g.going[i].hi) return NULL;
     BindlessKey k;
     bindless_key(t, v, type, &k);
     uint32_t h = fnv(&k, sizeof k, 0);
@@ -540,6 +549,13 @@ void bindless_texture_release(const tex_t *t) {
 
 void bindless_storage_gone(uint64_t lo, uint64_t hi) {
     plat_mutex_lock(&g_mu);
+    // From here until bindless_storage_settled, a registration or a bind over the range takes the placeholder: the host
+    // finds the pool's images by their storage until its own call (the image side's pool_gone) has run, and the two calls
+    // are made under different locks, so a registration racing the finalize would otherwise make a view of an image that
+    // is about to go.
+    if (g.ngoing == MAX_GOING)
+        rt_fatal("gfx: vulkan: bindless tables: %d pools are being finalized at once", MAX_GOING);
+    g.going[g.ngoing].lo = lo, g.going[g.ngoing].hi = hi, g.ngoing++;
     // A pool remade at the same address holds textures at the same storage with the same shape, whose registrations would
     // find the views of the finalized pool's textures by their key while a copy still shows them, and stand on images whose
     // memory went back to the backing map with the pool. Those views are no longer shared.
@@ -559,6 +575,16 @@ void bindless_storage_gone(uint64_t lo, uint64_t hi) {
             }
         }
     }
+    plat_mutex_unlock(&g_mu);
+}
+
+void bindless_storage_settled(uint64_t lo, uint64_t hi) {
+    plat_mutex_lock(&g_mu);
+    for (int i = 0; i < g.ngoing; i++)
+        if (g.going[i].lo == lo && g.going[i].hi == hi) {
+            g.going[i] = g.going[--g.ngoing];
+            break;
+        }
     plat_mutex_unlock(&g_mu);
 }
 
