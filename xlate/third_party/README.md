@@ -265,7 +265,14 @@ Changes of this project:
   8-bit one, 9 fewer for an unsigned 16-bit one and 10 fewer for an unsigned
   8-bit one; toward zero each has 1 fewer than that, so 3 more for a signed
   32-bit integer and 1 fewer than before for an unsigned one. No pass over the
-  corpus was made with this change.
+  corpus was made with this change. What the sequence gives for a NaN or an
+  infinity, here and in the conversions of the entry above, is what SPIR-V
+  says, and Vulkan does not hold a driver to it: the modules do not declare
+  `SignedZeroInfNanPreserve`, and without it a driver may assume that no
+  operand is a NaN or an infinity, for `NClamp`, for `OpIsNan` and for the
+  comparison alike (only what moves bits, `OpSelect` among it, is outside
+  that); with it declared the assumption still stands for `NClamp`. No device
+  has been measured.
 - `CodeGen/Spirv/CoopHmma.cs` (new), `CodeGen/Spirv/SpirvGenerator.cs`,
   `Generate` and `GenerateCoopHmma`, `CodeGen/Spirv/CodeGenContext.cs`,
   `GetArgumentPointer`; `Translation/HelperFunctionManager.cs`,

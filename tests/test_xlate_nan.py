@@ -38,6 +38,11 @@ so a 32-bit result takes its top value from a select on the source being above t
 integers are floats themselves and need nothing after the conversion. NClamp gives its lower bound for a NaN, which is
 the 0 of an unsigned result; a signed one selects its 0.
 
+What a green run says is what the module means. The evaluator gives NClamp, NMin, NMax, OpIsNan and the comparisons the
+SPIR-V specification's meaning for a NaN and an infinity; Vulkan lets a driver assume that no operand is either unless
+the module declares SignedZeroInfNanPreserve, which these modules do not, and for NClamp, NMin and NMax even then.
+What a device does with a NaN is not checked here and has not been measured.
+
 Run: python -m unittest discover -s tests -v   (skipped without a built oot2-xlate, see test_xlate_host)
 """
 

@@ -254,6 +254,9 @@ namespace Ryujinx.Graphics.Shader.Instructions
         // So: unsigned 16 and 8 bits, a clamp; unsigned 32 bits, a clamp, a comparison and a select; signed 16 and 8 bits, a clamp, a NaN test and a select; signed 32 bits, both.
         // No branch, and a value in range converts to what it did. Toward zero has no rounding instruction: OpConvertFToS and OpConvertFToU round toward zero themselves, and
         // the clamp's bounds are whole numbers, so the clamped float truncates to exactly what the truncated float clamps to (a NaN is the lower bound either way).
+        // What this rests on: the modules do not declare SignedZeroInfNanPreserve, and without it Vulkan lets a driver assume that no operand is a NaN or an infinity, for NClamp, for
+        // OpIsNan and for the comparison alike (only what moves bits, OpSelect among it, is outside that); with it declared the assumption still stands for NClamp. What the sequence
+        // gives for a NaN or an infinity is therefore what SPIR-V says, and a driver is not held to it, here and in FP32ToS32Bounded. No device has been measured.
         private static Operand FP32ToIntSaturated(EmitterContext context, Operand value, RoundMode2 roundingMode, bool signed, int bits)
         {
             Operand rounded = roundingMode switch
