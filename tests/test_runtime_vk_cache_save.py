@@ -12,7 +12,10 @@ folder opened the way the game opens it (gpu_vk_open_game): a named stop with ex
 every pipeline by the file; a clean exit saves; a run that made one more pipeline saves the growth; a run that made
 nothing new does not write the file again; the timer saves a run that is killed from outside (no stop hook), and with the
 timer off a killed run leaves nothing; OOT2_VK_CACHE_SAVE=off saves nothing; a save after the cache was flushed to a
-segment (what a builder does) is refused by name and the file stays as it was; the folder is made when it is not there.
+segment (what a builder does) is refused by name and the file stays as it was; the folder is made when it is not there;
+two processes saving into one folder at once each write a whole file; a temporary file of the process's own name left by
+an earlier process is removed at start; a cache file that was there and could not be read is not replaced by the run's part
+(and an empty one is); a stop while another thread is inside a long compile saves in milliseconds, without waiting for it.
 
 Run: python -m unittest discover -s tests -p test_runtime_vk_cache_save.py -v
 """
@@ -21,14 +24,21 @@ from __future__ import annotations
 
 import shutil
 import struct
+import subprocess
+import time
 import unittest
 from pathlib import Path
 
-from test_runtime_gpu import EXIT_FATAL, fatal_lines
-from test_runtime_vk_pipeline import DeviceTestCase, run
+import re
+
+from test_runtime_gpu import EXIT_FATAL, case_env, fatal_lines
+from test_runtime_vk_pipeline import (GLSL, SYNTH_KEYS, SYNTH_STAGE, DeviceTestCase, _build, cp, describe, io, program, run,
+                                      write_pack)
 
 HEADER = struct.Struct("<IIII16s")   # VkPipelineCacheHeaderVersionOne
 CACHE = Path("pipelines") / "pipeline.cache"
+LONG_KEY = "5100000000000010.00000000"      # tests/runtime/vk_pipeline_test.c, LONG_KEY
+LONG_OPERATIONS = 5000                      # dependent operations in the long compute stage: a compile of about two seconds
 
 
 class SaveSettingsTest(unittest.TestCase):
@@ -158,6 +168,124 @@ class SaveDeviceTest(DeviceTestCase):
         self.assertIn("the pipeline cache was NOT saved at the stop (exit 70): the cache was flushed to a segment", done.stderr)
         self.assertEqual(cache.read_bytes(), before)                    # the seed is not replaced by the part built since
         self.assertTrue((folder / "segment.bin").is_file())
+
+    @staticmethod
+    def half_written(pipelines: Path) -> bool:
+        try:
+            return any(p.suffix == ".tmp" and p.stat().st_size > 0 for p in pipelines.glob("*"))
+        except OSError:
+            return False
+
+    def test_two_processes_saving_into_one_folder_each_write_a_whole_file_and_the_later_rename_wins(self) -> None:
+        folder = self.game("two")
+        pipelines = folder / "pipelines"
+        slow = subprocess.Popen([str(program()), "synth_save", str(folder), "exit", "more", "stall=12000"], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=case_env({"OOT2_VK_VALIDATION": "off"}))
+        try:
+            deadline = time.time() + 60
+            while time.time() < deadline and slow.poll() is None and not self.half_written(pipelines):
+                time.sleep(0.05)                                    # until its temporary file is half written
+            if slow.poll() is not None:
+                self.fail("the slow writer ended before it paused: " + slow.communicate()[1][-1500:])
+            quick = self.save_run(folder, "exit")                    # saves a smaller cache while the slow one is paused
+            out, err = slow.communicate(timeout=120)
+        finally:
+            if slow.poll() is None:
+                slow.kill()
+        for name, code, log in (("quick", quick.returncode, quick.stderr), ("slow", slow.returncode, err)):
+            self.assertEqual(code, 0, name + ": " + log[-1500:])
+            self.assertIn("the pipeline cache was saved to ", log, name)
+            self.assertNotIn("NOT saved", log, name)
+        self.assertEqual([p.name for p in pipelines.glob("*.tmp")], [])      # nobody's temporary file is left
+        third = self.save_run(folder, "exit", "more")                        # the file is the slow writer's, whole
+        self.assertIn("cache_state 1", third.stdout)
+        s = self.stats(third.stdout)
+        self.assertEqual((s["computes"], s["compute_hits"]), (2, 2), s)
+        self.assert_all_served(third)
+
+    def test_a_temporary_file_of_this_process_name_left_by_an_earlier_one_is_removed_at_start(self) -> None:
+        folder = self.game("stale")
+        (folder / "pipelines").mkdir()
+        done = self.save_run(folder, "exit", "stale")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("the stale temporary file was removed", done.stdout)
+        self.assertEqual([p.name for p in (folder / "pipelines").glob("*.tmp")], [])
+
+    def test_a_cache_file_that_could_not_be_read_at_launch_is_not_replaced_by_the_runs_part(self) -> None:
+        folder = self.game("unread")
+        cache = folder / CACHE
+        self.save_run(folder, "fatal")
+        before = cache.read_bytes()
+        done = self.save_run(folder, "fatal", "more", f"readcap={len(before) - 1}")   # one byte too large to read
+        self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+        self.assertIn("cache_state 0", done.stdout)                              # it started empty
+        self.assertIn("could not be read (too large for memory, or unreadable): starting empty, and no save will replace it",
+                      done.stderr)
+        self.assertIn("the pipeline cache was NOT saved at the stop (exit 70): the cache file ", done.stderr)
+        self.assertIn(" could not be read at launch", done.stderr)
+        self.assertEqual(cache.read_bytes(), before)                             # the file is as it was
+        read = self.save_run(folder, "fatal", "more", f"readcap={len(before)}")  # the green counterpart: it is read, and grown
+        self.assertIn("cache_state 1", read.stdout)
+        self.assertIn("the pipeline cache was saved to ", read.stderr)
+        self.assertGreater(cache.stat().st_size, len(before))
+
+    def test_an_empty_cache_file_holds_nothing_to_lose_and_is_saved_over(self) -> None:
+        folder = self.game("empty")
+        (folder / "pipelines").mkdir()
+        (folder / CACHE).write_bytes(b"")
+        done = self.save_run(folder, "fatal")
+        self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+        self.assertIn("is empty: starting empty", done.stderr)
+        self.assertIn("the pipeline cache was saved to ", done.stderr)
+        self.assert_header(folder / CACHE)
+
+    def long_game(self, name: str) -> Path:
+        """A game folder whose pack holds the synthetic stages and one compute stage that takes seconds to compile."""
+        from build_game import GLSLANG_FLAGS  # tools/build_game.py is on the path through test_runtime_gpu
+        program()
+        work = self.dir / (name + "-pack")
+        work.mkdir()
+        body = "\n".join(f"    a = a * 1664525u + b; b = (b ^ (a >> {1 + i % 7})) + {i}u;" for i in range(LONG_OPERATIONS))
+        sources = dict(GLSL)
+        sources["long.comp"] = ("#version 450\nlayout(local_size_x = 32) in;\n"
+                                "layout(set = 1, binding = 9) buffer Out { uint v[]; } o;\n"
+                                "layout(set = 1, binding = 1) uniform Bank { uvec4 k; } bank;\n"
+                                "void main() {\n    uint a = gl_GlobalInvocationID.x + bank.k.x;\n    uint b = bank.k.y;\n"
+                                + body + "\n    o.v[gl_GlobalInvocationID.x] = a ^ b;\n}\n")
+        keys, stages = dict(SYNTH_KEYS, **{"long.comp": LONG_KEY}), dict(SYNTH_STAGE, **{"long.comp": "cs"})
+        entries = []
+        for stem, src in sources.items():
+            (work / stem).write_text(src, encoding="utf-8")
+            spv = work / (stem + ".spv")
+            done = subprocess.run([_build["glslang"], *GLSLANG_FLAGS, "-o", str(spv), str(work / stem)],
+                                  capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, f"glslang on {stem}:\n{done.stdout}{done.stderr}")
+            mod = spv.read_bytes()
+            kw: dict = {}
+            if stem == "vs.vert":
+                kw = {"outputs": [io(0)]}
+            elif stem == "ps.frag":
+                kw = {"inputs": [io(0), io(1)], "outputs": [io(0)]}
+            entries.append(cp.Entry(keys[stem], mod, describe(keys[stem], stages[stem], mod, **kw)))
+        folder = self.dir / name
+        (folder / "shaders").mkdir(parents=True)
+        shutil.copy(write_pack(work / "long.bin", entries), folder / "shaders" / "shader-base.bin")
+        return folder
+
+    def test_a_stop_during_a_long_compile_on_another_thread_saves_without_waiting_for_it(self) -> None:
+        env = {"OOT2_VK_VALIDATION": "off"}
+        timed = run("synth_stopcompile", str(self.long_game("compile-alone")), "compile", env=env, timeout=120)
+        self.assertEqual(timed.returncode, 0, timed.stdout + timed.stderr)
+        compile_ms = int(re.search(r"the long compile ended after (\d+) ms", timed.stdout).group(1))
+        folder = self.long_game("compile-stop")
+        done = run("synth_stopcompile", str(folder), "stop", env=env, timeout=120)
+        self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+        self.assertNotIn("the long compile ended", done.stdout)               # the stop came while it was under way
+        saved = re.search(r"the pipeline cache was saved to .* at the stop \(exit 70\): \d+ bytes .* in (\d+) ms", done.stderr)
+        self.assertIsNotNone(saved, done.stderr[-1500:])
+        # the driver reads a cache while another thread compiles into it: the save takes milliseconds, not the compile
+        self.assertLess(int(saved.group(1)), max(200, compile_ms // 2), (saved.group(1), compile_ms))
+        self.assert_header(folder / CACHE)
 
     def test_a_setting_outside_its_values_stops_the_start_by_name(self) -> None:
         folder = self.game("bad")

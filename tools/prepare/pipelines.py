@@ -223,7 +223,9 @@ class Pipelines(Step):
         if record.get("runtime") != RUNTIME_SAYS:
             return False                        # built by a runtime that did not say it zeroes workgroup memory
         try:
-            return (ctx.dest / OUT / CACHE).stat().st_size == record["cache_bytes"] and (ctx.dest / OUT / TIMES).is_file()
+            # Not smaller: the game saves what it built into this file (tasks, meshes, padded libraries), so a cache that grew
+            # since the step wrote it is the same cache and more; a smaller one was cut short.
+            return (ctx.dest / OUT / CACHE).stat().st_size >= record["cache_bytes"] and (ctx.dest / OUT / TIMES).is_file()
         except (OSError, KeyError, TypeError):
             return False
 

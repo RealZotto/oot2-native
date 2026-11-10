@@ -75,6 +75,7 @@ static struct {
     VkpCacheState cache_state;
     char cache_path[512];
     int flushed;                   // vkp_cache_flush swapped the cache for an empty one: a save would write a part of it
+    int unreadable;                // the cache file is there and was not read: a save would replace it with this run's part
     VkcList caps;
     int zero_workgroup;            // the device was made with zero-initialized workgroup memory (an optional feature)
     PlatMutex lock;
@@ -886,12 +887,16 @@ VkpCacheState vkp_cache_judge(const void *data, size_t size, const VkPhysicalDev
     return VKP_CACHE_LOADED;
 }
 
+int vkp_read_cap;         // tests only: a cache file larger than this many bytes counts as too large to read (0: no cap)
+int vkp_save_stall_ms;    // tests only: a save pauses this long after writing half of its file, so that two processes overlap
+
 static void *read_whole(const char *path, size_t *size) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     void *data = NULL;
     if (OFF_SEEK(f, 0, SEEK_END) == 0) {
         long long n = (long long)OFF_TELL(f);
+        if (vkp_read_cap && n > vkp_read_cap) n = 0;
         if (n > 0 && OFF_SEEK(f, 0, SEEK_SET) == 0 && (data = malloc((size_t)n)) != NULL) {
             if (fread(data, 1, (size_t)n, f) == (size_t)n) *size = (size_t)n;
             else free(data), data = NULL;
@@ -906,14 +911,23 @@ static void cache_open(const char *path) {
     size_t size = 0;
     uint64_t t0 = plat_now_ns();
     P.cache_state = VKP_CACHE_NONE;
+    P.unreadable = 0;
     if (path) {
         snprintf(P.cache_path, sizeof P.cache_path, "%s", path);
         data = read_whole(path, &size);
         if (!data) {
             FILE *there = fopen(path, "rb");
             if (there) {   // a file that is there and cannot be read is not the same as no file: say so
+                long long n = OFF_SEEK(there, 0, SEEK_END) == 0 ? (long long)OFF_TELL(there) : -1;
                 fclose(there);
-                rt_log("gfx: vulkan: the pipeline cache %s could not be read (empty, or too large for memory): starting empty", path);
+                if (n == 0) {
+                    rt_log("gfx: vulkan: the pipeline cache %s is empty: starting empty", path);
+                } else {
+                    // Not read, so not held: a save at the stop would replace what is in this file with what this run built.
+                    P.unreadable = 1;
+                    rt_log("gfx: vulkan: the pipeline cache %s could not be read (too large for memory, or unreadable): starting "
+                           "empty, and no save will replace it", path);
+                }
             }
         }
         if (data) {
@@ -987,6 +1001,11 @@ static void *cache_data(VkPipelineCache cache, size_t *size, int fatal, char *wh
     return NULL;
 }
 
+// The temporary file a write goes through. The process id is in its name: two processes that save into one folder (a game
+// left running on its timer and a new one, in a folder shared through a junction) never write the same file, so each
+// rename puts a whole file in place and the later one wins.
+static void temp_name(const char *path, char *out, size_t cap) { snprintf(out, cap, "%s.%u.tmp", path, plat_pid()); }
+
 // The cache's data written to path through a temporary file and a rename, so that an interrupted write leaves the old
 // file whole; *bytes (when not NULL) is its size. A Vulkan failure is a named fatal when `fatal` (the builder's flush),
 // else it is the reason in why (a save, which also runs at a stop, where a second fatal would end the run before the
@@ -995,10 +1014,16 @@ static int cache_write(VkPipelineCache cache, const char *path, size_t *bytes, i
     size_t size = 0;
     void *data = cache_data(cache, &size, fatal, why, cap);
     if (!data) return 0;
-    char tmp[sizeof P.cache_path + 8];
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    char tmp[sizeof P.cache_path + 24];
+    temp_name(path, tmp, sizeof tmp);
     FILE *f = fopen(tmp, "wb");
-    int ok = f && fwrite(data, 1, size, f) == size;
+    size_t first = vkp_save_stall_ms > 0 ? size / 2 : size;
+    int ok = f && fwrite(data, 1, first, f) == first;
+    if (ok && first < size) {   // tests only: the pause in which a second process saves into the same folder
+        ok = fflush(f) == 0;
+        plat_sleep_ns((uint64_t)vkp_save_stall_ms * 1000000ull);
+        ok = ok && fwrite((const char *)data + first, 1, size - first, f) == size - first;
+    }
     if (f && ok) ok = fflush(f) == 0 && SYNC_FILE(f) == 0;
     if (f && fclose(f) != 0) ok = 0;
     free(data);
@@ -1023,15 +1048,29 @@ static int cache_write(VkPipelineCache cache, const char *path, size_t *bytes, i
 
 static size_t g_saved_bytes;   // what the cache held when it was loaded, or when it was last saved (the growth a save looks for)
 
+// Why a save must not replace the cache file, or NULL: the cache holds a part of what the file holds.
+static const char *save_refusal(char *why, size_t cap) {
+    if (__atomic_load_n(&P.flushed, __ATOMIC_ACQUIRE)) {
+        snprintf(why, cap, "the cache was flushed to a segment (vkp_cache_flush), so it holds only what was built since "
+                           "and a save would replace %s with that part", P.cache_path);
+        return why;
+    }
+    if (P.unreadable) {
+        snprintf(why, cap, "the cache file %s was there and could not be read at launch (too large for memory, or unreadable), "
+                           "so this run started empty and a save would replace it with what this run built", P.cache_path);
+        return why;
+    }
+    return NULL;
+}
+
 int vkp_cache_save(char *why, size_t cap) {
     if (!P.open || !P.cache_path[0]) {
         if (why && cap) snprintf(why, cap, "no pipeline cache file was named");
         return 0;
     }
-    if (__atomic_load_n(&P.flushed, __ATOMIC_ACQUIRE)) {
-        if (why && cap)
-            snprintf(why, cap, "the cache was flushed to a segment (vkp_cache_flush), so it holds only what was built since "
-                               "and a save would replace %s with that part", P.cache_path);
+    char refusal[512];
+    if (save_refusal(refusal, sizeof refusal)) {
+        if (why && cap) snprintf(why, cap, "%s", refusal);
         return 0;
     }
     make_parent(P.cache_path);
@@ -1073,6 +1112,7 @@ static struct {
     int started, writer_added, stops;
     uint64_t every_ns;           // the timer's period; 0: no timer
     int saving;                  // one save at a time (atomic)
+    int refusal_logged;          // the timer names a refused or failed save once (atomic); a stop always names it
     PlatMutex lock;              // the timer thread's wait
     PlatCond cond;
     int thread_stop, thread_running;
@@ -1133,7 +1173,8 @@ static void autosave(const char *when, int stopping) {
     } else if (vkp_cache_save(why, sizeof why)) {
         rt_log("gfx: vulkan: the pipeline cache was saved to %s at %s: %zu bytes (%zu when loaded or last saved) in %.0f ms",
                P.cache_path, when, g_saved_bytes, before, (double)(plat_now_ns() - t0) / 1e6);
-    } else {
+    } else if (stopping || !__atomic_exchange_n(&S.refusal_logged, 1, __ATOMIC_ACQ_REL)) {
+        // A refusal or a failure: the stop always says it, the timer says it once, not every round.
         rt_log("gfx: vulkan: the pipeline cache was NOT saved at %s: %s", when, why);
     }
     __atomic_store_n(&S.saving, 0, __ATOMIC_RELEASE);
@@ -1175,6 +1216,11 @@ void vkp_cache_autosave_start(const VkpSaveSettings *settings) {
     }
     size_t base = 0;
     if (vkGetPipelineCacheData(gpu_vk.device, P.cache, &base, NULL) == VK_SUCCESS) g_saved_bytes = base;
+    // A temporary file of this very name is left by an earlier process that had this id and ended in the middle of a save.
+    char stale[sizeof P.cache_path + 24];
+    temp_name(P.cache_path, stale, sizeof stale);
+    remove(stale);
+    S.refusal_logged = 0;
     S.stops = 1;
     S.every_ns = (uint64_t)settings->seconds * 1000000000ull;
     if (!S.writer_added) {
@@ -1253,6 +1299,7 @@ void vkp_close(void) {
     P.cache_path[0] = 0;
     P.cache_state = VKP_CACHE_NONE;
     P.flushed = 0;
+    P.unreadable = 0;
     P.open = 0;
 }
 

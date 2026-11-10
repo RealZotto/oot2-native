@@ -107,7 +107,14 @@ class SettleTest(unittest.TestCase):
     def test_a_cache_cut_short_since_the_record_was_written_is_dropped(self) -> None:
         record = self.put(header() + b"x" * 100)
         self.out.write_bytes(header() + b"x" * 40)            # the header is whole, the rest is gone
-        self.assert_dropped(self.settle(record), "says 132", "cut short or changed")
+        self.assert_dropped(self.settle(record), "says 132", "cut short")
+
+    def test_a_cache_the_game_grew_since_the_record_is_kept_as_the_seed(self) -> None:
+        record = self.put(header() + b"x" * 100)
+        self.out.write_bytes(header() + b"x" * 100 + b"y" * 40)      # the game saved what it built beside the step's entries
+        seed = self.settle(record)
+        self.assertEqual((seed.outcome, seed.bytes), (pipeseed.KEPT, 172))
+        self.assertTrue(seed.used)
 
     def test_a_cache_of_another_runtime_is_dropped(self) -> None:
         record = self.put(header() + b"x")
@@ -188,6 +195,26 @@ class StepSeedTest(unittest.TestCase):
         self.assertEqual(self.serves(), ["serve no-cache none"])
         self.assertEqual(set(self.hits().values()), {"0"})
 
+    def test_a_cache_the_game_grew_is_kept_by_the_step_and_serves_as_the_seed(self) -> None:
+        extra = "t000000000000009.00000000"
+        with self.cache.open("ab") as f:
+            f.write(extra.encode() + b"\n")                    # what the game's save adds: an entry prepare did not build
+        status, ctx = self.env.run(self.ctx)                   # the same key: the step is current, nothing is built again
+        said = self.env.say(ctx)
+        self.assertEqual(status, "ok", said)
+        self.assertIn("pipelines: kept", said)
+        self.assertEqual(len(self.serves()), 1, said)
+        self.assertIn(extra, cache_keys(self.cache))
+        self.change_key()                                      # and a new key seeds from the grown cache
+        status, ctx = self.env.run(self.ctx)
+        said = self.env.say(ctx)
+        self.assertEqual(status, "ok", said)
+        rec = ctx.state["steps"]["pipelines"]
+        self.assertEqual(rec["seed"]["outcome"], pipeseed.KEPT, said)
+        self.assertEqual(self.serves()[1:], ["serve --cache loaded"])
+        self.assertIn(extra, cache_keys(self.cache))           # the game's entry is still in the cache
+        self.assertEqual(set(self.hits().values()), {"1"})
+
     def test_a_key_change_serves_every_unchanged_program_from_the_seed_and_builds_the_changed_one_cold(self) -> None:
         changed = "c000000000000002.00000000"
         self.change_key()
@@ -230,7 +257,7 @@ class StepSeedTest(unittest.TestCase):
         self.assertEqual(sorted(cache_keys(self.cache)), self.first_keys)              # a whole cache, built again
 
     def test_a_truncated_seed_is_dropped_by_name(self) -> None:
-        for cut, word in ((20, "shorter than the 32-byte header"), (self.cache.stat().st_size - 3, "cut short or changed")):
+        for cut, word in ((20, "shorter than the 32-byte header"), (self.cache.stat().st_size - 3, "cut short")):
             data = self.cache.read_bytes()[:cut]
             self.cache.write_bytes(data)
             self.change_key(f"cut {cut}")

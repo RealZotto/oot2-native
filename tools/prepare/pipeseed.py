@@ -18,7 +18,8 @@ deletes it, and the step builds from an empty cache as it always did:
 
   1. its header is a version-one pipeline cache header that names this vendor, device and pipeline cache UUID (the same
      rule as vkp_cache_judge in runtime/gpu/vk_pipeline.c: a cache is valid only for the driver that wrote it),
-  2. it is as large as the record of the run that wrote it says (a file cut short or changed since is not that cache),
+  2. it is at least as large as the record of the run that wrote it says (a file cut short is not that cache; a larger one is
+     the cache the game saved into the same file after the step wrote it, which holds the step's entries and more),
   3. the run that wrote it used the same runtime (the runtime zeroes workgroup memory before the driver sees a compute
      module, so a cache of a runtime that did not holds other modules than a launch asks for),
   4. that run used this device and driver,
@@ -115,8 +116,10 @@ def claims_of(record: dict | None) -> dict | None:
 def judge_claims(claims: dict, size: int, identity: str, runtime: dict) -> str:
     """Why the cache is not the one this run may be seeded with, from what was claimed of it, or ''."""
     want = claims.get("bytes")
-    if isinstance(want, int) and want != size:
-        return f"it is {size:,} bytes and the record of the run that wrote it says {want:,} (cut short or changed since)"
+    if isinstance(want, int) and size < want:
+        # A larger file is the cache the game saved after the step wrote it (the runtime adds what it built and keeps the
+        # rest), so it is kept; a smaller one is a cache that was cut short.
+        return f"it is {size:,} bytes and the record of the run that wrote it says {want:,} (cut short)"
     if claims.get("runtime") != runtime:
         return ("the run that wrote it used another runtime than this one "
                 f"({claims.get('runtime')!r}, this one {runtime!r}): its compute modules are not the ones a launch asks for")

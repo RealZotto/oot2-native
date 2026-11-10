@@ -44,12 +44,15 @@
 //                                device's workgroup memory with ones: it reads zeros
 //   synth_inflight PACK          a pipeline asked for with a submission in flight: a named fatal
 //   synth_cache PACK FILE PHASE  cold (build and save), warm (build from the file) or tamper (a driver change)
-//   synth_save FOLDER MODE [more]   a game folder opened the way the game opens it (gpu_vk_open_game: FOLDER/shaders/shader-base.bin,
+//   synth_save FOLDER MODE [OPTION...]   a game folder opened the way the game opens it (gpu_vk_open_game: FOLDER/shaders/shader-base.bin,
 //                                FOLDER/pipelines/pipeline.cache), the pipelines made, and the run ended by MODE: fatal (a
 //                                named stop, exit 70), exit (the guest's ExitProcess, exit 0), kill (no stop hook, as a
 //                                process killed from outside), timer (waits for the cache's own timer to write the file,
 //                                then ends without a stop hook) or flushed (the cache flushed to a segment as a builder
-//                                does, a save refused, then a named stop); "more" makes one more compute pipeline
+//                                does, a save refused, then a named stop). Options: more (one more compute pipeline), stale (a
+//                                temporary file of this process's name is planted before the start, and must be gone after
+//                                it), stall=MS (a save pauses MS after half of its file), readcap=N (a cache file over N
+//                                bytes counts as unreadable)
 //   synth_release PACK           a stage's objects released and made again
 //   synth_threads PACK           eight threads ask for one pipeline: it is made once
 //   synth_absent PACK            a stage the pack lacks: a named fatal with its shape
@@ -957,9 +960,28 @@ static int file_exists(const char *path) {
     return f != NULL;
 }
 
-static void case_synth_save(const char *folder, const char *mode, int more) {
+static void case_synth_save(const char *folder, const char *mode, int nopt, char **opt) {
+    int more = 0, stale = 0;
+    for (int i = 0; i < nopt; i++) {
+        if (!strcmp(opt[i], "more")) more = 1;
+        else if (!strcmp(opt[i], "stale")) stale = 1;
+        else if (!strncmp(opt[i], "stall=", 6)) vkp_save_stall_ms = atoi(opt[i] + 6);
+        else if (!strncmp(opt[i], "readcap=", 8)) vkp_read_cap = atoi(opt[i] + 8);
+        else {
+            printf("unknown option %s\n", opt[i]);
+            exit(2);
+        }
+    }
+    char stale_path[1024];
+    snprintf(stale_path, sizeof stale_path, "%s/pipelines/pipeline.cache.%u.tmp", folder, plat_pid());
+    if (stale) {   // what a process of this very id left when it ended in the middle of a save
+        FILE *f = fopen(stale_path, "wb");
+        CHECK(f && fputs("half a cache", f) >= 0);
+        fclose(f);
+    }
     gpu_vk_open();
     gpu_vk_open_game(folder);
+    if (stale) printf("the stale temporary file %s\n", file_exists(stale_path) ? "is still there" : "was removed");
     printf("cache_state %d\n", (int)vkp_cache_state());
     VkpStage vs = {.key = VS_KEY}, ps = {.key = PS_KEY}, cs = {.key = CS_KEY}, cs2 = {.key = CS2_KEY};
     CHECK(vkp_graphics(&vs, NULL, &ps, &F32) && vkp_graphics(&vs, NULL, &ps, &F16) && vkp_compute(&cs));
@@ -995,6 +1017,36 @@ static void case_synth_save(const char *folder, const char *mode, int more) {
     }
     printf("unknown mode %s\n", mode);
     exit(2);
+}
+
+#define LONG_KEY "5100000000000010.00000000"   // a compute stage of thousands of dependent operations: a compile of seconds
+
+static void long_compile_main(void *arg) {
+    (void)arg;
+    VkpStage cs = {.key = LONG_KEY};
+    uint64_t t0 = plat_now_ns();
+    CHECK(vkp_compute(&cs));
+    printf("the long compile ended after %.0f ms\n", (double)(plat_now_ns() - t0) / 1e6);
+    fflush(stdout);
+}
+
+// A named stop while another thread is inside a long pipeline compile of the same cache: the stop's save must not wait for
+// the compile. MODE compile only times the compile on this thread.
+static void case_synth_stopcompile(const char *folder, const char *mode) {
+    gpu_vk_open();
+    gpu_vk_open_game(folder);
+    VkpStage vs = {.key = VS_KEY}, ps = {.key = PS_KEY}, cs = {.key = CS_KEY};
+    CHECK(vkp_graphics(&vs, NULL, &ps, &F32) && vkp_compute(&cs));
+    if (!strcmp(mode, "compile")) {
+        long_compile_main(NULL);
+        fflush(stdout);
+        plat_exit(0);
+    }
+    CHECK(plat_thread_start(long_compile_main, NULL, 1u << 20) != NULL);
+    plat_sleep_ns(300000000ull);   // the compile is under way
+    printf("stopping\n");
+    fflush(stdout);
+    rt_fatal("synth_stopcompile: a named stop during a long compile");
 }
 
 static void case_synth_release(const char *pack) {
@@ -1377,7 +1429,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(cs, "synth_zeroinit") && argc >= 3) case_synth_zeroinit(argv[2]);
         else if (!strcmp(cs, "synth_inflight") && argc >= 3) case_synth_inflight(argv[2]);
         else if (!strcmp(cs, "synth_cache") && argc >= 5) case_synth_cache(argv[2], argv[3], argv[4]);
-        else if (!strcmp(cs, "synth_save") && argc >= 4) case_synth_save(argv[2], argv[3], argc >= 5 && !strcmp(argv[4], "more"));
+        else if (!strcmp(cs, "synth_save") && argc >= 4) case_synth_save(argv[2], argv[3], argc - 4, argv + 4);
+        else if (!strcmp(cs, "synth_stopcompile") && argc >= 4) case_synth_stopcompile(argv[2], argv[3]);
         else if (!strcmp(cs, "synth_release") && argc >= 3) case_synth_release(argv[2]);
         else if (!strcmp(cs, "synth_threads") && argc >= 3) case_synth_threads(argv[2]);
         else if (!strcmp(cs, "synth_absent") && argc >= 3) case_synth_absent(argv[2]);

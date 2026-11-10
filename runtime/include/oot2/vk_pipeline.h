@@ -137,7 +137,9 @@ int vkp_zero_workgroup(void);
 // leaves the old file whole; the folder the file is in is made when it is not there. A Vulkan failure is reported in
 // why and never stops the run (this runs at the stop of a run too). 1, or 0 with the reason in why. It is refused by name
 // once vkp_cache_flush has swapped the cache for an empty one: what the cache holds then is only what was built since
-// that flush, and writing it would replace the whole file (the seed a builder was started from) with that part.
+// that flush, and writing it would replace the whole file (the seed a builder was started from) with that part. It is
+// refused the same way when the file was there at launch and could not be read (too large for memory). The temporary
+// file has the process id in its name, so two processes saving into one folder never write the same file.
 int vkp_cache_save(char *why, size_t cap);
 
 // The game saves the cache it built by itself, so that the next run starts warm (the game folder's pipelines/pipeline.cache
@@ -227,6 +229,10 @@ int vkp_warm(int what, const VkpStage *s, VkpWarm *out);
 // Tests only: while non-zero, a vertex or mesh module is linked as translated, with no padding (the counter-run of the
 // padding rules: the validation layer then reports VUID-RuntimeSpirv-OpEntryPoint-08743 for a pixel input nothing writes).
 extern int vkp_unpad;
+// Tests only: a cache file larger than vkp_read_cap bytes counts as too large to read at launch (0: no cap), which the
+// save then refuses to replace; and a save pauses vkp_save_stall_ms milliseconds after writing half of its file, so that a
+// test can overlap two processes saving into one folder.
+extern int vkp_read_cap, vkp_save_stall_ms;
 // Destroy every library and pipeline that was made from the stage with this key (for program_release, when no program
 // holds it). The caller guarantees that no submission in flight uses them.
 void vkp_release(const char *key);
