@@ -52,7 +52,9 @@ enum { ST_VS = 0, ST_FS = 1, ST_CS = 5, ST_TS = 6, ST_MS = 7, ST_N = 8 };
 #define UNIFORM_ALIGN 256u
 #define SNAPS_MAX 4096
 #define WRITES_MAX 8192
-#define FRAMES_KEPT 4
+// One entry for every frame the recorder lets be in flight (its window goes to VKREC_MAX_FRAMES) and one to spare, so a
+// frame's written ranges are not recycled for a new frame while that frame is in flight.
+#define FRAMES_KEPT ((int)VKREC_MAX_FRAMES + 1)
 
 int vkr_no_snapshot;
 int vkr_no_flip;

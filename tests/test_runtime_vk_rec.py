@@ -17,6 +17,9 @@ device loss whose report names the last draw by its stages. OOT2_TIMING=1 also r
 Each check has a counter-run, a test-only switch of vk_rec_test that breaks the mechanism the check is for: a ring that
 does not wait for room, a third frame let through, a marker one draw past its record. The check must then fail.
 
+A source check that needs no build: the two host locks held across a submission (the texel copies' and the capture's) are
+taken with rt_kernel_lock, never plat_mutex_lock.
+
 Run: python -m unittest discover -s tests -v
 """
 
@@ -206,6 +209,45 @@ class RingAndPacketTest(RecorderBase):
 
     def test_counter_run_a_breadcrumb_naming_the_wrong_draw(self) -> None:
         self.counter_run("breadcrumbs", "skew")
+
+
+class LockSitesTest(unittest.TestCase):
+    """The host locks held across a submission are taken with rt_kernel_lock. A source check: no build, no device.
+
+    core_lock proves that rt_kernel_lock and the gate's yield work on a private mutex of the test. It cannot tell that the
+    real locks are taken that way, and one take that went back to plat_mutex_lock brings the deadlock back (a guest thread
+    holds the lock and has given its core up for the gate, a second one on that core waits for the lock with the core held)
+    while every other test stays green. The two locks are the texel copies' staging lock (g_xfer_mu, vk_image.c) and the
+    capture's (g_mu, vk_capture.c). The other mutex of vk_image.c, g_mu, guards its counters for a few instructions and is
+    not one of them.
+    """
+
+    GPU = ROOT / "runtime" / "gpu"
+    SITES = (("vk_image.c", "g_xfer_mu"), ("vk_capture.c", "g_mu"))
+    CALLS = ("rt_kernel_lock", "plat_mutex_lock", "plat_mutex_trylock")
+
+    @classmethod
+    def takes(cls, source: str, mutex: str) -> dict[str, int]:
+        """How many times each locking call takes `mutex` in the code of `source` (a comment is not a take)."""
+        code = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
+        return {call: len(re.findall(rf"\b{call}\(\s*&{mutex}\s*\)", code)) for call in cls.CALLS}
+
+    def test_every_take_of_a_lock_held_across_a_submission_is_rt_kernel_lock(self) -> None:
+        for name, mutex in self.SITES:
+            with self.subTest(file=name, mutex=mutex):
+                n = self.takes((self.GPU / name).read_text(encoding="utf-8"), mutex)
+                self.assertGreater(n["rt_kernel_lock"], 0, f"{name} has no rt_kernel_lock(&{mutex}): renamed? change SITES")
+                self.assertEqual(n["plat_mutex_lock"] + n["plat_mutex_trylock"], 0,
+                                 f"{name} takes {mutex} with plat_mutex_lock or plat_mutex_trylock {n}: use rt_kernel_lock")
+
+    def test_counter_run_a_take_that_went_back_to_plat_mutex_lock_is_seen_and_a_comment_is_not_a_take(self) -> None:
+        good = ("static PlatMutex g_xfer_mu, g_mu;\n"
+                "/* plat_mutex_lock(&g_xfer_mu) */ // plat_mutex_lock(&g_xfer_mu)\n"
+                "void f(void) { rt_kernel_lock(&g_xfer_mu); plat_mutex_lock(&g_mu); plat_mutex_unlock(&g_xfer_mu); }\n")
+        bad = good.replace("rt_kernel_lock(&g_xfer_mu);", "plat_mutex_lock( &g_xfer_mu );")
+        self.assertEqual(self.takes(good, "g_xfer_mu"), {"rt_kernel_lock": 1, "plat_mutex_lock": 0, "plat_mutex_trylock": 0})
+        self.assertEqual(self.takes(bad, "g_xfer_mu"), {"rt_kernel_lock": 0, "plat_mutex_lock": 1, "plat_mutex_trylock": 0})
+        self.assertEqual(self.takes(good, "g_mu"), {"rt_kernel_lock": 0, "plat_mutex_lock": 1, "plat_mutex_trylock": 0})
 
 
 class DeviceTest(RecorderBase):
