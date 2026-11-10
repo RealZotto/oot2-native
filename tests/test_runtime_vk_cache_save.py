@@ -14,17 +14,22 @@ nothing new does not write the file again; the timer saves a run that is killed 
 timer off a killed run leaves nothing; OOT2_VK_CACHE_SAVE=off saves nothing; a save after the cache was flushed to a
 segment (what a builder does) is refused by name and the file stays as it was; the folder is made when it is not there;
 two processes saving into one folder at once each write a whole file; a temporary file of the process's own name left by
-an earlier process is removed at start; a cache file that was there and could not be read is not replaced by the run's part
-(and an empty one is); a stop while another thread is inside a long compile saves in milliseconds, without waiting for it.
+an earlier process is removed at start, and so are those of processes that are gone (never those of a live one); a move
+that meets another process reading the cache is tried again for about a second; a cache file that was there and could not
+be read or opened is not replaced by the run's part (an empty one is, and a file that is not there is made); the timer names
+a refusal once, not every round; a stop while another thread is inside a long compile saves in milliseconds, without waiting
+for it (measured on one driver, and skipped when the compile is too short to tell).
 
 Run: python -m unittest discover -s tests -p test_runtime_vk_cache_save.py -v
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import struct
 import subprocess
+import sys
 import time
 import unittest
 from pathlib import Path
@@ -38,7 +43,9 @@ from test_runtime_vk_pipeline import (GLSL, SYNTH_KEYS, SYNTH_STAGE, DeviceTestC
 HEADER = struct.Struct("<IIII16s")   # VkPipelineCacheHeaderVersionOne
 CACHE = Path("pipelines") / "pipeline.cache"
 LONG_KEY = "5100000000000010.00000000"      # tests/runtime/vk_pipeline_test.c, LONG_KEY
-LONG_OPERATIONS = 5000                      # dependent operations in the long compute stage: a compile of about two seconds
+LONG_OPERATIONS = 20000                     # dependent operations in the long compute stage: a compile of seconds on this driver
+# (5,000 took 0.7 s on it on 2026-11-10, too short for the test below to tell anything)
+LONG_COMPILE_MS = 1000                      # under this the compile is too short for the stop test to mean anything
 
 
 class SaveSettingsTest(unittest.TestCase):
@@ -229,6 +236,81 @@ class SaveDeviceTest(DeviceTestCase):
         self.assertIn("the pipeline cache was saved to ", read.stderr)
         self.assertGreater(cache.stat().st_size, len(before))
 
+    def test_a_temporary_file_of_a_process_that_is_gone_is_removed_at_start_and_a_live_ones_is_kept(self) -> None:
+        folder = self.game("deadtemp")
+        pipelines = folder / "pipelines"
+        pipelines.mkdir()
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()
+        dead, alive = f"pipeline.cache.{gone.pid}.tmp", f"pipeline.cache.{os.getpid()}.tmp"   # this test's own process lives
+        others = ["pipeline.cache.abc.tmp", f"pipeline.cache.{gone.pid}.tmpx", f"other.cache.{gone.pid}.tmp", "pipeline.cache.tmp"]
+        for name in (dead, alive, *others):
+            (pipelines / name).write_bytes(b"half a cache")
+        done = self.save_run(folder, "exit")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertFalse((pipelines / dead).exists(), "the temporary file of a process that is gone is still there")
+        self.assertIn(f"{dead}: the temporary file of a save by process {gone.pid}, which is gone", done.stderr)
+        self.assertEqual((pipelines / alive).read_bytes(), b"half a cache")              # a live process may be writing it
+        for name in others:
+            self.assertEqual((pipelines / name).read_bytes(), b"half a cache", name)     # not a temporary file of a save
+
+    def test_a_cache_file_that_could_not_be_opened_is_not_replaced_and_one_that_is_not_there_is_made(self) -> None:
+        folder = self.game("denied")
+        cache = folder / CACHE
+        self.save_run(folder, "fatal")
+        before = cache.read_bytes()
+        done = self.save_run(folder, "fatal", "more", "openerr=13")                     # EACCES: it is there, held by someone
+        self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+        self.assertIn("cache_state 0", done.stdout)
+        self.assertRegex(done.stderr, r"the pipeline cache .* could not be opened \(.+\): starting empty, and no save will "
+                                      r"replace it")
+        self.assertIn("the pipeline cache was NOT saved at the stop (exit 70): the cache file ", done.stderr)
+        self.assertEqual(cache.read_bytes(), before)                                   # the file is as it was
+        absent = self.save_run(folder, "fatal", "more", "openerr=2")                    # ENOENT: not there, the counterpart
+        self.assertEqual(absent.returncode, EXIT_FATAL, absent.stdout + absent.stderr)
+        self.assertNotIn("could not be opened", absent.stderr)
+        self.assertIn("the pipeline cache was saved to ", absent.stderr)
+
+    def test_the_timer_names_each_reason_of_a_refusal_once_not_every_round(self) -> None:
+        for name, option in (("unreadable", "openerr=13"), ("flushed", "flush")):
+            with self.subTest(refusal=name):
+                folder = self.game("rounds-" + name)
+                self.save_run(folder, "fatal")                                          # a cache file the timer must not replace
+                before = (folder / CACHE).read_bytes()
+                done = self.save_run(folder, "wait", "more", option, "wait=4500", OOT2_VK_CACHE_SAVE_SECONDS="1")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                said = [line for line in done.stderr.splitlines() if "was NOT saved at the timer" in line]
+                self.assertEqual(len(said), 1, done.stderr[-1500:])                     # four rounds went by: one line
+                self.assertEqual((folder / CACHE).read_bytes(), before)
+
+    @unittest.skipUnless(os.name == "nt", "the sharing violation is Windows'")
+    def test_a_move_that_meets_another_process_reading_the_cache_is_tried_again(self) -> None:
+        folder = self.game("busy")
+        cache = folder / CACHE
+        pipelines = folder / "pipelines"
+        self.save_run(folder, "fatal")
+        small = cache.stat().st_size
+        slow = subprocess.Popen([str(program()), "synth_save", str(folder), "exit", "more", "stall=1500"], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=case_env({"OOT2_VK_VALIDATION": "off"}))
+        try:
+            deadline = time.time() + 60
+            while time.time() < deadline and slow.poll() is None and not self.half_written(pipelines):
+                time.sleep(0.02)
+            if slow.poll() is not None:
+                self.fail("the writer ended before it paused: " + slow.communicate()[1][-1500:])
+            with cache.open("rb") as reader:      # a reader without delete sharing, as the game's own read of the cache is
+                reader.read(1)
+                time.sleep(2.0)                   # past the end of the pause (1.5 s): the first tries of the move meet it
+            out, err = slow.communicate(timeout=120)
+        finally:
+            if slow.poll() is None:
+                slow.kill()
+        self.assertEqual(slow.returncode, 0, err[-1500:])
+        self.assertIn("the pipeline cache was saved to ", err)
+        self.assertNotIn("NOT saved", err)
+        self.assertGreater(cache.stat().st_size, small)                                 # the run's growth was not lost
+        self.assertEqual([p.name for p in pipelines.glob("*.tmp")], [])
+
     def test_an_empty_cache_file_holds_nothing_to_lose_and_is_saved_over(self) -> None:
         folder = self.game("empty")
         (folder / "pipelines").mkdir()
@@ -239,13 +321,14 @@ class SaveDeviceTest(DeviceTestCase):
         self.assertIn("the pipeline cache was saved to ", done.stderr)
         self.assert_header(folder / CACHE)
 
-    def long_game(self, name: str) -> Path:
-        """A game folder whose pack holds the synthetic stages and one compute stage that takes seconds to compile."""
+    def long_game(self, name: str, salt: int = 0) -> Path:
+        """A game folder whose pack holds the synthetic stages and one compute stage that takes seconds to compile. The salt
+        changes the stage's constants: two games with different salts never share an entry of the driver's own disk cache."""
         from build_game import GLSLANG_FLAGS  # tools/build_game.py is on the path through test_runtime_gpu
         program()
         work = self.dir / (name + "-pack")
         work.mkdir()
-        body = "\n".join(f"    a = a * 1664525u + b; b = (b ^ (a >> {1 + i % 7})) + {i}u;" for i in range(LONG_OPERATIONS))
+        body = "\n".join(f"    a = a * 1664525u + b; b = (b ^ (a >> {1 + i % 7})) + {i + salt}u;" for i in range(LONG_OPERATIONS))
         sources = dict(GLSL)
         sources["long.comp"] = ("#version 450\nlayout(local_size_x = 32) in;\n"
                                 "layout(set = 1, binding = 9) buffer Out { uint v[]; } o;\n"
@@ -273,12 +356,18 @@ class SaveDeviceTest(DeviceTestCase):
         return folder
 
     def test_a_stop_during_a_long_compile_on_another_thread_saves_without_waiting_for_it(self) -> None:
+        # Measured on this driver only: it hands the cache's data out while a compile into it is under way. Another driver may
+        # wait for the compile, and then this test is the one to say so.
         env = {"OOT2_VK_VALIDATION": "off"}
         timed = run("synth_stopcompile", str(self.long_game("compile-alone")), "compile", env=env, timeout=120)
         self.assertEqual(timed.returncode, 0, timed.stdout + timed.stderr)
         compile_ms = int(re.search(r"the long compile ended after (\d+) ms", timed.stdout).group(1))
-        folder = self.long_game("compile-stop")
-        done = run("synth_stopcompile", str(folder), "stop", env=env, timeout=120)
+        if compile_ms < LONG_COMPILE_MS:
+            self.skipTest(f"the compile takes {compile_ms} ms here, under {LONG_COMPILE_MS} ms: too short to tell a save that "
+                          f"waits for it from one that does not")
+        folder = self.long_game("compile-stop", salt=7)      # other constants: the alone run left nothing of this compile in the driver's disk cache
+        stop_after = compile_ms // 4                          # a fraction of the compile: the stop comes while it is under way
+        done = run("synth_stopcompile", str(folder), "stop", str(stop_after), env=env, timeout=120)
         self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
         self.assertNotIn("the long compile ended", done.stdout)               # the stop came while it was under way
         saved = re.search(r"the pipeline cache was saved to .* at the stop \(exit 70\): \d+ bytes .* in (\d+) ms", done.stderr)

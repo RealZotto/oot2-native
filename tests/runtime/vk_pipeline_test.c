@@ -52,7 +52,9 @@
 //                                does, a save refused, then a named stop). Options: more (one more compute pipeline), stale (a
 //                                temporary file of this process's name is planted before the start, and must be gone after
 //                                it), stall=MS (a save pauses MS after half of its file), readcap=N (a cache file over N
-//                                bytes counts as unreadable)
+//                                bytes counts as unreadable), openerr=N (opening the cache file at launch fails with errno N),
+//                                flush (mode wait only: the cache is flushed to a segment first), wait=MS (mode wait: the
+//                                timer's rounds go by for MS, then the run ends with no stop hook)
 //   synth_release PACK           a stage's objects released and made again
 //   synth_threads PACK           eight threads ask for one pipeline: it is made once
 //   synth_absent PACK            a stage the pack lacks: a named fatal with its shape
@@ -961,12 +963,15 @@ static int file_exists(const char *path) {
 }
 
 static void case_synth_save(const char *folder, const char *mode, int nopt, char **opt) {
-    int more = 0, stale = 0;
+    int more = 0, stale = 0, flush = 0, wait_ms = 0;
     for (int i = 0; i < nopt; i++) {
         if (!strcmp(opt[i], "more")) more = 1;
         else if (!strcmp(opt[i], "stale")) stale = 1;
         else if (!strncmp(opt[i], "stall=", 6)) vkp_save_stall_ms = atoi(opt[i] + 6);
         else if (!strncmp(opt[i], "readcap=", 8)) vkp_read_cap = atoi(opt[i] + 8);
+        else if (!strncmp(opt[i], "openerr=", 8)) vkp_open_errno = atoi(opt[i] + 8);
+        else if (!strcmp(opt[i], "flush")) flush = 1;
+        else if (!strncmp(opt[i], "wait=", 5)) wait_ms = atoi(opt[i] + 5);
         else {
             printf("unknown option %s\n", opt[i]);
             exit(2);
@@ -1004,6 +1009,15 @@ static void case_synth_save(const char *folder, const char *mode, int nopt, char
                (double)(plat_now_ns() - t0) / 1e9);
         fflush(stdout);
         plat_exit(0);   // no stop hook: only the timer can have written the file
+    } else if (!strcmp(mode, "wait")) {   // the timer's rounds go by, then the run ends with no stop hook
+        if (flush) {
+            char seg[1024], why[256] = "";
+            snprintf(seg, sizeof seg, "%s/segment.bin", folder);
+            size_t bytes = 0;
+            CHECK(vkp_cache_flush(seg, &bytes, why, sizeof why));
+        }
+        plat_sleep_ns((uint64_t)wait_ms * 1000000ull);
+        plat_exit(0);
     } else if (!strcmp(mode, "flushed")) {
         char seg[1024], why[256] = "";
         snprintf(seg, sizeof seg, "%s/segment.bin", folder);
@@ -1032,7 +1046,7 @@ static void long_compile_main(void *arg) {
 
 // A named stop while another thread is inside a long pipeline compile of the same cache: the stop's save must not wait for
 // the compile. MODE compile only times the compile on this thread.
-static void case_synth_stopcompile(const char *folder, const char *mode) {
+static void case_synth_stopcompile(const char *folder, const char *mode, int sleep_ms) {
     gpu_vk_open();
     gpu_vk_open_game(folder);
     VkpStage vs = {.key = VS_KEY}, ps = {.key = PS_KEY}, cs = {.key = CS_KEY};
@@ -1043,7 +1057,7 @@ static void case_synth_stopcompile(const char *folder, const char *mode) {
         plat_exit(0);
     }
     CHECK(plat_thread_start(long_compile_main, NULL, 1u << 20) != NULL);
-    plat_sleep_ns(300000000ull);   // the compile is under way
+    plat_sleep_ns((uint64_t)sleep_ms * 1000000ull);   // the compile is under way: a fraction of what it takes, set by the caller
     printf("stopping\n");
     fflush(stdout);
     rt_fatal("synth_stopcompile: a named stop during a long compile");
@@ -1430,7 +1444,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(cs, "synth_inflight") && argc >= 3) case_synth_inflight(argv[2]);
         else if (!strcmp(cs, "synth_cache") && argc >= 5) case_synth_cache(argv[2], argv[3], argv[4]);
         else if (!strcmp(cs, "synth_save") && argc >= 4) case_synth_save(argv[2], argv[3], argc - 4, argv + 4);
-        else if (!strcmp(cs, "synth_stopcompile") && argc >= 4) case_synth_stopcompile(argv[2], argv[3]);
+        else if (!strcmp(cs, "synth_stopcompile") && argc >= 4) case_synth_stopcompile(argv[2], argv[3], argc >= 5 ? atoi(argv[4]) : 300);
         else if (!strcmp(cs, "synth_release") && argc >= 3) case_synth_release(argv[2]);
         else if (!strcmp(cs, "synth_threads") && argc >= 3) case_synth_threads(argv[2]);
         else if (!strcmp(cs, "synth_absent") && argc >= 3) case_synth_absent(argv[2]);

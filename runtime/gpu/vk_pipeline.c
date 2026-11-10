@@ -27,6 +27,7 @@
 #define OFF_TELL _ftelli64
 #define SYNC_FILE(f) _commit(_fileno(f))
 #else
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #define OFF_SEEK fseeko
@@ -889,9 +890,15 @@ VkpCacheState vkp_cache_judge(const void *data, size_t size, const VkPhysicalDev
 
 int vkp_read_cap;         // tests only: a cache file larger than this many bytes counts as too large to read (0: no cap)
 int vkp_save_stall_ms;    // tests only: a save pauses this long after writing half of its file, so that two processes overlap
+int vkp_open_errno;       // tests only: opening the cache file to read it fails with this errno (0: it opens as it does)
 
-static void *read_whole(const char *path, size_t *size) {
-    FILE *f = fopen(path, "rb");
+// The cache file read whole, or NULL. *open_err is the errno when the file could not be opened (the C library maps the
+// system's file-not-found and path-not-found to ENOENT), else 0.
+static void *read_whole(const char *path, size_t *size, int *open_err) {
+    FILE *f = NULL;
+    errno = vkp_open_errno;
+    if (!vkp_open_errno) f = fopen(path, "rb");
+    *open_err = f ? 0 : errno;
     if (!f) return NULL;
     void *data = NULL;
     if (OFF_SEEK(f, 0, SEEK_END) == 0) {
@@ -914,8 +921,15 @@ static void cache_open(const char *path) {
     P.unreadable = 0;
     if (path) {
         snprintf(P.cache_path, sizeof P.cache_path, "%s", path);
-        data = read_whole(path, &size);
-        if (!data) {
+        int open_err = 0;
+        data = read_whole(path, &size, &open_err);
+        if (!data && open_err && open_err != ENOENT) {
+            // Only a file that is not there is absent. One that is there and cannot be opened (permission, a sharing
+            // violation) is not read, so not held, and a save at the stop would replace what is in it with this run's part.
+            P.unreadable = 1;
+            rt_log("gfx: vulkan: the pipeline cache %s could not be opened (%s): starting empty, and no save will replace it",
+                   path, strerror(open_err));
+        } else if (!data && !open_err) {
             FILE *there = fopen(path, "rb");
             if (there) {   // a file that is there and cannot be read is not the same as no file: say so
                 long long n = OFF_SEEK(there, 0, SEEK_END) == 0 ? (long long)OFF_TELL(there) : -1;
@@ -1001,10 +1015,65 @@ static void *cache_data(VkPipelineCache cache, size_t *size, int fatal, char *wh
     return NULL;
 }
 
+#define MOVE_TRIES 5                    // the move of a save over the cache file: tries, with the wait between two of them
+#define MOVE_WAIT_NS 250000000ull       // (4 waits: about a second)
+
 // The temporary file a write goes through. The process id is in its name: two processes that save into one folder (a game
 // left running on its timer and a new one, in a folder shared through a junction) never write the same file, so each
 // rename puts a whole file in place and the later one wins.
 static void temp_name(const char *path, char *out, size_t cap) { snprintf(out, cap, "%s.%u.tmp", path, plat_pid()); }
+
+// One file of the cache's folder named `name`: removed when it is a temporary file of a save ("<cache file>.<id>.tmp") whose
+// process is gone. A process that is alive may still be writing its own, and a number that cannot be read is left alone.
+static void remove_if_dead_temp(const char *dir, const char *name, const char *base) {
+    size_t blen = strlen(base);
+    if (strncmp(name, base, blen) || name[blen] != '.') return;
+    const char *digits = name + blen + 1;
+    size_t n = strspn(digits, "0123456789");
+    if (n == 0 || n > 10 || strcmp(digits + n, ".tmp")) return;
+    unsigned long long id = strtoull(digits, NULL, 10);
+    if (id == 0 || id > 0xffffffffull || id == plat_pid() || plat_pid_alive((unsigned)id)) return;
+    char path[sizeof P.cache_path + 300];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    if (remove(path) == 0)
+        rt_log("gfx: vulkan: removed %s: the temporary file of a save by process %llu, which is gone", path, id);
+}
+
+// A run that was killed in the middle of a save leaves its temporary file for good (each process writes its own name, so
+// no later save overwrites it): the ones of processes that are gone are removed when the saving starts.
+static void remove_dead_temps(void) {
+    char dir[sizeof P.cache_path + 8];
+    snprintf(dir, sizeof dir, "%s", P.cache_path);
+    char *slash = NULL;
+    for (char *c = dir; *c; c++)
+        if (*c == '/' || *c == '\\') slash = c;
+    const char *base = slash ? slash + 1 : dir;
+    char folder[sizeof dir];
+    if (slash) {
+        *slash = 0;
+        snprintf(folder, sizeof folder, "%s", slash == dir ? "/" : dir);
+    } else {
+        snprintf(folder, sizeof folder, ".");
+    }
+    char name[sizeof dir];
+    snprintf(name, sizeof name, "%s", base);   // the base, kept apart from the folder text it shared a buffer with
+#ifdef _WIN32
+    char pattern[sizeof dir + 16];
+    snprintf(pattern, sizeof pattern, "%s/%s.*.tmp", folder, name);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) remove_if_dead_temp(folder, fd.cFileName, name);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(folder);
+    if (!d) return;
+    for (struct dirent *e; (e = readdir(d)) != NULL;) remove_if_dead_temp(folder, e->d_name, name);
+    closedir(d);
+#endif
+}
 
 // The cache's data written to path through a temporary file and a rename, so that an interrupted write leaves the old
 // file whole; *bytes (when not NULL) is its size. A Vulkan failure is a named fatal when `fatal` (the builder's flush),
@@ -1033,7 +1102,16 @@ static int cache_write(VkPipelineCache cache, const char *path, size_t *bytes, i
         return 0;
     }
 #ifdef _WIN32
-    ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING) != 0;
+    // Another process that reads the cache (read_whole opens it without delete sharing) makes the replace fail with a
+    // sharing violation until it lets go, which is a read of milliseconds: the move is tried a few times over about a
+    // second before it is given up, since a refused move loses all of this run's growth.
+    for (int tries = 1;; tries++) {
+        ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING) != 0;
+        DWORD e = ok ? 0 : GetLastError();
+        int held = e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED || e == ERROR_LOCK_VIOLATION;
+        if (ok || !held || tries == MOVE_TRIES) break;
+        plat_sleep_ns(MOVE_WAIT_NS);
+    }
 #else
     ok = rename(tmp, path) == 0;
 #endif
@@ -1046,7 +1124,8 @@ static int cache_write(VkPipelineCache cache, const char *path, size_t *bytes, i
     return 1;
 }
 
-static size_t g_saved_bytes;   // what the cache held when it was loaded, or when it was last saved (the growth a save looks for)
+// What the cache held when it was loaded, or when it was last saved: a save is made when its size is not this one.
+static size_t g_saved_bytes;
 
 // Why a save must not replace the cache file, or NULL: the cache holds a part of what the file holds.
 static const char *save_refusal(char *why, size_t cap) {
@@ -1112,7 +1191,7 @@ static struct {
     int started, writer_added, stops;
     uint64_t every_ns;           // the timer's period; 0: no timer
     int saving;                  // one save at a time (atomic)
-    int refusal_logged;          // the timer names a refused or failed save once (atomic); a stop always names it
+    int refusals_logged;         // one bit per reason (REFUSE_*) the timer has named (atomic); a stop always names its reason
     PlatMutex lock;              // the timer thread's wait
     PlatCond cond;
     int thread_stop, thread_running;
@@ -1142,9 +1221,17 @@ int vkp_save_settings(const char *save, const char *seconds, VkpSaveSettings *ou
     return 1;
 }
 
+// The reasons a save is refused or fails. The timer names each of them once, not every round; a stop names its own.
+enum { REFUSE_FLUSHED, REFUSE_UNREADABLE, REFUSE_NO_SIZE, REFUSE_FAILED };
+
+static int name_it(int stopping, int reason) {
+    int bit = 1 << reason;
+    return !(__atomic_fetch_or(&S.refusals_logged, bit, __ATOMIC_ACQ_REL) & bit) || stopping;
+}
+
 // One save for `when` ("the stop (exit 70)", "the timer"). A stop is `stopping`: it waits for a save in progress, the timer
 // skips its round. Nothing here stops the run: every outcome is a log line, and only a save that wrote something or was
-// refused or failed says so (a round of the timer with nothing new is silent).
+// refused or failed says so (a round of the timer with nothing new is silent, and it names each reason of a refusal once).
 static void autosave(const char *when, int stopping) {
     if (!__atomic_load_n(&S.started, __ATOMIC_ACQUIRE) || !P.open || !P.cache_path[0]) return;
     for (uint64_t waited = 0; __atomic_exchange_n(&S.saving, 1, __ATOMIC_ACQ_REL); waited += 10000000ull) {
@@ -1162,10 +1249,11 @@ static void autosave(const char *when, int stopping) {
     VkResult r = vkGetPipelineCacheData(gpu_vk.device, P.cache, &now, NULL);
     if (__atomic_load_n(&P.flushed, __ATOMIC_ACQUIRE)) {
         vkp_cache_save(why, sizeof why);   // refused by name
-        rt_log("gfx: vulkan: the pipeline cache was NOT saved at %s: %s", when, why);
+        if (name_it(stopping, REFUSE_FLUSHED)) rt_log("gfx: vulkan: the pipeline cache was NOT saved at %s: %s", when, why);
     } else if (r != VK_SUCCESS) {
-        rt_log("gfx: vulkan: the pipeline cache was NOT saved at %s: vkGetPipelineCacheData failed: %s", when,
-               gpu_vk_result_name(r));
+        if (name_it(stopping, REFUSE_NO_SIZE))
+            rt_log("gfx: vulkan: the pipeline cache was NOT saved at %s: vkGetPipelineCacheData failed: %s", when,
+                   gpu_vk_result_name(r));
     } else if (now == g_saved_bytes) {
         if (stopping)
             rt_log("gfx: vulkan: the pipeline cache is not saved at %s: it holds %zu bytes, as when it was loaded or last saved",
@@ -1173,8 +1261,7 @@ static void autosave(const char *when, int stopping) {
     } else if (vkp_cache_save(why, sizeof why)) {
         rt_log("gfx: vulkan: the pipeline cache was saved to %s at %s: %zu bytes (%zu when loaded or last saved) in %.0f ms",
                P.cache_path, when, g_saved_bytes, before, (double)(plat_now_ns() - t0) / 1e6);
-    } else if (stopping || !__atomic_exchange_n(&S.refusal_logged, 1, __ATOMIC_ACQ_REL)) {
-        // A refusal or a failure: the stop always says it, the timer says it once, not every round.
+    } else if (name_it(stopping, P.unreadable ? REFUSE_UNREADABLE : REFUSE_FAILED)) {
         rt_log("gfx: vulkan: the pipeline cache was NOT saved at %s: %s", when, why);
     }
     __atomic_store_n(&S.saving, 0, __ATOMIC_RELEASE);
@@ -1220,7 +1307,8 @@ void vkp_cache_autosave_start(const VkpSaveSettings *settings) {
     char stale[sizeof P.cache_path + 24];
     temp_name(P.cache_path, stale, sizeof stale);
     remove(stale);
-    S.refusal_logged = 0;
+    remove_dead_temps();
+    S.refusals_logged = 0;
     S.stops = 1;
     S.every_ns = (uint64_t)settings->seconds * 1000000000ull;
     if (!S.writer_added) {

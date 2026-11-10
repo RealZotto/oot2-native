@@ -138,15 +138,17 @@ int vkp_zero_workgroup(void);
 // why and never stops the run (this runs at the stop of a run too). 1, or 0 with the reason in why. It is refused by name
 // once vkp_cache_flush has swapped the cache for an empty one: what the cache holds then is only what was built since
 // that flush, and writing it would replace the whole file (the seed a builder was started from) with that part. It is
-// refused the same way when the file was there at launch and could not be read (too large for memory). The temporary
-// file has the process id in its name, so two processes saving into one folder never write the same file.
+// refused the same way when the file was there at launch and could not be read (too large for memory) or opened
+// (permission, a sharing violation). The temporary file has the process id in its name, so two processes saving into one
+// folder never write the same file; those of processes that are gone (a run killed in the middle of a save) are removed
+// when the saving starts, never a live process's.
 int vkp_cache_save(char *why, size_t cap);
 
 // The game saves the cache it built by itself, so that the next run starts warm (the game folder's pipelines/pipeline.cache
 // is read at launch, gpu_vk_open_game): at every stop of the run (an exit through rt_run_stop_hook: a guest ExitProcess,
 // the window's close, every named stop with exits 70 to 73), and every `seconds` seconds for a run that is ended from
-// outside (the timer needs no stop). A save is made only when the cache grew since it was loaded or last saved, never
-// while another save runs, and a stop that finds the timer's save running waits for it. A save that fails or is refused is
+// outside (the timer needs no stop). A save is made only when the size of the cache changed since it was loaded or last
+// saved, never while another save runs, and a stop that finds the timer's save running waits for it. A save that fails or is refused is
 // logged by name and the run stops all the same. What it holds beyond prepare's own output: the task and mesh pipelines
 // and the padded vertex libraries, which are known only from play.
 //   OOT2_VK_CACHE_SAVE          on (the default) or off: no save at all, for a measurement of a cold start
@@ -233,6 +235,9 @@ extern int vkp_unpad;
 // save then refuses to replace; and a save pauses vkp_save_stall_ms milliseconds after writing half of its file, so that a
 // test can overlap two processes saving into one folder.
 extern int vkp_read_cap, vkp_save_stall_ms;
+// Tests only: while non-zero, opening the cache file to read it at launch fails with this errno (ENOENT counts as no file, any
+// other value as a file that is there and cannot be opened, which a save then refuses to replace).
+extern int vkp_open_errno;
 // Destroy every library and pipeline that was made from the stage with this key (for program_release, when no program
 // holds it). The caller guarantees that no submission in flight uses them.
 void vkp_release(const char *key);

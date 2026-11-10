@@ -47,6 +47,9 @@ uint64_t plat_pages_output(void);
 const char *plat_pages_output_name(void);
 int plat_cpu_count(void);
 unsigned plat_pid(void);
+// 0 only when no process has this id; 1 when one has, and when that cannot be told (a caller that deletes what a dead process
+// left must never take a live process for a dead one).
+int plat_pid_alive(unsigned pid);
 // Access faults of any thread go to hook first: it returns 1 when the access can be retried (it committed the page),
 // 0 to leave the fault to the next handler. write is 1 for a store; host_pc is the faulting host instruction.
 void plat_fault_hook(int (*hook)(uint64_t addr, int write, uint64_t host_pc));

@@ -81,7 +81,19 @@ int plat_cpu_count(void) {
 
 unsigned plat_pid(void) { return (unsigned)GetCurrentProcessId(); }
 
+int plat_pid_alive(unsigned pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return GetLastError() != ERROR_INVALID_PARAMETER;   // no such id; any other refusal (access) means it exists
+    DWORD code = 0;
+    int alive = !GetExitCodeProcess(h, &code) || code == STILL_ACTIVE;   // a process that ended can still be held open by others
+    CloseHandle(h);
+    return alive;
+}
+
 #else
+#include <errno.h>
+#include <signal.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 // The number after `key` in a /proc file of "name value" lines, times scale; 0 when it is missing.
@@ -129,4 +141,6 @@ int plat_cpu_count(void) {
 }
 
 unsigned plat_pid(void) { return (unsigned)getpid(); }
+
+int plat_pid_alive(unsigned pid) { return kill((pid_t)pid, 0) == 0 || errno != ESRCH; }
 #endif
