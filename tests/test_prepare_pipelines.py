@@ -69,9 +69,22 @@ def serve(args):
     if cfg.get("start_fail"):
         sys.stderr.write("FATAL: gfx: vulkan: stand-in has no device\n")
         sys.exit(70)
+    # the HMMA form: as the runtime's probe on a device that runs the native form, unless the configuration says otherwise
+    # (one form for every builder, or the n-th form for the n-th builder started)
+    hmma = cfg.get("hmma") or ("helper" if os.environ.get("OOT2_VK_HMMA") == "helper" else "native")
+    if cfg.get("hmma_by_start"):
+        n = 0
+        while True:
+            try:
+                os.close(os.open(os.path.join(segments, ".start%d" % n), os.O_CREAT | os.O_EXCL))
+                break
+            except FileExistsError:
+                n += 1
+        hmma = cfg["hmma_by_start"][min(n, len(cfg["hmma_by_start"]) - 1)]
     say(f"ready vendor={cfg.get('vendor', '10de')} device={cfg.get('device', '2486')} driver={cfg.get('driver', '0009a000')} "
         f"api=1.4.351 cache_uuid={cfg.get('uuid', 'ab' * 16)} cache={state} seeded={cfg.get('seeded', seeded_bytes)}"
         + ("" if cfg.get("older_runtime") else f" zero_workgroup={cfg.get('zero_workgroup', 1)}")
+        + ("" if cfg.get("older_runtime") or cfg.get("no_hmma") else f" hmma={hmma}")
         + " name=Stand-in")
     built = list(seeded)               # the real builder's first segment holds the seed it was given
     for line in sys.stdin:
@@ -412,6 +425,16 @@ class StepKeyTest(unittest.TestCase):
         everything = {p.name for p in pipelines.source_files()}
         self.assertTrue({"core", "nvn", "gpu"} <= everything)       # the program is built again when any of it changes
 
+    def test_the_hmma_setting_and_the_probes_sources_are_in_the_key(self) -> None:
+        with mock.patch.dict(os.environ):
+            os.environ.pop("OOT2_VK_HMMA", None)
+            base = self.key(host(device()))
+            os.environ["OOT2_VK_HMMA"] = "auto"
+            self.assertEqual(base, self.key(host(device())))            # auto is what an unset setting means
+            os.environ["OOT2_VK_HMMA"] = "helper"
+            self.assertNotEqual(base, self.key(host(device())))         # a cache in the helper's form is another cache
+        self.assertTrue({"vk_hmma.c", "vk_hmma.h", "hmma_probe.comp"} <= {p.name for p in pipelines.key_files()})
+
 
 class ProgressFileTest(unittest.TestCase):
     def test_a_segment_that_is_gone_a_crash_and_a_torn_line_are_not_kept_and_a_refusal_is(self) -> None:
@@ -491,6 +514,54 @@ class StepTest(unittest.TestCase):
         del ctx.state["steps"]["pipelines"]["runtime"]
         env.run(ctx)
         self.assertEqual(len(env.builds()), 2 * done)                    # the cache of the earlier runtime was built again
+
+    def test_a_cache_prepared_in_one_hmma_form_is_told_apart_from_the_other_and_seeds_its_build(self) -> None:
+        env = Env(self)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("OOT2_VK_HMMA", None)
+            status, ctx = env.run()
+            self.assertEqual(status, "ok", env.say(ctx))
+            rec = dict(ctx.state["steps"]["pipelines"])
+            self.assertEqual(rec["hmma"], "native")                     # what the builders said
+            self.assertTrue(Pipelines().current(ctx, rec))
+            native_key, done = Pipelines().key(ctx), len(env.builds())
+            os.environ["OOT2_VK_HMMA"] = "helper"                        # the same machine, the helper's form asked for
+            self.assertNotEqual(Pipelines().key(ctx), native_key)
+            self.assertFalse(Pipelines().current(ctx, rec))
+            status, ctx = env.run(ctx)
+            self.assertEqual(status, "ok", env.say(ctx))
+            self.assertEqual(len(env.builds()), 2 * done)                # built again, in the helper's form ...
+            self.assertIn("is the seed", env.say(ctx))                   # ... from the native cache, which serves the rest
+            self.assertEqual(ctx.state["steps"]["pipelines"]["hmma"], "helper")
+
+    def test_a_record_without_the_hmma_form_or_in_a_form_the_setting_excludes_is_not_current(self) -> None:
+        env = Env(self)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("OOT2_VK_HMMA", None)
+            _, ctx = env.run()
+            rec = dict(ctx.state["steps"]["pipelines"])
+            self.assertTrue(Pipelines().current(ctx, rec))
+            self.assertTrue(Pipelines().current(ctx, dict(rec, hmma="helper")))   # auto: the probe may choose either
+            self.assertFalse(Pipelines().current(ctx, {k: v for k, v in rec.items() if k != "hmma"}))   # an earlier runtime
+            self.assertFalse(Pipelines().current(ctx, dict(rec, hmma="tensor")))
+            os.environ["OOT2_VK_HMMA"] = "helper"
+            self.assertFalse(Pipelines().current(ctx, rec))
+            self.assertTrue(Pipelines().current(ctx, dict(rec, hmma="helper")))
+
+    def test_a_builder_that_does_not_say_its_hmma_form_or_chooses_another_stops_the_step(self) -> None:
+        for config, setting in (({"no_hmma": True}, None), ({"hmma": "tensor"}, None), ({"hmma": "native"}, "helper"),
+                                ({"hmma_by_start": ["native", "helper"], "delay": 0.05}, None)):
+            env = Env(self, config=config)
+            with mock.patch.dict(os.environ):
+                os.environ.pop("OOT2_VK_HMMA", None)
+                if setting:
+                    os.environ["OOT2_VK_HMMA"] = setting
+                status, ctx = env.run(env.context(pipelines_jobs=2))
+            said = env.say(ctx)
+            self.assertEqual(status, "failed", (config, said))
+            self.assertIn("another form than the step asked for", said, config)
+            self.assertIn("hmma=", said, config)
+            self.assertFalse((env.dest / "pipelines" / "pipeline.cache").exists(), config)
 
     def test_a_builder_whose_runtime_does_not_zero_workgroup_memory_stops_the_step(self) -> None:
         for config in ({"zero_workgroup": 0}, {"older_runtime": True}):

@@ -35,6 +35,7 @@ static struct {
 
 int vkh_native(void) { return H.native; }
 const char *vkh_reason(void) { return H.native ? "" : H.reason; }
+int vkh_fault;
 
 static void refuse(const char *fmt, const char *detail) {
     H.native = 0;
@@ -144,6 +145,14 @@ static const char *gate(void) {
     return shape ? NULL : "the device lists no 16x8x16 subgroup matrix with f16 A, B, C and result";
 }
 
+// Tests only (vkh_fault): the read-back with one fault in it. Lane 3's first half of D is a small integer in both forms, so
+// adding one to its word changes that half alone and leaves it no longer the exact sum.
+static void inject_fault(uint32_t *words) {
+    if (vkh_fault == VKH_FAULT_LENGTHS) words[W_LENGTHS] = 7;
+    if (vkh_fault == VKH_FAULT_HELPER || vkh_fault == VKH_FAULT_SUMS) words[W_HELPER + 2 * 3] += 1;
+    if (vkh_fault == VKH_FAULT_SUMS) words[W_NATIVE + 2 * 3] += 1;
+}
+
 // One dispatch of the probe over words (W_TOTAL), read back into words. 0 with why when the shader is missing.
 static int run_probe(uint32_t *words, const Push *push_in, char *why, size_t cap) {
     const GpuShader *s = gpu_shader("hmma_probe");
@@ -206,6 +215,7 @@ static int run_probe(uint32_t *words, const Push *push_in, char *why, size_t cap
     gpu_vk_end(NULL, 0);
     gpu_sync_wait(value, UINT64_MAX);
     memcpy(words, map, W_TOTAL * 4);
+    inject_fault(words);
 
     vkDestroyPipeline(gpu_vk.device, pipe, NULL);
     vkDestroyPipelineLayout(gpu_vk.device, layout, NULL);
@@ -285,8 +295,8 @@ void vkh_probe(void) {
                         inexact += from_half(native, &ok) != sum || !ok;
                     }
                 if (differ || inexact) {
-                    snprintf(why, sizeof why, "the native multiply differs from the helper's in %d of 128 elements and from the "
-                             "exact sums in %d", differ, inexact);
+                    snprintf(why, sizeof why, "a multiply of small integers differs between the forms in %d of 128 elements "
+                             "and the native one from the exact sums in %d", differ, inexact);
                     refuse("%s", why);
                 }
             }
@@ -301,7 +311,8 @@ void vkh_probe(void) {
     else snprintf(order, sizeof order, "the device's order not measured");
     if (H.native)
         rt_log("gfx: vulkan: HMMA on cooperative matrices (16x8x16 f16, subgroup): %s, the translator's order, and a "
-               "multiply on known inputs equals the helper's: the modules run as translated", order);
+               "multiply of small integers gives the exact sums in both forms (wiring and order, not rounding): the modules "
+               "run as translated", order);
     else
         rt_log("gfx: vulkan: HMMA in the helper: %s; every module's native HMMA becomes a call of the helper, by name (%s)",
                H.reason, order);

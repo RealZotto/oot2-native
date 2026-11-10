@@ -22,7 +22,8 @@ Which runtime. A cache is valid only for the runtime that reads it too: the runt
 workgroup memory starts zeroed) before the driver sees it, and the driver's cache keys on the module. The builder says in
 its ready line what it does (`zero_workgroup`); the key names what the step requires (RUNTIME_SAYS), a builder that says
 anything else stops the step with the reason, and the record keeps what the builder said, so a record made by an earlier
-runtime is not current and the step builds again.
+runtime is not current and the step builds again. The tensor programs' HMMA form (`hmma`, native or helper, which the
+runtime's start-up probe chooses) is told apart the same way, with the setting OOT2_VK_HMMA in the key (HMMA_FORMS).
 
 The seed. When the key changes the previous cache is not thrown away: pipeseed.py checks it (header, size, runtime, device
 and driver) and keeps it as the seed every builder starts from, so that the programs whose module did not change are served
@@ -84,6 +85,15 @@ FORMAT = 1                       # changes when the outputs change shape: the st
 # names it, a builder that does not say it is refused, and the record keeps what the builder said; a record without it (made
 # by an earlier runtime) is not current.
 RUNTIME_SAYS = {"zero_workgroup": "1"}
+# The form of the tensor programs' HMMA the cache holds (oot2/vk_hmma.h): the runtime's start-up probe chooses the native form
+# or the helper from the device and the setting OOT2_VK_HMMA, and turns every native module into another module, in the
+# helper's form, before the driver sees it, so a cache built in one form holds other tensor modules than a launch in the other
+# asks for, and those would build again, cold. The device is in the step's key, and so are the setting the builders run
+# with (they inherit prepare's environment, as a launch from the same environment does) and the probe's sources. Each
+# builder says the form it chose (hmma= in its ready line), one the setting allows and the same for all; the record keeps it,
+# and a record without it (made by an earlier runtime) is not current.
+HMMA_SETTING = "OOT2_VK_HMMA"
+HMMA_FORMS = ("native", "helper")
 HERE = Path(__file__).resolve().parent
 RUNTIME = build_game.RUNTIME
 SOURCE = TOOLS / "pipebuild" / "pipebuild.c"
@@ -98,8 +108,10 @@ BUILDER = "builder"
 MODULE_SIZE = 0x8000             # the placeholder module the builder's layout header describes (it loads no game)
 MERGE_TIMEOUT = 3600
 # The headers whose structures decide a create info, beside runtime/gpu itself: a change in any of them builds again.
-KEY_HEADERS = ("vk_pipeline.h", "vk_required.h", "vk_caps.h", "spirv.h", "shader_desc.h", "shader_cache.h", "gpu_vk.h")
-KEY_SOURCES = ("vk_pipeline.c", "vk_layout.c", "vk_caps.c", "spirv.c", "shader_desc.c", "vk_device.c")
+KEY_HEADERS = ("vk_pipeline.h", "vk_required.h", "vk_caps.h", "spirv.h", "shader_desc.h", "shader_cache.h", "gpu_vk.h",
+               "vk_hmma.h")
+KEY_SOURCES = ("vk_pipeline.c", "vk_layout.c", "vk_caps.c", "spirv.c", "shader_desc.c", "vk_device.c", "vk_hmma.c",
+               "shaders/hmma_probe.comp")
 SAMPLE = 64                      # items verify builds again from the cache
 NAMED = 5                        # failures named one by one in the warning
 GiB = 1 << 30
@@ -170,6 +182,17 @@ def list_keys(path: Path | None) -> list[str] | None:
     return [s for s in (line.strip() for line in lines) if s and not s.startswith("#")]
 
 
+def hmma_setting() -> str:
+    """OOT2_VK_HMMA as the builders read it (they inherit prepare's environment): unset or empty is auto. The runtime
+    refuses a value other than auto and helper by name."""
+    return os.environ.get(HMMA_SETTING) or "auto"
+
+
+def hmma_forms(setting: str) -> tuple[str, ...]:
+    """The forms a builder may choose under the setting: the helper when the setting asks for it, else the probe's choice."""
+    return ("helper",) if setting == "helper" else HMMA_FORMS
+
+
 def source_files() -> list[Path]:
     """Everything the builder program is compiled from: its stamp, so that it is built again when any of it changes."""
     parts = [RUNTIME / "core", RUNTIME / "nvn", RUNTIME / "gpu"]
@@ -213,6 +236,7 @@ class Pipelines(Step):
         ctx.facts["pipelines_previous"] = ctx.record(self.id)
         return fingerprint(f"pipelines-{FORMAT}", f"device={device.identity if device else 'skipped: ' + why}",
                            f"runtime={','.join(f'{k}={v}' for k, v in sorted(RUNTIME_SAYS.items()))}",
+                           f"hmma={hmma_setting()}",
                            f"skip={bool(getattr(ctx.options, 'skip_pipelines', False))}",
                            f"list={hashlib.sha256(chr(10).join(sorted(listed)).encode()).hexdigest() if listed else 'all'}",
                            *builder, HERE / "pipelines.py", HERE / "pipesched.py", *key_files())
@@ -222,6 +246,8 @@ class Pipelines(Step):
             return True
         if record.get("runtime") != RUNTIME_SAYS:
             return False                        # built by a runtime that did not say it zeroes workgroup memory
+        if record.get("hmma") not in hmma_forms(hmma_setting()):
+            return False                        # built by a runtime that did not say its HMMA form, or in a form excluded now
         try:
             # Not smaller: the game saves what it built into this file (tasks, meshes, padded libraries), so a cache that grew
             # since the step wrote it is the same cache and more; a smaller one was cut short.
@@ -313,6 +339,7 @@ class Pipelines(Step):
             os.fsync(progress_file.fileno())   # a power cut must not leave a record whose segment was never written
 
         gov = pipesched.Governor(budget)
+        forms = {"hmma": hmma_forms(hmma_setting())}
         shown = Progress(rep, items, kept)
         serve = ["serve", "--pack", str(pack), "--segments", str(segments)]
         if seed.used:
@@ -320,7 +347,7 @@ class Pipelines(Step):
         p = pipesched.Pool(lambda wid: builder + serve, todo,
                            workers, gov, logs, segments, lambda rs, seg, size: record(rs), lambda r: record([r]),
                            next_segment=pipesched.next_segment_number(segments), env=env, on_result=shown.add,
-                           expect=device.expect(), runtime=RUNTIME_SAYS,
+                           expect=device.expect(), runtime=RUNTIME_SAYS, forms=forms,
                            # A flush replaces the builder's cache with an empty one (vkp_cache_flush), so a seeded builder
                            # that flushed on its timer would serve the seed only until the first flush and build every
                            # later unchanged program cold. It saves when it is recycled and at the end instead.
@@ -406,6 +433,9 @@ class Pipelines(Step):
             "device": {"index": device.index, "name": device.name, "identity": device.identity},
             "builder": builder_id,
             "runtime": dict(p.runtime_seen) or dict(RUNTIME_SAYS),     # no worker ran when every item was kept: the key held it
+            # The form the builders chose. With no worker (every item kept) and a setting that leaves the choice to the probe,
+            # nothing said it: the record is then not current, and the next run asks a builder, served by this cache.
+            "hmma": p.forms_seen.get("hmma") or (forms["hmma"][0] if len(forms["hmma"]) == 1 else None),
         }
 
 

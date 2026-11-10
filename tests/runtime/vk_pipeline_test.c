@@ -60,8 +60,8 @@
 //   synth_release PACK           a stage's objects released and made again
 //   synth_threads PACK           eight threads ask for one pipeline: it is made once
 //   synth_absent PACK            a stage the pack lacks: a named fatal with its shape
-//   hmma_probe                   the device and the builder opened and closed: the start-up probe's decision on HMMA
-//                                (oot2/vk_hmma.h)
+//   hmma_probe [FAULT]           the device and the builder opened and closed: the start-up probe's decision on HMMA
+//                                (oot2/vk_hmma.h), with a fault in its read-back when named (lengths, helper, sums)
 //   hmma_build PACK KEY          a translated compute module with HMMA built in the form the probe chose
 // Cases on the player's own pack (the desktop, never in continuous integration):
 //   firstdraw DRAW PACK VKEY PKEY OUT   tools/firstdraw's draw, built from the pack through the builder
@@ -1150,8 +1150,13 @@ static void case_synth_absent(const char *pack) {
 }
 
 // HMMA on cooperative matrices: the device and the pipeline builder opened (the builder's open runs the start-up probe,
-// which logs the decision) and closed again.
-static void case_hmma_probe(void) {
+// which logs the decision) and closed again; with a fault in the probe's read-back when one is named (vkh_fault).
+static void case_hmma_probe(const char *fault) {
+    if (fault) {
+        vkh_fault = !strcmp(fault, "lengths") ? VKH_FAULT_LENGTHS : !strcmp(fault, "helper") ? VKH_FAULT_HELPER
+                  : !strcmp(fault, "sums")    ? VKH_FAULT_SUMS : 0;
+        CHECK(vkh_fault);
+    }
     gpu_vk_open();
     vkp_open(NULL);
     printf("hmma native %d%s%s\n", vkh_native(), vkh_native() ? "" : ": ", vkh_reason());
@@ -1166,7 +1171,7 @@ static void case_hmma_probe(void) {
 // helper, the native function taken out by spv_hmma_fallback).
 static void case_hmma_build(const char *pack, const char *key) {
     open_all(pack, NULL);
-    printf("hmma native %d\n", vkh_native());
+    printf("hmma native %d%s%s\n", vkh_native(), vkh_native() ? "" : ": ", vkh_reason());
     VkpStage cs = {.key = key};
     CHECK(vkp_compute(&cs));
     print_stats("hmma");
@@ -1501,7 +1506,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(cs, "synth_release") && argc >= 3) case_synth_release(argv[2]);
         else if (!strcmp(cs, "synth_threads") && argc >= 3) case_synth_threads(argv[2]);
         else if (!strcmp(cs, "synth_absent") && argc >= 3) case_synth_absent(argv[2]);
-        else if (!strcmp(cs, "hmma_probe")) case_hmma_probe();
+        else if (!strcmp(cs, "hmma_probe")) case_hmma_probe(argc >= 3 ? argv[2] : NULL);
         else if (!strcmp(cs, "hmma_build") && argc >= 4) case_hmma_build(argv[2], argv[3]);
         else if (!strcmp(cs, "firstdraw") && argc >= 7) case_firstdraw(argv[2], argv[3], argv[4], argv[5], argv[6]);
         else if (!strcmp(cs, "corpus_pairs") && argc >= 6) case_corpus(argv[2], argv[3], 1, atoi(argv[4]), argv[5], argc >= 7);

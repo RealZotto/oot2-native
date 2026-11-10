@@ -17,7 +17,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
     // word r: row g + 8 r, columns 2t and 2t + 1; the low half of a word first), and a cooperative matrix's components are held by the lanes
     // in an order the extension leaves to the implementation. On NVIDIA the lanes hold the same positions as the console's fragments, in an
     // order of their own (measured at start-up by the runtime's probe, runtime/gpu/vk_hmma.c, which compares this order with the device's
-    // and the native result with the helper's on known inputs before any module runs). Each console element e moves into component
+    // and, on small integers whose sums are exact, the native result with the helper's and the exact sums before any module runs: the
+    // wiring and the order, not the rounding, which differs between the forms on general inputs). Each console element e moves into component
     // Order[e] with OpCompositeInsert, one OpCooperativeMatrixMulAddKHR multiplies, and D's components move back out with
     // OpCompositeExtract in the accumulator's order. The workgroup-memory form (stores, OpCooperativeMatrixLoadKHR, a barrier) would need
     // no order but keeps the helper's stores, loads and both synchronisations, the cost that made the helper-body swap gain 1.5 times

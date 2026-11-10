@@ -7,24 +7,28 @@ builder's turn of it into the helper (spv_hmma_fallback, runtime/gpu/spirv.c) an
 Three groups, by what they need:
 
 - The translator (py -3 tools/build_xlate.py): one program's native form and helper form, the memory operands the Vulkan
-  memory model gives its workgroup accesses, its components against the runtime's copy of the order, the option's values.
+  memory model gives its workgroup accesses, its components against the runtime's copy of the order, the option's values,
+  and the helper kept for a workgroup whose width is not a whole number of subgroups.
 - The translator and the pipeline builder's test program (clang and the Vulkan SDK, as tests/test_runtime_vk_pipeline.py):
   the native module turned into the helper, validated by spirv-val, and what a module without matrices or without the
   helper gets.
 - A GPU with every item and VK_KHR_cooperative_matrix, and the harness of the HMMA cost study (built here by
   tools/build_vkdraw.py --harness vkhmmacost): one chain of HMMA run in both forms and compared, one HMMA against the
-  CPU model of that study (tools/hmmacost/hmma_cost.py), the start-up probe's decision, and a native module built through
-  the pipeline builder in both forms.
+  CPU model of that study (tools/hmmacost/hmma_cost.py), the start-up probe's decision and its third check against a
+  fault in its read-back, and a native module built through the pipeline builder in both forms. The probe's own gate
+  (vk_hmma.c, gate()) says when a device cannot run the native form; the cases that need the native form skip on it.
 
 How the forms compare (the chain tests). On inputs whose every partial sum f16 holds exactly (A in {-1, 0, 1}, B in
 {-1, 0, 1} / 256, C k / 256), every form gives the exact sums, so the native and the helper results must be equal bit for
-bit, and equal to the CPU model, which is how a wrong component order shows. On general inputs they are not equal: driver
-617.14 folds the helper's pack and unpack between two inlined calls and keeps an f32 accumulator across a chain (the
-HMMA cost study; the helper's results here equal that study's f32-chain model word for word), while the tensor cores
-round every HMMA's D to f16 as the console's register holds it, after their own internal accumulation (that study:
-long f16 chains on them stray from a round-to-nearest model). The test bounds the difference by 2^-6 of the largest
-magnitude, the study's own tolerance for the helper's cooperative form, far below what a wrong order gives (errors of
-the magnitudes themselves).
+bit, and equal to the CPU model, which is how a wrong component order shows. On general inputs they are not equal. The
+helper rounds D to f16 at every call (its pack, as the console's register holds it), as the CPU model does by default;
+driver 617.14 folds that pack and the next call's unpack away between two inlined calls, so there the helper's results
+keep an f32 accumulator across a chain and equal the model's f32-chain variant word for word (the HMMA cost study): a
+property of that driver, not of the helper. The tensor cores round every HMMA's D to f16 after their own internal
+accumulation (that study: long f16 chains on them stray from a round-to-nearest model). The test bounds the difference
+by 2^-6 of the largest magnitude, the study's own tolerance for the helper's cooperative form, far below what a wrong
+order gives (errors of the magnitudes themselves): that bound is the portable check. The f32-chain equality is checked
+where the helper's results show the fold, and skips where they equal the per-call model (a driver that does not fold).
 
 The programs are assembled from instruction words (the HMMA cost study's assembler), never read from game files. The
 translator tests skip when it has not been built, unless OOT2_REQUIRE_XLATE is set; the program tests without clang or
@@ -62,6 +66,7 @@ from test_xlate_host import EXE, SKIP_NO_EXE, SPIRV_VAL, Harness  # noqa: E402
 
 COOP_HEADER = ROOT / "xlate" / "third_party" / "ryujinx" / "src" / "Ryujinx.Graphics.Shader" / "CodeGen" / "Spirv" / "CoopHmma.cs"
 RUNTIME_HEADER = ROOT / "runtime" / "include" / "oot2" / "vk_hmma.h"
+RUNTIME_PROBE = ROOT / "runtime" / "gpu" / "vk_hmma.c"
 
 NATIVE, HELPER = "dmsh_hmma16816_coop", "dmsh_hmma16816_f16"
 CAP_FLOAT16, CAP_VULKAN_MEMORY_MODEL, CAP_DEVICE_SCOPE, CAP_COOPERATIVE_MATRIX = 9, 5345, 5346, 6022
@@ -138,14 +143,41 @@ def orders(source: Path, pattern: str) -> list[list[int]]:
     return [[int(x) for x in f.split(",")] for f in found]
 
 
+def gate_reasons() -> list[str]:
+    """What the probe's gate says of a device that cannot run the native form (the strings of gate() in vk_hmma.c): the
+    probe's own verdict on the device, on which a case that needs the native form skips, where a refusal by the order or the
+    result checks is a failure."""
+    text = RUNTIME_PROBE.read_text(encoding="utf-8")
+    body = text[text.index("static const char *gate(void)"):]
+    return re.findall(r'"(the device[^"]*)"', body[:body.index("\n}\n")])
+
+
+def verdict(out: str) -> tuple[int, str]:
+    """The probe's decision as the pipeline builder's test program prints it: "hmma native N[: reason]"."""
+    m = re.search(r"^hmma native (\d)(?:: (.*))?$", out, re.M)
+    if not m:
+        raise AssertionError(f"no decision in {out[-500:]!r}")
+    return int(m.group(1)), (m.group(2) or "").strip()
+
+
+def skip_on_the_gate(test: unittest.TestCase, native: int, reason: str) -> None:
+    """Skip a case that needs the native form when the probe's gate says the device cannot run it."""
+    if native == 0 and reason in gate_reasons():
+        why = f"the probe's gate keeps the helper on this device: {reason}"
+        if require_gpu():
+            raise RuntimeError(f"OOT2_REQUIRE_GPU is set but {why}")
+        test.skipTest(why)
+
+
 # ---- the translator --------------------------------------------------------------------------------------
 
-def translate(work: Path, key: str, p: hc.Program, hmma: str | None = None) -> pool.Result:
+def translate(work: Path, key: str, p: hc.Program, hmma: str | None = None,
+              local: tuple[int, int, int] = (hc.LOCAL, 1, 1)) -> pool.Result:
     """One program through the translator: its module and description in work, as key.spv and key.res.json."""
     code = work / f"{key}.bin"
     code.write_bytes(p.binary())
     job = {"key": key, "stage": "cs", "arch": "sm86", "code": str(code), "c1": "", "nvn2_cs": [0, 0, 0, 16, 0, 0, 0],
-           "local": [hc.LOCAL, 1, 1], "shared": p.shared}
+           "local": list(local), "shared": p.shared}
     if hmma is not None:
         job["options"] = {"hmma": hmma}
     (r,), _ = pool.run_pool([str(EXE)], [(job, work)], 1, work / "logs", timeout=600)
@@ -221,6 +253,25 @@ class NativeFormTest(Harness):
         self.assertEqual(len(translator), 3)
         self.assertEqual(translator, runtime)
         self.assertEqual(written, translator[0] + translator[1] + translator[2])
+
+    def test_a_workgroup_whose_width_is_not_a_whole_number_of_subgroups_keeps_the_helper(self):
+        """A subgroup matrix needs every lane of its subgroup, and Vulkan requires the width of a module that holds one to be
+        a multiple of the subgroup size (VUID-VkPipelineShaderStageCreateInfo-module-08987). 48 x 1 x 1 leaves its second
+        subgroup partial; 16 x 2 x 1 and 8 x 4 x 4 fill theirs, but not by their width: all three keep the helper. 32 x 4 x 1
+        runs natively. The game's 71 tensor programs are 32, 128 or 256 lanes wide (the compute build time census)."""
+        for local, native in (((48, 1, 1), False), ((16, 2, 1), False), ((8, 4, 4), False), ((32, 4, 1), True)):
+            with self.subTest(local=local):
+                key = "local" + "x".join(map(str, local))
+                r = translate(self.dir, key, hc.hmma_program(self.COUNT, False, True), local=local)
+                self.assertEqual((r.status, r.message), ("ok", ""))
+                path = self.dir / f"{key}.spv"
+                if SPIRV_VAL:
+                    v = validate.validate_one(SPIRV_VAL, path.stem, path)
+                    self.assertTrue(v.ok, v.message)
+                m = Module(path.read_bytes())
+                self.assertEqual((m.calls(NATIVE), m.calls(HELPER)), (self.COUNT, 0) if native else (0, self.COUNT))
+                self.assertEqual(CAP_COOPERATIVE_MATRIX in m.caps, native)
+                self.assertEqual(m.model, MODEL_VULKAN if native else MODEL_GLSL450)
 
     def test_an_unknown_value_of_the_option_is_a_bad_job(self):
         r = translate(self.dir, "bad", hc.hmma_program(4, False, True), "native")
@@ -367,11 +418,19 @@ class DeviceTest(unittest.TestCase):
         p = hc.hmma_program(32, False, True)
         inp = hc.lane_input(11)
         native, helper = self.run_form(p, None, inp, "general"), self.run_form(p, "helper", inp, "general")
-        self.assertEqual(int(np.count_nonzero(helper != hc.model(p, inp, f32_chains=True))), 0)   # the helper's own model
         n, h = hc.lane_halves(native).astype(np.float64), hc.lane_halves(helper).astype(np.float64)
         self.assertTrue(np.all(np.isfinite(n)))
         scale = float(np.max(np.abs(h)))
-        self.assertLessEqual(float(np.max(np.abs(n - h))), 2.0 ** -6 * scale)
+        self.assertLessEqual(float(np.max(np.abs(n - h))), 2.0 ** -6 * scale)   # the portable check
+        # The helper rounds D to f16 at every call (the per-call model); a driver that folds its pack and the next call's
+        # unpack (617.14) carries f32 across the chain instead (the f32-chain model). Which one ran is the driver's doing.
+        per_call, folded = hc.model(p, inp), hc.model(p, inp, f32_chains=True)
+        with self.subTest("the helper's results equal the f32-chain model where the driver folds"):
+            self.assertGreater(int(np.count_nonzero(per_call != folded)), 0, "these inputs cannot tell a fold")
+            if np.count_nonzero(helper != folded) and not np.count_nonzero(helper != per_call):
+                self.skipTest("this driver keeps the helper's rounding of D at every call (its results are the per-call "
+                              "model's): the f32-chain model holds only where a driver folds the pack and unpack")
+            self.assertEqual(int(np.count_nonzero(helper != folded)), 0)
 
     def test_one_hmma_equals_the_cpu_model(self):
         p = hc.hmma_program(4, False, False)   # one HMMA on each chain
@@ -396,23 +455,41 @@ class ProbeTest(unittest.TestCase):
         cls.pack = cls.dir / "hmma.bin"
         cp.write_pack(cls.pack, [entry], translator=hashlib.sha256(EXE.read_bytes()).hexdigest())
 
-    def probe(self, **env: str) -> tuple[str, str]:
-        done = run("hmma_probe", env={"OOT2_VK_VALIDATION": "on", **env})
+    def probe(self, *args: str, **env: str) -> tuple[str, str]:
+        done = run("hmma_probe", *args, env={"OOT2_VK_VALIDATION": "on", **env})
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr[-3000:])
         self.assertIn("validation errors 0 warnings 0", done.stdout)
         self.assertEqual(fatal_lines(done.stderr), [])
         return done.stdout, done.stderr
 
+    def test_the_gate_reasons_are_read_from_the_probe(self):
+        reasons = gate_reasons()
+        self.assertEqual(len(reasons), 6, reasons)
+        self.assertIn("the device lists no 16x8x16 subgroup matrix with f16 A, B, C and result", reasons)
+
     def test_the_probe_measures_the_translators_order_and_keeps_the_native_form(self):
         out, err = self.probe()
         line = next((l for l in err.splitlines() if "HMMA" in l), "")
-        if "the device lists no 16x8x16" in line:
-            self.assertIn("hmma native 0", out)               # another GPU: the helper, named
-            return
+        skip_on_the_gate(self, *verdict(out))
         a, b, c = orders(RUNTIME_HEADER, r"#define VKH_ORDER_[ABC] \{([0-9, ]+)\}")
         self.assertIn("hmma native 1", out, line)
         self.assertIn(f"components A {' '.join(map(str, a))}, B {' '.join(map(str, b))}, C {' '.join(map(str, c))}, "
                       "the translator's order", line)
+
+    def test_a_fault_in_the_probes_read_back_keeps_the_helper_by_name(self):
+        """The third check, counter-run on the device: a read-back whose lanes hold 7 components of A, whose helper's D
+        differs from the native one in one half, or whose two forms agree on a half that is not the exact sum, keeps the
+        helper, with the count named. Without the lengths check or either count, a case gives the native form."""
+        for fault, why in (("lengths", "a lane holds 7, 4 and 4 components of A, B and C, not 8, 4 and 4"),
+                           ("helper", "a multiply of small integers differs between the forms in 1 of 128 elements and the "
+                                      "native one from the exact sums in 0"),
+                           ("sums", "a multiply of small integers differs between the forms in 0 of 128 elements and the "
+                                    "native one from the exact sums in 1")):
+            with self.subTest(fault=fault):
+                out, err = self.probe(fault)
+                skip_on_the_gate(self, *verdict(out))
+                self.assertEqual(verdict(out), (0, why))
+                self.assertIn(f"HMMA in the helper: {why}", err)
 
     def test_the_setting_forces_the_helper(self):
         out, err = self.probe(OOT2_VK_HMMA="helper")
@@ -421,11 +498,14 @@ class ProbeTest(unittest.TestCase):
 
     def test_a_native_module_is_built_in_either_form(self):
         for setting, native in (("auto", 1), ("helper", 0)):
-            done = run("hmma_build", str(self.pack), "native", env={"OOT2_VK_VALIDATION": "on", "OOT2_VK_HMMA": setting})
-            self.assertEqual(done.returncode, 0, done.stdout + done.stderr[-3000:])
-            self.assertIn(f"hmma native {native}", done.stdout)
-            self.assertIn("ok hmma_build", done.stdout)
-            self.assertIn("validation errors 0 warnings 0", done.stdout)
+            with self.subTest(setting=setting):
+                done = run("hmma_build", str(self.pack), "native", env={"OOT2_VK_VALIDATION": "on", "OOT2_VK_HMMA": setting})
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr[-3000:])
+                if setting == "auto":
+                    skip_on_the_gate(self, *verdict(done.stdout))      # a device without the native form: the helper, named
+                self.assertEqual(verdict(done.stdout)[0], native, done.stdout)
+                self.assertIn("ok hmma_build", done.stdout)
+                self.assertIn("validation errors 0 warnings 0", done.stdout)
 
 
 if __name__ == "__main__":

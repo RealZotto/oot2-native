@@ -232,8 +232,9 @@ Changes of this project:
   stores get `NonPrivatePointer` and `MakePointerVisible` or
   `MakePointerAvailable` at workgroup scope, as glslang writes a `shared`
   variable, and nothing else of the module changes. A module with a Coherent
-  image keeps the helper (its native function is a call of the helper). The
-  host's job option `hmma` chooses: `coop` (the default) or `helper`, the form
-  every module had before. On the movie's ten tensor programs every module
+  image keeps the helper (its native function is a call of the helper), and so
+  does a program whose workgroup width is not a multiple of 32, since a subgroup
+  matrix needs every lane of its subgroup. The host's job option `hmma`
+  chooses: `coop` (the default) or `helper`, the form every module had before. On the movie's ten tensor programs every module
   passes spirv-val (Vulkan 1.3), and the driver's code for the largest falls
   from 1,621,632 to 221,568 bytes.

@@ -101,7 +101,7 @@ class PipeBuildTest(DeviceTestCase):
         tmp, segments = self.folder()
         w = Worker(self.exe, self.pack, segments)
         self.assertRegex(w.ready, r"^ready vendor=[0-9a-f]{4} device=[0-9a-f]{4} driver=[0-9a-f]{8} api=1\.\d+\.\d+ "
-                                  r"cache_uuid=[0-9a-f]{32} cache=none seeded=\d+ zero_workgroup=1 name=")
+                                  r"cache_uuid=[0-9a-f]{32} cache=none seeded=\d+ zero_workgroup=1 hmma=(native|helper) name=")
         built = {}
         for kind, key in (("vs", VS), ("ps", PS), ("cs", CS)):
             reply = w.ask(f"build {kind} {key}").split()
@@ -205,6 +205,16 @@ class PipeBuildTest(DeviceTestCase):
         _, err = bad.finish()
         self.assertEqual(bad.proc.returncode, 70)
         self.assertIn('OOT2_VK_DRIVER_CACHE is "maybe"', err)
+
+    def test_the_ready_line_names_the_hmma_form_the_setting_asks_for(self) -> None:
+        """The form of the tensor programs the start-up probe chose (oot2/vk_hmma.h), which prepare keys and records: a
+        cache built in one form holds other tensor modules than a launch in the other asks for."""
+        _, segments = self.folder()
+        w = Worker(self.exe, self.pack, segments, OOT2_VK_HMMA="helper")
+        self.assertRegex(w.ready, r" zero_workgroup=1 hmma=helper name=")
+        last, err = w.finish()
+        self.assertIn("HMMA in the helper: OOT2_VK_HMMA=helper", err)
+        self.assertIn("validation_errors 0 validation_warnings 0", last, err[-2000:])
 
     def test_the_step_compiles_the_builder_and_builds_a_synthetic_pack_with_validation_clean(self) -> None:
         """The pipelines step end to end: its own compile of the builder, the host probe's device, workers on the GPU,

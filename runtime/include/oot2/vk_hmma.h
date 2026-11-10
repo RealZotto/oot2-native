@@ -12,8 +12,13 @@
 //              16-bit floats (the optional feature shader_float16) and the Vulkan memory model (an item);
 //   the order  a probe loads row-major matrices whose components are their positions and reads back every lane's
 //              components: each console element of every lane must sit in the component the translator's order names;
-//   the result the same lanes' fragments of small integers multiplied by the native form and by the helper's algorithm
-//              must give the same D, bit for bit, and the exact sums.
+//   the result the same lanes' fragments of small integers, whose every sum f16 holds exactly whatever the order or the
+//              width of the additions, multiplied by the native form and by the helper's algorithm must give the same D,
+//              bit for bit, and the exact sums; and each lane must hold 8, 4 and 4 components of A, B and C.
+//
+// The third check proves the wiring end to end on the device (each lane's D comes from the positions the order names,
+// through the moves in and out) and nothing about rounding: on general inputs the two forms differ, the native one rounding
+// as the tensor cores do.
 //
 // When all three hold the modules run as translated. Otherwise, or with OOT2_VK_HMMA=helper, the pipeline builder makes
 // every call of the native function a call of the helper, found by name, and takes the native function and the matrix
@@ -37,3 +42,9 @@ void vkh_probe(void);
 int vkh_native(void);
 // Why, in a few words ("OOT2_VK_HMMA=helper", "the device lists no 16x8x16 f16 subgroup matrix", ...); "" when native.
 const char *vkh_reason(void);
+
+// Tests only: a fault written into the probe's read-back before the third check judges it (the counter-run of that check):
+// VKH_FAULT_LENGTHS says a lane holds 7 components of A, VKH_FAULT_HELPER changes one half of the helper's D, and
+// VKH_FAULT_SUMS changes that half of both forms' D alike, so that they agree and miss the exact sum. 0: none.
+enum { VKH_FAULT_LENGTHS = 1, VKH_FAULT_HELPER, VKH_FAULT_SUMS };
+extern int vkh_fault;

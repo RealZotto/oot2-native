@@ -49,6 +49,7 @@
 
 #include "oot2/gpu_vk.h"
 #include "oot2/runtime.h"
+#include "oot2/vk_hmma.h"
 #include "oot2/vk_pipeline.h"
 
 #define LINE_MAX_BYTES 1024
@@ -100,10 +101,13 @@ static void print_ready(void) {
     hex(p->pipelineCacheUUID, VK_UUID_SIZE, uuid);
     // zero_workgroup says what this runtime does to a compute module before the driver sees it: a cache built by a
     // runtime that did not zero them holds other modules than the ones a launch asks for (tools/prepare/pipelines.py).
-    reply("ready vendor=%04x device=%04x driver=%08x api=%u.%u.%u cache_uuid=%s cache=%s seeded=%llu zero_workgroup=%d name=%s",
+    // hmma says the form the start-up probe chose for the tensor programs (oot2/vk_hmma.h): the same holds of a cache
+    // built in the other form.
+    reply("ready vendor=%04x device=%04x driver=%08x api=%u.%u.%u cache_uuid=%s cache=%s seeded=%llu zero_workgroup=%d "
+          "hmma=%s name=%s",
           p->vendorID, p->deviceID, p->driverVersion, VK_API_VERSION_MAJOR(p->apiVersion), VK_API_VERSION_MINOR(p->apiVersion),
           VK_API_VERSION_PATCH(p->apiVersion), uuid, cache_state_name(vkp_cache_state()),
-          (unsigned long long)vkp_cache_size(), vkp_zero_workgroup(), p->deviceName);
+          (unsigned long long)vkp_cache_size(), vkp_zero_workgroup(), vkh_native() ? "native" : "helper", p->deviceName);
 }
 
 // A named fatal of the runtime (a module that does not fit, a capability the device lacks, a failed Vulkan call) stops the

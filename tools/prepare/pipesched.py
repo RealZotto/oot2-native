@@ -378,11 +378,16 @@ class Pool:
                  on_failed: Callable[[Result], None], next_segment: int = 1, flush_seconds: float | None = None,
                  timeout: float | None = None, start_timeout: float | None = None, env: dict | None = None,
                  on_result: Callable[[Result], None] | None = None, final_flush: bool = True,
-                 expect: dict[str, str] | None = None, runtime: dict[str, str] | None = None):
+                 expect: dict[str, str] | None = None, runtime: dict[str, str] | None = None,
+                 forms: dict[str, tuple[str, ...]] | None = None):
         self.final_flush = final_flush   # a warm pass has nothing to save: its cache is the file it was seeded from
         self.expect = expect or {}       # fields of the builder's ready line (vendor, device, driver, cache_uuid)
         self.runtime = runtime or {}     # fields of it that name the runtime the builder was linked with (zero_workgroup)
         self.runtime_seen: dict[str, str] = {}
+        # Fields of it that name a choice the runtime makes when it opens (hmma: the form of the tensor programs, which the
+        # start-up probe chooses): each builder must say one of the values allowed, and every builder the same one.
+        self.forms = forms or {}
+        self.forms_seen: dict[str, str] = {}
         self.cache_seen: dict[str, int] = {}   # what each builder's ready line said of the cache it was given (cache=)
         self.seeded_seen: list[int] = []       # what the builders that said "loaded" said they hold (seeded=)
         self.flush_lock = threading.Lock()     # one flush at a time: each copies the whole cache beside the driver's
@@ -458,6 +463,19 @@ class Pool:
                              f"({', '.join(f'{k}={v or chr(45)}, expected {self.runtime[k]}' for k, v in stale.items())}): it would "
                              "build the compute modules in a form a launch never asks for, and every program with "
                              "workgroup memory would build again, cold, at the first launch.")
+        with self.lock:
+            odd = {k: got.get(k, "") for k, allowed in self.forms.items()
+                   if got.get(k, "") not in allowed or got.get(k) != self.forms_seen.get(k, got.get(k))}
+            if not odd:
+                self.forms_seen.update({k: got[k] for k in self.forms})
+        if odd:
+            # The driver's cache keys on the module, and a builder in another form than the one asked for (or than the other
+            # builders) writes other modules than a launch in that form asks for.
+            child.close(kill=True)
+            wanted = {k: self.forms_seen.get(k) or " or ".join(self.forms[k]) for k in odd}
+            raise SchedError("the pipeline builder chose another form than the step asked for ("
+                             + ", ".join(f"{k}={v or '-'}, expected {wanted[k]}" for k, v in odd.items())
+                             + "): its cache would hold other modules than a launch in that form asks for.")
         state = got.get("cache", "?")
         if state == "loaded":
             # What a builder that holds a seed weighs before it builds anything: the driver may keep far more than the
