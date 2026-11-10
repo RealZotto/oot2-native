@@ -35,6 +35,7 @@
 #define SYNC_FILE(f) fsync(fileno(f))
 #endif
 
+#include "oot2/bench_timers.h"
 #include "oot2/gpu.h"
 #include "oot2/gpu_vk.h"
 #include "oot2/runtime.h"
@@ -683,17 +684,17 @@ static VkPipeline build_link(void *c) {
 void vkp_graphics_key(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
                       char *out, size_t cap) {
     char vd[66], td[66], pd[66], ft[96];
-    cache_digest_text(vs, vd, sizeof vd);
-    cache_digest_text(task, td, sizeof td);
-    cache_digest_text(ps, pd, sizeof pd);
-    formats_text(formats, ft, sizeof ft);
+    BT_TIME(BT_S3_KEY_DIGEST, cache_digest_text(vs, vd, sizeof vd); cache_digest_text(task, td, sizeof td);
+            cache_digest_text(ps, pd, sizeof pd));
+    BT_TIME(BT_S3_KEY_FORMATS, formats_text(formats, ft, sizeof ft));
+    BT_TIME(BT_S3_KEY_PRINT,
     if (vs->shape && vs->shape->kind == NVN_STAGE_MS) {
         if (task) snprintf(out, cap, "g|t:%s%s|m:%s%s|p:%s%s|%s", task->key, td, vs->key, vd, ps->key, pd, ft);
         else snprintf(out, cap, "g|m:%s%s|p:%s%s|%s", vs->key, vd, ps->key, pd, ft);
     } else {
         if (task) rt_fatal("gfx: vulkan: a task stage is bound without a mesh stage");
         snprintf(out, cap, "g|%s%s|%s%s|%s", vs->key, vd, ps->key, pd, ft);
-    }
+    });
 }
 
 static VkPipeline graphics_get(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats,
@@ -719,6 +720,58 @@ VkPipeline vkp_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage
     return vkp_graphics_ex(vs, task, ps, formats, NULL);
 }
 
+#ifdef OOT2_BENCH_HOOKS
+// BENCHMARK ONLY (tests/runtime/vk_replay_cost.c): the builder is taken for open without a device, and every pair the replay
+// asks for that the table does not hold is entered as a ready pipeline with a made-up handle, at its first ask. The
+// lookup below it (the key, the hash, the lock, the chain) is the one a run makes. `filler` unrelated ready objects
+// stand for the population of a long session.
+int vkp_bench_prime;
+uint64_t vkp_bench_primed;
+void vkp_bench_open(uint32_t filler) {
+    P.open = 1;
+    vkp_bench_prime = 1;
+    for (uint32_t i = 0; i < filler; i++) {
+        Obj *o = calloc(1, sizeof *o);
+        if (!o) rt_fatal("bench: out of memory");
+        snprintf(o->key, sizeof o->key, "x|filler-%08x|a-key-the-replay-never-asks-for", i * 2654435761u);
+        o->pipe = (VkPipeline)(uintptr_t)(0x100000u + i);
+        o->ready = 1;
+        uint32_t h = hash_key(o->key);
+        o->next = P.tab[h], P.tab[h] = o;
+    }
+}
+#endif
+
+#if defined(OOT2_BENCH_HOOKS) || defined(OOT2_BENCH_TIMERS)
+// The table's side of vkp_find_graphics: the hash, the lock and the chain (split out so a timer can wrap it).
+static VkPipeline find_ready(const char *key) {
+    uint32_t h = hash_key(key);
+    plat_mutex_lock(&P.lock);
+    Obj *o = find_locked(h, key);
+#ifdef OOT2_BENCH_HOOKS
+    if (!o && vkp_bench_prime) {
+        o = calloc(1, sizeof *o);
+        if (!o) rt_fatal("bench: out of memory");
+        snprintf(o->key, sizeof o->key, "%s", key);
+        o->pipe = (VkPipeline)(uintptr_t)(0x1000u + ++vkp_bench_primed);
+        o->ready = 1;
+        o->next = P.tab[h], P.tab[h] = o;
+    }
+#endif
+    VkPipeline p = o && o->ready ? o->pipe : VK_NULL_HANDLE;
+    plat_mutex_unlock(&P.lock);
+    return p;
+}
+
+VkPipeline vkp_find_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats) {
+    if (!P.open) return VK_NULL_HANDLE;
+    char key[KEY_MAX];
+    BT_TIME(BT_S3_KEY, vkp_graphics_key(vs, task, ps, formats, key, sizeof key));
+    VkPipeline p;
+    BT_TIME(BT_S3_TABLE, p = find_ready(key));
+    return p;
+}
+#else
 VkPipeline vkp_find_graphics(const VkpStage *vs, const VkpStage *task, const VkpStage *ps, const VkpFormats *formats) {
     if (!P.open) return VK_NULL_HANDLE;
     char key[KEY_MAX];
@@ -730,6 +783,7 @@ VkPipeline vkp_find_graphics(const VkpStage *vs, const VkpStage *task, const Vkp
     plat_mutex_unlock(&P.lock);
     return p;
 }
+#endif
 
 // ---------- compute pipelines
 

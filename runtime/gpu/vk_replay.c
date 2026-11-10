@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "oot2/bench_timers.h"
 #include "oot2/capture.h"
 #include "oot2/gfx.h"
 #include "oot2/gpu_vk.h"
@@ -341,7 +342,17 @@ static Bound zero_block(void) {
 }
 
 // A driver bank: the bytes of the last bank written for the same use, or a new copy.
+#ifdef OOT2_BENCH_TIMERS
+static Bound bank_body(BankCache *c, const uint8_t *bytes, uint32_t size);
 static Bound bank(BankCache *c, const uint8_t *bytes, uint32_t size) {
+    Bound r;
+    BT_TIME(BT_S5_BANK, r = bank_body(c, bytes, size));
+    return r;
+}
+static Bound bank_body(BankCache *c, const uint8_t *bytes, uint32_t size) {
+#else
+static Bound bank(BankCache *c, const uint8_t *bytes, uint32_t size) {
+#endif
     if (c->valid && !memcmp(c->bytes, bytes, size)) return c->at;
     void *p;
     c->at = scratch(size, UNIFORM_ALIGN, &p);
@@ -404,8 +415,19 @@ static void note(char kind, uint64_t addr, uint64_t bytes, int write) {
 
 static Bound snapshot(uint64_t addr, uint64_t size) {
     Rng r = {addr, addr + size};
+#ifdef OOT2_BENCH_TIMERS
+    {
+        int found = -1;
+        BT_TIME(BT_S5_SNAP_SEARCH, for (uint32_t i = 0; i < F.nsnaps; i++) if (F.snaps[i].lo == r.lo && F.snaps[i].hi == r.hi) {
+                found = (int)i;
+                break;
+            });
+        if (found >= 0) return F.snap_at[found];
+    }
+#else
     for (uint32_t i = 0; i < F.nsnaps; i++)
         if (F.snaps[i].lo == r.lo && F.snaps[i].hi == r.hi) return F.snap_at[i];
+#endif
     void *p;
     Bound b = scratch((uint32_t)size, UNIFORM_ALIGN, &p);
     memcpy(p, (const void *)(uintptr_t)addr, size);
@@ -420,11 +442,23 @@ static Bound uniform(VknBuf b) {
     if (!b.addr || !b.size) return zero_block();
     uint64_t size = b.size < UNIFORM_MAX ? b.size : UNIFORM_MAX;
     BackingRef ref;
-    F.ops->resolve(b.addr, size, F.value, &ref);
+    BT_TIME(BT_S5_RESOLVE, F.ops->resolve(b.addr, size, F.value, &ref));
+#ifdef OOT2_BENCH_TIMERS
+    int written = 0;
+    if (ref.kind == BACKING_IMPORT && !vkr_no_snapshot && !vkr_no_drop)
+        BT_TIME(BT_S5_WRITTEN, written = vkr_written(b.addr, size));
+    if (ref.kind == BACKING_IMPORT && !vkr_no_snapshot && !written) {
+        note('U', b.addr, size, 0);
+        Bound snap;
+        BT_TIME(BT_S5_SNAPSHOT, snap = snapshot(b.addr, size));
+        return snap;
+    }
+#else
     if (ref.kind == BACKING_IMPORT && !vkr_no_snapshot && (vkr_no_drop || !vkr_written(b.addr, size))) {
         note('U', b.addr, size, 0);
         return snapshot(b.addr, size);
     }
+#endif
     note(backing_letter(ref.kind), b.addr, size, 0);
     g_stats.live_uniforms++;
     return (Bound){(VkBuffer)(uintptr_t)ref.buffer, ref.offset};
@@ -746,14 +780,15 @@ static void bind_pipeline(int compute, VkPipeline p) {
 
 static VkpStage replay_stage(const nvn_stage *s) {
     uint8_t digest[SHC_DIGEST_BYTES];
-    ledger_track_answers_digest(&S.track, s->kind, digest);
+    BT_TIME(BT_S1_DIGEST, ledger_track_answers_digest(&S.track, s->kind, digest));
     VkpStage stage = {.key = s->key, .shape = s};
     vkp_stage_set_ledger_digest(&stage, digest);
     return stage;
 }
 
 static const ShaderBinds *binds_of(const VkpStage *stage, int kind) {
-    const ShaderBinds *b = F.ops->binds(stage);
+    const ShaderBinds *b;
+    BT_TIME(BT_S2_BINDS, b = F.ops->binds(stage));
     if (!b) stop("stage %s has no description the replay can read", stage->key);
     if (b->kind != kind) stop("stage %s is a %s program where a %s was bound", stage->key, shd_kind_name(b->kind),
                               shd_kind_name(kind));
@@ -858,7 +893,7 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
         } else if (cb->slot == 2) {
             static const uint64_t none[128];
             uint8_t c2[VKN_BANK_BYTES];
-            vkn_c2_fill(c2, S.tex[st], S.img[st], none, none);
+            BT_TIME(BT_S5_C2, vkn_c2_fill(c2, S.tex[st], S.img[st], none, none));
             at = bank(&F.c2[st], c2, VKN_BANK_BYTES), range = VKN_BANK_BYTES;
         } else if (cb->slot == 24) {
             int k = st == ST_CS;
@@ -898,7 +933,7 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
         put_buffer(s, sb->binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (Bound){(VkBuffer)(uintptr_t)ref.buffer, ref.offset},
                    range);
         note(backing_letter(ref.kind), base, range, sb->write);
-        if (sb->write) vkr_wrote(base, range, 0, F.draws + 1);   // the draw being prepared
+        if (sb->write) BT_TIME(BT_S5_WROTE, vkr_wrote(base, range, 0, F.draws + 1));   // the draw being prepared
     }
     // Storage images: the handle in c[2]'s image rows names a texture pool ID (nvnDeviceGetImageHandle), whose texture
     // the device views for stores, in the general layout every image keeps (D18)
@@ -915,7 +950,7 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
         put_image(s, m->binding, view);
         note('G', storage, bytes, m->write);
         g_stats.storage_images++;
-        if (m->write && bytes) vkr_wrote(storage, bytes, 1, F.draws + 1);   // the draw or dispatch being prepared
+        if (m->write && bytes) BT_TIME(BT_S5_WROTE, vkr_wrote(storage, bytes, 1, F.draws + 1));   // the draw or dispatch being prepared
     }
     for (uint32_t i = 0; i < b->ntex; i++) {
         const ShdTex *t = &b->tex[i];
@@ -1075,10 +1110,10 @@ static void vertex_input(const ShaderBinds *vb) {
             .inputRate = div ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX, .divisor = 1};
         BackingRef ref;
         uint64_t size = S.vbuf[s].size ? S.vbuf[s].size : 1;
-        F.ops->resolve(S.vbuf[s].address, size, F.value, &ref);
+        BT_TIME(BT_S4_RESOLVE, F.ops->resolve(S.vbuf[s].address, size, F.value, &ref));
         VkBuffer buf = (VkBuffer)(uintptr_t)ref.buffer;
         VkDeviceSize off = ref.offset;
-        vkrec_BindVertexBuffers2(s, 1, &buf, &off, NULL, NULL);
+        BT_TIME(BT_S4_PACK, vkrec_BindVertexBuffers2(s, 1, &buf, &off, NULL, NULL));
     }
     if (need_default) {
         // An attribute with no format or no buffer reads (0, 0, 0, 1), as the console reads an unfed input.
@@ -1097,11 +1132,21 @@ static void vertex_input(const ShaderBinds *vb) {
             if (in.a[i].binding == UINT32_MAX) in.a[i].binding = spare;
         vkrec_BindVertexBuffers2(spare, 1, &at.buf, &at.off, NULL, NULL);
     }
-    vkrec_SetVertexInputEXT(in.nb, in.b, in.na, in.a);
+    BT_TIME(BT_S4_PACK, vkrec_SetVertexInputEXT(in.nb, in.b, in.na, in.a));
 }
 
 // The pipeline, the state and the resources of a graphics draw; 0 when rendering is disabled.
+#ifdef OOT2_BENCH_TIMERS
+static int draw_prepare_body(int prim, uint32_t base_instance, VkBool32 *restart_out);
 static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out) {
+    int r;
+    BT_TIME(BT_DRAW_PREPARE, r = draw_prepare_body(prim, base_instance, restart_out));
+    return r;
+}
+static int draw_prepare_body(int prim, uint32_t base_instance, VkBool32 *restart_out) {
+#else
+static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out) {
+#endif
     g_stats.draw_ops++;
     if (!S.render) {
         g_stats.render_off++;
@@ -1122,15 +1167,22 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
     *restart_out = restart;
     // A pipeline that is not ready and may be skipped (oot2/vk_miss.h) answers NULL: nothing of the draw is written, so
     // the state the frame keeps (the bound pipeline, the dynamic state, the buffers) is as the draw before left it.
+#ifdef OOT2_BENCH_TIMERS
+    VkPipeline pipe;
+    int may_skip;
+    BT_TIME(BT_U_STAMPS, may_skip = targets_hold_earlier_picture());
+    BT_TIME(BT_S3_GRAPHICS, pipe = F.ops->graphics(&vst, NULL, &fst, &F.formats, may_skip));
+#else
     VkPipeline pipe = F.ops->graphics(&vst, NULL, &fst, &F.formats, targets_hold_earlier_picture());
+#endif
     if (!pipe) {
         g_stats.skipped++;
         return 0;
     }
     bind_pipeline(0, pipe);
-    stamp_targets();
+    BT_TIME(BT_U_STAMPS, stamp_targets());
     bind_set0(0);
-    dyn_emit(topo, restart, 0);
+    BT_TIME(BT_U_DYN, dyn_emit(topo, restart, 0));
     Set1 s;
     memset(&s, 0, sizeof s);
     if (vb->raw || fb->raw) {
@@ -1141,15 +1193,15 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
         if (fb->raw) raw_stages[nraw++] = fs;
         raw_pass_note(raw_stages, nraw);
     }
-    vertex_input(vb);
-    support(&s);
+    BT_TIME(BT_S4_VERTEX, vertex_input(vb));
+    BT_TIME(BT_S6_SUPPORT, support(&s));
     uint8_t c0[VKN_BANK_BYTES];
-    vkn_c0_graphics(c0, NVN_STAGE_VS, S.ssbo[ST_VS], base_instance);
-    stage_resources(&s, ST_VS, vs, &P.ps[ST_VS], vb, c0, 1);
-    vkn_c0_graphics(c0, NVN_STAGE_PS, S.ssbo[ST_FS], base_instance);
-    stage_resources(&s, ST_FS, fs, &P.ps[ST_FS], fb, c0, 1);
-    vkrec_PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, F.ops->graphics_layout, 1, s.n, s.w);
-    vkrec_PushConstants(F.ops->graphics_layout, vkp_push_range(VKP_GRAPHICS).stageFlags, 0, VKP_PUSH_BYTES, s.push);
+    BT_TIME(BT_S5_C0, vkn_c0_graphics(c0, NVN_STAGE_VS, S.ssbo[ST_VS], base_instance));
+    BT_TIME(BT_S5_RESOURCES, stage_resources(&s, ST_VS, vs, &P.ps[ST_VS], vb, c0, 1));
+    BT_TIME(BT_S5_C0, vkn_c0_graphics(c0, NVN_STAGE_PS, S.ssbo[ST_FS], base_instance));
+    BT_TIME(BT_S5_RESOURCES, stage_resources(&s, ST_FS, fs, &P.ps[ST_FS], fb, c0, 1));
+    BT_TIME(BT_S6_PUSHDESC, vkrec_PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, F.ops->graphics_layout, 1, s.n, s.w));
+    BT_TIME(BT_S6_PUSHCONST, vkrec_PushConstants(F.ops->graphics_layout, vkp_push_range(VKP_GRAPHICS).stageFlags, 0, VKP_PUSH_BYTES, s.push));
     vkr_report_draw();
     F.draws++, g_stats.draws++;
     if (!F.pass_draws++) F.pass_vs = vs->key, F.pass_fs = fs->key;
@@ -1611,7 +1663,7 @@ static void record_op(const op_hdr *r);
 // rows were made, and the next record is replayed as if this one were not.
 static void record(const op_hdr *r) {
     if (!makes_rows(r->op) || !collecting()) {
-        record_op(r);
+        BT_TIME(BT_RECORD, record_op(r));
         return;
     }
     jmp_buf here;
@@ -1655,7 +1707,7 @@ static void record_op(const op_hdr *r) {
         memcpy(S.dr[v->first], v->r, sizeof v->r[0] * (size_t)v->n);
         break;
     }
-    case OP_BIND_PROGRAM: bind_program(a); break;
+    case OP_BIND_PROGRAM: BT_TIME(BT_U_PROGRAM, bind_program(a)); break;
     case OP_BIND_STATE: bind_state(a); break;
     case OP_BIND_VATTR: {
         const p_bind_vattr *v = a;
@@ -1780,7 +1832,7 @@ static void record_op(const op_hdr *r) {
         }
     }
     F.cur = NULL;
-    ledger_track_op(&S.track, r);
+    BT_TIME(BT_U_LEDGER_OP, ledger_track_op(&S.track, r));
 }
 
 static void walk(int index, uint64_t handle) {
@@ -1792,7 +1844,7 @@ static void walk(int index, uint64_t handle) {
         if (h.size < sizeof h || (h.size & 7) || h.op >= OP_COUNT_ || h.op == OP_JUMP || h.op == OP_CALL ||
             (at == 0) != (h.op == OP_BEGIN))
             stop("recording %d is not whole at +%zu (op %u, %u bytes)", index, at, h.op, h.size);
-        record((const op_hdr *)(const void *)(p + at));
+        BT_TIME(BT_WALK, record((const op_hdr *)(const void *)(p + at)));
         at += h.size;
         if (h.op == OP_END) return;
     }

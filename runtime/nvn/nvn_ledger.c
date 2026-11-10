@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "nvn_api.h"
+#include "oot2/bench_timers.h"
 #include "oot2/ledger.h"
 #include "oot2/loader.h"
 #include "oot2/nvn_program.h"
@@ -247,7 +248,7 @@ static char *answers_text(const RowBin *r, uint8_t digest[32]) {
     bput(&wrapped, "{%s}", ans.s ? ans.s : "");
     free(ans.s);
     if (first) memset(digest, 0, 32);
-    else rt_sha256(wrapped.s, wrapped.n, digest);
+    else BT_TIME(BT_S1_SHA, rt_sha256(wrapped.s, wrapped.n, digest));
     return wrapped.s;
 }
 
@@ -381,7 +382,13 @@ static int text_add(char *line) {
     return 1;
 }
 
+#ifdef OOT2_BENCH_TIMERS
+static void add_row_body(const RowBin *r);
+static void add_row(const RowBin *r) { BT_TIME(BT_U_LEDGER_ROW, add_row_body(r)); }
+static void add_row_body(const RowBin *r) {
+#else
 static void add_row(const RowBin *r) {
+#endif
     uint64_t h = fnv(r, sizeof *r);
     plat_mutex_lock(&g_lock);
     if (!bin_seen_or_add(r, h) && text_add(format_row(r))) g_dirty = 1;
@@ -519,8 +526,7 @@ void ledger_track_answers_digest(LedgerTrack *t, int kind, uint8_t out[32]) {
     memcpy(r.img_fmt, t->img_fmt[s], sizeof r.img_fmt);
     if (s == 0) memcpy(r.attr, t->attr, sizeof r.attr);
     if (s == 1) memcpy(r.fout, t->fout, sizeof r.fout);
-    char *text = answers_text(&r, out);
-    free(text);
+    BT_TIME(BT_S1_TEXT, char *text = answers_text(&r, out); free(text));
     memcpy(t->answers_digest[slot], out, 32);
     t->answers_digest_valid |= (uint8_t)(1u << slot);
 }
