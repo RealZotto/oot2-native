@@ -20,7 +20,9 @@
 // the chain's dispatches in order, which is where a person gets the keys.
 //
 // A chain is open from a keep program's dispatch to a blit program's dispatch of the same submission: a skip program
-// outside it runs as usual, and so does a blit program with no chain open. A mistake in the setting or the file is a
+// outside it runs as usual, and so does a blit program with no chain open. A chain that skipped dispatches and is still
+// open at the end of the submission, or meets a second keep program first, is a named stop (the picture would be stale);
+// a keep program alone, with nothing skipped, is not. A mistake in the setting or the file is a
 // named fatal at start-up (vkmb_open) or at the first dispatch; nothing falls back to the default quietly.
 #pragma once
 

@@ -1322,14 +1322,14 @@ static void movie_blit(const nvn_stage *cs) {
                src.width, src.height, (int)src.format, F.movie_src, dst.width, dst.height, (int)dst.format, dst_id);
 }
 
-// A chain that skipped dispatches and whose blit program never came in the submission would leave the picture stale or
-// garbage with nothing said (another movie that reuses the keep program, a last program the key file does not name), so
-// it is a named stop at the end of the submission (or at the next keep program). A keep alone, with nothing skipped,
-// leaves nothing stale.
-static void movie_unclosed(void) {
+// A chain that skipped dispatches and whose blit program never came would leave the picture stale or garbage with nothing
+// said (another movie that reuses the keep program, a last program the key file does not name), so it is a named stop, at
+// the end of the submission or at the next keep program, whichever comes first; `why` says which. A keep alone, with
+// nothing skipped, leaves nothing stale.
+static void movie_unclosed(const char *why) {
     if (!F.movie_open || !F.movie_skips) return;
-    stop("test_movie_blit: the chain opened by program %s skipped %u dispatches (first %s, last %s) and no blit program came "
-         "in this submission, so the movie's picture would be stale", F.movie_keep, F.movie_skips, F.movie_first, F.movie_last);
+    stop("test_movie_blit: the chain opened by program %s skipped %u dispatches (first %s, last %s) and %s, so the movie's "
+         "picture would be stale", F.movie_keep, F.movie_skips, F.movie_first, F.movie_last, why);
 }
 
 // 1 when this dispatch is the stand-in's (skipped, or replaced by the resample), 0 when it runs as it always does: the
@@ -1338,7 +1338,7 @@ static int movie_replaces(const nvn_stage *cs) {
     VkmbRole role = vkmb_role(cs->key);
     if (role == VKMB_NONE) return 0;
     if (role == VKMB_KEEP) {   // it runs, and its picture is the one resampled
-        movie_unclosed();   // a keep program again, with the chain it opened still waiting for its blit
+        movie_unclosed("the chain's first program came again before any blit program");   // the chain it opened still waits
         VkpStage st = replay_stage(cs);
         F.movie_src = stored_image(cs, binds_of(&st, SHD_CS), "first");
         F.movie_open = 1;
@@ -1751,7 +1751,7 @@ uint64_t vkr_submit(const uint64_t *handles, int n) {
     full_barrier();   // the frame's work after every earlier submission's (D18)
     for (int i = 0; i < n; i++) walk(i, handles[i]);
     pass_end();
-    movie_unclosed();
+    movie_unclosed("no blit program came before the end of this submission");
     if (ops->frame_end) ops->frame_end(value);
     vkr_report_frame_end();   // after the frame's end: its events and reports follow the backing map's write-backs
     g_stats.frames++;

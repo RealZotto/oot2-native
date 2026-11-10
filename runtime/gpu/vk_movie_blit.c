@@ -36,8 +36,9 @@ __attribute__((noreturn, format(printf, 3, 4))) static void bad(const char *path
     va_start(ap, fmt);
     vsnprintf(what, sizeof what, fmt, ap);
     va_end(ap);
-    if (line) rt_fatal("gfx: vulkan: test_movie_blit is on and its key file %s, line %d: %s", path, line, what);
-    rt_fatal("gfx: vulkan: test_movie_blit is on and its key file %s: %s", path, what);
+    // Every mistake in the file also stops the game at start-up (vkmb_open), before its menu: the way out is said last.
+    if (line) rt_fatal("gfx: vulkan: test_movie_blit is on and its key file %s, line %d: %s" SWITCH_OFF, path, line, what);
+    rt_fatal("gfx: vulkan: test_movie_blit is on and its key file %s: %s" SWITCH_OFF, path, what);
 }
 
 static int is_key(const char *s) {
