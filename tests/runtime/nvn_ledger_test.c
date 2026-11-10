@@ -37,6 +37,8 @@ typedef unsigned long long ull;
 #define POOL_SIZE (4 * MiB)
 #define CPU_UNCACHED 0x2u
 #define GPU_CACHED 0x20u
+#define WRITE 0u        // NVNeventSignalMode
+#define EQUAL 0u        // NVNeventWaitMode
 #define MB MOD_MAIN_BASE
 #define LOW32(v) ((v) & 0xffffffffu)
 
@@ -527,6 +529,139 @@ static void case_digest_cache(void) {
     printf("ok digest-cache\n");
 }
 
+// ---------- case queues: each queue has its own bound state, texture pool and render enable. Lane A binds the scene, disables
+// rendering and binds a texture, and is held at a WaitEvent; lane B, on another queue, makes the texture pool another one
+// (the same IDs, other textures), binds another program, other attributes and other targets, enables rendering and draws; the
+// CPU signal then lets lane A go on to bind a second texture and draw. Each lane's rows are those it makes alone (run
+// before, on queues of their own, with the event signalled so that nothing is held), and A's draw is skipped, B's is not. A
+// third queue, met last, starts from the defaults.
+static uint64_t g_tp2;
+static struct { uint64_t prog2, attr2, colors2; } Q;
+
+static uint64_t event_object(uint64_t offset) {
+    uint64_t b = galloc(0x20, 16), e = galloc(0x40, 16);
+    NVN(nvnEventBuilderSetDefaults, b);
+    NVN(nvnEventBuilderSetStorage, b, g_pool, offset);
+    CHECK((NVN(nvnEventInitialize, e, b) & 0xff) == 1);
+    return e;
+}
+static void submit_to(uint64_t q, uint64_t handle_) {
+    uint64_t a = galloc(8, 8);
+    wr64(a, handle_);
+    NVN(nvnQueueSubmitCommands, q, 1, a);
+}
+
+static uint64_t lane_a(uint64_t cb, uint64_t ev) {
+    record_begin(cb);
+    NVN(nvnCommandBufferSetRenderEnable, cb, 0);
+    bind_scene(cb);
+    NVN(nvnCommandBufferBindTexture, cb, 1, 0, handle(ID_ARRAY));
+    NVN(nvnCommandBufferWaitEvent, cb, ev, EQUAL, 1);
+    NVN(nvnCommandBufferBindTexture, cb, 1, 5, handle(ID_CUBE));
+    NVN(nvnCommandBufferDrawArrays, cb, 4, 1, 3);
+    return record_end(cb);
+}
+static uint64_t lane_b(uint64_t cb) {
+    record_begin(cb);
+    NVN(nvnCommandBufferSetRenderEnable, cb, 1);
+    NVN(nvnCommandBufferSetTexturePool, cb, g_tp2);
+    NVN(nvnCommandBufferBindProgram, cb, Q.prog2, 3);
+    NVN(nvnCommandBufferBindVertexAttribState, cb, 2, Q.attr2);
+    NVN(nvnCommandBufferSetRenderTargets, cb, 1, Q.colors2, 0, 0, 0);
+    NVN(nvnCommandBufferBindTexture, cb, 1, 0, handle(ID_ARRAY));
+    NVN(nvnCommandBufferBindTexture, cb, 1, 5, handle(ID_CUBE));
+    NVN(nvnCommandBufferDrawArrays, cb, 4, 2, 3);
+    return record_end(cb);
+}
+// B goes on after A has gone on: it binds nothing and draws, with what it left
+static uint64_t lane_b_again(uint64_t cb) {
+    record_begin(cb);
+    NVN(nvnCommandBufferDrawArrays, cb, 4, 3, 3);
+    return record_end(cb);
+}
+
+#define SNAP 8
+static int snapshot(char **out) {
+    int n = 0;
+    for (uint64_t i = 0; ledger_row_text(i); i++) {
+        CHECK(n < SNAP);
+        out[n++] = strdup(ledger_row_text(i));
+    }
+    return n;
+}
+static int in_set(char **set, int n, const char *text) {
+    for (int i = 0; i < n; i++)
+        if (!strcmp(set[i], text)) return 1;
+    return 0;
+}
+static void queues_log(uint64_t fence, int index, const op_hdr *r, void *ctx) {
+    (void)fence, (void)index, (void)ctx;
+    if (r->op == OP_DRAW)
+        printf("draw %d %s\n", ((const p_draw *)(const void *)(r + 1))->first,
+               gfx_null_render_enabled() ? "renders" : "skipped");
+}
+
+static void case_queues(void) {
+    scene();
+    // Texture pool 2: the IDs the scene registered in pool 1 name other textures here (the array is a 3D, the cube a 2D)
+    g_tp2 = galloc(0x40, 16);
+    CHECK((NVN(nvnTexturePoolInitialize, g_tp2, g_pool, 0x20000, 64) & 0xff) == 1);
+    NVN(nvnTexturePoolRegisterTexture, g_tp2, ID_ARRAY, S.tex_3d, 0);
+    NVN(nvnTexturePoolRegisterTexture, g_tp2, ID_CUBE, S.tex_2d, 0);
+    Q.prog2 = program("vp", 5);
+    static const int formats2[2] = {NVN_FORMAT_RG16I, NVN_FORMAT_RGBA32UI};
+    Q.attr2 = attribs(formats2, 2);
+    Q.colors2 = galloc(8, 8);
+    wr64(Q.colors2, texture(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8));
+    uint64_t cba = command_buffer(), cbb = command_buffer();
+    char *a[SNAP], *b[SNAP], *both[SNAP];
+
+    // Each lane alone, on a queue of its own, its wait already satisfied
+    uint64_t ev0 = event_object(0x300000);
+    NVN(nvnEventSignal, ev0, WRITE, 1);
+    submit_to(queue(), lane_a(cba, ev0));
+    CHECK(gfx_null_parked() == 0);
+    int na = snapshot(a);
+    ledger_reset();
+    submit_to(queue(), lane_b(cbb));
+    int nb = snapshot(b);
+    ledger_reset();
+    CHECK(na == 2 && nb == 2);
+    for (int i = 0; i < na; i++) {
+        CHECK(!in_set(b, nb, a[i]));
+        printf("alone-a %s\n", a[i]);
+    }
+    for (int i = 0; i < nb; i++) printf("alone-b %s\n", b[i]);
+
+    // Both at once: A is held at its wait, B draws, the CPU signal lets A go on, B draws again
+    uint64_t ev1 = event_object(0x300040), qa = queue(), qb = queue();
+    gfx_null_log_ops(queues_log, NULL);
+    submit_to(qa, lane_a(cba, ev1));
+    CHECK(gfx_null_parked() == 1);
+    submit_to(qb, lane_b(cbb));
+    CHECK(gfx_null_parked() == 1);
+    NVN(nvnEventSignal, ev1, WRITE, 1);
+    CHECK(gfx_null_parked() == 0);
+    submit_to(qb, lane_b_again(cbb));
+    // A queue not met before starts with nothing bound but its program, no depth target, one sample and rendering
+    // enabled, whatever the others left
+    uint64_t cbc = command_buffer();
+    record_begin(cbc);
+    NVN(nvnCommandBufferBindProgram, cbc, S.prog, 3);
+    NVN(nvnCommandBufferDrawArrays, cbc, 4, 4, 3);
+    submit_to(queue(), record_end(cbc));
+    gfx_null_log_ops(NULL, NULL);
+    int nr = snapshot(both);
+    CHECK(nr == 6 && ledger_rows() == 6);
+    for (int i = 0; i < nr; i++) {
+        CHECK(i >= 4 || in_set(a, na, both[i]) || in_set(b, nb, both[i]));
+        printf("row %s\n", both[i]);
+    }
+    for (int i = 0; i < na; i++) CHECK(in_set(both, nr, a[i]));
+    for (int i = 0; i < nb; i++) CHECK(in_set(both, nr, b[i]));
+    printf("ok queues\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
@@ -540,6 +675,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "stop") && argc == 3) case_stop(argv[2]);
     else if (!strcmp(argv[1], "file") && argc == 3) case_file(argv[2]);
     else if (!strcmp(argv[1], "stopframe") && argc == 3) case_stop_in_submit(argv[2]);
+    else if (!strcmp(argv[1], "queues")) case_queues();
     else if (!strcmp(argv[1], "digest")) case_digest();
     else if (!strcmp(argv[1], "digest-cache")) case_digest_cache();
     else {

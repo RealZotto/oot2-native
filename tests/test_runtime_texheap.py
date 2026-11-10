@@ -208,6 +208,21 @@ class TexheapTest(unittest.TestCase):
                 self.assertEqual(after1[1], after1[2])
                 self.assertEqual(after2[1], after2[2])
 
+    def test_a_held_queue_binds_in_the_texture_pool_it_set_not_the_one_another_queue_set_meanwhile(self) -> None:
+        # queue 1 sets pool 1 and is held at a wait before its bind of ID 0 (T1 in pool 1); queue 2 sets pool 2, where ID 0
+        # is another texture (T5), and binds it; queue 1 then goes on. Completing fence value 1 alone selects T1.
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, _ = self.passing(level, "held_pool", release="release")
+                after1 = re.search(r"^pool-after-1 selected (\d+) expected (\d+)$", done.stdout, re.M)
+                after2 = re.search(r"^pool-after-2 selected (\d+) expected (\d+)$", done.stdout, re.M)
+                self.assertIsNotNone(after1, done.stdout)
+                self.assertIsNotNone(after2, done.stdout)
+                self.assertGreater(int(after1[2]), 10)
+                self.assertEqual(after1[1], after1[2])
+                self.assertGreater(int(after2[2]), int(after1[2]))
+                self.assertEqual(after2[1], after2[2])
+
     def test_a_submission_completes_by_itself_while_an_earlier_one_of_another_queue_is_held(self) -> None:
         for level in LEVELS:
             with self.subTest(level=level):

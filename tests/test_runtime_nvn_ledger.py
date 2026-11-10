@@ -18,6 +18,11 @@ attributes.
   "tex" answer; a vertex attribute with no format is no answer; an image format the translator has no storage format
   for is "Unknown".
 - mesh: a task, mesh and pixel program makes a row for each stage on a mesh draw, direct or indirect.
+- queues: each queue has its own bound state, texture pool and render enable. One queue is held at a WaitEvent between
+  its binds, another changes the texture pool, the program, the attributes, the targets and the render enable and draws,
+  and the CPU's signal lets the first go on: each lane makes the rows it makes alone on a queue of its own, with its own
+  pool's texture types, and its draw is skipped where the other lane's renders. A queue met after them starts from the
+  defaults (nothing bound, no depth target, one sample, rendering on).
 - stop: the run's stop path (ExitProcess, a fatal) flushes the ledger like the end of main.
 - stopframe: a stop raised inside a submission (a replay that stops on a draw) writes the file all the same, with the
   rows made so far, where a flush asked for at that point by anything else is refused.
@@ -218,6 +223,30 @@ class LedgerTest(unittest.TestCase):
                 row(ps, "ps", {"fout": fout, "tex": {"0": "2darray"}}, ATTACH),
                 row(ps, "ps", {"fout": fout, "tex": {"0": "2d"}}, ATTACH),
             ])
+
+    def test_each_queue_keeps_its_own_binds_texture_pool_and_render_enable_across_a_held_wait(self) -> None:
+        a_tex, b_tex = {"0": "2darray", "5": "cube"}, {"0": "3d", "5": "2d"}   # the same IDs, in pool 1 and pool 2
+        for done in self.passes("queues"):
+            rows = Rows(done.stdout)
+            self.check_text(rows)
+            alone = {k: [json.loads(line.split(" ", 1)[1]) for line in done.stdout.splitlines()
+                         if line.startswith(f"alone-{k} ")] for k in "ab"}
+            vs_a, vs_b = rows.keys["vs"][0], rows.keys["vs"][1]
+            ps_a, ps_b = rows.keys["ps"][0], rows.keys["ps"][1]
+            # lane A: pool 1 and its binds on both sides of the wait; lane B: pool 2, program 2, two attributes, one target
+            self.assertEqual(alone["a"], [row(vs_a, "vs", {"attr": VS_ANSWERS["attr"]}, ATTACH),
+                                          row(ps_a, "ps", {"fout": PS_ANSWERS["fout"], "tex": a_tex}, ATTACH)])
+            self.assertEqual([(r["key"], r["kind"]) for r in alone["b"]], [(vs_b, "vs"), (ps_b, "ps")])
+            self.assertEqual(alone["b"][0]["answers"], {"attr": {"0": "sint", "1": "uint"}})
+            self.assertEqual(alone["b"][1]["answers"], {"fout": {"0": "float"}, "tex": b_tex})
+            self.assertEqual(alone["b"][1]["attach"]["color"], [nvn_format("RGBA8")])
+            # held and resumed, in the order the rows were made (lane B's first: lane A was held when it drew)
+            self.assertEqual(rows.rows[:4], alone["b"] + alone["a"])
+            # a queue met for the first time: its program alone, no attribute, target or texture, no depth, one sample
+            fresh = {"color": [], "depth": None, "samples": 1}
+            self.assertEqual(rows.rows[4:], [row(vs_a, "vs", {}, fresh), row(ps_a, "ps", {}, fresh)])
+            self.assertEqual(re.findall(r"^draw (\d+ \w+)$", done.stdout, re.M),
+                             ["2 renders", "1 skipped", "3 renders", "4 renders"])
 
     def test_a_run_that_stops_writes_the_file(self) -> None:
         for level in nvn.LEVELS:

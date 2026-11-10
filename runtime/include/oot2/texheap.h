@@ -109,7 +109,10 @@ void texheap_desc(const dpool_ref *pool, int id, const tex_t *t);
 // independently and a queue held at a wait replays its records after later submissions', so each record and each
 // completion names its submission's fence value.
 void texheap_submit(uint64_t fence);
-void texheap_op(uint64_t fence, const op_hdr *r);   // a record of the submission with fence value `fence`
+// A record of the submission with fence value `fence`. tex_pool is the table address of the texture pool bound on the
+// record's queue, as the record leaves it (a queue's pool is its own: a queue resumed after a wait binds in the pool it set,
+// not the one another queue set meanwhile).
+void texheap_op(uint64_t fence, const op_hdr *r, uint64_t tex_pool);
 void texheap_complete(uint64_t fence);              // that submission only
 
 void texheap_present(uint64_t seq);

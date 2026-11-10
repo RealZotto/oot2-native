@@ -27,7 +27,8 @@
 // submission or a held one). Such a report counts as 0 when it is a timestamp or any other counter, and as unknown when
 // it is samples passed: an unknown condition renders, as does one whose words the CPU cannot read (a draw costs at most
 // the work the condition would have saved). RenderEnable and the condition hold across submissions, as on one GPU
-// channel.
+// channel, and each queue has its own: so do the bound programs, textures, attributes and targets and the texture pool
+// (QueueState below), since a queue held at a wait is resumed after other queues have replayed.
 //
 // WaitEvent is answered by reordering (oot2/nvn_order.h, gfx.h): the records of every queue pass through the order
 // engine, which shows a queue's records in that queue's order and parks the queue at a wait that the replay so far does
@@ -163,9 +164,39 @@ static void keep(uint64_t fence, const op_hdr *r) {
 #define PENDING 256   // reports remembered, newest last: the newest to an address decides while it is not complete
 static struct { uint64_t addr, fence; int samples; } g_pending[PENDING];
 static unsigned g_pending_head;
-static int g_render = 1;                       // RenderEnable and the condition, as replay leaves them
 
-int gfx_null_render_enabled(void) { return g_render; }
+// ---------- what replay keeps for each queue (g_lock)
+// A queue is one channel on the console: the programs, textures, vertex attributes and render targets it was told to bind,
+// the texture pool, and RenderEnable with the condition of conditional rendering stay as they were left until that same
+// queue changes them, whatever another queue binds meanwhile. A queue held at a wait and resumed later therefore goes on
+// with its own state, not with what the queues replayed in between left. One set per queue, made when its first record
+// is replayed (the lanes of nvn_order.c are keyed the same way, by the front end's serial, and are likewise kept for the
+// process); the set of the queue replay is in is found once per record, and is the same one for the next record of that
+// queue. A queue starts as the process did: nothing bound, no depth target, one sample, the render enabled, no pool.
+typedef struct QueueState {
+    struct QueueState *next;
+    uint64_t queue;
+    int render;            // RenderEnable and the condition, as replay leaves them
+    LedgerTrack track;     // the bound state across records and submissions (also its texture pool: track.tex_pool)
+} QueueState;
+static QueueState *g_qs, **g_qs_tail = &g_qs;
+static QueueState *g_qs_cur;                   // the set of the record replayed last
+
+static QueueState *queue_state(uint64_t queue) {
+    if (g_qs_cur && g_qs_cur->queue == queue) return g_qs_cur;
+    QueueState *q = g_qs;
+    while (q && q->queue != queue) q = q->next;
+    if (!q) {
+        q = calloc(1, sizeof *q);
+        if (!q) rt_fatal("gfx: null back end: out of memory for the state of a queue");
+        q->queue = queue, q->render = 1;
+        q->track.depth_fmt = -1, q->track.samples = 1;
+        *g_qs_tail = q, g_qs_tail = &q->next;
+    }
+    return g_qs_cur = q;
+}
+
+int gfx_null_render_enabled(void) { return g_qs_cur ? g_qs_cur->render : 1; }
 
 // 1: *v read; 2: a samples-passed report not complete (unknown); 0: the CPU cannot read the word.
 static int counter_word(uint64_t addr, uint64_t *v) {
@@ -192,11 +223,11 @@ static int condition(const p_render_cond *p) {
     return p->mode == 0 ? x == y : x != y;
 }
 
-static void replay(uint64_t fence, const op_hdr *r) {
+static void replay(QueueState *q, uint64_t fence, const op_hdr *r) {
     const void *a = r + 1;
     switch (r->op) {
-    case OP_RENDER_ENABLE: g_render = ((const p_flag *)a)->value != 0; break;
-    case OP_RENDER_COND: g_render = condition(a); break;
+    case OP_RENDER_ENABLE: q->render = ((const p_flag *)a)->value != 0; break;
+    case OP_RENDER_COND: q->render = condition(a); break;
     case OP_REPORT_COUNTER: {
         const p_report_counter *p = a;
         unsigned i = g_pending_head++ % PENDING;
@@ -209,8 +240,6 @@ static void replay(uint64_t fence, const op_hdr *r) {
     default: break;
     }
 }
-
-static LedgerTrack g_track = {.depth_fmt = -1, .samples = 1};                  // the bound state across records and submissions (g_lock)
 
 // A recording is whole: OP_BEGIN first, sizes that stay 8-byte aligned, known ops, no call or jump, OP_END last. Checked
 // when the submission is made, before any record of it is replayed.
@@ -396,9 +425,10 @@ static void sink_record(void *ctx, uint64_t queue, uint64_t fence, int index, co
     (void)ctx;
     __atomic_fetch_add(&g_records, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_op_counts[r->op], 1, __ATOMIC_RELAXED);
-    replay(fence, r);
-    ledger_track_op(&g_track, r);
-    if (texheap_on()) texheap_op(fence, r);
+    QueueState *q = queue_state(queue);
+    replay(q, fence, r);
+    ledger_track_op(&q->track, r);
+    if (texheap_on()) texheap_op(fence, r, q->track.tex_pool);
     if (g_log) g_log(fence, index, r, g_log_ctx);
     if (how) sink_wait(queue, (const p_wait_event *)(const void *)(r + 1), how);
 }

@@ -192,6 +192,25 @@ static void submit_on(uint64_t queue, uint64_t table, const uint32_t *ids, int n
     uint64_t handle = (uint64_t)(uintptr_t)buf;
     CHECK(gfx_backend()->submit(queue, &handle, 1) != 0);
 }
+// A recording that sets the texture pool, is held at a wait, and then binds the IDs: the bind comes after the wait, and
+// another queue can set another pool in between.
+static void submit_split(uint64_t queue, uint64_t table, const uint32_t *ids, int n, volatile uint32_t *wait_on) {
+    static uint8_t buf[4096] __attribute__((aligned(8)));
+    size_t at = 0;
+    PUT(OP_BEGIN, NULL, 0);
+    p_set_pool sp = {{table, 64, 0}};
+    PUT(OP_SET_TEX_POOL, &sp, sizeof sp);
+    p_wait_event we = {wait_on, NVN_EVENT_WAIT_MODE_EQUAL, 1, 0x1000};
+    PUT(OP_WAIT_EVENT, &we, sizeof we);
+    p_bind_handles bh;
+    memset(&bh, 0, sizeof bh);
+    bh.stage = 1, bh.n = n;
+    for (int i = 0; i < n; i++) bh.h[i] = ids[i];
+    PUT(OP_BIND_TEX, &bh, sizeof bh);
+    PUT(OP_END, NULL, 0);
+    uint64_t handle = (uint64_t)(uintptr_t)buf;
+    CHECK(gfx_backend()->submit(queue, &handle, 1) != 0);
+}
 static void submit_binding(uint64_t table, const uint32_t *ids, int n, const tex_t *rt) {
     submit_on(1, table, ids, n, rt, NULL);
 }
@@ -216,7 +235,8 @@ static int no_write_watch(void) { return pagegen_scan(heap, heap + P4) == UINT64
 // The world of the selection cases. P: a pool of 1 MiB. T1 a CPU-written texture with edge pages, T2 a small one inside
 // T1's pages, B a buffer inside one of T1's pages, T3 a render target, T4 a bound texture nobody writes, T5 another CPU-written
 // texture. The texture pool's table lies at the end of the pool.
-enum { OFF_T1 = 0x800, OFF_T2 = 0x8000, OFF_B = 0x5100, OFF_T3 = 0x20000, OFF_T4 = 0x30000, OFF_T5 = 0x40000, OFF_TP = 0xF0000 };
+enum { OFF_T1 = 0x800, OFF_T2 = 0x8000, OFF_B = 0x5100, OFF_T3 = 0x20000, OFF_T4 = 0x30000, OFF_T5 = 0x40000, OFF_TP = 0xF0000,
+       OFF_TP2 = 0xE0000 };
 static struct { uint64_t p, base, tp, t1, t2, t3, t4, t5, s1; } w;
 
 static void world(void) {
@@ -333,7 +353,7 @@ static void case_rewrite(void) {
 // was made in, not to the newest one, and a completed submission completes itself and no earlier one. Completion is
 // held in held_bind (the bind is replayed while both submissions are in flight, and each is completed by its fence value)
 // and is not in held_complete (the second completes while the first is held).
-static volatile uint32_t g_ev;
+static volatile uint32_t g_ev, g_ev2;
 static uint64_t t5_pages(void) { return (last_page(w.base + OFF_T5, tex_size(w.t5)) - first_page(w.base + OFF_T5)) / P4; }
 static void case_held_bind(void) {
     if (no_write_watch()) return (void)printf("skip held_bind\n");
@@ -358,6 +378,36 @@ static void case_held_bind(void) {
     printf("after-2 selected %llu expected %llu\n", (ull)s.released, (ull)(t1_expected() + t5_pages()));
     CHECK(s.released == t1_expected() + t5_pages());
     printf("ok held_bind\n");
+}
+// Two queues, two texture pools: the first sets pool 1 (ID 0 is T1), is held at a wait and binds ID 0 after it; the second
+// sets pool 2 (ID 0 is T5) and binds ID 0, and is whole. The first, released, binds in the pool it set, not in the pool the
+// second left: completing fence value 1 alone selects T1, and fence value 2 then adds T5.
+static void case_held_pool(void) {
+    if (no_write_watch()) return (void)printf("skip held_pool\n");
+    world();
+    write_cpu_textures();
+    uint64_t tp2 = texture_pool(w.p, OFF_TP2, 64);
+    NVN(nvnTexturePoolRegisterTexture, tp2, 0, w.t5, 0);
+    static const uint32_t id0[] = {0};
+    gfx_null_hold(1);
+    submit_split(1, tp_addr(), id0, 1, &g_ev);
+    g_ev2 = 1;                                      // the second queue's wait holds at once
+    submit_split(2, w.base + OFF_TP2, id0, 1, &g_ev2);
+    CHECK(gfx_null_parked() == 1);
+    g_ev = 1;
+    gfx_backend()->guest_written((uint64_t)(uintptr_t)&g_ev, 4);   // the first goes on, after the second set its pool
+    CHECK(gfx_null_parked() == 0);
+    CHECK(gfx_null_complete(1) == 1);
+    present();
+    uint64_t first = stats().released;
+    printf("pool-after-1 selected %llu expected %llu\n", (ull)first, (ull)t1_expected());
+    CHECK(first == t1_expected());
+    CHECK(gfx_null_complete(2) == 2);
+    present();
+    uint64_t both = stats().released;
+    printf("pool-after-2 selected %llu expected %llu\n", (ull)both, (ull)(t1_expected() + t5_pages()));
+    CHECK(both == t1_expected() + t5_pages());
+    printf("ok held_pool\n");
 }
 static void case_held_complete(void) {
     if (no_write_watch()) return (void)printf("skip held_complete\n");
@@ -439,6 +489,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "read_released")) case_read_released();
     else if (!strcmp(cs, "frames")) case_frames();
     else if (!strcmp(cs, "held_bind")) case_held_bind();
+    else if (!strcmp(cs, "held_pool")) case_held_pool();
     else if (!strcmp(cs, "held_complete")) case_held_complete();
     else return 2;
     return 0;

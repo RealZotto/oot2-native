@@ -85,7 +85,6 @@ static Sub **g_subs;                                        // submissions in fl
 static size_t g_sub_head, g_sub_n, g_sub_cap;
 static uint32_t *g_ready_recs;                              // bound since the last present, to select
 static size_t g_ready_n, g_ready_cap;
-static uint64_t g_tex_pool;                                 // the texture pool the replay has bound
 static int g_range[2] = {-1, -1};
 static uint64_t g_cur;   // the present being counted (its sequence number, after the previous present's)
 static TexheapWatch g_watch;   // the reader of the write watch main.c installs (the page generations)
@@ -720,16 +719,15 @@ static uint64_t region_bytes(const nvn_tex_rec *t, const NVNcopyRegion *r) {
 
 static uint32_t rec_of_tex(const nvn_tex_rec *t) { return t->present ? rec_find((uintptr_t)t->tex.mem, t->tex.L.size) : 0; }
 
-void texheap_op(uint64_t fence, const op_hdr *h) {
+void texheap_op(uint64_t fence, const op_hdr *h, uint64_t tex_pool) {
     switch (h->op) {
-    case OP_SET_TEX_POOL: case OP_BIND_TEX: case OP_BIND_IMG: case OP_SET_RT: case OP_COPY_B2T: case OP_COPY_T2B:
+    case OP_BIND_TEX: case OP_BIND_IMG: case OP_SET_RT: case OP_COPY_B2T: case OP_COPY_T2B:
     case OP_COPY_T2T: case OP_CLEAR_TEX: break;
     default: return;
     }
     const void *a = h + 1;
     plat_mutex_lock(&g_lock);
     switch (h->op) {
-    case OP_SET_TEX_POOL: g_tex_pool = ((const p_set_pool *)a)->pool.addr; break;
     case OP_BIND_TEX: {
         const p_bind_handles *b = a;
         Sub *s = NULL;   // the record's own submission: a held queue's records are replayed after later submissions' (gfx.h)
@@ -739,7 +737,7 @@ void texheap_op(uint64_t fence, const op_hdr *h) {
                 break;
             }
         for (int i = 0; s && i < b->n && i < 32; i++) {
-            uint32_t ir = desc_find(g_tex_pool, nvn_handle_texture_id(b->h[i]));
+            uint32_t ir = desc_find(tex_pool, nvn_handle_texture_id(b->h[i]));
             g_n.bind_ids++;
             if (!ir) {
                 g_n.bind_miss++;   // no texture was registered at that ID of the bound texture pool
@@ -763,7 +761,7 @@ void texheap_op(uint64_t fence, const op_hdr *h) {
     case OP_BIND_IMG: {
         const p_bind_handles *b = a;
         for (int i = 0; i < b->n && i < 32; i++) {
-            uint32_t ir = desc_find(g_tex_pool, nvn_handle_texture_id(b->h[i]));
+            uint32_t ir = desc_find(tex_pool, nvn_handle_texture_id(b->h[i]));
             if (ir) rec_at(ir)->gpu |= G_IMG;
         }
         break;

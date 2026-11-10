@@ -135,7 +135,8 @@ typedef void (*GfxNullOpLog)(uint64_t fence, int index, const op_hdr *record, vo
 void gfx_null_log_ops(GfxNullOpLog fn, void *ctx);
 uint64_t gfx_null_records(void);    // records the null back end has walked
 // Inside the op log: 1 when the draws, dispatches and clears of the record shown would render (RenderEnable and the
-// condition of conditional rendering, as the replay decided them).
+// condition of conditional rendering, as the replay decided them for the queue the record belongs to: each queue keeps
+// its own, and a queue that has not set them renders).
 int gfx_null_render_enabled(void);
 // Completion held, for tests and for a run that wants work in flight: while on, a submission is replayed at submit and
 // completed later, by gfx_null_complete or when the hold ends, in the order replay finished them (submission order unless
