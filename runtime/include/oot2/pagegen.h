@@ -37,6 +37,9 @@ void pagegen_set_source(PagegenSource src);
 // generation, which is returned. UINT64_MAX when the source does not watch the range (no write watch on this platform,
 // or the range is not in the heap or alias region): nothing then says which of its pages changed.
 uint64_t pagegen_scan(uint64_t lo, uint64_t hi);
+// Whether pagegen_scan would watch [lo, hi) (1), asked without a reset and without a stamp: no consumer loses a mark and no
+// generation is handed out. 0 when the source does not watch the range, or it is not whole pages.
+int pagegen_covered(uint64_t lo, uint64_t hi);
 // Stamp every page of [lo, hi) with a new generation without a query, and return it: the CPU said it wrote them (a
 // flush of a mapped range, the runtime's own writes, a write-back of GPU results).
 uint64_t pagegen_mark(uint64_t lo, uint64_t hi);

@@ -63,9 +63,11 @@
 //                that cut a mirror, the dry verdict of growing it instead (right after the miss, with the imports it would
 //                replace as they were), the cut and what the bind made, kept after a thousand hits, counted when the ring
 //                already lost some, and with the origin of a mirror a promotion made
-//   raw_dry_grow, raw_dry_g4, raw_dry_cap, raw_dry_kind, raw_dry_none   the dry verdict's counters: would grow, refused by an
-//                import the submission used, by the cap on the mirrors' total, by the rule's own kind, not evaluated; the map
-//                is the same after each evaluation (the digest check counts any change)
+//   raw_dry_grow, raw_dry_g4, raw_dry_g4_on, raw_dry_cap, raw_dry_kind, raw_dry_none, raw_dry_g8, raw_dry_g5, raw_dry_g1,
+//                raw_dry_g2   the dry verdict's counters: would grow, refused by an import the submission used (its hull off
+//                the pages the growth adds, then on them), by the cap on the mirrors' total, by the rule's own kind, not
+//                evaluated, by the write watch not covering the pages, by the head reaching before the buffer's start, by
+//                the size of the growth, by another mirror on the pages; the map is the same after each evaluation
 //   raw_sync_wait   a mirror the CPU wrote is brought current for a raw-access submission after the older one in flight
 //   raw_sync_nowait the same with only a GPU-current page stamped since: no wait, nothing is copied over the older stores
 //   raw_promote, raw_promote_small, raw_promote_wait, raw_promote_cap   an import a raw-access submission binds a range larger than a
@@ -129,7 +131,7 @@ static void counter_raise(uint64_t to) {
 static uint64_t g_heap, g_heap_size;
 static uint8_t *g_marks;
 static int g_untracked;
-static uint64_t g_src_calls;
+static uint64_t g_src_calls, g_src_resets;   // queries, and those that take the marks they report
 
 // The echo window: pages in [g_echo_lo, g_echo_hi) also count as written when their bytes differ from a copy taken at the
 // last query (or when the window was set), as the operating system's mark follows a write of any content by any code,
@@ -139,6 +141,7 @@ static uint8_t *g_echo_shadow;
 
 static uint64_t src_written(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max, int reset) {
     g_src_calls++;
+    g_src_resets += (uint64_t)!!reset;
     if (g_untracked || addr < g_heap || addr + size > g_heap + g_heap_size) return UINT64_MAX;
     uint64_t n = 0;
     for (uint64_t a = addr & ~(PG - 1); a < addr + size && n < max; a += PG) {
@@ -2010,26 +2013,30 @@ static void case_raw_diag_birth(void) {
 // tests/test_runtime_coherence.py, which reads the key=value lines printed here against the dump. churn: binds far from
 // all this, each a miss with its own import, which fill the event ring (a stop after more events than it holds says how
 // many it lost); hits: resolves of M after B0 (more than the ring of binds holds pushes B0 out of that one).
-enum { T_KIND, T_G1, T_G2, T_G3, T_G4, T_G5, T_G6, T_G7A, T_G7B, T_G8, T_G9, T_CAP, T_N };   // BackingStats raw_dry_g
+enum { T_KIND, T_G1, T_G2, T_G3, T_G4, T_G5, T_G6, T_G7A, T_G7B, T_G8, T_G9, T_CAP, T_G4_OFF, T_N };   // BackingStats raw_dry_g
 
-static uint64_t ev_prefix(uint64_t *p_out, uint64_t *v0_out, int hit_i0) {
+static uint64_t ev_prefix_below(uint64_t *p_out, uint64_t *v0_out, int hit_i0, uint64_t below) {
     setup(64 * MiB, 0);
     backing_set_mirror_hook(want_all);
     uint64_t p = g_heap + 8 * MiB;
-    pool(p - 1 * MiB, 16 * MiB);
+    pool(p - (below > 1 * MiB ? below : 1 * MiB), 16 * MiB);
     cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
     uint64_t v0 = sub_begin();
     CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR);
     sub_end(v0);
     gpu_run(v0, NULL);
-    cpu_fill(p - 0x20000, 0x20000, 0xBBBBBBBBu);   // committed below the mirror since: an import at the begin
+    cpu_fill(p - below, below, 0xBBBBBBBBu);   // committed below the mirror since: an import at the begin
     uint64_t v = sub_begin();
     backing_raw_begin(v);
     BackingStats s = stats();
-    CHECK(s.mirrors == 1 && s.imports == 1 && s.import_bytes == 0x20000 && s.raw_dry_evals == 0);
+    CHECK(s.mirrors == 1 && s.imports == 1 && s.import_bytes == below && s.raw_dry_evals == 0);
     if (hit_i0) CHECK(resolve(p - 0x10000, 4, v).kind == BACKING_IMPORT);   // I0 is used by the submission
     *p_out = p, *v0_out = v0;
     return v;
+}
+
+static uint64_t ev_prefix(uint64_t *p_out, uint64_t *v0_out, int hit_i0) {
+    return ev_prefix_below(p_out, v0_out, hit_i0, 0x20000);
 }
 
 static void ev_scene(const char *name, int hits, int churn) {
@@ -2096,11 +2103,27 @@ static void dry_expect(const BackingStats *s, int would, int only_guard) {
     for (int i = 0; i < T_N; i++) CHECK(s->raw_dry_g[i] == (uint64_t)(i == only_guard));
 }
 
+// The same for a set of refusals: bit i of mask is T_* i. A bind can count in several. No case here makes G3, G6 or G7b
+// refuse (they need a second cell, a mirror at the end of its buffer, and an allocation just before a mirror's part). G9
+// has none either: in the scene tried (a write declared in the other mirror over the first page the growth adds) the run
+// stopped by name right after the verdict ("the write cannot move to it"), so its counter could not be read.
+static void dry_expect_mask(const BackingStats *s, uint32_t mask) {
+    CHECK(s->raw_dry_evals == 1 && s->raw_dry_would_grow == (uint64_t)!mask && s->raw_dry_refused == (uint64_t)!!mask);
+    CHECK(s->raw_dry_mutated == 0);
+    for (int i = 0; i < T_N; i++) {
+        if (s->raw_dry_g[i] != (uint64_t)(mask >> i & 1u))
+            fprintf(stderr, "dry mask: counter %d is %llu, want %u\n", i, (ull)s->raw_dry_g[i], mask >> i & 1u);
+        CHECK(s->raw_dry_g[i] == (uint64_t)(mask >> i & 1u));
+    }
+}
+
 // B0 cuts a mirror the submission did not resolve, over an import it did not use: growing the mirror would pass every guard.
 static void case_raw_dry_grow(void) {
     uint64_t p, v0, v = ev_prefix(&p, &v0, 0);
     uint64_t version = backing_version();
+    uint64_t calls = g_src_calls, resets = g_src_resets;
     CHECK(resolve(p - 0x800, 0x1000, v).kind == BACKING_IMPORT);
+    CHECK(g_src_calls == calls + 1 && g_src_resets == resets);   // one question to the write watch (G8), and no mark taken
     BackingStats s = stats();
     CHECK(s.raw_dry_evals == 1 && s.raw_dry_would_grow == 1 && s.raw_dry_refused == 0 && s.raw_dry_mutated == 0);
     for (int i = 0; i < T_N; i++) CHECK(s.raw_dry_g[i] == 0);
@@ -2114,8 +2137,77 @@ static void case_raw_dry_g4(void) {
     uint64_t p, v0, v = ev_prefix(&p, &v0, 1);
     CHECK(resolve(p - 0x800, 0x1000, v).kind == BACKING_IMPORT);
     BackingStats s = stats();
-    dry_expect(&s, 0, T_G4);
+    dry_expect_mask(&s, 1u << T_G4 | 1u << T_G4_OFF);   // its hull is a word 0x10000 bytes below the pages the growth adds
     ev_finish(p, "raw_dry_g4");
+}
+
+// The same, but the submission used the import ON the pages the growth would add: G4 refuses, and the hull is not off them.
+static void case_raw_dry_g4_on(void) {
+    uint64_t p, v0, v = ev_prefix(&p, &v0, 0);
+    CHECK(resolve(p - 0x400, 4, v).kind == BACKING_IMPORT);   // a word of I0 on the page [p - 0x1000, p) the bind adds
+    CHECK(resolve(p - 0x800, 0x1000, v).kind == BACKING_IMPORT);
+    BackingStats s = stats();
+    dry_expect_mask(&s, 1u << T_G4);
+    ev_finish(p, "raw_dry_g4_on");
+}
+
+// The write watch does not cover the pages the growth would add (the stand-in answers "not watched" for the one query of
+// the bind): G8 alone, and the map is the same.
+static void case_raw_dry_g8(void) {
+    uint64_t p, v0, v = ev_prefix(&p, &v0, 0);
+    g_untracked = 1;
+    BackingRef b0 = resolve(p - 0x800, 0x1000, v);
+    g_untracked = 0;
+    CHECK(b0.kind == BACKING_IMPORT);
+    BackingStats s = stats();
+    dry_expect_mask(&s, 1u << T_G8);
+    ev_finish(p, "raw_dry_g8");
+}
+
+// The head the growth adds (0x18000 bytes) is more than the mirror has before its start in its buffer (a mirror reserves
+// BACKING_MIRROR_GUARD there): G5 alone.
+static void case_raw_dry_g5(void) {
+    uint64_t p, v0, v = ev_prefix(&p, &v0, 0);
+    CHECK(resolve(p - 0x18000, 0x18800, v).kind == BACKING_IMPORT);   // pages [p - 0x18000, p + 0x1000)
+    BackingStats s = stats();
+    dry_expect_mask(&s, 1u << T_G5);
+    ev_finish(p, "raw_dry_g5");
+}
+
+// A growth of more than BACKING_MIRROR_GROW_MAX (1.125 MiB of head): G1, and G5 with it (the head is also past the guard).
+static void case_raw_dry_g1(void) {
+    uint64_t p, v0, v = ev_prefix_below(&p, &v0, 0, 0x140000);
+    CHECK(resolve(p - 0x120000, 0x120800, v).kind == BACKING_IMPORT);
+    BackingStats s = stats();
+    dry_expect_mask(&s, 1u << T_G1 | 1u << T_G5);
+    ev_finish(p, "raw_dry_g1");
+}
+
+// Two mirrors M2 = [p - 0x20000, p - 0x10000) and M = [p, p + 256 KiB), the gap between them committed since (an import at
+// the raw-access begin), none resolved by the submission: a bind across M2's last page, the gap and M's first page cuts
+// one of them, and the pages its growth would add lie on the other mirror: G2.
+static void case_raw_dry_g2(void) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 8 * MiB;
+    pool(p - 1 * MiB, 16 * MiB);
+    cpu_fill(p - 0x20000, 0x10000, 0xBBBBBBBBu);
+    cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(p - 0x20000, 4, v0).kind == BACKING_MIRROR);
+    CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(p - 0x10000, 0x10000, 0xCCCCCCCCu);
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);
+    BackingStats s0 = stats();
+    CHECK(s0.mirrors == 2 && s0.imports == 1 && s0.import_bytes == 0x10000);
+    CHECK(resolve(p - 0x10800, 0x11000, v).kind == BACKING_IMPORT);   // pages [p - 0x11000, p + 0x1000)
+    BackingStats s = stats();
+    // G7a with it: M2 would grow 0x11000 bytes at its end, into the block space the other mirror's allocation holds
+    dry_expect_mask(&s, 1u << T_G2 | 1u << T_G7A);
+    ev_finish(p, "raw_dry_g2");
 }
 
 // The mirrors already hold more than the cap on their total (three of 44 MiB, as in raw_grow_over_total): growing one is
@@ -2202,7 +2294,9 @@ int main(int argc, char **argv) {
         {"raw_ev_miss", case_raw_ev_miss}, {"raw_ev_survives_hits", case_raw_ev_survives_hits},
         {"raw_ev_lost", case_raw_ev_lost}, {"raw_ev_origin", case_raw_ev_origin},
         {"raw_dry_grow", case_raw_dry_grow}, {"raw_dry_g4", case_raw_dry_g4}, {"raw_dry_cap", case_raw_dry_cap},
-        {"raw_dry_kind", case_raw_dry_kind}, {"raw_dry_none", case_raw_dry_none},
+        {"raw_dry_kind", case_raw_dry_kind}, {"raw_dry_none", case_raw_dry_none}, {"raw_dry_g4_on", case_raw_dry_g4_on},
+        {"raw_dry_g8", case_raw_dry_g8}, {"raw_dry_g5", case_raw_dry_g5}, {"raw_dry_g1", case_raw_dry_g1},
+        {"raw_dry_g2", case_raw_dry_g2},
     };
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++)
         if (!strcmp(argv[1], cases[i].name)) {

@@ -1016,7 +1016,9 @@ static uint64_t fnv_backing(uint64_t h, const Backing *b) {
 }
 
 // A digest of what the map is: its version and counters, every backing of every pool, every block's free list and the
-// queues' lengths. The dump takes it before and after its dry evaluation of the growth's guards, and prints both.
+// deferred-release queue's length. The dump takes it before and after its dry evaluation of the growth's guards, and prints
+// both. It leaves out the list of GPU writes to write back: the completion thread changes it under g_coh alone, while
+// the dry evaluation holds g_lock, so a digest that read it could differ with nothing mutated (and read it unsynchronised).
 static uint64_t diag_digest(void) {
     uint64_t h = 0xcbf29ce484222325ull;
     h = fnv(h, backing_version());
@@ -1036,7 +1038,7 @@ static uint64_t diag_digest(void) {
         h = fnv(h, b->used), h = fnv(h, (uint64_t)b->nfree);
         for (int j = 0; j < b->nfree; j++) h = fnv(h, b->free[j].lo), h = fnv(h, b->free[j].hi);
     }
-    return fnv(fnv(h, (uint64_t)g_ndef), (uint64_t)g_npend);
+    return fnv(h, (uint64_t)g_ndef);
 }
 
 static void diag_hull(char *out, size_t n, const Backing *b) {
@@ -1223,6 +1225,7 @@ static const char *const k_ev[] = {"begin", "promote", "fill", "miss", "made", "
 typedef struct EvImp {
     uint64_t lo, hi, used, res_value, res_lo, res_hi, res_n, born_value, born0_value, born0_lo, born0_hi;
     int kind, born_by, born0_by;
+    int added;   // a verdict's replaced import: 0 not asked, 1 its hull is off the pages the growth would add, 2 on them, 3 unknown
 } EvImp;
 typedef struct EvSnap { EvImp imp[EV_IMP]; int n, more; } EvSnap;
 
@@ -1236,9 +1239,14 @@ typedef struct EvEnt {
 } EvEnt;
 
 // The names of the verdict's refusals, in the order of the counters (BackingStats raw_dry_g) and of the mask's bits. G8,
-// the write watch, is never evaluated: its query resets the marks it reports, which a dry evaluation must not do.
-enum { DRY_KIND, DRY_G1, DRY_G2, DRY_G3, DRY_G4, DRY_G5, DRY_G6, DRY_G7A, DRY_G7B, DRY_G8, DRY_G9, DRY_CAP, DRY_N };
-static const char *const k_dry[DRY_N] = {"rule_kind", "G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G8", "G9", "cap"};
+// the write watch, is asked by pagegen_covered, which resets no mark and stamps no page. G4_hull_off is not a guard: it
+// comes with G4 when every import G4 refuses on has a hull of this submission and none of the hulls lies on the pages the
+// growth would add (the byte-level G4 would pass); G4 alone leaves that open (a hull that is not this submission's, or one
+// on the added pages).
+enum { DRY_KIND, DRY_G1, DRY_G2, DRY_G3, DRY_G4, DRY_G5, DRY_G6, DRY_G7A, DRY_G7B, DRY_G8, DRY_G9, DRY_CAP, DRY_G4_OFF,
+       DRY_N };
+static const char *const k_dry[DRY_N] = {"rule_kind", "G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G8", "G9", "cap",
+                                         "G4_hull_off"};
 _Static_assert(DRY_N == sizeof ((BackingStats *)0)->raw_dry_g / sizeof ((BackingStats *)0)->raw_dry_g[0],
                "the counters and the verdict's refusals are the same list");
 
@@ -1253,17 +1261,33 @@ static struct { uint64_t evals, would, refused, mutated, g[DRY_N]; } g_dry;
 
 static void ev_imp_of(EvImp *o, const Backing *b) {
     *o = (EvImp){b->gpu_lo, b->gpu_hi, used_by(b), b->res_value, b->res_lo, b->res_hi, b->res_n, b->born_value,
-                 b->born0_value, b->born0_lo, b->born0_hi, b->kind, b->born_by, b->born0_by};
+                 b->born0_value, b->born0_lo, b->born0_hi, b->kind, b->born_by, b->born0_by, 0};
 }
 
-// The backings of c inside [lo, hi), except skip, into s (the first EV_IMP in full, the rest counted).
-static void ev_snap(EvSnap *s, const Cell *c, uint64_t lo, uint64_t hi, const Backing *skip) {
+// Whether the hull of what submission value resolved in b lies on the pages a growth of [old_lo, old_hi) to [lo, hi) would
+// add: 1 off them, 2 on them, 3 unknown (b has no hull of this submission: it may have been used, by a later one, anywhere).
+static int hull_on_added(const Backing *b, uint64_t value, uint64_t lo, uint64_t hi, uint64_t old_lo, uint64_t old_hi) {
+    if (b->res_value != value || !b->res_n || b->res_lo >= b->res_hi) return 3;
+    int on = (lo < old_lo && overlaps(lo, old_lo, b->res_lo, b->res_hi)) ||
+             (old_hi < hi && overlaps(old_hi, hi, b->res_lo, b->res_hi));
+    return on ? 2 : 1;
+}
+
+// The backings of c inside [lo, hi), except skip, into s (the first EV_IMP in full, the rest counted). When value is not 0
+// each also says whether its hull lies on the pages a growth from [old_lo, old_hi) to [lo, hi) adds.
+static void ev_snap(EvSnap *s, const Cell *c, uint64_t lo, uint64_t hi, const Backing *skip, uint64_t value,
+                    uint64_t old_lo, uint64_t old_hi) {
     *s = (EvSnap){0};
     for (int i = 0; i < c->nimp; i++) {
         const Backing *b = c->imp[i];
         if (b == skip || !overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) continue;
-        if (s->n < EV_IMP) ev_imp_of(&s->imp[s->n++], b);
-        else s->more++;
+        if (s->n < EV_IMP) {
+            ev_imp_of(&s->imp[s->n], b);
+            if (value) s->imp[s->n].added = hull_on_added(b, value, lo, hi, old_lo, old_hi);
+            s->n++;
+        } else {
+            s->more++;
+        }
     }
 }
 
@@ -1293,9 +1317,9 @@ static EvEnt *ev_new(uint64_t value, int what) {
 
 // The candidate growth of a mirror m the bind [plo, phi) of a raw-access submission cut instead of growing it, evaluated
 // and written as an event, acted on by nothing. Each guard of grow_taken is evaluated on its own (as diag_guards does),
-// plus the rule's own kind and the cap on the mirrors' total; no write watch query (G8), no wait, no span taken, nothing
-// deferred, no counter of the map moved, the version unchanged. g_lock exclusive, in the miss, before beside() and before
-// any import is replaced.
+// plus the rule's own kind and the cap on the mirrors' total; G8 is asked of the write watch without a reset
+// (pagegen_covered); no wait, no span taken, nothing deferred, no counter of the map moved, the version unchanged. g_lock
+// exclusive, in the miss, before beside() and before any import is replaced.
 static void dry_growth(const Rec *rec, const Cell *c, const Backing *m, uint64_t plo, uint64_t phi, uint64_t value,
                        int kind, uint64_t others) {
     EvEnt *e = ev_new(value, EV_VERDICT);
@@ -1304,15 +1328,21 @@ static void dry_growth(const Rec *rec, const Cell *c, const Backing *m, uint64_t
     uint64_t lo = plo < old_lo ? plo : old_lo, hi = phi > old_hi ? phi : old_hi;
     uint64_t added = old_lo - lo + hi - old_hi, before, after;
     uint32_t mask = 0;
-    ev_snap(&e->s, c, lo, hi, m);
+    ev_snap(&e->s, c, lo, hi, m, value, old_lo, old_hi);
     if (kind != BACKING_MIRROR) mask |= 1u << DRY_KIND;
     if (added > BACKING_MIRROR_GROW_MAX) mask |= 1u << DRY_G1;
+    int used_on_added = 0;   // an import G4 refuses on may have its hull on the added pages, or have no hull to say
     for (int i = 0; i < c->nimp; i++) {
         const Backing *b = c->imp[i];
         if (b == m || !overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) continue;
-        if (b->kind != BACKING_IMPORT) mask |= 1u << DRY_G2;
-        else if (used_by(b) >= value) mask |= 1u << DRY_G4;
+        if (b->kind != BACKING_IMPORT) {
+            mask |= 1u << DRY_G2;
+        } else if (used_by(b) >= value) {
+            mask |= 1u << DRY_G4;
+            used_on_added |= hull_on_added(b, value, lo, hi, old_lo, old_hi) != 1;
+        }
     }
+    if ((mask >> DRY_G4 & 1u) && !used_on_added) mask |= 1u << DRY_G4_OFF;
     for (int i = 0; i < g_index.n; i++) {
         const Rec *other = (const Rec *)g_index.e[i].key;
         if (other->cls != CLS_CPU) continue;
@@ -1342,6 +1372,7 @@ static void dry_growth(const Rec *rec, const Cell *c, const Backing *m, uint64_t
         if (p->m != m && overlaps(lo, hi, p->lo, p->hi) && p->value >= value) mask |= 1u << DRY_G9;
     }
     plat_mutex_unlock(&g_coh);
+    if (!pagegen_covered(lo, hi)) mask |= 1u << DRY_G8;   // the real G8 asks the same of the whole grown range, with a reset
     if (g_st.mirror_bytes + added > BACKING_PROMOTE_MIRROR_MAX) mask |= 1u << DRY_CAP;
     ev_imp_of(&e->mir, m);
     e->kind = kind, e->mask = mask;
@@ -1374,14 +1405,18 @@ static void ev_hull(char *out, size_t n, const EvImp *o) {
     else snprintf(out, n, "[%#llx, %#llx) of submission %llu", (ull)o->res_lo, (ull)o->res_hi, (ull)o->res_value);
 }
 
+// What a verdict's replaced import says of its hull and the pages the growth would add (EvImp added).
+static const char *const k_added[] = {"", " hull_on_added_pages no", " hull_on_added_pages yes",
+                                      " hull_on_added_pages unknown (no hull of this submission)"};
+
 static void ev_imp_line(const EvEnt *e, const char *role, const EvImp *o) {
     char hull[112];
     ev_hull(hull, sizeof hull, o);
     rt_log(DIAG "event %llu: %s %s [%#llx, %#llx) used_by %llu (%s submission %llu) hull %s res_n %llu born %s for %llu "
-           "born0 %s for %llu was [%#llx, %#llx)", (ull)e->seq, role, kind_name(o->kind), (ull)o->lo, (ull)o->hi,
+           "born0 %s for %llu was [%#llx, %#llx)%s", (ull)e->seq, role, kind_name(o->kind), (ull)o->lo, (ull)o->hi,
            (ull)o->used, o->used >= e->value ? "reached by" : "before", (ull)e->value, hull, (ull)o->res_n,
            k_born[o->born_by], (ull)o->born_value, k_born[o->born0_by], (ull)o->born0_value, (ull)o->born0_lo,
-           (ull)o->born0_hi);
+           (ull)o->born0_hi, k_added[o->added]);
 }
 
 static void ev_snap_lines(const EvEnt *e, const char *role) {
@@ -1390,7 +1425,7 @@ static void ev_snap_lines(const EvEnt *e, const char *role) {
 }
 
 static void ev_line(const EvEnt *e) {
-    char d[640] = "";
+    char d[800] = "";
     const uint64_t *x = e->x;
     switch (e->what) {
     case EV_BEGIN:
@@ -1429,7 +1464,7 @@ static void ev_line(const EvEnt *e) {
             if (e->mask >> i & 1u) at += sn(list + at, sizeof list - at, "%s%s", at ? "," : "", k_dry[i]);
         snprintf(d, sizeof d, "the mirror [%#llx, %#llx) would grow to [%#llx, %#llx), adding %#llx bytes (head %#llx, "
                  "its offset %#llx); rule says %s; mirror_bytes %llu, at most %llu; block room before its part [%#llx, "
-                 "%#llx) %#llx after %#llx; %llu other mirrors of the cell on the bind; G8 not evaluated; the evaluation left the map %s; refuses: %s",
+                 "%#llx) %#llx after %#llx; %llu other mirrors of the cell on the bind; the evaluation left the map %s (its digest leaves out the list of GPU writes); refuses: %s",
                  (ull)x[0], (ull)x[1], (ull)x[2], (ull)x[3], (ull)x[4], (ull)x[6], (ull)x[7], kind_name(e->kind),
                  (ull)x[5], (ull)BACKING_PROMOTE_MIRROR_MAX, (ull)x[10], (ull)x[11], (ull)x[8], (ull)x[9], (ull)x[12],
                  x[13] ? "CHANGED" : "unchanged", e->mask ? list : "nothing (it would grow)");
@@ -1869,7 +1904,7 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
                 continue;
             EvSnap pre;
             uint64_t old_lo = m->gpu_lo, old_hi = m->gpu_hi;
-            ev_snap(&pre, c, plo < old_lo ? plo : old_lo, phi > old_hi ? phi : old_hi, m);
+            ev_snap(&pre, c, plo < old_lo ? plo : old_lo, phi > old_hi ? phi : old_hi, m, 0, 0, 0);
             if (grow_taken(r, c, m, plo, phi, value, why)) {
                 EvEnt *ge = ev_new(value, EV_GREW);
                 ge->kind = BACKING_MIRROR, ge->s = pre;
@@ -1910,7 +1945,7 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
     ring_note(value, addr, size, RING_MADE, b->kind, b->gpu_lo, b->gpu_hi);
     EvEnt *me = ev_new(value, EV_MADE);   // the backings cell_put replaces, read before it does
     me->kind = b->kind, me->x[0] = b->gpu_lo, me->x[1] = b->gpu_hi;
-    ev_snap(&me->s, c, rs, re, NULL);
+    ev_snap(&me->s, c, rs, re, NULL, 0, 0, 0);
     cell_put(c, rs, re, b);
 }
 
@@ -2437,7 +2472,7 @@ int backing_is_open(void) { return g_open; }
 void backing_close(void) {
     if (!g_open) return;
     if (g_st.raw_begins) {   // once per run that used the raw path: what the candidate growth would have done
-        char d[200];
+        char d[260];
         size_t at = 0;
         for (int i = 0; i < DRY_N; i++)
             at += sn(d + at, sizeof d - at, "%s%s %llu", i ? ", " : "", k_dry[i], (ull)g_dry.g[i]);

@@ -45,7 +45,8 @@ PASSING = ("generations", "upload", "admission", "guarded_admission", "writeback
            "raw_grow_guarded_head", "raw_grow_guarded_tail", "raw_grow_over_total", "raw_grow_head_import",
            "raw_grow_tail_import", "raw_grow_wait", "raw_sync_wait", "raw_sync_nowait",
            "raw_promote", "raw_promote_small", "raw_promote_wait", "raw_promote_cap",
-           "raw_dry_grow", "raw_dry_g4", "raw_dry_cap", "raw_dry_kind", "raw_dry_none")
+           "raw_dry_grow", "raw_dry_g4", "raw_dry_cap", "raw_dry_kind", "raw_dry_none", "raw_dry_g4_on", "raw_dry_g8",
+           "raw_dry_g5", "raw_dry_g1", "raw_dry_g2")
 
 # case: text the one FATAL line must hold
 FAILING = {
@@ -73,8 +74,12 @@ FAILING = {
 }
 
 # The dry growth's refusals, in the order of BackingStats raw_dry_g, as the exit line names them; the case that has each.
-DRY_REFUSALS = ["rule_kind", "G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G8", "G9", "cap"]
-DRY_CASES = {"raw_dry_grow": None, "raw_dry_g4": "G4", "raw_dry_cap": "cap", "raw_dry_kind": "rule_kind"}
+DRY_REFUSALS = ["rule_kind", "G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G8", "G9", "cap", "G4_hull_off"]
+# The refusals each case ends with. A bind can count in several: G4 comes with G4_hull_off when the import it refuses on has
+# its hull off the pages the growth adds; G1 comes with G5 (a head over 1 MiB is also past the 64 KiB the mirror reserves).
+DRY_CASES = {"raw_dry_grow": (), "raw_dry_g4": ("G4", "G4_hull_off"), "raw_dry_g4_on": ("G4",), "raw_dry_cap": ("cap",),
+             "raw_dry_kind": ("rule_kind",), "raw_dry_g8": ("G8",), "raw_dry_g5": ("G5",), "raw_dry_g1": ("G1", "G5"),
+             "raw_dry_g2": ("G2", "G7a")}
 EXIT_LINE = "[rt] gfx: vulkan: backing map: dry growth at exit: "
 
 # The dump's lines, as the log writes them: one prefix, the text after it.
@@ -125,6 +130,21 @@ def events(lines: list[str]) -> list[dict]:
         if m and found and found[-1]["seq"] == int(m[1]):
             found[-1]["sub"].append(m[2])
     return found
+
+
+class DryDigestTest(unittest.TestCase):
+    """The digest the dry evaluation takes of the map before and after must not read what another thread changes under
+    another lock: the completion thread rewrites the list of GPU writes to write back under the coherence lock alone, while
+    the evaluation holds the map's lock, so a digest that read the list could differ with nothing mutated."""
+
+    def test_the_digest_leaves_out_the_pending_writes(self) -> None:
+        text = (ROOT / "runtime" / "gpu" / "backing.c").read_text(encoding="utf-8")
+        start = text.index("static uint64_t diag_digest(void) {")
+        body = text[start:text.index("\n}", start)]
+        code = "\n".join(line.split("//", 1)[0] for line in body.splitlines())
+        self.assertIn("g_ndef", code)   # it still reads the queue the map's lock guards
+        self.assertNotIn("g_npend", code)
+        self.assertNotIn("g_pend", code)
 
 
 class WriteWatchOwnerTest(unittest.TestCase):
@@ -313,8 +333,10 @@ class CoherenceTest(unittest.TestCase):
                 self.assertIn(f"the mirror [{hx(p)}, {hx(p + 0x40000)}) would grow to [{hx(p - 0x1000)}, "
                               f"{hx(p + 0x40000)}), adding 0x1000 bytes (head 0x1000, ", verdict["text"])
                 self.assertIn("rule says mirror;", verdict["text"])
-                self.assertIn("G8 not evaluated; the evaluation left the map unchanged; refuses: nothing (it would grow)",
-                              verdict["text"])
+                self.assertIn("the evaluation left the map unchanged (its digest leaves out the list of GPU writes); refuses: nothing "
+                              "(it would grow)", verdict["text"])
+                self.assertNotIn("not evaluated", verdict["text"])
+                self.assertIn(" hull_on_added_pages unknown (no hull of this submission)", verdict["sub"][1])
                 self.assertEqual(len(verdict["sub"]), 2, verdict["sub"])
                 self.assertTrue(verdict["sub"][0].startswith(
                     f"the mirror it would grow mirror [{hx(p)}, {hx(p + 0x40000)}) used_by {v0} (before submission {v})"),
@@ -394,15 +416,15 @@ class CoherenceTest(unittest.TestCase):
                 self.assertIn(f"(submission {v1}: 0 of 2; submission {v}: 0 of 8)", lines[-2])
 
     def test_a_run_that_does_not_stop_prints_the_dry_counters_once_at_exit(self) -> None:
-        for case, refusal in DRY_CASES.items():
+        for case, refusals in DRY_CASES.items():
             for level in LEVELS:
                 with self.subTest(case=case, level=level):
                     done = self.run_case(level, case)
                     self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
                     found = [line for line in done.stderr.splitlines() if line.startswith(EXIT_LINE)]
                     self.assertEqual(len(found), 1, done.stderr)
-                    refused = 0 if refusal is None else 1
-                    want = ", ".join(f"{name} {int(name == refusal)}" for name in DRY_REFUSALS)
+                    refused = int(bool(refusals))
+                    want = ", ".join(f"{name} {int(name in refusals)}" for name in DRY_REFUSALS)
                     self.assertEqual(found[0][len(EXIT_LINE):],
                                      f"1 raw-access submissions, 1 binds cut a mirror the submission had not resolved "
                                      f"there, {1 - refused} would have grown it, {refused} refused (refusals: {want}), "

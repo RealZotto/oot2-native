@@ -296,9 +296,10 @@ typedef struct BackingStats {
     uint64_t raw_straddle_stops;                                       // raw-access stops whose dump was printed (beside)
     // The candidate growth of a mirror a raw-access bind cut, evaluated and never done (nothing changes): binds that cut a
     // mirror the submission had not resolved there, those where growing it would have passed every guard, those where it
-    // would not, and the refusals by name in the order rule's kind, G1, G2, G3, G4, G5, G6, G7a, G7b, G8 (never evaluated:
-    // its query would reset the write watch's marks), G9, the cap on the mirrors' total (one bind can count in several).
-    uint64_t raw_dry_evals, raw_dry_would_grow, raw_dry_refused, raw_dry_g[12];
+    // would not, and the refusals by name in the order rule's kind, G1, G2, G3, G4, G5, G6, G7a, G7b, G8 (asked without
+    // a reset of the write watch's marks), G9, the cap on the mirrors' total, and G4_hull_off (with G4: every import it
+    // refuses on has a hull of the submission off the pages the growth adds); one bind can count in several.
+    uint64_t raw_dry_evals, raw_dry_would_grow, raw_dry_refused, raw_dry_g[13];
     uint64_t raw_dry_mutated;   // evaluations after which the map's digest differed: always 0
 } BackingStats;
 void backing_stats(BackingStats *out);

@@ -76,6 +76,15 @@ static int whole_pages(uint64_t lo, uint64_t hi) {
     return lo < hi && !(lo & (PAGEGEN_PAGE - 1)) && !(hi & (PAGEGEN_PAGE - 1)) && hi <= RT_ADDRESS_LIMIT;
 }
 
+int pagegen_covered(uint64_t lo, uint64_t hi) {
+    if (!whole_pages(lo, hi)) return 0;
+    uint64_t one[1];
+    plat_mutex_lock(&g_lock);
+    uint64_t n = source()(lo, hi - lo, one, 1, 0);   // no reset: no mark is taken from any consumer, no page is stamped
+    plat_mutex_unlock(&g_lock);
+    return n != UINT64_MAX;
+}
+
 uint64_t pagegen_scan(uint64_t lo, uint64_t hi) {
     if (!whole_pages(lo, hi))
         rt_fatal("page generations: a query of [%#llx, %#llx), which is not whole guest pages", (unsigned long long)lo,
