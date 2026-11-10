@@ -25,9 +25,13 @@
 //       ended (the other submissions between them, and idle), and the time the completion thread spent in the frame's
 //       effects (the write-backs and the reports: the CPU's part of the wait for its value)
 //   B value imports import_bytes mirrors mirror_bytes uploads upload_bytes writebacks writeback_bytes raw_writebacks
-//     raw_writeback_bytes promoted promote_bytes raw_begins resolves resolve_misses
+//     raw_writeback_bytes promoted promote_bytes raw_begins resolves resolve_misses raw_ended_ns raw_mark_ns
+//     raw_cpu_pages sink_bytes sinks_made pagegen_scan_ns pagegen_scans
 //       the backing map's and the raw path's counters (cumulative; imports and mirrors as they stand) when this frame ended, in
-//       the first frame and every 60th after it
+//       the first frame and every 60th after it; the last seven are the raw write-back's: the time its effect took on the
+//       completion thread and the part of it in pagegen_mark_gpu_direct, the pages of it the CPU had written since the
+//       submission began (plain stamp), the bytes of host imports under mirrors (the write-back's sinks) as they stand and the
+//       sinks made, then the write watch queries of all the page generations' consumers (their time and their number)
 //   M value index what label x y z ns notes
 //       one marked command: what (dispatch, pass, xfer, barrier), its label (a dispatch's stage key, a pass's first
 //       vertex and pixel stage keys, a transfer's operation), the dispatch's group counts (0 for an indirect one, a

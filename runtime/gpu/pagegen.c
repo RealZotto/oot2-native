@@ -138,6 +138,50 @@ uint64_t pagegen_mark_gpu(uint64_t lo, uint64_t hi) {
     return g;
 }
 
+uint64_t pagegen_mark_gpu_direct(uint64_t lo, uint64_t hi, uint64_t since, uint64_t *cpu_pages) {
+    if (!whole_pages(lo, hi))
+        rt_fatal("page generations: a direct write-back mark of [%#llx, %#llx), which is not whole guest pages",
+                 (unsigned long long)lo, (unsigned long long)hi);
+    plat_mutex_lock(&g_lock);
+    uint64_t g = ++g_now, cpu = 0, clean = 0;
+    // What the watch reports is the CPU's since its last reset (a pagegen_scan of any consumer, the creation of a host
+    // import over the pages): stamp it plain first, so that the page loop below sees it as the CPU's.
+    PagegenSource src = source();
+    int tracked = 1;
+    for (;;) {
+        uint64_t n = src(lo, hi - lo, g_batch, BATCH, 1);
+        if (n == UINT64_MAX) {
+            tracked = 0;
+            break;
+        }
+        for (uint64_t k = 0; k < n; k++) {
+            uint64_t a = g_batch[k] & ~(PAGEGEN_PAGE - 1);
+            if (a >= lo && a < hi) stamp(a, g);
+        }
+        if (n < BATCH) break;
+    }
+    for (uint64_t a = lo; a < hi; a += PAGEGEN_PAGE) {
+        Piece *p = piece(a, 1);
+        uint64_t k = (a >> PAGE_SHIFT) & (PAGES_PER_PIECE - 1);
+        // A page stamped after `since` by a write-back (its stamp is its GPU stamp) is another submission's GPU write,
+        // not the CPU's. The test comes before the stamp, which would hide it.
+        int cpu_wrote = !tracked || (p->page[k] > since && p->page[k] != p->gpu[k]);
+        stamp(a, g);
+        if (cpu_wrote) {
+            cpu++;
+        } else {
+            p->gpu[k] = g;
+            clean++;
+        }
+    }
+    g_st.marks++, g_st.mark_pages += (hi - lo) >> PAGE_SHIFT;
+    g_st.gpu_marks += clean != 0, g_st.gpu_mark_pages += clean;
+    g_st.direct_marks++, g_st.direct_cpu_pages += cpu;
+    plat_mutex_unlock(&g_lock);
+    if (cpu_pages) *cpu_pages = cpu;
+    return g;
+}
+
 uint64_t pagegen_gpu_stamp(uint64_t page) {
     plat_mutex_lock(&g_lock);
     const Piece *p = page < RT_ADDRESS_LIMIT ? piece(page, 0) : NULL;

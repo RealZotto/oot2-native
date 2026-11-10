@@ -18,7 +18,11 @@ mapped page resolving, a range a finalized pool left and another pool took reach
 grows past a mirror the table maps inside one submission of two raw-access stages (the table follows the map to the end
 of the recording, the stage recorded after the bind reaches the pages it committed, and the bound and the raw views of
 them are the same bytes), and a previously bound mirror that grows in place with consistent bound/raw writes and
-write-back, including when a GPU-only extent already occupies adjacent block space. Each runs under the synchronization
+write-back, including when a GPU-only extent already occupies adjacent block space. The write-back cases (a 1024-thread
+variant of the program, raw_program(big=True)) store into 10,101 pages the way the opening's chain does and check that
+the device wrote them into guest memory byte for byte (the same hash as the build that copied them on the completion
+thread), that a CPU write after the device's page and before the stamp is kept and reaches the mirror, and that pages the
+guest unmapped in between are left out. Each runs under the synchronization
 validation layer, which must report no error. The heap case measures
 what the invariant costs (resident bytes, VRAM, the invariant's pass and the table's build) over a heap of
 OOT2_RAW_HEAP_MIB MiB, 256 by default.
@@ -50,11 +54,15 @@ TEST_SOURCE = ROOT / "tests" / "runtime" / "vk_raw_test.c"
 LEVEL = "-O2"
 EXIT_NO_DEVICE = 3
 TID_X = 33
+CTAID_X = 37
 THREADS = 64
+BIG_THREADS = 1024   # raw_program_big: one group of the write-back cases
 TABLE = (1 << 39) + 0x4000_0000   # the pointer table: vk_raw_test.c, TABLE
 ENTRY = 32
 CASES = ("kinds", "keep", "miss", "commit", "reuse", "edges", "grow", "grow_taken", "grow_guarded_head",
          "grow_guarded_tail")
+# The write-back cases run the 1024-thread program (groups of 1024 threads, one entry each)
+BIG_CASES = ("wb", "wbcpu", "wbunmap", "wbflight")
 
 
 def mov_imm(rd: int, imm: int) -> bytes:
@@ -78,9 +86,13 @@ def atomg_add(rd: int, ra: int, rb: int) -> bytes:
     return scheduled(ampere(0x3a8, rd=rd, ra=ra, rb=rb, rc=0, high_bits=bit(72)))
 
 
-def raw_program() -> bytes:
-    return b"".join([
-        s2r(2, TID_X),
+def raw_program(big: bool = False) -> bytes:
+    """The program above; big: the thread's index is its group's times 1024 plus its place in the group (CTAID_X), so
+    that groups of 1024 threads reach one entry each of a table larger than one group's."""
+    index = [s2r(2, TID_X)]
+    if big:
+        index += [s2r(3, CTAID_X), imad_imm(2, 3, BIG_THREADS, 2)]
+    return b"".join(index + [
         mov_imm(20, TABLE & 0xFFFFFFFF),
         imad_imm(4, 2, ENTRY, 20),            # R4:R5 = the thread's entry
         mov_imm(5, TABLE >> 32),
@@ -110,23 +122,24 @@ def program() -> Path:
     return _build["exe"]  # type: ignore[return-value]
 
 
-def translate(out: Path) -> Path:
-    """The raw program through the translator: its SPIR-V's path."""
+def translate(out: Path, big: bool = False) -> Path:
+    """The raw program (the 1024-thread one when big) through the translator: its SPIR-V's path."""
     if XLATE is None:
         if os.environ.get("OOT2_REQUIRE_XLATE"):
             raise RuntimeError("OOT2_REQUIRE_XLATE is set but oot2-xlate is not built under build/xlate")
         raise unittest.SkipTest(SKIP_NO_EXE)
-    code = out / "raw.bin"
-    code.write_bytes(raw_program())
-    job = compute_job("raw", code, local=[THREADS, 1, 1])
+    name = "rawbig" if big else "raw"
+    code = out / f"{name}.bin"
+    code.write_bytes(raw_program(big))
+    job = compute_job(name, code, local=[BIG_THREADS if big else THREADS, 1, 1])
     results, _ = pool.run_pool([XLATE], [(job, out)], 1, out / "logs", timeout=120)
     (got,) = results
     if (got.status, got.message) != ("ok", ""):
         raise AssertionError(f"the translator refused the raw program: {got.status} {got.message}")
-    res = json.loads((out / "raw.res.json").read_text(encoding="utf-8"))
+    res = json.loads((out / f"{name}.res.json").read_text(encoding="utf-8"))
     ra = res["raw_access"]
     assert (ra["page_table"], ra["store_bits"], ra["push_offset"], ra["push_bytes"]) == (True, True, 0, 16), ra
-    return out / "raw.spv"
+    return out / f"{name}.spv"
 
 
 def run(case: str, *args: str, env: dict[str, str] | None = None, timeout: int = 300) -> subprocess.CompletedProcess:
@@ -139,6 +152,7 @@ class VkRawTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.tmp = tempfile.TemporaryDirectory(prefix="oot2-vkraw-spv-", ignore_cleanup_errors=True)
         cls.spv = translate(Path(cls.tmp.name))
+        cls.spv_big = translate(Path(cls.tmp.name), big=True)
         done = run("usable")
         skip_on_partial_device(done)
         if done.returncode == EXIT_NO_DEVICE:
@@ -157,6 +171,21 @@ class VkRawTest(unittest.TestCase):
         for case in CASES:
             with self.subTest(case=case):
                 done = run(case, str(self.spv), env={"OOT2_VK_VALIDATION": "sync"})
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr[-4000:])
+                self.assertIn(f"ok {case}", done.stdout)
+                self.assertEqual(fatal_lines(done.stderr), [])
+                m = re.search(r"^validation errors (\d+) warnings (\d+)$", done.stdout, re.M)
+                self.assertIsNotNone(m, done.stdout)
+                self.assertEqual(m.group(1), "0", done.stdout + done.stderr[-4000:])
+                print(f"\n{case}:\n" + "".join(f"  {line}\n" for line in done.stdout.splitlines()), end="")
+
+    def test_the_write_back_of_a_movie_frame_reaches_guest_memory_whole(self) -> None:
+        # wb: 10,101 pages (39.5 MiB, what the opening's chain writes a present) byte for byte and the time the raw path's
+        # effect takes on the completion thread; wbcpu: a CPU write between the GPU's write-back and its stamp is kept;
+        # wbunmap: pages the guest unmapped mid-flight are left out. The times are printed, not judged.
+        for case in BIG_CASES:
+            with self.subTest(case=case):
+                done = run(case, str(self.spv_big), env={"OOT2_VK_VALIDATION": "sync"})
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr[-4000:])
                 self.assertIn(f"ok {case}", done.stdout)
                 self.assertEqual(fatal_lines(done.stderr), [])

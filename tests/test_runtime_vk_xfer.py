@@ -256,7 +256,7 @@ class TransferTest(vp.DeviceTestCase):
         self.assertEqual(int(frames[0][9]), 0)   # the first frame has no frame before it
         # the backing map's counters ride on the first frame: the CPU-visible pool is mirrored, and its copies went through the map
         self.assertEqual(len(counters), 1)
-        self.assertEqual(len(counters[0]), 17, counters)
+        self.assertEqual(len(counters[0]), 24, counters)   # B, the value, 15 counters and the raw write-back's seven
         self.assertGreaterEqual(int(counters[0][4]), 1, counters)   # a mirror
         self.assertGreater(int(counters[0][15]), 0, counters)       # resolves
         # the marks split the main command buffer between its first and last timestamps: they cannot add up to more

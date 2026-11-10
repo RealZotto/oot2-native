@@ -2,13 +2,14 @@
 // Copyright (C) 2026 The oot2-native contributors
 //
 // Raw write-back (oot2/vk_raw.h): at the end of a raw-access submission, after its own work, copy the page table's
-// header and miss log out and zero its miss count, and copy out every mirrored page whose store bit is set, clearing the
-// bit. The completion thread then logs the misses and writes the pages into guest memory, before the value is done.
+// header and miss log out and zero its miss count, and for every mirrored page whose store bit is set clear the bit, note
+// the page in a bitmap, and copy the page into the guest's own page through the page's sink (a host import over the
+// guest's pages), so the CPU writes none of it: the completion thread then logs the misses and stamps the pages, before
+// the value is done. A page with no sink (the guest has no committed page there) is noted and not copied.
 //
 // Every address comes in the push constants, and so do the table's word offsets (oot2/raw_table.h), so this file holds
 // no copy of the ABI. The out buffer, in words: [0] the pages taken, [head, head + head_words) the table's first
-// head_words words, [list, list + slots) the index of each taken page in the page list, then from `data` (a multiple of
-// 1024) one 1024-word page per slot. A page past `slots` is counted and not copied: the effect stops by name.
+// head_words words, then from `list` one bit for each page of the page list, set when the page was written.
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
@@ -19,7 +20,14 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
     uint w[];
 };
 
-// A mirrored page: x its leaf slot, zw the device address of its bytes (oot2/vk_raw.h, RawMirrorPage).
+// A page's bytes copied four words at a time: both ends are 4 KiB aligned.
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Quads {
+    uvec4 q[];
+};
+
+// A mirrored page (oot2/vk_raw.h, RawMirrorPage, 32 bytes, two entries of the array): the first, x its leaf slot and zw the
+// device address of its bytes in the mirror; the second, xy the device address of the guest's page through its sink
+// (0 for none).
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Pages {
     uvec4 p[];
 };
@@ -29,45 +37,45 @@ layout(push_constant) uniform Raw {
     uvec2 pages;
     uvec2 dst;
     uint count;        // mirrored pages in the list
-    uint slots;        // pages the out buffer holds
     uint bits_word;    // RAW_STORE_BITS_WORD
     uint miss_word;    // RAW_HEADER_MISS_COUNT
     uint head_words;   // RAW_MISS_LOG_WORD + RAW_MISS_ENTRIES * RAW_MISS_ENTRY_WORDS
 } raw;
 
 const uint HEAD = 16u;
-const uint PAGE_WORDS = 1024u;
+const uint PAGE_QUADS = 256u;
 
-shared uint s_slot;
+shared uint s_hit;
 
 void main() {
     Words t = Words(raw.table);
     Words o = Words(raw.dst);
     uint lane = gl_LocalInvocationIndex;
     uint list = HEAD + raw.head_words;
-    uint data = (list + raw.slots + PAGE_WORDS - 1u) & ~(PAGE_WORDS - 1u);
     if (gl_WorkGroupID.x == 0u) {
         for (uint i = lane; i < raw.head_words; i += gl_WorkGroupSize.x) o.w[HEAD + i] = t.w[i];
         barrier();
         if (lane == 0u) t.w[raw.miss_word] = 0u;
     }
     for (uint i = gl_WorkGroupID.x; i < raw.count; i += gl_NumWorkGroups.x) {
-        uvec4 e = Pages(raw.pages).p[i];
+        uvec4 e = Pages(raw.pages).p[2u * i];
+        uvec4 f = Pages(raw.pages).p[2u * i + 1u];
         if (lane == 0u) {
             uint word = raw.bits_word + (e.x >> 5u), bit = 1u << (e.x & 31u);
-            uint s = 0xFFFFFFFFu;
+            uint hit = 0u;
             if ((t.w[word] & bit) != 0u) {
                 atomicAnd(t.w[word], ~bit);
-                s = atomicAdd(o.w[0], 1u);
-                if (s < raw.slots) o.w[list + s] = i;
+                atomicAdd(o.w[0], 1u);
+                atomicOr(o.w[list + (i >> 5u)], 1u << (i & 31u));
+                hit = 1u;
             }
-            s_slot = s;
+            s_hit = hit;
         }
         barrier();
-        uint s = s_slot;
-        if (s < raw.slots) {
-            Words src = Words(e.zw);
-            for (uint k = lane; k < PAGE_WORDS; k += gl_WorkGroupSize.x) o.w[data + s * PAGE_WORDS + k] = src.w[k];
+        if (s_hit != 0u && (f.x | f.y) != 0u) {
+            Quads src = Quads(e.zw);
+            Quads dst = Quads(f.xy);
+            for (uint k = lane; k < PAGE_QUADS; k += gl_WorkGroupSize.x) dst.q[k] = src.q[k];
         }
         barrier();
     }

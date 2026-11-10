@@ -33,6 +33,17 @@
 //            window: resident bytes and VRAM before and after the first raw-access submission, the invariant's pass and
 //            the table's build timed, then a second submission with the map unchanged (measured, not judged; the full
 //            5.5 GiB heap takes more than 4 GB of RAM: a HEAVY slot)
+//   wb [PROBES]   (the 1024-thread program, groups of 1024 threads) the write-back at the opening's size: 10,101 pages
+//                (39.5 MiB) stored into a mirror and written into guest memory by the device through the mirror's sinks,
+//                every page compared with what the fill and the stores leave and hashed (the hash is the same in the
+//                build that copies them on the completion thread), nothing copied back into the mirror, and the time the
+//                raw path's effect takes on the completion thread and the whole submission takes, printed
+//   wbcpu        a CPU write between the device's write-back and the effect that stamps it is kept in guest memory and
+//                reaches the mirror, that page alone
+//   wbunmap      pages the guest unmapped (SetHeapSize) after the device wrote them and before the effect are left out and
+//                counted, not stamped, not committed again; the pages of the other mirror are written back
+//   wbflight     the same with the guest giving the heap back while the submission is in flight and the device held (a
+//                semaphore the test signals afterwards): the device writes the unmapped pages through their sink
 //
 // Every case closes the device and prints the validation counts; tests/test_runtime_vk_raw.py runs them under the
 // synchronization layer and requires no error.
@@ -46,6 +57,7 @@
 #include "oot2/gpu.h"
 #include "oot2/gpu_vk.h"
 #include "oot2/memory.h"
+#include "oot2/pagegen.h"
 #include "oot2/runtime.h"
 #include "oot2/vk_pipeline.h"
 #include "oot2/vk_raw.h"
@@ -409,18 +421,28 @@ static void case_keep(const char *spv) {
     BackingStats b0;
     backing_stats(&b0);
     CHECK(b0.upload_bytes > 0);   // the committed pages of the mirror went in once
-    // The next submission reads the words the first stored, and counts on from 16, with nothing copied into the mirror.
+    // The next submissions read the words the first stored, and count on from 16, with nothing copied into the mirror once
+    // the sink's marks in the write watch are taken (the first of them copies the mirror in once more: settle_big says why).
     for (int i = 0; i < 16; i++) e[i] = (Entry){mir + (uint64_t)i * PG + PROBE + 4, counter, 0, 0, {0}};
-    dispatch(e);
-    for (int i = 0; i < 16; i++) CHECK(e[i].loaded == (MARK | (uint32_t)i));
-    CHECK(word_at(counter) == 32);
-    BackingStats b1;
-    backing_stats(&b1);
-    CHECK(b1.upload_bytes == b0.upload_bytes);
+    int quiet = 0, subs = 1;
+    BackingStats b1 = b0;
+    while (quiet < 2) {
+        BackingStats before;
+        backing_stats(&before);
+        CHECK(subs < 20);
+        dispatch(e);
+        subs++;
+        for (int i = 0; i < 16; i++) CHECK(e[i].loaded == (MARK | (uint32_t)i));
+        CHECK(word_at(counter) == 16 * (uint32_t)subs);
+        backing_stats(&b1);
+        quiet = b1.upload_bytes == before.upload_bytes ? quiet + 1 : 0;
+        if (quiet < 2) plat_sleep_ns(20ull * 1000 * 1000);
+    }
     GpuVkRawStats s;
     gpu_vk_raw_stats(&s);
-    CHECK(s.submissions == 2 && s.misses == 0 && s.writebacks == 34 && s.writeback_bytes == 34 * PG);
-    // The CPU writes the counter's page: the third submission takes it from guest memory, one page, and counts from it.
+    CHECK(s.submissions == (uint64_t)subs && s.misses == 0 && s.writebacks == 17 * (uint64_t)subs &&
+          s.writeback_bytes == 17 * (uint64_t)subs * PG);
+    // The CPU writes the counter's page: the next submission takes it from guest memory, one page, and counts from it.
     fill_words(counter, PG, 100);
     for (int i = 0; i < 16; i++) e[i] = (Entry){mir + (uint64_t)i * PG + PROBE + 4, counter, 0, 0, {0}};
     dispatch(e);
@@ -428,9 +450,10 @@ static void case_keep(const char *spv) {
     BackingStats b2;
     backing_stats(&b2);
     CHECK(b2.upload_bytes == b1.upload_bytes + PG);
-    printf("a mirror's raw stores, written back: the next submission copied %llu bytes into it (17 pages before the "
-           "change), a CPU write to a page of it %llu\n", (ull)(b1.upload_bytes - b0.upload_bytes),
-           (ull)(b2.upload_bytes - b1.upload_bytes));
+    printf("a mirror's raw stores, written back: the %d submissions after the first copied %llu bytes into it (17 pages "
+           "before the change; the sink's marks in the write watch, taken by the first of them or two, cost the rest), "
+           "the last two copied nothing; a CPU write to a page of it %llu\n", subs - 1,
+           (ull)(b1.upload_bytes - b0.upload_bytes), (ull)(b2.upload_bytes - b1.upload_bytes));
     stats_line();
     pool_t *all[] = {&pm, &t};
     close_all(all, 2);
@@ -903,6 +926,317 @@ static void case_heap(const char *spv, uint64_t mib) {
     printf("ok heap\n");
 }
 
+// ---------- the write-back at the movie's size
+// The 1024-thread program (test_runtime_vk_raw.py, raw_program_big): thread g of group k reads entry k * 1024 + g of the
+// pointer table, so one dispatch of W groups stores into up to W * 1024 pages.
+#define BIG 1024u
+
+static uint32_t page_word(uint32_t page, uint32_t k) { return page * 2654435761u + k * 40503u + 0x1234u; }
+
+static void fill_page(uint64_t addr, uint32_t page) {
+    for (uint32_t k = 0; k < PG / 4; k++) ((volatile uint32_t *)(uintptr_t)addr)[k] = page_word(page, k);
+}
+
+static void stamp_now(void *arg, uint64_t value) {
+    (void)value;
+    __atomic_store_n((uint64_t *)arg, plat_now_ns(), __ATOMIC_RELEASE);
+}
+
+// While g_gate is set the next dispatch_big submits with a wait on it (a timeline semaphore at 0), calls g_in_flight with the
+// submission in flight and not run, then signals the gate.
+static VkSemaphore g_gate;
+static void (*g_in_flight)(void *);
+static void *g_in_flight_arg;
+
+// One submission of the 1024-thread program over groups * 1024 entries. before (may be NULL) is a test effect queued just
+// ahead of the raw path's own (it runs on the completion thread once the device reached the value, before the write-back
+// is stamped). The time the raw path's effect took on the completion thread comes back in *effects_ns, and the time from
+// the submit to the value done in *wall_ns.
+static uint64_t dispatch_big(const Entry *e, unsigned groups, GpuEffect before, void *before_arg, uint64_t *effects_ns,
+                             uint64_t *wall_ns) {
+    backing_sync();
+    uint64_t v = gpu_vk_begin(GPU_VK_INTERNAL);
+    VkCommandBuffer cb = gpu_vk_cmd();
+    const uint64_t bytes = (uint64_t)groups * BIG * sizeof(Entry);
+    BackingRef r;
+    backing_resolve(TABLE, bytes, v, &r);
+    barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    for (uint64_t off = 0; off < bytes; off += 65536) {
+        uint64_t n = bytes - off < 65536 ? bytes - off : 65536;
+        vkCmdUpdateBuffer(cb, (VkBuffer)(uintptr_t)r.buffer, r.offset + off, n, (const char *)e + off);
+    }
+    barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    uint32_t push[4];
+    gpu_vk_raw_begin(v, push);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_pipe);
+    vkCmdPushConstants(cb, g_lay.compute, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
+    vkCmdDispatch(cb, groups, 1, 1);
+    uint64_t t_from = 0, t_to = 0;
+    gpu_sync_effect(stamp_now, &t_from);
+    if (before) gpu_sync_effect(before, before_arg);
+    gpu_vk_raw_end(v);
+    gpu_sync_effect(stamp_now, &t_to);
+    uint64_t t0 = plat_now_ns();
+    backing_submit_end(v);
+    if (g_gate) {   // the device waits for the gate, so the test acts while the submission is in flight, before its work
+        VkSemaphoreSubmitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_gate, .value = 1,
+                                      .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        CHECK(gpu_vk_end(&wait, 1) == v);
+        CHECK(!gfx_vulkan_backend.fence_wait(v, 200000000ull));   // held
+        g_in_flight(g_in_flight_arg);
+        VkSemaphoreSignalInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g_gate, .value = 1};
+        CHECK(vkSignalSemaphore(gpu_vk.device, &si) == VK_SUCCESS);
+    } else {
+        CHECK(gpu_vk_end(NULL, 0) == v);
+    }
+    CHECK(gfx_vulkan_backend.fence_wait(v, 20000000000ull) == 1);
+    uint64_t t1 = plat_now_ns();
+    gfx_vulkan_backend.cpu_synced(v);
+    if (effects_ns) *effects_ns = t_to - t_from;
+    if (wall_ns) *wall_ns = t1 - t0;
+    return v;
+}
+
+// The entries from n on, up to a whole number of groups, are pad. The groups.
+static unsigned big_entries(Entry *all, unsigned n, Entry pad) {
+    unsigned groups = (n + BIG - 1) / BIG;
+    for (unsigned i = n; i < groups * BIG; i++) all[i] = pad;
+    return groups;
+}
+
+static uint64_t fnv64(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+// Submissions of the entries e until two in a row copy nothing into the mirrors. Making a sink (a host import over the
+// mirror's pages) marks its pages in the write watch, when it is made and again a few milliseconds after (Measured: with a
+// delay of 300 ms after the import the second mark was taken by the mirror's own sync, without one it came after the sync;
+// the device's writes through the sink do not mark them), and the mirror's sync reads a mark as the CPU's write and copies
+// the page: once or twice after a sink is made, never again. The count of submissions made, at most 20.
+static int settle_big(const Entry *e, unsigned groups) {
+    int quiet = 0;
+    for (int n = 1; n <= 20; n++) {
+        BackingStats a, b;
+        backing_stats(&a);
+        dispatch_big(e, groups, NULL, NULL, NULL, NULL);
+        backing_stats(&b);
+        quiet = b.upload_bytes == a.upload_bytes ? quiet + 1 : 0;
+        if (quiet == 2) return n;
+        plat_sleep_ns(20ull * 1000 * 1000);
+    }
+    fprintf(stderr, "the mirror was still copied in by the 20th submission: a mark every submission\n");
+    exit(1);
+}
+
+// wb PROBES: a mirror of PROBES + 2 pages (default 10,099, so 10,101 pages are written back a submission, as the opening's
+// chain writes: the probe pages, the counter's and the padding threads' scratch page). Each submission stores one word into
+// each probe page and adds to the counter, and the raw path writes the stored pages back. After each value is done every
+// page is compared with what the CPU's fill and the stores must have left and hashed (the hash is the same in any build
+// that writes them back right), the next submission copies nothing into the mirror, and the time the raw path's effect took
+// on the completion thread (what the value waits for after the device) is printed.
+static void case_wb(const char *spv, unsigned probes) {
+    open_all(spv);
+    const uint64_t size = ((uint64_t)(probes + 2) * PG + 2 * MiB - 1) / (2 * MiB) * (2 * MiB);
+    pool_t t = make_pool(TABLE, 2 * MiB, NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS);
+    const uint64_t mir = g_heap + 32 * MiB, counter = mir + (uint64_t)probes * PG, scratch = counter + PG;
+    g_mirror_lo = mir, g_mirror_hi = mir + size;
+    pool_t pm = make_pool(mir, size, 0);
+    for (unsigned i = 0; i < probes + 2; i++) fill_page(mir + (uint64_t)i * PG, i);
+    fill_words(counter, PG, 0);
+    read_back(mir, size);   // the mirror is made at a bind, and brought current
+    BackingPage bp;
+    backing_page(mir, &bp);
+    CHECK(bp.kind == BACKING_MIRROR);
+    const unsigned groups = (probes + BIG - 1) / BIG;
+    Entry *e = calloc((size_t)groups * BIG, sizeof *e);
+    CHECK(e && (uint64_t)groups * BIG * sizeof(Entry) <= 1 * MiB);
+    for (unsigned i = 0; i < probes; i++) e[i] = (Entry){mir + (uint64_t)i * PG + PROBE, counter, 0, 0, {0}};
+    big_entries(e, probes, (Entry){scratch + PROBE, counter, 0, 0, {0}});
+    const int warm = settle_big(e, groups);
+    enum { RUNS = 5 };
+    double eff[RUNS], wall[RUNS];
+    uint64_t hash = 0;
+    BackingStats up0;
+    backing_stats(&up0);
+    for (int run = 0; run < RUNS; run++) {
+        uint64_t en, wn;
+        dispatch_big(e, groups, NULL, NULL, &en, &wn);
+        eff[run] = (double)en / 1e6, wall[run] = (double)wn / 1e6;
+        uint64_t h = 14695981039346656037ull;
+        for (unsigned i = 0; i < probes; i++) {
+            const uint32_t *page = (const uint32_t *)(uintptr_t)(mir + (uint64_t)i * PG);
+            for (unsigned k = 0; k < PG / 4; k++) {
+                uint32_t want = k == (PROBE + 4) / 4 ? (MARK | i) : page_word(i, k);
+                if (page[k] != want) {
+                    fprintf(stderr, "run %d: page %u word %u is %#x, want %#x\n", run, i, k, page[k], want);
+                    exit(1);
+                }
+            }
+            h = fnv64(h, page, PG);
+        }
+        CHECK(word_at(counter) == groups * BIG * (uint32_t)(warm + run + 1));
+        if (!run) hash = h;
+        CHECK(h == hash);   // the same bytes after every submission
+        BackingStats b;
+        backing_stats(&b);
+        GpuVkRawStats rs;
+        gpu_vk_raw_stats(&rs);
+        printf("wb run %d: raw path's effect %.2f ms, submit to value done %.2f ms; %llu pages the CPU had written since "
+               "a submission began (in all, %d submissions made before the first run), %llu KiB copied into the mirror\n",
+               run, eff[run], wall[run], (ull)rs.writeback_cpu_pages, warm, (ull)((b.upload_bytes - up0.upload_bytes) >> 10));
+        CHECK(b.upload_bytes == up0.upload_bytes);   // the pages the GPU wrote are the mirror's own: nothing is copied back into it
+    }
+    GpuVkRawStats s;
+    gpu_vk_raw_stats(&s);
+    const uint64_t per = probes + 2;   // the probe pages, the counter's and the scratch page
+    const uint64_t subs = (uint64_t)(warm + RUNS);
+    CHECK(s.submissions == subs && s.misses == 0 && s.writebacks == subs * per && s.writeback_bytes == subs * per * PG);
+    double em = 0, wm = 0, emin = 1e9, emax = 0;
+    for (int run = 0; run < RUNS; run++) {
+        em += eff[run], wm += wall[run];
+        if (eff[run] < emin) emin = eff[run];
+        if (eff[run] > emax) emax = eff[run];
+    }
+    printf("wb: %llu pages (%.1f MiB) written back a submission, every page byte-identical to what the fill and the stores "
+           "leave, hash %016llx, nothing copied back into the mirror\n", (ull)per, (double)(per * PG) / (double)MiB,
+           (ull)hash);
+    printf("wb: %d submissions: raw path's effect on the completion thread mean %.2f ms (min %.2f, max %.2f); submit to "
+           "value done mean %.2f ms\n", RUNS, em / RUNS, emin, emax, wm / RUNS);
+    stats_line();
+    free(e);
+    pool_t *all[] = {&pm, &t};
+    close_all(all, 2);
+    printf("ok wb\n");
+}
+
+// wbcpu: the CPU writes a word of a page the GPU stored into, after the device wrote the page back and before the raw
+// path stamps it (a test effect queued ahead of the raw path's own). The write is not lost (the GPU's write is whole
+// pages, and it came first) and the mirror takes it: that page is the only one the next submission copies into the
+// mirror, and a raw load of that word reads the CPU's value.
+static void cpu_writes(void *arg, uint64_t value) {
+    (void)value;
+    uint64_t *at = arg;
+    *(volatile uint32_t *)(uintptr_t)at[0] = (uint32_t)at[1];
+}
+
+static void case_wbcpu(const char *spv) {
+    open_all(spv);
+    pool_t t = make_pool(TABLE, 2 * MiB, NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS);
+    const uint64_t mir = g_heap + 32 * MiB, counter = mir + 16 * PG, scratch = counter + PG, word = mir + 3 * PG + 0x100;
+    g_mirror_lo = mir, g_mirror_hi = mir + 1 * MiB;
+    pool_t pm = make_pool(mir, 1 * MiB, 0);
+    for (unsigned i = 0; i < 256; i++) fill_page(mir + (uint64_t)i * PG, i);   // every page of the pool written once
+    fill_words(counter, PG, 0);
+    read_back(mir, 1 * MiB);
+    Entry e[BIG];
+    for (unsigned i = 0; i < 16; i++) e[i] = (Entry){mir + (uint64_t)i * PG + PROBE, counter, 0, 0, {0}};
+    big_entries(e, 16, (Entry){scratch + PROBE, counter, 0, 0, {0}});
+    BackingStats b0, b1, b2;
+    settle_big(e, 1);   // the counts start after the sink's marks are taken (all 256 pages of this mirror, 238 of them never written by the GPU)
+    backing_stats(&b0);
+    uint64_t cmd[2] = {word, 0xC0FFEE42u};
+    dispatch_big(e, 1, cpu_writes, cmd, NULL, NULL);
+    CHECK(word_at(word) == 0xC0FFEE42u);   // the CPU's write came after the GPU's: it is in guest memory
+    for (unsigned i = 0; i < 16; i++) CHECK(word_at(mir + (uint64_t)i * PG + PROBE + 4) == (MARK | i));
+    CHECK(word_at(mir + 3 * PG + 0x104) == page_word(3, 0x104 / 4));   // the rest of its page is the GPU's (the fill)
+    backing_stats(&b1);
+    CHECK(b1.upload_bytes == b0.upload_bytes);
+    // The next submission reads that word, and the GPU's stored words, through the mirror.
+    for (unsigned i = 0; i < 16; i++)
+        e[i] = (Entry){i == 3 ? word : mir + (uint64_t)i * PG + PROBE + 4, counter, 0, 0, {0}};
+    dispatch_big(e, 1, NULL, NULL, NULL, NULL);
+    read_back(TABLE, 16 * sizeof(Entry));
+    const Entry *got = (const Entry *)(const void *)g_words;
+    CHECK(got[3].loaded == 0xC0FFEE42u);   // the mirror took the CPU's write: the page was not stamped as the GPU's
+    for (unsigned i = 0; i < 16; i++)
+        if (i != 3) CHECK(got[i].loaded == (MARK | i));
+    backing_stats(&b2);
+    CHECK(b2.upload_bytes == b1.upload_bytes + PG);   // that page and no other
+    CHECK(word_at(word) == 0xC0FFEE42u);
+    printf("wbcpu: a CPU write between the GPU's write-back and its stamp is kept in guest memory and reaches the mirror "
+           "(%llu bytes copied in: that page only)\n", (ull)(b2.upload_bytes - b1.upload_bytes));
+    stats_line();
+    pool_t *all[] = {&pm, &t};
+    close_all(all, 2);
+    printf("ok wbcpu\n");
+}
+
+// wbunmap: two mirrors, the upper one in the last 2 MiB of the heap, which the guest gives back (SetHeapSize) after the
+// device wrote it and before the raw path stamps it. Its pages are left out, counted, not stamped and not committed
+// again; the other mirror's pages are written back as before. wbflight: the same, but the guest gives the heap back while
+// the submission is in flight and the device has not run it (it waits for a semaphore the test signals afterwards), so the
+// device writes the unmapped pages through their sink: the sink's import keeps them valid until the submission is done (no
+// device loss, no validation error), and the effect leaves them out all the same.
+typedef struct Shrink { uint64_t size, generation; } Shrink;
+
+static void heap_shrinks(void *arg, uint64_t value) {
+    (void)value;
+    Shrink *sh = arg;
+    sh->generation = pagegen_now();   // the raw path's effect stamps after this, or leaves the pages alone
+    Cpu cpu = {0};
+    cpu.x[0] = 0, cpu.x[1] = sh->size;
+    rt_svc(&cpu, 0x01, 0);   // SetHeapSize
+}
+
+static void unmap_in_flight(void *arg) { heap_shrinks(arg, 0); }
+
+static void case_wbunmap(const char *spv, int in_flight) {
+    open_all(spv);
+    pool_t t = make_pool(TABLE, 2 * MiB, NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS);
+    const uint64_t low = g_heap + 32 * MiB, high = g_heap + 254 * MiB, counter = low + 16 * PG, scratch = counter + PG;
+    g_mirror_lo = low, g_mirror_hi = g_heap + 256 * MiB;
+    pool_t pl = make_pool(low, 1 * MiB, 0), ph = make_pool(high, 2 * MiB, 0);
+    for (unsigned i = 0; i < 18; i++) fill_page(low + (uint64_t)i * PG, i);
+    for (unsigned i = 0; i < 64; i++) fill_page(high + (uint64_t)i * PG, 100 + i);
+    fill_words(counter, PG, 0);
+    read_back(low, 1 * MiB);
+    read_back(high, 2 * MiB);
+    BackingPage bp;
+    backing_page(high, &bp);
+    CHECK(bp.kind == BACKING_MIRROR);
+    backing_page(low, &bp);
+    CHECK(bp.kind == BACKING_MIRROR);
+    Entry e[BIG];
+    for (unsigned i = 0; i < 16; i++) e[i] = (Entry){low + (uint64_t)i * PG + PROBE, counter, 0, 0, {0}};
+    for (unsigned i = 0; i < 64; i++) e[16 + i] = (Entry){high + (uint64_t)i * PG + PROBE, counter, 0, 0, {0}};
+    big_entries(e, 80, (Entry){scratch + PROBE, counter, 0, 0, {0}});
+    Shrink shrink = {254 * MiB, 0};
+    if (in_flight) {
+        VkSemaphoreTypeCreateInfo tl = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = 0};
+        VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &tl};
+        CHECK(vkCreateSemaphore(gpu_vk.device, &sci, NULL, &g_gate) == VK_SUCCESS);
+        g_in_flight = unmap_in_flight, g_in_flight_arg = &shrink;
+        dispatch_big(e, 1, NULL, NULL, NULL, NULL);
+        vkDestroySemaphore(gpu_vk.device, g_gate, NULL);
+        g_gate = VK_NULL_HANDLE;
+        CHECK(shrink.generation);   // the heap was given back while the device waited
+    } else {
+        dispatch_big(e, 1, heap_shrinks, &shrink, NULL, NULL);
+    }
+    GpuVkRawStats s;
+    gpu_vk_raw_stats(&s);
+    CHECK(s.misses == 0 && s.writebacks == 18 && s.writebacks_skipped == 64);   // 16 probes, the counter, the scratch page
+    for (unsigned i = 0; i < 16; i++) CHECK(word_at(low + (uint64_t)i * PG + PROBE + 4) == (MARK | i));
+    int c = 1;
+    uint64_t run = rt_mem_commit_run(high, 2 * MiB, &c);
+    CHECK(run == UINT64_MAX || !c);   // the unmapped pages are still unmapped: nothing committed them again
+    for (unsigned i = 0; i < 64; i++)   // and nothing stamped them since the guest gave them back
+        CHECK(pagegen_stamp(high + (uint64_t)i * PG) <= shrink.generation && pagegen_gpu_stamp(high + (uint64_t)i * PG) == 0);
+    for (unsigned i = 0; i < 16; i++) CHECK(pagegen_stamp(low + (uint64_t)i * PG) > shrink.generation);   // the others were
+    printf("%s: 64 pages the guest unmapped %s left out and counted (%llu skipped), none stamped or committed "
+           "again; the other mirror's 18 pages written back\n", in_flight ? "wbflight" : "wbunmap",
+           in_flight ? "while the submission was in flight, written by the device through their sink, are"
+                     : "after the device wrote them are", (ull)s.writebacks_skipped);
+    stats_line();
+    pool_t *all[] = {&ph, &pl, &t};
+    close_all(all, 3);
+    printf(in_flight ? "ok wbflight\n" : "ok wbunmap\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc >= 2 && !strcmp(argv[1], "usable")) {
@@ -925,6 +1259,10 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "grow_guarded_head")) case_grow_guarded(spv, 1);
     else if (!strcmp(cs, "grow_guarded_tail")) case_grow_guarded(spv, 0);
     else if (!strcmp(cs, "heap") && argc >= 4) case_heap(spv, strtoull(argv[3], NULL, 10));
+    else if (!strcmp(cs, "wb")) case_wb(spv, argc >= 4 ? (unsigned)strtoul(argv[3], NULL, 10) : 10099);
+    else if (!strcmp(cs, "wbcpu")) case_wbcpu(spv);
+    else if (!strcmp(cs, "wbunmap")) case_wbunmap(spv, 0);
+    else if (!strcmp(cs, "wbflight")) case_wbunmap(spv, 1);
     else {
         fprintf(stderr, "unknown case %s\n", cs);
         return 2;

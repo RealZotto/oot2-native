@@ -123,7 +123,7 @@ void raw_write(const BackingRun *runs, int n, const RawLayout *l, uint32_t *word
             leaf[(uint64_t)slot * RAW_ENTRY_WORDS] = (uint32_t)delta;
             leaf[(uint64_t)slot * RAW_ENTRY_WORDS + 1] = (uint32_t)(delta >> 32);
             if (r->kind != BACKING_MIRROR) continue;
-            pages[m] = (RawMirrorPage){slot, 0, r->address + (a - r->lo)};
+            pages[m] = (RawMirrorPage){slot, 0, r->address + (a - r->lo), 0, 0};
             guest[m++] = r->guest + (a - r->lo);
         }
     }

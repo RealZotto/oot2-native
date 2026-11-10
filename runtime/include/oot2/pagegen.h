@@ -49,6 +49,18 @@ uint64_t pagegen_mark(uint64_t lo, uint64_t hi);
 // copy of them into a mirror stays. A CPU write into a page between the copy and this call is taken for the copy's own
 // (the caller's contract: the CPU does not write bytes the GPU is writing).
 uint64_t pagegen_mark_gpu(uint64_t lo, uint64_t hi);
+// A mark for pages the GPU wrote into guest memory itself, through a host import, which the device had written by the time
+// of the call: no CPU copy was made, so there is no echo of one to settle, and what the CPU wrote while the GPU ran has
+// to be told apart from what the GPU wrote. Whole pages [lo, hi). The write watch is queried (with reset) and every page
+// it reports, and every page stamped after `since` by anything but a write-back, is a page the CPU wrote since `since`
+// (the generation at the start of the submission, taken before its mirrors were brought current): the mirror may lack that
+// write, and the page may hold it on top of the GPU's bytes or have lost it under them, so it gets the plain stamp (the next
+// sync copies it into the mirror, from the guest's page, whichever of the two it holds). Every other page is recorded
+// GPU-current as pagegen_mark_gpu records one. *cpu_pages (may be NULL) is how many pages kept the plain stamp; all of
+// them do when the source does not watch the range. Contract, as for pagegen_mark_gpu: a CPU write into bytes the GPU
+// writes in the same submission is not kept in guest memory (the GPU's whole page replaces it), and the page is stamped
+// as the CPU's all the same.
+uint64_t pagegen_mark_gpu_direct(uint64_t lo, uint64_t hi, uint64_t since, uint64_t *cpu_pages);
 uint64_t pagegen_gpu_stamp(uint64_t page);   // the stamp pagegen_mark_gpu gave the page (0: none)
 uint64_t pagegen_now(void);   // the newest generation handed out (0 before the first)
 
@@ -68,6 +80,8 @@ typedef struct PagegenStats {
     uint64_t marks, mark_pages;             // marks and their pages
     uint64_t chunks;                        // 256 MiB pieces of the table made
     uint64_t gpu_marks, gpu_mark_pages;     // write-back marks (pagegen_mark_gpu) and the pages they recorded GPU-current
+    uint64_t direct_marks, direct_cpu_pages;   // marks of pages the GPU wrote itself (pagegen_mark_gpu_direct) and the pages
+                                               // of them that kept the plain stamp (their GPU-current pages count above)
 } PagegenStats;
 void pagegen_stats(PagegenStats *out);
 // Forget every stamp and counter, and restore rt_mem_written as the source (tests, between cases of one process).

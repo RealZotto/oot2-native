@@ -19,6 +19,7 @@
 
 #include "oot2/backing.h"
 #include "oot2/gpu_vk.h"
+#include "oot2/pagegen.h"
 #include "oot2/runtime.h"
 #include "oot2/vk_gpu_time.h"
 #include "oot2/vk_raw.h"
@@ -48,6 +49,7 @@ typedef struct Frame {
     int has_stats;              // the backing map's and the raw path's counters when the frame ended (every STATS_EVERY frames)
     BackingStats bs;
     GpuVkRawStats rs;
+    PagegenStats pg;
     Mark mark[MAX_MARKS];
     struct Frame *next;
 } Frame;
@@ -215,6 +217,7 @@ void vkgt_frame_end(void) {
     if (G.ended++ % STATS_EVERY == 0) {
         backing_stats(&f->bs);
         gpu_vk_raw_stats(&f->rs);
+        pagegen_stats(&f->pg);
         f->has_stats = 1;
     }
     uint32_t at = 2 + f->marks;
@@ -253,10 +256,14 @@ static void frame_done(void *arg, uint64_t value) {
     if (f->has_stats) {
         const BackingStats *b = &f->bs;
         const GpuVkRawStats *r = &f->rs;
-        fprintf(G.file, "B\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n", (ull)value,
+        const PagegenStats *pg = &f->pg;
+        fprintf(G.file, "B\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu"
+                "\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n", (ull)value,
                 (ull)b->imports, (ull)b->import_bytes, (ull)b->mirrors, (ull)b->mirror_bytes, (ull)b->uploads,
                 (ull)b->upload_bytes, (ull)b->writebacks, (ull)b->writeback_bytes, (ull)r->writebacks, (ull)r->writeback_bytes,
-                (ull)b->raw_promoted, (ull)b->raw_promote_bytes, (ull)b->raw_begins, (ull)b->resolves, (ull)b->resolve_misses);
+                (ull)b->raw_promoted, (ull)b->raw_promote_bytes, (ull)b->raw_begins, (ull)b->resolves, (ull)b->resolve_misses,
+                (ull)r->ended_ns, (ull)r->mark_ns, (ull)r->writeback_cpu_pages, (ull)r->sink_bytes, (ull)r->sinks_made,
+                (ull)pg->scan_ns, (ull)pg->scans);
     }
     fflush(G.file);
     G.prev_end_tick = t[n - 1];

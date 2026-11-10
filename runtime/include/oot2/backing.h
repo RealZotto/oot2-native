@@ -103,7 +103,7 @@
 // bind get an import again), when the growth adds at most BACKING_MIRROR_GROW_MAX bytes, its enlarged range stays
 // write-watched and fits in the block, and no other mirror, import the submission bound, or backing of another cell lies
 // on the added pages; otherwise it is a named fatal that says which of these held. The mirrors' total is not checked
-// there: the raw path's write-back stops by name at the end of a submission whose stores reach more pages than it holds.
+// there: the raw path's write-back reaches every mirrored page (vk_raw.h, The sinks), whatever the total.
 //
 // An import is never what the rule would give a bind on a discrete device, and the invariant above makes one of every
 // committed page: the GPU reads an import across the bus, so a compute program that works on its buffers stalls on every
@@ -114,8 +114,9 @@
 // submissions that reached the import are waited for, the mirror is brought current from guest memory, and its GPU writes
 // are written back like any mirror's (the page table's store bits for raw stores, the declared ranges for binds). An
 // import the submission wrote stays one until the next, and one the admission refuses stays an import. So does one whose
-// mirror would take the mirrors past BACKING_PROMOTE_MIRROR_MAX: the raw path's write-back holds RAW_WRITEBACK_PAGES
-// pages, and while every mirror fits it the raw stores of a submission cannot reach more pages than it holds.
+// mirror would take the mirrors past BACKING_PROMOTE_MIRROR_MAX: the raw path writes back every page its stores reach
+// across the bus at the end of the submission and keeps a host import (a sink, vk_raw.h) over each mirror, so what a
+// promotion makes is bounded.
 //
 // Locking: one reader-writer lock. A resolve that finds its backing holds it shared; one that makes a backing holds it
 // exclusively, and imports are made under it. The mirrors' coherence state (their generations, the GPU writes not yet
@@ -138,7 +139,7 @@
 #define BACKING_MIRROR_GROW_MAX (1ull << 20)  // the most one in-place growth of a bound mirror adds (a few pages, not a new mirror)
 #define BACKING_MIRROR_RESERVE 8              // section 8: a mirror leaves an eighth of the VRAM budget free
 #define BACKING_PROMOTE_MIN (64ull << 10)     // a bind larger than a uniform's (maxUniformBufferRange) marks its import hot
-#define BACKING_PROMOTE_MIRROR_MAX (128ull << 20)   // a promotion leaves the mirrors at or under this many bytes (vk_raw.h's write-back)
+#define BACKING_PROMOTE_MIRROR_MAX (128ull << 20)   // a promotion leaves the mirrors at or under this many bytes (the raw write-back's traffic and sinks, vk_raw.h)
 enum { BACKING_NONE, BACKING_EXTENT, BACKING_IMPORT, BACKING_MIRROR };
 
 // What a bind asks for: its range and its pool's flags (NVNmemoryPoolFlags).
@@ -243,6 +244,10 @@ void backing_cpu_synced(uint64_t fence);
 // Submission `value` holds a raw-access program: keep the invariant, bring the mirrors current and record it. On the
 // submission's thread, before the table is read.
 void backing_raw_begin(uint64_t value);
+// The page generation up to which every live mirror is current (the lowest of their syncs; 0 for one never brought
+// current), UINT64_MAX when there is none: a page stamped at or before it by the CPU is in its mirror, one stamped after it
+// may not be (the raw path's write-back, oot2/pagegen.h, pagegen_mark_gpu_direct). Read after backing_raw_begin.
+uint64_t backing_synced_min(void);
 // The map's version: it changes whenever a backing enters or leaves the map or a virtual pool's pages move.
 uint64_t backing_version(void);
 // The lowest address and the highest end of the pools in the map: 1, or 0 with none. A backing is inside a pool, so a table

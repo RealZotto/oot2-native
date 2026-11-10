@@ -1326,6 +1326,19 @@ void backing_sync_mirrors(uint64_t value) {
     plat_unlock_shared(&g_lock);
 }
 
+uint64_t backing_synced_min(void) {
+    uint64_t min = UINT64_MAX;
+    plat_lock_shared(&g_lock);
+    plat_mutex_lock(&g_coh);
+    for (int i = 0; i < g_nmirrors; i++) {
+        uint64_t s = g_mirrors[i]->fresh ? 0 : g_mirrors[i]->synced;
+        if (s < min) min = s;
+    }
+    plat_mutex_unlock(&g_coh);
+    plat_unlock_shared(&g_lock);
+    return min;
+}
+
 // The write-back of one submission: its GPU writes into mirrors, read back at its end, and where they go.
 typedef struct WbItem { uint64_t lo, size; const void *host; } WbItem;
 typedef struct Wb { int n; WbItem item[]; } Wb;
@@ -1564,12 +1577,12 @@ static void promote_hot(uint64_t value) {
                     continue;
                 }
                 if (g_st.mirror_bytes + up(hi - lo, BACKING_EXTENT_ALIGN) > BACKING_PROMOTE_MIRROR_MAX) {
-                    // the raw path's write-back holds the pages the stores of one submission reach only while every mirror fits it
+                    // the raw path writes back across the bus every page its stores reach and keeps a sink over each mirror: bounded
                     __atomic_store_n(&b->hot, 0, __ATOMIC_RELAXED);
                     if (!r->mirror_logged) {
                         r->mirror_logged = 1;
                         rt_log("gfx: vulkan: backing map: the mirror of [%#llx, %#llx) (%llu KiB) in pool [%#llx, %#llx) is not made: "
-                               "the mirrors would pass %llu MiB, which the raw write-back holds; imported", (ull)lo, (ull)hi,
+                               "the mirrors would pass %llu MiB, the most a promotion makes; imported", (ull)lo, (ull)hi,
                                (ull)((hi - lo) >> 10), (ull)r->lo, (ull)r->hi, (ull)(BACKING_PROMOTE_MIRROR_MAX >> 20));
                     }
                     continue;

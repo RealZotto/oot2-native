@@ -30,6 +30,10 @@
 //                the guest sees the GPU's bytes, a CPU write into one is copied in, a mirror that replaced another takes
 //                every page, and a long run of write-backs leaves the record where it was
 //   gpu_mark     pagegen_mark_gpu: whole pages recorded and their echo in the write watch settled, partial ones stamped
+//   gpu_mark_direct   pagegen_mark_gpu_direct: pages the GPU wrote into guest memory itself; the ones the CPU wrote since
+//                the mirror's sync (the watch says so, a scan or a mark stamped them after it) keep the plain stamp, the
+//                others are recorded GPU-current, another submission's GPU stamp is not the CPU's, an unwatched range
+//                keeps every page plain; gpu_mark_direct_partial stops by name on a range that is not whole pages
 //   replace      a bind that grows a mirror's run waits for the submission in flight that wrote it, so the new mirror
 //                holds the GPU's write
 //   watch        (Windows; a skip line elsewhere) the real write watch: every hook and sync between a CPU write and the
@@ -46,7 +50,7 @@
 //                a page boundary near its start, then a bind that starts below the mirror and ends past that boundary
 //   raw_grow_guarded_tail, raw_grow_guarded_head   the same when a GPU-only extent blocks the adjacent block space
 //   raw_grow_over_total   the growth is held to its own size, not to the mirrors' total: with 132 MiB of mirrors made by
-//                binds (more than the raw write-back's cap, which only a promotion keeps), one still grows by two pages
+//                binds (more than the promotions' cap, which only a promotion keeps), one still grows by two pages
 //   raw_grow_head_import, raw_grow_tail_import   an import the growth overlaps goes, but the mirror takes only the bind's
 //                pages and copies only those in; the import's other pages (128 KiB at the head, 16 MiB at the tail) get
 //                an import again
@@ -55,7 +59,7 @@
 //   raw_promote, raw_promote_small, raw_promote_wait, raw_promote_cap   an import a raw-access submission binds a range larger than a
 //                uniform's of becomes a mirror at the next raw-access begin: brought current, in the page table, left alone when
 //                the submission bound it before its raw stage or the admission refuses, never for a small bind, after the older
-//                raw-access submission in flight, and not past the mirrors' cap (the raw write-back's size)
+//                raw-access submission in flight, and not past the mirrors' cap (BACKING_PROMOTE_MIRROR_MAX)
 //   unwritten, replace_written, raw_grow_bound_import, raw_grow_fragmented, raw_grow_guarded_blocked,
 //   raw_grow_untracked, raw_grow_cap   stop by name, each with the reason the mirror could not grow
 #include <stdio.h>
@@ -693,6 +697,60 @@ static void case_gpu_mark(void) {
     done("gpu_mark");
 }
 
+// pagegen_mark_gpu_direct, the mark of pages the GPU wrote into guest memory itself (the raw path's sinks): nothing copied,
+// so nothing to settle, and what the CPU wrote since `since` is told from the GPU's own writes. Eight pages the GPU wrote
+// after the mirror's sync g1: page 2 the CPU wrote and nobody has scanned (the watch reports it), page 4 the CPU wrote and
+// another consumer's scan stamped after g1, page 5 a plain mark stamped, page 6 another submission's write-back stamped
+// GPU-current after g1 (not the CPU's). Pages 2, 4 and 5 keep the plain stamp; the other five are recorded GPU-current.
+static void case_gpu_mark_direct(void) {
+    setup(64 * MiB, 0);
+    uint64_t a = g_heap + 1 * MiB, pages, cpu;
+    cpu_fill(a, 8 * PG, 1);
+    uint64_t g1 = pagegen_scan(a, a + 8 * PG);
+    cpu_fill(a + 2 * PG + 8, 4, 7);
+    cpu_fill(a + 4 * PG + 8, 4, 7);
+    pagegen_scan(a + 4 * PG, a + 5 * PG);
+    pagegen_mark(a + 5 * PG, a + 5 * PG + 4);
+    pagegen_mark_gpu(a + 6 * PG, a + 7 * PG);
+    uint64_t g = pagegen_mark_gpu_direct(a, a + 8 * PG, g1, &cpu);
+    CHECK(cpu == 3);
+    for (int k = 0; k < 8; k++) {
+        uint64_t page = a + (uint64_t)k * PG;
+        int plain = k == 2 || k == 4 || k == 5;
+        CHECK(pagegen_stamp(page) == g);
+        CHECK(plain ? pagegen_gpu_stamp(page) != g : pagegen_gpu_stamp(page) == g);
+    }
+    Runs r = {.n = 0};
+    pages = pagegen_runs_cpu(a, a + 8 * PG, g - 1, collect, &r);   // what the mirror copies at its next sync
+    CHECK(pages == 3 && r.n == 2 && r.lo[0] == a + 2 * PG && r.hi[0] == a + 3 * PG && r.lo[1] == a + 4 * PG &&
+          r.hi[1] == a + 6 * PG);
+    // The watch was asked with a reset: the next query finds nothing, and the mark has taken the CPU's page 2 for good.
+    uint64_t scans = g_src_calls;
+    uint64_t g2 = pagegen_scan(a, a + 8 * PG);
+    CHECK(g_src_calls > scans && pagegen_stamp(a + 2 * PG) == g && g2 == g + 1);
+    // A second submission that wrote them again and saw no CPU write since the first one's stamp: all eight are the GPU's.
+    uint64_t since = pagegen_now();
+    g = pagegen_mark_gpu_direct(a, a + 8 * PG, since, &cpu);
+    CHECK(cpu == 0);
+    for (int k = 0; k < 8; k++) CHECK(pagegen_gpu_stamp(a + (uint64_t)k * PG) == g);
+    PagegenStats s;
+    pagegen_stats(&s);
+    CHECK(s.direct_marks == 2 && s.direct_cpu_pages == 3);
+    // Where the watch does not cover the range nothing says which pages the CPU wrote: every page keeps the plain stamp.
+    g_untracked = 1;
+    g = pagegen_mark_gpu_direct(a, a + 4 * PG, pagegen_now(), &cpu);
+    CHECK(cpu == 4);
+    for (int k = 0; k < 4; k++) CHECK(pagegen_stamp(a + (uint64_t)k * PG) == g && pagegen_gpu_stamp(a + (uint64_t)k * PG) != g);
+    done("gpu_mark_direct");
+}
+
+// A direct mark of a range that is not whole pages is a named stop.
+static void case_gpu_mark_direct_partial(void) {
+    setup(64 * MiB, 0);
+    pagegen_mark_gpu_direct(g_heap + 0x800, g_heap + PG + 0x800, 0, NULL);
+    done("gpu_mark_direct_partial");
+}
+
 static void gpu_writes_dd(void) { memset(g_mirror + 0x100, 0xDD, 0x100); }
 static uint64_t g_run_later;
 static void run_later(void *arg) {
@@ -1206,7 +1264,7 @@ static void case_raw_promote_wait(void) {
 }
 
 // A promotion that would take the mirrors past BACKING_PROMOTE_MIRROR_MAX leaves its import as it was: the raw path's
-// write-back holds that many bytes of pages, and a submission's stores cannot reach more than the mirrors it maps.
+// write-back and the sinks under the mirrors are bounded by it.
 static void case_raw_promote_cap(void) {
     setup(512 * MiB, 0);
     backing_set_mirror_hook(want_all);
@@ -1597,7 +1655,7 @@ static int runs_cover(const BackingRun *runs, int n, uint64_t a) {
 }
 
 // A growth is held to its own size (BACKING_MIRROR_GROW_MAX), not to a total of the mirrors: the mirrors a bind makes are
-// not held to the raw write-back's cap (only a promotion is), so a run can hold more than that in mirrors and still need
+// not held to the promotions' cap (only a promotion is), so a run can hold more than that in mirrors and still need
 // one of them to grow by two pages. Three mirrors of 44 MiB, one in each window (132 MiB, over the 128 MiB), then the
 // layout of the stop of the Forest run grows the first.
 static void case_raw_grow_over_total(void) {
@@ -1875,6 +1933,7 @@ int main(int argc, char **argv) {
         {"writeback", case_writeback},     {"writeback_no_reupload", case_writeback_no_reupload},
         {"writeback_partial_page", case_writeback_partial_page}, {"writeback_replaced", case_writeback_replaced},
         {"writeback_long_run", case_writeback_long_run}, {"gpu_mark", case_gpu_mark},
+        {"gpu_mark_direct", case_gpu_mark_direct}, {"gpu_mark_direct_partial", case_gpu_mark_direct_partial},
         {"replace", case_replace},   {"watch", case_watch},
         {"unwritten", case_unwritten},     {"replace_written", case_replace_written},
         {"raw_grow", case_raw_grow},       {"raw_grow_whole", case_raw_grow_whole},
