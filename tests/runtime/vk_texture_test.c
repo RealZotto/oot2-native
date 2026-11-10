@@ -41,6 +41,8 @@
 //              and the last slice) as colour attachment and, where the device has image2DViewOf3D, as storage; a 2D array
 //              view of slices; the last layer of a layered texture and a 2D one; a layer past the image is refused by the
 //              plan, so no call carries it; the validation layer reports nothing
+//   targets    the replay's render-target op on a slice of a volume and a plain texture (a view the validation layer
+//              accepts) and on a BC1 image made without the attachment usage (skipped, named once, no view call)
 //   depth_stop (fatal) a depth texture the CPU wrote stops by name at the first submission that binds it
 // Every device case ends with the validation layer's counts (the driver sets synchronization validation): 0 and 0.
 #include <stdio.h>
@@ -61,6 +63,8 @@
 #include "oot2/vk_bindless.h"
 #include "oot2/vk_format.h"
 #include "oot2/vk_image.h"
+#include "oot2/vk_rec.h"
+#include "oot2/vk_replay.h"
 #include "oot2/vk_texture.h"
 #include "oot2/vk_view_plan.h"
 #include "plat.h"
@@ -960,10 +964,11 @@ static void make_view(VkbImage *img, int type, uint32_t level, uint32_t base, ui
     printf("%s: view type %d, layers %u..%u made\n", what, (int)plan.type, plan.base_layer, plan.base_layer + plan.layers);
 }
 
-static VkbImage *image_for(uint64_t *at, const Spec *s, uint32_t id) {
+static VkbImage *image_for(uint64_t *at, const Spec *s, uint32_t id, tex_t **tex_out) {
     uint64_t storage = (*at + 0xFFFF) & ~0xFFFFull;
     tex_t *t = malloc(sizeof *t);   // the texture outlives the case: the registry keeps looking at it
     CHECK(t);
+    if (tex_out) *tex_out = t;
     *t = tex_of(storage, s);
     *at = storage + t->L.size + 0x10000;
     write_storage(t, storage);
@@ -981,7 +986,7 @@ static void case_views(void) {
     const VkImageUsageFlags color = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, store = VK_IMAGE_USAGE_STORAGE_BIT;
     // a volume of 8 slices
     Spec vol = {NVN_TEXTURE_TARGET_3D, NVN_FORMAT_RGBA8, 0, 32, 32, 8, 1, 0};
-    VkbImage *v = image_for(&at, &vol, 1);
+    VkbImage *v = image_for(&at, &vol, 1, NULL);
     VkbShape sh;
     vkb_image_shape(v, &sh);
     CHECK(sh.type == VK_IMAGE_TYPE_3D && sh.depth == 8 && sh.layers == 1);
@@ -1003,11 +1008,11 @@ static void case_views(void) {
     printf("volume, slice 8 of 8: refused (%s)\n", why);
     // a texture of four layers, and a plain one
     Spec arr = {NVN_TEXTURE_TARGET_2D_ARRAY, NVN_FORMAT_RGBA8, 0, 32, 32, 4, 1, 0};
-    VkbImage *a = image_for(&at, &arr, 2);
+    VkbImage *a = image_for(&at, &arr, 2, NULL);
     make_view(a, VKV_PICK, 0, 3, 1, color, "four layers, last layer as a render target");
     make_view(a, VKV_PICK, 0, 0, 4, color, "four layers as a layered render target");
     Spec flat = {NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8, 0, 32, 32, 1, 1, 0};
-    VkbImage *f = image_for(&at, &flat, 3);
+    VkbImage *f = image_for(&at, &flat, 3, NULL);
     make_view(f, VKV_PICK, 0, 0, 1, color, "plain 2D texture as a render target");
     vkb_image_shape(f, &sh);
     VkvImage fim = {sh.type, sh.depth, sh.layers, sh.levels, sh.flags, sh.usage, gpu_vk.image_2d_view_of_3d};
@@ -1015,6 +1020,50 @@ static void case_views(void) {
     CHECK(!vkv_plan(&fim, &one_past, &plan, &why));
     printf("plain 2D texture, layer 1 of 1: refused (%s)\n", why);
     finish("views");
+}
+
+// The replay's render-target op (dev_target in runtime/gpu/vk_replay_dev.c), through the device ops inside a recorder frame, on
+// images that have the attachment usage and on one made without it: a slice of a volume and a plain texture give a view that the
+// validation layer accepts; a BC1 image (its format gives no attachment) is skipped, and named once, instead of reaching
+// vkCreateImageView with a usage the image lacks.
+static void case_targets(void) {
+    setup(64 * MiB, 1024 * MiB);
+    uint64_t at = g_heap + 4 * MiB;
+    tex_t *vol_tex, *flat_tex, *bc1_tex;
+    Spec vol = {NVN_TEXTURE_TARGET_3D, NVN_FORMAT_RGBA8, 0, 32, 32, 8, 1, 0};
+    VkbImage *v = image_for(&at, &vol, 1, &vol_tex);
+    Spec flat = {NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8, 0, 32, 32, 1, 1, 0};
+    VkbImage *f = image_for(&at, &flat, 2, &flat_tex);
+    Spec bc1 = {NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA_DXT1, 0, 64, 64, 1, 1, 0};
+    VkbImage *b = image_for(&at, &bc1, 3, &bc1_tex);
+    VkbShape sh;
+    vkb_image_shape(b, &sh);
+    CHECK(!(sh.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));   // the fixture: an image without the usage
+    vkb_image_shape(v, &sh);
+    CHECK(sh.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    vkb_image_shape(f, &sh);
+    CHECK(sh.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    const VkReplayOps *ops = vkr_device_ops();
+    CHECK(ops->target);
+    VkRecOpen open = {0};
+    vkrec_open(&open);
+    uint64_t frame = vkrec_begin(GPU_VK_REPLAY);
+    VkrTarget out;
+    nvn_tex_rec slice = {.tex = *vol_tex, .present = 1, .has_view = 1};
+    slice.view.set_layers = 1, slice.view.min_layer = 5, slice.view.nlayers = 1;
+    CHECK(ops->target(&slice, 0, frame, &out) == 1 && out.view != VK_NULL_HANDLE && out.layers == 1);
+    printf("target, slice 5 of a volume: a view made\n");
+    nvn_tex_rec plain = {.tex = *flat_tex, .present = 1};
+    CHECK(ops->target(&plain, 0, frame, &out) == 1 && out.view != VK_NULL_HANDLE && out.layers == 1);
+    printf("target, a plain 2D texture: a view made\n");
+    nvn_tex_rec block = {.tex = *bc1_tex, .present = 1};
+    for (int again = 0; again < 2; again++) {
+        CHECK(ops->target(&block, 0, frame, &out) == 0 && out.view == VK_NULL_HANDLE);
+        printf("target, a BC1 image without the attachment usage: skipped (ask %d)\n", again + 1);
+    }
+    vkrec_end(NULL, 0);
+    vkrec_close();
+    finish("targets");
 }
 
 static void case_stop(int depth) {
@@ -1053,6 +1102,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "astc")) case_astc();
     else if (!strcmp(argv[1], "rawview")) case_rawview();
     else if (!strcmp(argv[1], "views")) case_views();
+    else if (!strcmp(argv[1], "targets")) case_targets();
     else if (!strcmp(argv[1], "depth_stop")) case_stop(1);
     else {
         fprintf(stderr, "unknown case %s\n", argv[1]);

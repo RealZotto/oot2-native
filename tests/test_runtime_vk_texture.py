@@ -141,6 +141,17 @@ class DeviceTest(unittest.TestCase):
         self.assertIn("volume, slice 8 of 8: refused", done.stdout)
         self.assertIn("plain 2D texture, layer 1 of 1: refused", done.stdout)
 
+    def test_the_replays_render_target_op_skips_an_image_without_the_usage_by_name_once(self) -> None:
+        """dev_target on the device: a slice of a volume and a plain texture give a view (validation clean), a BC1 image
+        made without the attachment usage gives none, asked twice and named once, and nothing stops the run."""
+        done = self.passing("targets")
+        self.assertIn("target, slice 5 of a volume: a view made", done.stdout)
+        self.assertIn("target, a plain 2D texture: a view made", done.stdout)
+        self.assertIn("target, a BC1 image without the attachment usage: skipped (ask 2)", done.stdout)
+        named = re.findall(r"the render target view of the texture at \S+ \(NVN format \S+\) is skipped: "
+                           r"its image was made without colour attachment usage \(usage \S+\)", done.stderr)
+        self.assertEqual(len(named), 1, done.stderr[-2000:])
+
     def test_the_arena_gets_its_memory_back_when_textures_are_replaced(self) -> None:
         done = self.passing("churn")
         self.assertRegex(done.stdout, r"90 textures registered one after another at one ID: 90 images made, \d+ destroyed, arena peak \d+ MiB, \d+ MiB in use now")
