@@ -72,6 +72,9 @@ static void synthetic(MemTerms *t) {
     unsigned n = __atomic_add_fetch(&g_calls, 1, __ATOMIC_RELAXED);
     t->heap_committed += (uint64_t)n * MiB;
     t->private += (uint64_t)n * MiB;
+    t->astc_dec_w4 = 100 * MiB, t->astc_dec_w6 = 1500 * MiB, t->astc_dec_w12 = 40 * MiB, t->astc_dec_srgb_bytes = 900 * MiB;
+    t->astc_dec_arena_bytes = 1600 * MiB, t->astc_dec_images = 321, t->bc_equiv_bytes = 410 * MiB;
+    t->native_bc_bytes = 55 * MiB, t->other_bytes = 66 * MiB;
     t->img_own = 3, t->img_live = 800, t->vk_heap0_used = 2000 * MiB, t->vk_heap0_budget = 7000 * MiB;
 }
 

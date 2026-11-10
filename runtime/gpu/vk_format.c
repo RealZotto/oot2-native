@@ -235,3 +235,63 @@ const char *vkf_decoded_stop(const VkfRow *r, VkFormat made, VkfUse use) {
     }
     return NULL;
 }
+
+// ---------- the memory the images hold, by class
+
+static const uint8_t k_footprints[VKF_ASTC_FOOTPRINTS][2] = {
+    {4, 4}, {5, 4}, {5, 5}, {6, 5}, {6, 6}, {8, 5}, {8, 6}, {8, 8}, {10, 5}, {10, 6}, {10, 8}, {10, 10}, {12, 10}, {12, 12}};
+
+int vkf_img_class(const VkfRow *r, int decoded) {
+    if (!r) return VKF_CLS_OTHER;
+    if (decoded && (r->flags & VKF_ASTC)) {
+        for (int i = 0; i < VKF_ASTC_FOOTPRINTS; i++)
+            if (k_footprints[i][0] == r->bw && k_footprints[i][1] == r->bh) return 2 * i + ((r->flags & VKF_SRGB) ? 1 : 0);
+        return VKF_CLS_OTHER;
+    }
+    if ((r->flags & VKF_BLOCK) && !(r->flags & VKF_ASTC)) return VKF_CLS_NATIVE_BC;
+    return VKF_CLS_OTHER;
+}
+
+void vkf_img_class_footprint(int cls, unsigned *w, unsigned *h, int *srgb) {
+    if (cls < 0 || cls >= VKF_CLS_NATIVE_BC) {
+        *w = *h = 0, *srgb = 0;
+        return;
+    }
+    *w = k_footprints[cls / 2][0], *h = k_footprints[cls / 2][1], *srgb = cls & 1;
+}
+
+uint64_t vkf_bc_bytes(uint32_t w, uint32_t h, uint32_t d, uint32_t levels, uint32_t layers) {
+    uint64_t sum = 0;
+    if (!levels) levels = 1;
+    if (!layers) layers = 1;
+    for (uint32_t l = 0; l < levels; l++) {
+        uint64_t lw = (w >> l) ? (w >> l) : 1, lh = (h >> l) ? (h >> l) : 1, ld = (d >> l) ? (d >> l) : 1;
+        sum += ((lw + 3) & ~3ull) * ((lh + 3) & ~3ull) * ld;
+    }
+    return sum * layers;
+}
+
+void vkf_img_table_add(VkfImgTable *t, int cls, uint64_t mem, uint64_t bc, int arena, int dir) {
+    if (cls < 0 || cls >= VKF_CLS_COUNT) return;
+    if (dir > 0) {
+        t->images[cls]++, t->mem[cls] += mem, t->bc[cls] += bc;
+        if (arena) t->arena[cls] += mem;
+    } else {
+        t->images[cls]--, t->mem[cls] -= mem, t->bc[cls] -= bc;
+        if (arena) t->arena[cls] -= mem;
+    }
+}
+
+void vkf_img_columns(const VkfImgTable *t, VkfImgColumns *out) {
+    memset(out, 0, sizeof *out);
+    for (int c = 0; c < VKF_CLS_NATIVE_BC; c++) {
+        unsigned w, h;
+        int srgb;
+        vkf_img_class_footprint(c, &w, &h, &srgb);
+        int g = w == 4 ? 0 : w == 5 ? 1 : w == 6 ? 2 : w == 8 ? 3 : w == 10 ? 4 : 5;
+        out->dec_w[g] += t->mem[c];
+        if (srgb) out->dec_srgb += t->mem[c];
+        out->dec_arena += t->arena[c], out->dec_images += t->images[c], out->bc_equiv += t->bc[c];
+    }
+    out->native_bc = t->mem[VKF_CLS_NATIVE_BC], out->other = t->mem[VKF_CLS_OTHER];
+}

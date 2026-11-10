@@ -33,6 +33,7 @@
 #include "volk.h"
 
 #include "oot2/bindless.h"
+#include "oot2/vk_format.h"
 
 typedef struct VkbImage VkbImage;
 
@@ -105,5 +106,6 @@ typedef struct VkbImageStats {
     uint64_t skipped_cpu, skipped_format;      // textures with no image: CPU-visible storage; no format
     uint64_t views_made, views_live;
     uint64_t transitions, texel_reads, texel_writes;
+    VkfImgTable cls;                           // the live images in the arena or with memory of their own, by class
 } VkbImageStats;
 void vkb_image_stats(VkbImageStats *out);

@@ -35,6 +35,12 @@
 // the mirror and import bytes, the Vulkan heap usage) are columns but not in the sum. Whether the texture arena's blocks are
 // device-local (so not in the VirtualQuery groups) or host-visible (so in them already, and double counted) is decided by
 // the first desktop run: its residual says.
+// The astc_dec_*, bc_equiv_bytes, native_bc_bytes and other_bytes columns are a breakdown of the images in the arena and the
+// images with memory of their own (not in the sum): astc_dec_wN are the bytes of ASTC textures held decoded as RGBA8, by the
+// width of their block (4, 5, 6, 8, 10, 12), astc_dec_srgb_bytes and astc_dec_arena_bytes the parts of them that are sRGB and
+// that lie in the arena, astc_dec_images their count, bc_equiv_bytes what the same images would hold as BC7 or BC3 (1 byte a
+// texel, mips and layers included, edges rounded up to 4), and native_bc_bytes and other_bytes the images made in a BC format
+// and in any other. The saving of BC is the sum of the astc_dec_wN less bc_equiv_bytes (tools/check_memline.py prints it).
 #pragma once
 #include <stdint.h>
 
@@ -49,7 +55,7 @@
     X(tex_ring_chunks) X(tex_ring_bytes) X(tex_arena_blocks) X(tex_arena_bytes) X(tex_arena_used) X(tex_arena_frees) \
     X(bk_blocks) X(bk_block_bytes) X(bk_extents) X(bk_extent_bytes) X(bk_imports) X(bk_import_bytes)                \
     X(bk_mirrors) X(bk_mirror_bytes) X(bk_deferred)                                                                  \
-    X(img_live) X(img_own) X(img_own_bytes) X(img_arena)                                                             \
+    X(img_live) X(img_own) X(img_own_bytes) X(img_arena)                                                                 X(astc_dec_w4) X(astc_dec_w5) X(astc_dec_w6) X(astc_dec_w8) X(astc_dec_w10) X(astc_dec_w12)                          X(astc_dec_srgb_bytes) X(astc_dec_arena_bytes) X(astc_dec_images) X(bc_equiv_bytes) X(native_bc_bytes)               X(other_bytes)                                                                                                   \
     X(pipe_resident) X(pipe_cache_bytes) X(pipe_libraries) X(pipe_links)                                             \
     X(cmd_host_bytes) X(cmd_copies)                                                                                  \
     X(nvn_buffers) X(nvn_textures) X(nvn_pools) X(nvn_pool_bytes)                                                    \

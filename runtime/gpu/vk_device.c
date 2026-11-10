@@ -451,6 +451,12 @@ static void memline_fill(MemTerms *t) {
         VkbImageStats is;
         vkb_image_stats(&is);
         t->img_live = is.live, t->img_own = is.unaliased, t->img_own_bytes = is.unaliased_bytes, t->img_arena = is.arena;
+        VkfImgColumns ic;
+        vkf_img_columns(&is.cls, &ic);
+        t->astc_dec_w4 = ic.dec_w[0], t->astc_dec_w5 = ic.dec_w[1], t->astc_dec_w6 = ic.dec_w[2];
+        t->astc_dec_w8 = ic.dec_w[3], t->astc_dec_w10 = ic.dec_w[4], t->astc_dec_w12 = ic.dec_w[5];
+        t->astc_dec_srgb_bytes = ic.dec_srgb, t->astc_dec_arena_bytes = ic.dec_arena, t->astc_dec_images = ic.dec_images;
+        t->bc_equiv_bytes = ic.bc_equiv, t->native_bc_bytes = ic.native_bc, t->other_bytes = ic.other;
         VkpStats ps;
         vkp_stats(&ps);
         t->pipe_resident = ps.resident, t->pipe_libraries = ps.libraries, t->pipe_links = ps.links;

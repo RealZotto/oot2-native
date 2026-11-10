@@ -36,9 +36,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
 import layout  # noqa: E402
+from test_runtime_gpu import vulkan_or_skip  # noqa: E402
 from test_runtime_nvn import CORE, LEVELS, MODULE_SIZE, NVN, compile_flags, find_compiler  # noqa: E402
 
 TEST_SOURCE = ROOT / "tests" / "runtime" / "memline_test.c"
+IMGTABLE_SOURCE = ROOT / "tests" / "runtime" / "imgtable_test.c"
 HOST_SOURCE = ROOT / "tests" / "runtime" / "pages_host.c"
 END_SOURCE = ROOT / "tests" / "runtime" / "endmark.c"
 PAGEGEN_SOURCE = ROOT / "runtime" / "gpu" / "pagegen.c"
@@ -150,6 +152,16 @@ class MemlineTest(unittest.TestCase):
                 check = [sys.executable, "-I", str(ROOT / "tools" / "check_memline.py"), str(files[0])]
                 done = subprocess.run(check, capture_output=True, text=True)
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                # the breakdown of the images round-trips through the file, is no term of the sum, and the checker prints its saving
+                scene_row = next(r for k, r in data["rows"] if k == "scene")
+                self.assertEqual((scene_row["astc_dec_w4"], scene_row["astc_dec_w6"], scene_row["astc_dec_w12"],
+                                  scene_row["astc_dec_w5"], scene_row["astc_dec_images"]), (100 * MIB, 1500 * MIB, 40 * MIB, 0, 321))
+                self.assertEqual((scene_row["bc_equiv_bytes"], scene_row["native_bc_bytes"], scene_row["other_bytes"]),
+                                 (410 * MIB, 55 * MIB, 66 * MIB))
+                self.assertFalse({c for c in data["columns"] if c.startswith("astc_dec") or c.endswith("_equiv_bytes")} & set(data["sum"]))
+                self.assertRegex(done.stdout, r"bc saving \(scene\): decoded 1\.60 GiB \(4: 0\.10 GiB, 6: 1\.46 GiB, 12: 0\.04 GiB\) - "
+                                              r"bc_equiv 0\.40 GiB = 1\.20 GiB; 321 decoded images")
+                self.assertRegex(done.stdout, r"bc saving \(end\): ")
                 lines = files[0].read_text(encoding="utf-8").splitlines()
                 col = data["columns"].index("img_own_bytes") + 2
                 scene = next(i for i, ln in enumerate(lines) if ln.startswith("row\tscene\t"))
@@ -162,6 +174,18 @@ class MemlineTest(unittest.TestCase):
                 done = subprocess.run(check[:-1] + [str(dropped)], capture_output=True, text=True)
                 self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
                 self.assertIn("term img_own_bytes is 0 here", done.stdout)
+
+    def test_the_bc_size_the_classes_and_the_live_counts_of_the_image_table(self) -> None:
+        include, _ = vulkan_or_skip()
+        cc = find_compiler()
+        exe = Path(self.tmp.name) / f"imgtable_test{'.exe' if os.name == 'nt' else ''}"
+        cmd = [*compile_flags(cc), "-O1", "-I", str(ROOT / "runtime" / "include"), "-I", str(include), "-I", str(include / "Volk"),
+               str(IMGTABLE_SOURCE), str(ROOT / "runtime" / "gpu" / "vk_format.c"), "-o", str(exe)]
+        built = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        done = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("ok imgtable", done.stdout)
 
     def test_the_gather_reads_what_the_runtime_reads_and_the_cost_is_reported(self) -> None:
         for level in LEVELS:

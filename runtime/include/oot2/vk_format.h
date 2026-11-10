@@ -83,3 +83,32 @@ int vkf_extent_ok(const VkfRow *r, VkFormat made);
 typedef enum { VKF_USE_STORAGE_VIEW = 1, VKF_USE_TEXEL_COPY = 2 } VkfUse;
 // The words naming `use` (for a stop) when an image made in `made` for row r is a decoded one, else NULL (the use is allowed).
 const char *vkf_decoded_stop(const VkfRow *r, VkFormat made, VkfUse use);
+
+// ---- the memory the images hold, by class (the memory line's table of the texture arena). Without a device.
+// A class is what an image's bytes would save as BC: an ASTC texture decoded to RGBA8 (4 bytes a texel) is one class for each of
+// the 14 ASTC block footprints and each of linear and sRGB; BC7 or BC3 would hold it at 1 byte a texel. An image made in BC is
+// VKF_CLS_NATIVE_BC (already compressed), any other (including ASTC the device samples as blocks) VKF_CLS_OTHER.
+enum { VKF_ASTC_FOOTPRINTS = 14, VKF_CLS_NATIVE_BC = 2 * VKF_ASTC_FOOTPRINTS, VKF_CLS_OTHER, VKF_CLS_COUNT };
+// The class of an image made for row r in a format whose decoded state is `decoded` (vkf_decoded).
+int vkf_img_class(const VkfRow *r, int decoded);
+// The block footprint of an ASTC class (0 to 13, in the order 4x4 5x4 5x5 6x5 6x6 8x5 8x6 8x8 10x5 10x6 10x8 10x10 12x10 12x12)
+// as its width and height, and 1 when the class is sRGB; 0 in *w for a class that is not an ASTC one.
+void vkf_img_class_footprint(int cls, unsigned *w, unsigned *h, int *srgb);
+// The bytes the image would hold as BC at 1 byte a texel: every mip level's width and height rounded up to the BC block of 4,
+// times its depth, times the layers. A level halves from the base (a level's size is at least 1 before the rounding).
+uint64_t vkf_bc_bytes(uint32_t w, uint32_t h, uint32_t d, uint32_t levels, uint32_t layers);
+
+// The live images by class: how many, the bytes of memory they hold (the driver's size), the BC bytes of the decoded ones, and
+// how many of the memory bytes lie in the texture arena (the rest is memory of their own).
+typedef struct VkfImgTable {
+    uint64_t images[VKF_CLS_COUNT], mem[VKF_CLS_COUNT], bc[VKF_CLS_COUNT], arena[VKF_CLS_COUNT];
+} VkfImgTable;
+// An image of class cls made (dir +1) or destroyed (dir -1): mem and bc are what it was added with; arena is 1 when its memory
+// is an extent of the arena. The caller serialises.
+void vkf_img_table_add(VkfImgTable *t, int cls, uint64_t mem, uint64_t bc, int arena, int dir);
+// The memory line's columns from the table: decoded ASTC bytes by footprint width (4, 5, 6, 8, 10, 12), those of them that are
+// sRGB and that lie in the arena, the decoded images, their BC bytes, and the bytes already BC and the bytes of any other class.
+typedef struct VkfImgColumns {
+    uint64_t dec_w[6], dec_srgb, dec_arena, dec_images, bc_equiv, native_bc, other;
+} VkfImgColumns;
+void vkf_img_columns(const VkfImgTable *t, VkfImgColumns *out);

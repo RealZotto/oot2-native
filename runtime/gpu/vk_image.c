@@ -46,6 +46,8 @@ struct VkbImage {
     int placed, doomed, refs, pending;
     int arena;                    // its memory is an extent of the texture arena: the CPU writes its texels (vk_texture.c)
     int decoded;                  // an ASTC texture the device does not sample: this image holds its decoded RGBA8 texels
+    int counted, cls;             // in the table of classes (vkf_img_table_add): its arena or own memory; the class
+    uint64_t cmem, cbc;           // what it was added with: the driver's size of its memory and its BC bytes
     TexExtent ext;
     nvn_texdesc desc;             // the texture it was made for (an arena image uploads by it)
     VktState up;
@@ -312,6 +314,13 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
     g_st.made++, g_st.live++;
     if (placed) g_st.placed++;
     if (arena) g_st.arena++;
+    // The memory line's table of what the images hold: an image whose memory is the arena's or its own (one placed in its pool's
+    // extent shares the game's storage and adds nothing).
+    if (arena || dedicated) {
+        i->counted = 1, i->cls = vkf_img_class(row, decoded), i->cmem = mr.size;
+        i->cbc = decoded ? vkf_bc_bytes(sh->w, sh->h, sh->d, sh->levels, sh->layers) : 0;
+        vkf_img_table_add(&g_st.cls, i->cls, i->cmem, i->cbc, arena, +1);
+    }
     return i;
 }
 
@@ -406,6 +415,7 @@ static void image_destroy(VkbImage *i) {
     if (i->dedicated) vkFreeMemory(gpu_vk.device, i->dedicated, NULL);
     if (i->arena) texarena_free(&i->ext);
     g_st.destroyed++, g_st.live--, g_st.unaliased_bytes -= i->own_bytes;
+    if (i->counted) vkf_img_table_add(&g_st.cls, i->cls, i->cmem, i->cbc, i->arena, -1);
     free(i);
 }
 

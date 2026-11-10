@@ -17,6 +17,11 @@ term that is 0 or -1 in the failing row yet positive in another row (the likely 
 term, with the size it has elsewhere), and the residual itself. It also prints, for
 information, the Vulkan heap 0 usage that no VRAM term explains.
 
+For the rows of kind scene and end it also prints, when the file has the columns (an older file has not, and prints
+nothing more), what the images in the texture arena and with memory of their own hold: the ASTC textures held decoded as
+RGBA8 by block width, what BC7 or BC3 would hold the same at 1 byte a texel, and the saving 'bc saving = decoded -
+bc_equiv', with the bytes already BC and the other formats beside it. It is information: it never fails a row.
+
 Exit status: 0 every judged row passes, 1 a row fails or a required row is missing, 2 the
 file is not a memory line.
 
@@ -125,6 +130,29 @@ def judge(name: str, index: int, row: dict[str, int], rows: list[tuple[str, dict
     return problems
 
 
+DEC_WIDTHS = ("w4", "w5", "w6", "w8", "w10", "w12")
+
+
+def bc_report(kind: str, row: dict[str, int]) -> str | None:
+    """The line of the BC saving of a row, or None when the file has not the columns or the row did not read them."""
+    cols = [f"astc_dec_{w}" for w in DEC_WIDTHS]
+    if any(c not in row for c in cols) or "bc_equiv_bytes" not in row:
+        return None
+    if any(row[c] < 0 for c in cols) or row["bc_equiv_bytes"] < 0:
+        return None
+    decoded = sum(row[c] for c in cols)
+    saving = decoded - row["bc_equiv_bytes"]
+    by_width = ", ".join(f"{w[1:]}: {gib(row[f'astc_dec_{w}'])}" for w in DEC_WIDTHS if row[f"astc_dec_{w}"])
+    line = (f"bc saving ({kind}): decoded {gib(decoded)} ({by_width or 'none'}) - bc_equiv {gib(row['bc_equiv_bytes'])} "
+            f"= {gib(saving)}")
+    extra = [f"{label} {gib(row[c])}" for label, c in (("srgb", "astc_dec_srgb_bytes"), ("in the arena", "astc_dec_arena_bytes"),
+                                                       ("already BC", "native_bc_bytes"), ("other formats", "other_bytes"))
+             if c in row and row[c] >= 0]
+    if "astc_dec_images" in row and row["astc_dec_images"] >= 0:
+        extra.insert(0, f"{row['astc_dec_images']} decoded images")
+    return line + ("; " + ", ".join(extra) if extra else "")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("file", type=Path)
@@ -156,6 +184,11 @@ def main(argv: list[str] | None = None) -> int:
             continue
         judged += 1
         problems += judge(name, pick[0], pick[1], rows, summed, args.tolerance)
+    for kind, row in rows:
+        if kind in ("scene", "end"):
+            line = bc_report(kind, row)
+            if line:
+                print(line)
     if not judged and not problems:
         problems.append("no row to judge")
     for p in problems:

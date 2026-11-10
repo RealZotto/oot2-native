@@ -148,6 +148,44 @@ class CheckMemlineTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("scene: no such row", out)
 
+    def test_the_bc_saving_is_printed_for_the_scene_and_end_rows(self) -> None:
+        def decoded(i, kind, t):
+            t.update(astc_dec_w4=100 * MIB, astc_dec_w6=1500 * MIB, astc_dec_w12=40 * MIB, bc_equiv_bytes=410 * MIB,
+                     astc_dec_srgb_bytes=900 * MIB, astc_dec_arena_bytes=1600 * MIB, astc_dec_images=321,
+                     native_bc_bytes=55 * MIB, other_bytes=66 * MIB)
+        code, out, _ = self.run_check(synth(self.dir / "m.tsv", decoded))
+        self.assertEqual(code, 0, out)
+        lines = [ln for ln in out.splitlines() if ln.startswith("bc saving")]
+        self.assertEqual([ln.split(":")[0] for ln in lines], ["bc saving (scene)", "bc saving (end)"])
+        self.assertIn("decoded 1.60 GiB (4: 0.10 GiB, 6: 1.46 GiB, 12: 0.04 GiB) - bc_equiv 0.40 GiB = 1.20 GiB", lines[0])
+        self.assertIn("321 decoded images, srgb 0.88 GiB, in the arena 1.56 GiB, already BC 0.05 GiB, other formats 0.06 GiB", lines[0])
+
+    def test_a_row_that_could_not_read_the_counters_prints_no_saving(self) -> None:
+        def unread(i, kind, t):
+            t["astc_dec_w6"] = cm.UNREAD
+        code, out, _ = self.run_check(synth(self.dir / "m.tsv", unread))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("bc saving", out)
+
+    def test_a_file_of_the_older_format_without_the_columns_still_parses_and_prints_no_saving(self) -> None:
+        new = [c for c in COLUMNS if c.startswith("astc_dec") or c in ("bc_equiv_bytes", "native_bc_bytes", "other_bytes")]
+        self.assertEqual(len(new), 12)
+        for c in new:
+            self.assertNotIn(c, SUMMED)
+        path = self.dir / "old.tsv"
+        text = synth(path).read_text(encoding="utf-8").splitlines()
+        keep = [i for i, c in enumerate(COLUMNS) if c not in new]
+        for n, ln in enumerate(text):
+            f = ln.split("\t")
+            if f[0] == "columns":
+                text[n] = "\t".join(["columns"] + [f[1 + i] for i in keep])
+            elif f[0] == "row":
+                text[n] = "\t".join(f[:2] + [f[2 + i] for i in keep])
+        path.write_text("\n".join(text) + "\n", encoding="utf-8")
+        code, out, _ = self.run_check(path, "--require", "title,plateau,scene")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("bc saving", out)
+
     def test_not_a_memory_line_is_exit_two(self) -> None:
         path = self.dir / "x.tsv"
         path.write_text("oot2-capture 1\n", encoding="utf-8")
