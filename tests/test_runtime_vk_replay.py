@@ -648,6 +648,68 @@ class ComputeTest(ReplayBase):
             for p in pcs:
                 self.assertIn(" 0=0x7ab1e000 4=0x7e 8=0x80 12=0x400", p)
 
+    def test_the_miss_diagnostics_record_a_copy_of_the_miss_log_and_a_clear_of_its_count_after_each_raw_access_stage(self) -> None:
+        # Settings raw_diag (oot2/vk_raw.h): the ops give a snapshot after a raw-access dispatch and at the end of a pass whose
+        # draws had raw-access stages. The replay records, between full barriers and outside any pass, the copy of the page
+        # table's header and miss log into the snapshot and the clear of the count, so each stage keeps 64 entries of its own.
+        out = self.passing("raw_snap")
+        barrier = "PipelineBarrier2 full=1"
+        f = frame(out, 1)
+        dispatches = [i for i, p in enumerate(f) if p.startswith("Dispatch ")]
+        self.assertEqual([f[i] for i in dispatches], ["Dispatch 4 2 1", "Dispatch 1 1 1", "Dispatch 2 1 1"])
+        self.assertEqual(f[dispatches[0] + 1:dispatches[0] + 6],
+                         [barrier, "CopyBuffer 0x7ab1e->0xd1a6 0->0 size=1088", barrier, "FillBuffer 0x7ab1e 16 4 0", barrier])
+        between = f[dispatches[1] + 1:dispatches[2]]   # the program with no raw access gets none
+        self.assertFalse([p for p in between if p.startswith(("CopyBuffer", "FillBuffer"))], between)
+        self.assertEqual(f[dispatches[2] + 1:dispatches[2] + 6],
+                         [barrier, "CopyBuffer 0x7ab1e->0xd1a6 0->1088 size=1088", barrier, "FillBuffer 0x7ab1e 16 4 0", barrier])
+        g = frame(out, 2)   # the pass of the two raw-access draws: the snapshot follows its end, once
+        end = g.index("EndRendering")
+        self.assertEqual(g[end + 1:end + 6],
+                         [barrier, "CopyBuffer 0x7ab1e->0xd1a6 0->2176 size=1088", barrier, "FillBuffer 0x7ab1e 16 4 0", barrier])
+        self.assertEqual(len([p for p in g if p.startswith("Draw")]), 2)
+        self.assertEqual(len([p for p in g if p.startswith("FillBuffer")]), 1)
+        self.assertEqual(max(i for i, p in enumerate(g) if p.startswith("Draw")) + 1, end)   # no copy inside the pass
+        # what the replay told the ops: the stage's key, its kind, the draws, and the storage buffer it bound
+        ops = [line for line in out.splitlines() if line.startswith("op raw_snap ")]
+        self.assertEqual(len(ops), 3)
+        self.assertEqual(ops[0], "op raw_snap frame 1 kind c draws 0 keys 00000000000000c4.00000001 ranges s:0x40000300+0x20")
+        self.assertEqual(ops[1], ops[0])
+        self.assertTrue(ops[2].startswith("op raw_snap frame 2 kind d draws 2 keys 00000000000000a2.00000001 ranges"), ops[2])
+
+    def test_an_indirect_mesh_draw_is_snapshotted_with_its_own_pass_and_not_with_the_one_its_record_ended(self) -> None:
+        # The record of an indirect mesh draw is copied by the GPU between two passes: the pass the draw was in ends and begins
+        # again. The snapshot of the draws before it is recorded as that pass ends, before the record's copies, and the draw
+        # itself belongs to the pass after: its snapshot follows the draw, never precedes it.
+        out = self.passing("raw_snap_mesh")
+        f = frame(out, 1)
+        direct = next(i for i, p in enumerate(f) if p.startswith("DrawMeshTasksEXT"))
+        indirect = next(i for i, p in enumerate(f) if p.startswith("DrawMeshTasksIndirectEXT"))
+        dispatch = next(i for i, p in enumerate(f) if p.startswith("Dispatch "))
+        snaps = [i for i, p in enumerate(f) if p.startswith("CopyBuffer 0x7ab1e")]
+        records = [i for i, p in enumerate(f) if p.startswith("CopyBuffer") and "0x7ab1e" not in p and direct < i < indirect]
+        self.assertEqual(len(snaps), 3, f)
+        self.assertTrue(records, f)
+        self.assertTrue(direct < snaps[0] < records[0], (direct, snaps, records))
+        self.assertTrue(indirect < snaps[1] < dispatch, (indirect, snaps, dispatch))
+        self.assertGreater(snaps[2], dispatch)
+        ops = [line for line in out.splitlines() if line.startswith("op raw_snap ")]
+        self.assertEqual([line.split(" keys ")[0] for line in ops],
+                         ["op raw_snap frame 1 kind d draws 1", "op raw_snap frame 1 kind d draws 1",
+                          "op raw_snap frame 1 kind c draws 0"])
+        self.assertIn(" keys 00000000000000d4.00000001 ranges", ops[0])
+        self.assertIn(" keys 00000000000000d4.00000001 ranges", ops[1])
+        self.assertIn(" keys 00000000000000c4.00000001 ranges", ops[2])
+
+    def test_ops_that_refuse_a_snapshot_or_give_none_record_nothing(self) -> None:
+        for case in ("raw_snap_refused", "raw_first"):
+            with self.subTest(case=case):
+                out = self.passing(case)
+                self.assertFalse([p for p in packets(out) if p.startswith("FillBuffer")], case)
+                self.assertFalse([p for p in packets(out) if p.startswith("CopyBuffer 0x7ab1e")], case)
+        refused = self.passing("raw_snap_refused")
+        self.assertEqual(len([line for line in refused.splitlines() if line.startswith("op raw_snap ")]), 3)   # asked, answered 0
+
     def test_dispatches_become_their_packets(self) -> None:
         out = self.passing("compute")
         f = frame(out, 1)

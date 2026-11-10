@@ -401,6 +401,7 @@ const VkReplayOps *vkr_device_ops(void) {
                               .queries = dev_queries, .query_results = dev_query_results, .cpu_reads = dev_cpu_reads};
     const VkpLayouts *l = vkp_layouts();   // read at every call: the pipeline builder may open after the first frame
     ops.graphics_layout = l->graphics, ops.compute_layout = l->compute;
+    ops.raw_snap = gpu_vk_raw_diag() ? gpu_vk_raw_snap : NULL;   // settings.h raw_diag: off, no snapshot packets
     return &ops;
 }
 

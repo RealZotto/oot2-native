@@ -205,6 +205,21 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(keys_of(done.stdout)["test_movie_blit"], ("1", "environment", "OOT2_TEST_MOVIE_BLIT"))
         self.refused("show", OOT2_TEST_MOVIE_BLIT="2")   # a value the key does not take is refused by name
 
+    def test_raw_diag_is_a_diagnostic_switch_that_is_off_by_default_and_read_at_start_up(self) -> None:
+        done = self.passes("table")[0]
+        rows = {line.split("\t")[0]: line.split("\t") for line in done.stdout.splitlines() if "\t" in line}
+        key, group, kind, apply, default, low, high, names, env, what = rows["raw_diag"]
+        self.assertEqual((group, kind, apply, default, low, high, env),
+                         ("debug", "bool", "restart", "0", "0", "1", "OOT2_RAW_DIAG"))
+        self.assertIn("DIAGNOSTIC", what)
+        self.assertIn("never part of a timed run", what)
+        self.assertIn("64 entries", what)   # what it buys: a stage keeps its own miss log
+        for done in self.passes("show"):
+            self.assertEqual(keys_of(done.stdout)["raw_diag"], ("0", "default", "the default"))
+        for done in self.passes("show", OOT2_RAW_DIAG="1"):
+            self.assertEqual(keys_of(done.stdout)["raw_diag"], ("1", "environment", "OOT2_RAW_DIAG"))
+        self.refused("show", OOT2_RAW_DIAG="2")   # a value the key does not take is refused by name
+
     # ---- the layers
     def test_command_line_then_environment_then_file_then_default_for_a_key_of_each_type(self) -> None:
         # key, its default, then the file's, the environment's and the command line's value

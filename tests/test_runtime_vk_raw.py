@@ -186,6 +186,74 @@ class VkRawTest(unittest.TestCase):
                 self.assertEqual(m.group(1), "0", done.stdout + done.stderr[-4000:])
                 print(f"\n{case}:\n" + "".join(f"  {line}\n" for line in done.stdout.splitlines()), end="")
 
+    def test_the_miss_diagnostics_name_the_stage_the_pool_and_the_memory_of_each_miss(self) -> None:
+        # Setting raw_diag (OOT2_RAW_DIAG=1): after the dispatch the miss log is copied into a snapshot of its own and cleared
+        # (the case does what the replay records), the completion thread hands the stage's 24 misses to the replay thread, and
+        # the classification says what the log alone does not: the stage, that no pool holds the address, that the game
+        # declared it mapped and the host committed it, that the map holds nothing there. One line a class, with the table and
+        # the bound buffer that holds the missed pointer; the capture's raw-access counter holds the 24 misses.
+        done = run("missdiag", str(self.spv), env={"OOT2_VK_VALIDATION": "sync", "OOT2_RAW_DIAG": "1"})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr[-4000:])
+        self.assertIn("ok missdiag", done.stdout)
+        self.assertEqual(fatal_lines(done.stderr), [])
+        m = re.search(r"^validation errors (\d+) warnings (\d+)$", done.stdout, re.M)
+        self.assertIsNotNone(m, done.stdout)
+        self.assertEqual(m.group(1), "0", done.stdout + done.stderr[-4000:])
+        self.assertIn("raw_diag is on", done.stderr)
+        self.assertRegex(done.stderr, r"\+0x[0-9a-f]+ \[buffers read \d+ timeline value\(s\) after the miss's submission\]")
+        self.assertIn("1 stage snapshot, 24 entries classified", done.stdout)
+        for kind in ("load", "store", "atomic"):
+            with self.subTest(kind=kind):
+                self.assertRegex(done.stderr, rf"miss class B \({kind}/no-chunk/pool:none/decl:mapped/commit:yes/now:none\), "
+                                              rf"first seen in dispatch synthetic\.dispatch, submission \d+, which the stage "
+                                              rf"missed 24 times: 0x")
+        self.assertNotIn("miss class A", done.stderr)   # nothing here is a page the table lacks
+        self.assertIn("in no pool (the nearest pool below ends at", done.stderr)
+        self.assertIn("the game declared it mapped; committed; the map has no backing for it now", done.stderr)
+        self.assertIn("verdict B, an address in no pool the GPU could reach at that submission: the pointer is the question",
+                      done.stderr)
+        self.assertRegex(done.stderr, r"the table of the submission: span of \d+ chunks of 2 MiB from 0x[0-9a-f]+, \d+ leaf "
+                                      r"blocks, \d+ pages \(\d+ mirrored\), built at map version \d+, the map is at \d+")
+        self.assertRegex(done.stderr, r"address 0x[0-9a-f]+; the address is a word of bound uniform buffer 0 \[0x[0-9a-f]+, "
+                                      r"\+0x1000\) at \+0x[0-9a-f]+")
+        self.assertRegex(done.stderr, r"raw path: summary: raw-misses: 24 ")   # the numbers once more at the close
+        self.assertRegex(done.stderr, r"raw path: summary: raw-miss B load/no-chunk/pool:none/decl:mapped/commit:yes/now:none: ")
+        print("\nmissdiag:\n" + "".join(f"  {line}\n" for line in done.stderr.splitlines() if "raw path" in line), end="")
+
+    def test_each_class_of_miss_is_named_by_the_facts_of_a_real_submission(self) -> None:
+        # missclass: one miss a submission, each in another place. A page of a live pool the CPU never committed is C; a page
+        # committed after the table was built is L (the next begin's pass learned it, so the map moved on and the table is
+        # not the same version: never T); a miss in a pool finalized before the drain is E; a page of a virtual pool no
+        # mapping request mapped is B, and one mapped over a physical page nothing committed is C by that page.
+        done = run("missclass", str(self.spv), env={"OOT2_VK_VALIDATION": "sync", "OOT2_RAW_DIAG": "1"})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr[-4000:])
+        self.assertIn("ok missclass", done.stdout)
+        self.assertEqual(fatal_lines(done.stderr), [])
+        m = re.search(r"^validation errors (\d+) warnings (\d+)$", done.stdout, re.M)
+        self.assertIsNotNone(m, done.stdout)
+        self.assertEqual(m.group(1), "0", done.stdout + done.stderr[-4000:])
+        want = {
+            "C in a live pool": r"miss class C \(\w+/[a-z-]+/pool:cpu/decl:mapped/commit:no/now:none\)",
+            "L after the table": r"miss class L \(\w+/[a-z-]+/pool:cpu/decl:mapped/commit:yes/now:(import|mirror)\)",
+            "E in an ended pool": r"miss class E \(\w+/[a-z-]+/pool:cpu/[^)]*/ended\)",
+            "B in a virtual pool": r"miss class B \(\w+/[a-z-]+/pool:virtual/decl:free/commit:unknown/now:\w+\)",
+            "C by the physical page": r"miss class C \(\w+/[a-z-]+/pool:virtual/decl:mapped/commit:no/now:\w+\)",
+        }
+        for what, pattern in want.items():
+            with self.subTest(what=what):
+                self.assertRegex(done.stderr, pattern)
+        self.assertNotIn("miss class T", done.stderr)   # nothing here is a page the table of the map's own version lacks
+        self.assertNotIn("miss class A", done.stderr)
+        self.assertRegex(done.stderr, r"built at map version (\d+), the map is at (?!\1\b)\d+")   # the L row's two versions differ
+
+    def test_with_the_setting_off_a_miss_is_counted_into_the_capture_and_logged_as_it_was(self) -> None:
+        done = run("miss", str(self.spv), env={"OOT2_VK_VALIDATION": "sync"})   # the case checks the capture counter and the stats
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr[-4000:])
+        self.assertIn("ok miss", done.stdout)
+        self.assertNotIn("raw_diag", done.stderr)
+        self.assertNotIn("miss class", done.stderr)
+        self.assertRegex(done.stderr, r"submission \d+ missed the page table 24 times \(a miss reads 0 and drops its write\)")
+
     def test_the_write_back_of_a_movie_frame_reaches_guest_memory_whole(self) -> None:
         # wb: 10,101 pages (39.5 MiB, what the opening's chain writes a present) byte for byte and the time the raw path's
         # effect takes on the completion thread; wbcpu: a CPU write between the GPU's write-back and its stamp is kept;

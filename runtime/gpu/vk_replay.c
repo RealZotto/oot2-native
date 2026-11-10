@@ -179,8 +179,15 @@ static struct {
     uint32_t movie_src;                       // and the texture pool ID of the picture its first program stored
     uint32_t movie_skips;                     // the dispatches skipped since it opened: how many, and the keys of the program
     char movie_keep[26], movie_first[26], movie_last[26];   // that opened it and of the first and the last one skipped
+    // The miss diagnostics (settings.h raw_diag; kept only while F.ops->raw_snap is not NULL): the keys of the raw-access stages
+    // of the open pass's draws and how many binds they made, and the buffers the raw-access stage being prepared binds
+    char pass_raw_key[3][26];
+    uint32_t pass_raw_keys, pass_raw_draws;
+    RawRange rng[16];
+    uint32_t nrng;
 } F;
 _Static_assert(sizeof(((nvn_stage *)0)->key) == sizeof F.movie_keep, "a stage key fits the movie chain's notes");
+_Static_assert(sizeof(((nvn_stage *)0)->key) == sizeof F.pass_raw_key[0], "a stage key fits the pass's raw-access notes");
 
 // What the frames in flight wrote (vkr_writes), a ring of FRAMES_KEPT by replayed frame (timeline values are shared with
 // the back end's own submissions, so a value modulo the ring would let two frames in flight share an entry).
@@ -435,6 +442,23 @@ static void full_barrier(void) {
     F.after_xfer = 0;
 }
 
+// The miss diagnostics (oot2/vk_raw.h, settings.h raw_diag): after a raw-access dispatch, and at the end of a pass with raw-access
+// draws, the page table's miss log is copied into a snapshot of its own and its count cleared, so that the stage keeps its misses
+// apart from the submission's and the snapshot names it. Outside any pass, between full barriers: the copy reads what the stage's
+// shaders wrote, and the clear lands before the next stage's. Nothing is recorded when the ops give no snapshot (the setting off).
+static void raw_diag_flush(int kind, const char *const *keys, int nkeys, uint32_t draws) {
+    RawSnap snap;
+    int taken = F.ops->raw_snap && F.ops->raw_snap(F.value, kind, keys, nkeys, draws, F.rng, (int)F.nrng, &snap);
+    F.nrng = 0;
+    if (!taken) return;
+    full_barrier();
+    VkBufferCopy cp = {snap.src_offset, snap.dst_offset, snap.bytes};
+    vkrec_CopyBuffer((VkBuffer)(uintptr_t)snap.src, (VkBuffer)(uintptr_t)snap.dst, &cp);
+    full_barrier();
+    vkrec_FillBuffer((VkBuffer)(uintptr_t)snap.src, snap.count_offset, sizeof(uint32_t), 0);
+    full_barrier();
+}
+
 static void pass_end(void) {
     if (!F.in_pass) return;
     vkr_report_pass_end();   // a samples-passed query begun in the pass ends in it
@@ -444,6 +468,12 @@ static void pass_end(void) {
         char label[56];
         snprintf(label, sizeof label, "%s+%s", F.pass_vs ? F.pass_vs : "none", F.pass_fs ? F.pass_fs : "none");
         vkgt_mark(VKGT_PASS, label, F.pass_draws, F.pass_w, F.pass_h);
+    }
+    if (F.pass_raw_draws) {
+        const char *keys[3] = {F.pass_raw_key[0], F.pass_raw_key[1], F.pass_raw_key[2]};
+        uint32_t draws = F.pass_raw_draws, nkeys = F.pass_raw_keys;
+        F.pass_raw_draws = F.pass_raw_keys = 0;
+        raw_diag_flush('d', keys, (int)nkeys, draws);
     }
 }
 
@@ -750,6 +780,26 @@ static void raw_words(Set1 *s, const nvn_stage *stage) {
     note('R', 0, 0, 0);
 }
 
+// The raw-access stages of a draw, noted for the pass that will hold it (the miss diagnostics name the pass's draws when it ends):
+// once the draw is in the pass it ends in, so after a record that ends the pass and begins it again (an indirect mesh draw's).
+static void raw_pass_note(const nvn_stage *const *stages, int n) {
+    if (!F.ops->raw_snap) return;
+    F.pass_raw_draws++;
+    for (int i = 0; i < n; i++) {
+        uint32_t k = 0;
+        while (k < F.pass_raw_keys && strcmp(F.pass_raw_key[k], stages[i]->key)) k++;
+        if (k == F.pass_raw_keys && k < 3)
+            snprintf(F.pass_raw_key[F.pass_raw_keys++], sizeof F.pass_raw_key[0], "%s", stages[i]->key);
+    }
+}
+
+// A buffer a raw-access stage binds, kept for the search of the word that holds a missed pointer (oot2/vk_raw.h).
+static void raw_range(const ShaderBinds *b, char kind, uint64_t addr, uint64_t size) {
+    if (!F.ops->raw_snap || !b->raw || !addr || !size || gfx_gpu_only(addr)) return;
+    if (F.nrng == sizeof F.rng / sizeof *F.rng) return;
+    F.rng[F.nrng++] = (RawRange){addr, size, kind};
+}
+
 static void put_buffer(Set1 *s, uint32_t binding, VkDescriptorType type, Bound b, VkDeviceSize range) {
     if (s->n == VKP_SET1_MAX) stop("more than %u descriptors at set 1", VKP_SET1_MAX);
     s->bi[s->n] = (VkDescriptorBufferInfo){b.buf, b.off, range};
@@ -817,6 +867,7 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
             VknBuf u = S.ubo[st][cb->slot - 3];
             at = uniform(u);
             if (u.addr && u.size) range = u.size < UNIFORM_MAX ? u.size : UNIFORM_MAX;
+            raw_range(b, 'u', u.addr, u.size);
         } else {
             stop("stage %s reads constant bank c[%u]", stage->key, cb->slot);
         }
@@ -841,6 +892,7 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
             continue;
         }
         uint64_t base = addr & ~(uint64_t)(STORAGE_ALIGN - 1), range = size + (addr - base);
+        raw_range(b, 's', base, range);
         BackingRef ref;
         F.ops->resolve(base, range, F.value, &ref);
         put_buffer(s, sb->binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (Bound){(VkBuffer)(uintptr_t)ref.buffer, ref.offset},
@@ -1081,7 +1133,14 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
     dyn_emit(topo, restart, 0);
     Set1 s;
     memset(&s, 0, sizeof s);
-    if (vb->raw || fb->raw) raw_words(&s, vb->raw ? vs : fs);
+    if (vb->raw || fb->raw) {
+        raw_words(&s, vb->raw ? vs : fs);
+        const nvn_stage *raw_stages[2];
+        int nraw = 0;
+        if (vb->raw) raw_stages[nraw++] = vs;
+        if (fb->raw) raw_stages[nraw++] = fs;
+        raw_pass_note(raw_stages, nraw);
+    }
     vertex_input(vb);
     support(&s);
     uint8_t c0[VKN_BANK_BYTES];
@@ -1224,6 +1283,14 @@ static void op_draw_mesh(const p_draw_mesh *d, uint64_t indirect) {
         Bound first = scratch(MESH_FIRST_TASK_WORD_BYTES, MESH_FIRST_TASK_WORD_BYTES, &first_word);
         memcpy(first_word, &d->first, sizeof(uint32_t));
         first_address = scratch_address(first);
+    }
+    if ((ts && tb->raw) || mb->raw || fb->raw) {   // in the pass it ends in: the indirect record above ended the first one
+        const nvn_stage *raw_stages[3];
+        int nraw = 0;
+        if (ts && tb->raw) raw_stages[nraw++] = ts;
+        if (mb->raw) raw_stages[nraw++] = ms;
+        if (fb->raw) raw_stages[nraw++] = fs;
+        raw_pass_note(raw_stages, nraw);
     }
     bind_pipeline(0, pipe);
     stamp_targets();
@@ -1387,7 +1454,7 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     bind_set0(1);
     Set1 s;
     memset(&s, 0, sizeof s);
-    if (b->raw) raw_words(&s, cs);
+    if (b->raw) raw_words(&s, cs), F.nrng = 0;
     uint8_t c0[VKN_BANK_BYTES];
     if (!vkn_c0_compute(c0, cs->ctl, cs->ctl_size, groups, (const uint32_t(*)[64])S.root[1], S.ubo[ST_CS], S.ssbo[ST_CS]))
         stop("stage %s: its control section's driver bank layout does not fit %u bytes", cs->key, VKN_BANK_BYTES);
@@ -1406,6 +1473,7 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     if (!ind) {
         vkrec_Dispatch(groups[0], groups[1], groups[2]);
         if (vkgt_enabled) vkgt_mark(VKGT_DISPATCH, cs->key, groups[0], groups[1], groups[2]);
+        if (b->raw) raw_diag_flush('c', (const char *const[]){cs->key}, 1, 0);
         F.noting = 0;
         return;
     }
@@ -1417,6 +1485,7 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     vkrec_DispatchIndirect(buf, ref.offset);
     F.c0[ST_CS].valid = 0;   // the bank holds the GPU's counts now, not the CPU's bytes
     if (vkgt_enabled) vkgt_mark(VKGT_DISPATCH, cs->key, 0, 0, 0);   // the counts are the GPU's: unknown here
+    if (b->raw) raw_diag_flush('c', (const char *const[]){cs->key}, 1, 0);
     F.noting = 0;
 }
 

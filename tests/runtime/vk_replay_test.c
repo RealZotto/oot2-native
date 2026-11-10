@@ -99,9 +99,9 @@ static void lput(Log *l, const char *fmt, ...) {
 
 // ---------- the stages and their bindings
 // g_vs_raw and g_cs_raw: stages that reach memory through the page table; g_cs_img: a compute stage that stores to an image
-static nvn_stage g_vs, g_ps, g_cs, g_ts, g_ms, g_mps, g_vs_raw, g_cs_raw, g_cs_img;
+static nvn_stage g_vs, g_ps, g_cs, g_ts, g_ms, g_mps, g_vs_raw, g_cs_raw, g_cs_img, g_ms_raw;
 static ShaderBinds g_vs_binds, g_ps_binds, g_cs_binds, g_ts_binds, g_ms_binds, g_mps_binds, g_vs_raw_binds,
-    g_cs_raw_binds, g_cs_img_binds;
+    g_cs_raw_binds, g_cs_img_binds, g_ms_raw_binds;
 // The movie chain's four roles (settings.h test_movie_blit; synthetic keys, the key file is the driver's): the first
 // program, which stores a picture; a middle one that reaches memory through the page table; a middle one that stores an
 // image; and the last, which stores the output.
@@ -159,6 +159,9 @@ static void make_stages(void) {
     g_ms_binds.tex[0] = (ShdTex){.via = SHD_VIA_PUSH_SLOT, .kind = SHD_TEX_COMBINED, .view = BV_2D, .set = 1,
                                  .binding = 0, .array_length = 1, .push_slot = 0, .push_offset = 16, .c2_slot = 0};
     g_mps_binds.kind = SHD_PS, g_mps_binds.fits = 1;
+    stage(&g_ms_raw, "00000000000000d4.00000001", NVN_STAGE_MS, 0, 0);   // the mesh stage, with the page table
+    g_ms_raw_binds = g_ms_binds;
+    g_ms_raw_binds.raw = 1;
 
     stage(&g_cs_raw, "00000000000000c4.00000001", NVN_STAGE_CS, 0, 0);   // the same layout as g_cs, and the page table
     g_cs_raw.ctl[0xA9] = 2, g_cs_raw.ctl[0xB1] = 3, g_cs_raw.ctl[0xB2] = 2;
@@ -216,6 +219,7 @@ static const ShaderBinds *op_binds(const VkpStage *stage) {
     return s == &g_vs ? &g_vs_binds : s == &g_ps ? &g_ps_binds : s == &g_cs ? &g_cs_binds
            : s == &g_ts ? &g_ts_binds : s == &g_ms ? &g_ms_binds : s == &g_mps ? &g_mps_binds
            : s == &g_vs_raw ? &g_vs_raw_binds : s == &g_cs_raw ? &g_cs_raw_binds : s == &g_cs_img ? &g_cs_img_binds
+           : s == &g_ms_raw ? &g_ms_raw_binds
            : s == &g_cs_keep ? &g_cs_keep_binds : s == &g_cs_mid_raw ? &g_cs_mid_raw_binds
            : s == &g_cs_mid_img ? &g_cs_mid_img_binds : s == &g_cs_last ? &g_cs_last_binds : NULL;
 }
@@ -766,6 +770,13 @@ static p_bind_program program_mesh_only(void) {
     return p;
 }
 
+// The mesh program of a mesh stage and a pixel stage, the mesh stage reaching memory through the page table.
+static p_bind_program program_mesh_raw_only(void) {
+    p_bind_program p = program_mesh_only();
+    p.id[0] = &g_ms_raw;
+    return p;
+}
+
 // The same programs with the stage that reaches memory through the page table: the compute stage, or the vertex stage.
 static p_bind_program program_raw(int compute) {
     p_bind_program p = program(compute);
@@ -905,6 +916,78 @@ static void case_raw_first(void) {
     vkr_submit(&h2, 1);
     close_fakes();
     printf("ok raw_first\n");
+}
+
+// ---------- the miss diagnostics (settings.h raw_diag, oot2/vk_raw.h)
+// The ops give a snapshot after a raw-access dispatch and at the end of a pass whose draws had raw-access stages: the replay
+// records, outside any pass and between full barriers, a copy of the page table's miss log and a clear of its count. A stage
+// with no raw access gets none; ops that answer 0 (the submission's room is used) or have no such op record nothing.
+static uint32_t g_snaps;
+static int g_snap_answer = 1;
+static int op_raw_snap(uint64_t value, int kind, const char *const *keys, int nkeys, uint32_t draws, const RawRange *ranges,
+                       int nranges, RawSnap *out) {
+    lput(&g_ops, "op raw_snap frame %llu kind %c draws %u keys", (ull)value, kind, draws);
+    for (int i = 0; i < nkeys; i++) lput(&g_ops, " %s", keys[i]);
+    lput(&g_ops, " ranges");
+    for (int i = 0; i < nranges; i++) lput(&g_ops, " %c:0x%llx+0x%llx", ranges[i].kind, (ull)ranges[i].addr, (ull)ranges[i].size);
+    lput(&g_ops, "\n");
+    if (!g_snap_answer) return 0;
+    *out = (RawSnap){.src = 0x7AB1E, .dst = 0xD1A6, .dst_offset = 1088ull * g_snaps++, .bytes = 1088, .count_offset = 16};
+    return 1;
+}
+static VkReplayOps g_ops_snap;
+static void case_raw_snap(int answer) {
+    open_fakes();
+    g_snap_answer = answer;
+    g_ops_snap = g_fake_ops;
+    g_ops_snap.raw_snap = op_raw_snap;
+    vkr_set_ops(&g_ops_snap);
+    Rec *r = rec_begin(0);   // frame 1: a raw-access dispatch, one with no raw access, another raw-access dispatch
+    PUT(r, OP_BIND_PROGRAM, program_raw(1));
+    PUT(r, OP_BIND_SSBO, (p_bind_buf){.stage = 5, .index = 1, .addr = VRAM + 0x300, .size = 0x20});
+    PUT(r, OP_DISPATCH, (p_dispatch){4, 2, 1, 0});
+    PUT(r, OP_BIND_PROGRAM, program(1));
+    PUT(r, OP_DISPATCH, (p_dispatch){1, 1, 1, 0});
+    PUT(r, OP_BIND_PROGRAM, program_raw(1));
+    PUT(r, OP_DISPATCH, (p_dispatch){2, 1, 1, 0});
+    uint64_t h = rec_end(r);
+    vkr_submit(&h, 1);
+    r = rec_begin(1);   // frame 2: two raw-access draws in one pass, which the frame's end closes
+    graphics_state(r);
+    PUT(r, OP_BIND_PROGRAM, program_raw(0));
+    PUT(r, OP_DRAW, (p_draw){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 3, .base_instance = 0, .instances = 1});
+    PUT(r, OP_DRAW, (p_draw){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 6, .base_instance = 0, .instances = 1});
+    uint64_t h2 = rec_end(r);
+    vkr_submit(&h2, 1);
+    close_fakes();
+    printf("ok %s\n", answer ? "raw_snap" : "raw_snap_refused");
+}
+
+// An indirect mesh draw's record is copied by the GPU between two passes (the pass the draw is in ends, and begins again): the
+// snapshot of the draws before it is recorded as that pass ends, and the draw itself belongs to the pass that follows. A direct raw
+// mesh draw, an indirect one, then a raw dispatch: three snapshots, in the order the stages ran, none of them before its stage.
+static void case_raw_snap_mesh(void) {
+    open_fakes();
+    g_mesh_pushes = 1;
+    g_snap_answer = 1;
+    g_ops_snap = g_fake_ops;
+    g_ops_snap.raw_snap = op_raw_snap;
+    vkr_set_ops(&g_ops_snap);
+    const uint32_t records[1][2] = {{3, 41}};
+    memcpy(g_vram + 0x100, records, sizeof records);
+    Rec *r = rec_begin(0);
+    p_set_rt rt = one_target(0);
+    put(r, OP_SET_RT, &rt, sizeof rt);
+    PUT(r, OP_VIEWPORTS, (p_viewports){.first = 0, .n = 1, .v = {{0, 0, 64, 32}}});
+    PUT(r, OP_BIND_PROGRAM, program_mesh_raw_only());
+    PUT(r, OP_DRAW_MESH, (p_draw_mesh){.first = 21, .count = 1});
+    PUT(r, OP_DRAW_MESH_IND, (p_draw_mesh_ind){.ind = VRAM + 0x100});
+    PUT(r, OP_BIND_PROGRAM, program_raw(1));
+    PUT(r, OP_DISPATCH, (p_dispatch){1, 1, 1, 0});
+    uint64_t h = rec_end(r);
+    vkr_submit(&h, 1);
+    close_fakes();
+    printf("ok raw_snap_mesh\n");
 }
 
 // ---------- storage images
@@ -1726,6 +1809,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "depth")) case_depth();
     else if (!strcmp(cs, "compute")) case_compute();
     else if (!strcmp(cs, "raw_first")) case_raw_first();
+    else if (!strcmp(cs, "raw_snap")) case_raw_snap(1);
+    else if (!strcmp(cs, "raw_snap_refused")) case_raw_snap(0);
+    else if (!strcmp(cs, "raw_snap_mesh")) case_raw_snap_mesh();
     else if (!strcmp(cs, "storage_image")) case_storage_image();
     else if (!strcmp(cs, "movie_chain")) case_movie_chain(argc >= 3 ? argv[2] : NULL);
     else if (!strcmp(cs, "movie_stop") && argc >= 3) case_movie_stop(argv[2]);

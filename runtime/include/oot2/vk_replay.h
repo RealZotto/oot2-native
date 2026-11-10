@@ -78,6 +78,7 @@
 #include "oot2/backing.h"
 #include "oot2/nvn_obj.h"
 #include "oot2/vk_pipeline.h"
+#include "oot2/vk_raw.h"
 
 struct nvn_stage;
 
@@ -153,6 +154,12 @@ typedef struct VkReplayOps {
     // The page table for a raw-access stage of the frame `value` (gpu_vk_raw_begin): the push words 0 to 3. NULL: a
     // raw-access stage stops by name.
     void (*raw)(uint64_t value, uint32_t push[4]);
+    // The miss diagnostics (settings.h raw_diag, oot2/vk_raw.h): NULL unless the setting is on, and then the replay asks, after a
+    // raw-access dispatch (kind 'c', one key) and at the end of a render pass that held raw-access draws (kind 'd', the keys of up
+    // to three stages and the draws), for a snapshot: 1 and what to record (a copy of the page table's miss log into a buffer, then
+    // a clear of its count, each after a full barrier), or 0 for none. ranges: the uniform and storage buffers the stage bound.
+    int (*raw_snap)(uint64_t value, int kind, const char *const *keys, int nkeys, uint32_t draws, const RawRange *ranges,
+                    int nranges, RawSnap *out);
     // Around a frame: before its value is taken (the backing map's sync), and after its last packet, before the frame
     // is handed over (the images made for it brought to the general layout, the backing map's end of submission).
     // Either may be NULL.

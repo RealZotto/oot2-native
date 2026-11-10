@@ -35,6 +35,8 @@ static Snap g_snap[MAX_SNAPS];
 static int g_nsnap, g_nslots, g_full_said;
 static PlatMutex g_lock = PLAT_MUTEX_INIT;
 static uint64_t g_first_ns;
+static NvnStatSource g_sources[NVN_CENSUS_SOURCES];   // a back end's census rows (nvn_census_add_source)
+static int g_nsources;   // atomic: a source is written before the count that names it
 
 static uint64_t g_title_present;   // the present of the title line, 0 before it (census mode: its snapshot is taken at that present)
 
@@ -399,7 +401,21 @@ void nvn_census_stats(NvnStatRow emit, void *ctx) {
                  "a resample %llu", (ull)skipped, (ull)blits);
         emit(ctx, "test-movie-blit", skipped + blits, why);
     }
+    int nsources = __atomic_load_n(&g_nsources, __ATOMIC_ACQUIRE);   // a back end's rows
+    for (int i = 0; i < nsources; i++) g_sources[i](emit, ctx);
     emit(ctx, "presents", nvn_present_count(), "nvnQueuePresentTexture calls that reached the back end");
+}
+
+void nvn_census_add_source(NvnStatSource fn) {
+    static PlatMutex lock = PLAT_MUTEX_INIT;
+    plat_mutex_lock(&lock);
+    int n = g_nsources, known = 0;
+    for (int i = 0; i < n; i++) known |= g_sources[i] == fn;
+    if (!known && n < NVN_CENSUS_SOURCES) {
+        g_sources[n] = fn;
+        __atomic_store_n(&g_nsources, n + 1, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock(&lock);
 }
 
 // ---- the movie chain's stand-in (settings.h test_movie_blit): what the Vulkan replay did not run or replaced

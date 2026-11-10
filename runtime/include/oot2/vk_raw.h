@@ -118,6 +118,44 @@ void gpu_vk_raw_close(void);
 // gpu_vk_raw_close, restore the device's. Set between submissions, with the device open.
 void gpu_vk_raw_set_ops(const BackingOps *ops);
 
+// ---- the miss diagnostics (setting raw_diag, off by default; runtime/gpu/raw_diag.c, oot2/raw_diag.h)
+// The helper logs 64 misses a submission, the first 64 lanes to miss, and the log says an address, a kind and a reason: not
+// which program, not whether a pool holds the address, not whether the page was ever committed. The log's size is compiled
+// into every translated program (RAW_MISS_ENTRIES), so the runtime cannot raise it; with the setting on, each raw-access
+// dispatch and each render pass with raw-access draws is followed by a copy of the table's header and miss log into a
+// snapshot and a clear of the miss count (the replay records the copy, vk_replay.c), so each stage keeps 64 of its own and
+// the snapshot names the stage. The completion thread reads the snapshots; the replay thread classifies the missed addresses
+// at its next raw-access submission's begin, after the invariant pass (the facts need the backing map's lock, which no
+// completion effect may take): the pool that holds the address (an index of every pool the game made), what the game
+// declared mapped, what the host committed, and what the map holds then. Each stage and class is logged once, with the table
+// that served the submission; the counts by class go to census.tsv, and every miss to the capture's raw-access counter.
+// A bound range a stage reads, for the search of the word that holds a missed pointer: 'u' a uniform buffer, 's' a storage
+// buffer.
+typedef struct RawRange {
+    uint64_t addr, size;
+    char kind;
+} RawRange;
+// What the replay records after a stage: copy `bytes` from `src_offset` of buffer `src` into `dst` at `dst_offset`, then
+// fill the 4 bytes at `count_offset` of `src` with zero. The buffers are VkBuffer handles.
+typedef struct RawSnap {
+    uint64_t src, dst;
+    uint64_t src_offset, dst_offset, bytes, count_offset;
+} RawSnap;
+// 1 when the setting raw_diag is on (read once).
+int gpu_vk_raw_diag(void);
+// After a raw-access dispatch (kind 'c', one key) or at the end of a render pass whose draws had raw-access stages (kind 'd',
+// the keys of up to three of them and the number of draws): the snapshot to record, or 0 for none (the setting off, or the
+// submission's room for snapshots is used). Only between gpu_vk_raw_begin and gpu_vk_raw_end of value.
+int gpu_vk_raw_snap(uint64_t value, int kind, const char *const *keys, int nkeys, uint32_t draws, const RawRange *ranges,
+                    int nranges, RawSnap *out);
+// A pool the game made or finalized (the back end's pool_init and pool_fini), for the index of pools: nothing with the setting
+// off.
+void gpu_vk_raw_pool_made(const pool_t *p);
+void gpu_vk_raw_pool_gone(const pool_t *p);
+// The misses classified and not yet (the replay thread does it at the next raw-access begin), by an owner that needs the
+// numbers whole: tests.
+void gpu_vk_raw_diag_drain(void);
+
 typedef struct RawMiss {
     uint64_t address;
     uint32_t kind, reason;   // RAW_MISS_KIND_*, RAW_MISS_REASON_*
@@ -141,5 +179,7 @@ typedef struct GpuVkRawStats {
     uint64_t last_miss_value;                               // the newest submission with misses
     uint32_t last_misses;                                   // its entries in last_miss (at most RAW_MISS_ENTRIES)
     RawMiss last_miss[RAW_MISS_ENTRIES];
+    uint64_t diag_snapshots, diag_classified, diag_pools;   // setting raw_diag: stage snapshots recorded, missed addresses
+                                                            // classified, pools indexed; 0 with it off
 } GpuVkRawStats;
 void gpu_vk_raw_stats(GpuVkRawStats *out);

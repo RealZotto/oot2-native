@@ -16,6 +16,8 @@
 //   miss     8 threads at guest memory no pool covers: their loads read 0, their stores and atomics are dropped (guest
 //            memory keeps its bytes), all 24 are in the miss log with the address, the kind and the reason; the next
 //            submission's misses are its own
+//   missclass   (raw_diag on) the classes a miss is given: an uncommitted page, a page committed after the table, a pool
+//            finalized before the drain, a virtual pool's unmapped page and its page over an uncommitted physical one
 //   commit   a chunk of a pool committed after the pool was mapped: a miss before, its word read by the next submission
 //   edges    the lowest and the highest mapped page, the lowest in the guest heap and the highest at the top of the window
 //   reuse    a pool finalized and another made over the same range, CPU-visible and in the window: the new pool's words
@@ -253,6 +255,10 @@ static uint32_t device_word(uint64_t addr) {
     return g_words[(addr & (PG - 1)) / 4];
 }
 
+// The buffer the stand-in replay names as bound by the dispatch, for the diagnostics' search of the word that holds a missed pointer
+// (the pointer table lies in a pool of the GPU's window, which no host thread reads: a case points this at guest memory)
+static RawRange g_diag_range = {TABLE, THREADS * sizeof(Entry), 's'};
+
 // One raw-access submission of the program over the entries e: the table written into the pointer table's pool, the
 // dispatch, the raw path's end; waited for and cpu_synced. The entries come back with the loaded words and old values.
 static uint64_t dispatch(Entry e[THREADS]) {
@@ -270,6 +276,17 @@ static uint64_t dispatch(Entry e[THREADS]) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_pipe);
     vkCmdPushConstants(cb, g_lay.compute, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
     vkCmdDispatch(cb, 1, 1, 1);
+    if (gpu_vk_raw_diag()) {   // what the replay records after a raw-access dispatch with the setting raw_diag on (vk_replay.c)
+        RawSnap sn;
+        const char *keys[1] = {"synthetic.dispatch"};
+        CHECK(gpu_vk_raw_snap(v, 'c', keys, 1, 0, &g_diag_range, 1, &sn));
+        VkBufferCopy cp = {sn.src_offset, sn.dst_offset, sn.bytes};
+        barrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+        vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)sn.src, (VkBuffer)(uintptr_t)sn.dst, 1, &cp);
+        barrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+        vkCmdFillBuffer(cb, (VkBuffer)(uintptr_t)sn.src, sn.count_offset, sizeof(uint32_t), 0);
+        barrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    }
     gpu_vk_raw_end(v);
     finish(v);
     read_back(TABLE, THREADS * sizeof(Entry));
@@ -474,7 +491,9 @@ static void case_keep(const char *spv) {
 }
 
 // ---------- miss
-static void case_miss(const char *spv) {
+// diag: with the setting raw_diag on (OOT2_RAW_DIAG=1) each dispatch is followed by the replay's snapshot of the miss log, and
+// the misses are classified: three classes (a load, a store and an atomic at guest memory in no pool), 24 entries in one stage.
+static void case_miss(const char *spv, int diag) {
     open_all(spv);
     Entry e[THREADS];
     pool_t t = table_pool(e);
@@ -484,6 +503,14 @@ static void case_miss(const char *spv) {
     fill_words(none, 16 * PG, 0x77777777u);
     for (int i = 0; i < 8; i++) e[i] = (Entry){none + (uint64_t)i * PG + PROBE, none + 8 * PG, 0, 0, {0}};
     for (int i = 8; i < THREADS; i++) e[i] = (Entry){imp + (uint64_t)(i % 16) * PG + PROBE, imp + 32 * PG, 0, 0, {0}};
+    if (diag) {   // a page of guest memory in no pool that holds every missed address as a word, bound as a uniform buffer
+        const uint64_t cell = g_heap + 64 * MiB;
+        fill_words(cell, PG, 0);
+        volatile uint64_t *w = (volatile uint64_t *)(uintptr_t)cell;
+        for (int i = 0; i < 8; i++) w[2 + i] = none + (uint64_t)i * PG + PROBE, w[16 + i] = none + (uint64_t)i * PG + PROBE + 4;
+        w[40] = none + 8 * PG;
+        g_diag_range = (RawRange){cell, PG, 'u'};
+    }
     dispatch(e);
     for (int i = 0; i < 8; i++) CHECK(e[i].loaded == 0 && e[i].old == 0);
     for (int i = 8; i < THREADS; i++) CHECK(e[i].loaded == 0x01010101u);
@@ -493,6 +520,14 @@ static void case_miss(const char *spv) {
     gpu_vk_raw_stats(&s);
     CHECK(s.misses == 24 && s.miss_submissions == 1 && s.last_misses == 24);
     CHECK(capture_counter(CAPTURE_RAW_MISSES) == 24);   // the capture's raw-access column holds them: the proof judge reads it
+    if (diag) {
+        gpu_vk_raw_diag_drain();   // the replay thread's classification, which the next raw-access begin does too
+        gpu_vk_raw_stats(&s);
+        CHECK(s.diag_snapshots == 1 && s.diag_classified == 24 && s.diag_pools >= 2);
+        printf("raw_diag: 1 stage snapshot, 24 entries classified, %llu pools indexed\n", (ull)s.diag_pools);
+    } else {
+        CHECK(s.diag_snapshots == 0 && s.diag_classified == 0 && s.diag_pools == 0);   // off: nothing kept
+    }
     int seen[4] = {0};
     for (uint32_t i = 0; i < s.last_misses; i++) {
         const RawMiss *m = &s.last_miss[i];
@@ -513,7 +548,55 @@ static void case_miss(const char *spv) {
     stats_line();
     pool_t *all[] = {&pi, &t};
     close_all(all, 2);
-    printf("ok miss\n");
+    printf("ok %s\n", diag ? "missdiag" : "miss");
+}
+
+// ---------- missclass
+// raw_diag on: the classes the diagnostics give a miss, each from a real submission. One miss a submission, classified at once
+// (gpu_vk_raw_diag_drain) or, for L, by the next raw-access begin as the replay does:
+//   C  a page of a live pool the CPU never committed
+//   L  a page the CPU committed after the table was built: the next begin's pass learns it, so the map has moved on
+//   E  a miss inside a pool finalized after the submission and before the drain
+//   B  a page of a virtual pool no mapping request mapped
+//   C  a page of a virtual pool mapped over a physical page the CPU never committed (judged by the physical page)
+static uint64_t miss_at(Entry e[THREADS], uint64_t addr) {
+    for (int i = 0; i < THREADS; i++) e[i].probe = TABLE + 1 * MiB + (uint64_t)i * PG + PROBE;
+    e[0].probe = addr;
+    return dispatch(e);
+}
+
+static void case_missclass(const char *spv) {
+    CHECK(gpu_vk_raw_diag());   // the case is for the setting on
+    open_all(spv);
+    Entry e[THREADS];
+    pool_t t = table_pool(e);
+    const uint64_t pc = g_heap + 64 * MiB, ended = g_heap + 80 * MiB, phys = g_heap + 96 * MiB, virt = WIN + 48 * MiB;
+    pool_t pcpu = make_pool(pc, 4 * MiB, 0), pend = make_pool(ended, 2 * MiB, 0);
+    pool_t pph = make_pool(phys, 2 * MiB, NVN_MEMORY_POOL_FLAGS_PHYSICAL);
+    pool_t pv = make_pool(virt, 2 * MiB, NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL);
+    map_run(&pv, &pph, 0, 1 * MiB);
+    fill_words(pc, 1 * MiB, 0x0F0F0F0Fu);   // the first part of the pool only
+    GpuVkRawStats s;
+
+    miss_at(e, pc + 3 * MiB + PROBE);   // C: never committed
+    gpu_vk_raw_diag_drain();
+    miss_at(e, pc + 2 * MiB + PROBE);   // L: committed after the table was built, before the next begin
+    fill_words(pc + 2 * MiB, PG, 0xC0C0C0C0u);
+    miss_at(e, TABLE + 1 * MiB + PROBE);   // this begin's pass learns the page, then the miss before is classified
+    gpu_vk_raw_diag_drain();
+    miss_at(e, ended + PROBE);   // E: the pool ends before the miss is classified
+    gfx_vulkan_backend.pool_fini(&pend);
+    gpu_vk_raw_diag_drain();
+    miss_at(e, virt + 1 * MiB + PROBE);   // B: no mapping request mapped it
+    gpu_vk_raw_diag_drain();
+    miss_at(e, virt + PROBE);   // C: mapped to a physical page nothing committed
+    gpu_vk_raw_diag_drain();
+    gpu_vk_raw_stats(&s);
+    CHECK(s.diag_snapshots >= 5 && s.misses >= 10);
+    printf("raw_diag: C, L, E, B and C again from five submissions, %llu entries classified\n", (ull)s.diag_classified);
+    pool_t *all[] = {&pv, &pph, &pcpu, &t};
+    close_all(all, 4);
+    printf("ok missclass\n");
 }
 
 // ---------- commit
@@ -1644,7 +1727,9 @@ int main(int argc, char **argv) {
     const char *cs = argv[1], *spv = argv[2];
     if (!strcmp(cs, "kinds")) case_kinds(spv);
     else if (!strcmp(cs, "keep")) case_keep(spv);
-    else if (!strcmp(cs, "miss")) case_miss(spv);
+    else if (!strcmp(cs, "miss")) case_miss(spv, 0);
+    else if (!strcmp(cs, "missdiag")) case_miss(spv, 1);
+    else if (!strcmp(cs, "missclass")) case_missclass(spv);
     else if (!strcmp(cs, "commit")) case_commit(spv);
     else if (!strcmp(cs, "edges")) case_edges(spv);
     else if (!strcmp(cs, "reuse")) case_reuse(spv);

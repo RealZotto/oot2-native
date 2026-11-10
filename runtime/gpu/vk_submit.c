@@ -33,6 +33,7 @@
 #include "oot2/vk_image.h"
 #include "oot2/vk_miss.h"
 #include "oot2/vk_present.h"
+#include "oot2/vk_raw.h"
 #include "oot2/vk_replay.h"
 #include "plat.h"
 
@@ -206,11 +207,17 @@ uint64_t gpu_vk_end_present(const VkSemaphoreSubmitInfo *waits, uint32_t nwaits,
 
 // ---------- the back-end table
 // Pools are the backing map's (oot2/backing.h): pool_fini returns once no submission in flight used the pool.
-static int vk_pool_init(pool_t *p) { return backing_pool_init(p); }
+static int vk_pool_init(pool_t *p) {
+    int ok = backing_pool_init(p);
+    if (ok) gpu_vk_raw_pool_made(p);   // the miss diagnostics' index of pools (settings.h raw_diag): nothing with it off
+    return ok;
+}
 // The entries over the pool's storage show the placeholder and its images can no longer be reached, before the pool's
 // extent goes back to its block (the images are destroyed once no submission can read them).
 static void vk_pool_fini(pool_t *p) {
     uint64_t lo = (uint64_t)(uintptr_t)p->mem;
+    // First: backing_pool_fini waits for the submissions that used the pool, and the index keeps this call's timeline value
+    gpu_vk_raw_pool_gone(p);
     bindless_storage_gone(lo, lo + p->size);
     vkb_image_pool_gone(lo, lo + p->size);
     bindless_storage_settled(lo, lo + p->size);

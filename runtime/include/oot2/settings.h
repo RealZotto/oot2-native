@@ -216,7 +216,13 @@ typedef enum RtSettingSource {
       "TEST switch that CHANGES THE PICTURE, never set in a proof run: the Vulkan replay does not run the movie's "     \
       "enhancement chain between its first and last dispatch and resamples the first dispatch's picture into the "      \
       "last one's output instead, so the opening plays at the game's pace; the chain's programs are named by the file " \
-      "OOT2_MOVIE_BLIT_KEYS, kept outside the repository. A run with it on is logged, counted and listed as not a proof run")
+      "OOT2_MOVIE_BLIT_KEYS, kept outside the repository. A run with it on is logged, counted and listed as not a proof run") \
+    X(raw_diag, DEBUG, BOOL, RESTART, 0, 0, 1, NULL,                                                                   \
+      "DIAGNOSTIC switch, off by default, slower while on, never part of a timed run: explain each raw-access miss of the " \
+      "Vulkan back end. After each raw-access dispatch and each render pass with raw-access draws the replay copies the "   \
+      "page table's miss log out and clears it, so a stage keeps its own 64 entries instead of sharing 64 with the "        \
+      "submission; every memory pool the game makes is indexed with its range; each missed address is classified (pool, "   \
+      "declared mapped, committed, mapped now), logged once for each stage and class, and counted per class in census.tsv")
 
 typedef enum RtSettingId {
 #define RT_SETTING_ID(key, group, type, apply, def, min, max, names, what) RT_SET_##key,
