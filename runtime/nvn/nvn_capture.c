@@ -17,6 +17,7 @@
 
 #include "oot2/capture.h"
 #include "oot2/gfx.h"
+#include "oot2/memline.h"
 #include "oot2/kernel.h"
 #include "oot2/nvn_pace.h"
 #include "oot2/runtime.h"
@@ -256,6 +257,7 @@ static const char *reason(int code) {
 
 void capture_end(int code) {
     if (!__atomic_load_n(&g_started, __ATOMIC_ACQUIRE) || __atomic_exchange_n(&g_ending, 1, __ATOMIC_ACQ_REL)) return;
+    memline_end();   // the memory line's closing row first: it waits for its helper at most a second and takes no capture lock
     MemNow m = mem_now();
     uint64_t c[CAPTURE_COUNTERS];
     counters_now(c);
@@ -352,6 +354,7 @@ void capture_start(const char *folder) {
     rt_add_stop_writer(stop_writer);
     __atomic_store_n(&g_started, 1, __ATOMIC_RELEASE);
     if (!plat_thread_start(sampler_main, NULL, 1ull << 20)) rt_fatal("capture: cannot start the sampling thread");
+    memline_start(folder, stamp, plat_pid());   // memory-<stamp>-<pid>.tsv beside this file (oot2/memline.h)
     rt_log("capture: writing %s (title mark at present %llu, %s)", path, (unsigned long long)g_title_seq,
            g_length_ns ? "the run ends by itself after the capture's length" : "until the run ends");
 }
@@ -489,7 +492,9 @@ void capture_present(uint64_t seq) {
             g_title_seen = 1, g_title_t = t;
             l_str(&g_l, "title"), l_t(&g_l, seq), l_t(&g_l, t), l_counters(&g_l, c);
             append(&g_l);
+            memline_mark(MEMLINE_TITLE, seq);   // a flag; the helper gathers
         }
+        memline_mark(MEMLINE_SCENE, seq);   // acts once, at OOT2_MEMLINE_SCENE, when that is set
         end_now = g_title_seen && g_length_ns && t - g_title_t >= g_length_ns;
     }
     plat_mutex_unlock(&g_data);

@@ -36,6 +36,7 @@ struct VkbImage {
     ImgKey key;
     VkImage image;
     VkDeviceMemory dedicated;     // memory of its own when it could not be placed
+    uint64_t own_bytes;           // the size of that memory
     VkFormat format;
     VkImageAspectFlags aspect, all_aspects;   // the one a copy takes; every aspect of the format
     VkImageCreateFlags flags;
@@ -256,6 +257,7 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
                  (mr.memoryTypeBits >> ref.type & 1);
     }
     VkDeviceMemory dedicated = VK_NULL_HANDLE;
+    uint64_t own_bytes = 0;
     if (arena) {
         // nothing more: its memory is the extent
     } else if (placed) {
@@ -268,7 +270,7 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
                                    .memoryTypeIndex = type};
         GPU_VK_OK(vkAllocateMemory(gpu_vk.device, &alloc, NULL, &dedicated), "vkAllocateMemory (an unaliased image)");
         GPU_VK_OK(vkBindImageMemory(gpu_vk.device, image, dedicated, 0), "vkBindImageMemory (an unaliased image)");
-        g_st.unaliased++;
+        g_st.unaliased++, g_st.unaliased_bytes += own_bytes = mr.size;
         if (!vkf_extent_ok(row, fmt))
             rt_log("gfx: vulkan: the image of the ASTC texture at %#llx holds its decoded RGBA8 texels, not the game's blocks, so "
                    "it does not stand in its pool's extent: it has memory of its own and loses the game's aliasing",
@@ -285,7 +287,7 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
     }
     VkbImage *i = calloc(1, sizeof *i);
     if (!i) rt_fatal("gfx: vulkan: out of memory for an image");
-    i->key = *key, i->image = image, i->dedicated = dedicated, i->format = fmt, i->flags = flags, i->usage = usage;
+    i->key = *key, i->image = image, i->dedicated = dedicated, i->own_bytes = own_bytes, i->format = fmt, i->flags = flags, i->usage = usage;
     i->aspect = (row->flags & VKF_DEPTH) ? VK_IMAGE_ASPECT_DEPTH_BIT : (row->flags & VKF_STENCIL) ? VK_IMAGE_ASPECT_STENCIL_BIT
                                                                                               : VK_IMAGE_ASPECT_COLOR_BIT;
     i->all_aspects = i->aspect | ((row->flags & (VKF_DEPTH | VKF_STENCIL)) == (VKF_DEPTH | VKF_STENCIL) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
@@ -388,7 +390,7 @@ static void image_destroy(VkbImage *i) {
     vkDestroyImage(gpu_vk.device, i->image, NULL);
     if (i->dedicated) vkFreeMemory(gpu_vk.device, i->dedicated, NULL);
     if (i->arena) texarena_free(&i->ext);
-    g_st.destroyed++, g_st.live--;
+    g_st.destroyed++, g_st.live--, g_st.unaliased_bytes -= i->own_bytes;
     free(i);
 }
 

@@ -41,6 +41,9 @@ NVN_API(nvnBufferBuilderGetMemoryPool) { ret_x(c, (uintptr_t)((const buf_builder
 NVN_API(nvnBufferBuilderGetMemoryOffset) { ret_x(c, (uint64_t)((const buf_builder_t *)arg_p(c, 0))->off); }
 NVN_API(nvnBufferBuilderGetSize) { ret_x(c, ((const buf_builder_t *)arg_p(c, 0))->size); }
 
+static uint64_t g_buffers_live;
+uint64_t nvn_buffers_live(void) { return __atomic_load_n(&g_buffers_live, __ATOMIC_RELAXED); }
+
 // NVNboolean nvnBufferInitialize(NVNbuffer *b, const NVNbufferBuilder *builder): false for a range outside an
 // initialised pool
 NVN_API(nvnBufferInitialize) {
@@ -52,6 +55,7 @@ NVN_API(nvnBufferInitialize) {
         ret_x(c, 0);
         return;
     }
+    if (o->magic != BUF_MAGIC) __atomic_fetch_add(&g_buffers_live, 1, __ATOMIC_RELAXED);   // an initialise of a live one is the same buffer
     *o = (buf_t){BUF_MAGIC, s->pool, s->off, s->size};
     if (texheap_on() && !gfx_gpu_only((uintptr_t)p->mem))
         texheap_range(TEXHEAP_OBJECT, (uintptr_t)p->mem + (uint64_t)s->off, s->size);
@@ -62,6 +66,7 @@ NVN_API(nvnBufferFinalize) {
     buf_t *o = arg_p(c, 0);
     if (texheap_on() && o->magic == BUF_MAGIC && o->pool && !gfx_gpu_only((uintptr_t)o->pool->mem))
         texheap_range(TEXHEAP_OBJECT_END, (uintptr_t)o->pool->mem + (uint64_t)o->off, o->size);
+    if (o->magic == BUF_MAGIC) __atomic_fetch_sub(&g_buffers_live, 1, __ATOMIC_RELAXED);
     *o = (buf_t){0};
 }
 // void nvnBufferSetDebugLabel(NVNbuffer *b, const char *label): for NVN's debugging tools only

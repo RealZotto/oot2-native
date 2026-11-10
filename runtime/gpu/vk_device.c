@@ -22,7 +22,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "oot2/backing.h"
 #include "oot2/gpu_vk.h"
+#include "oot2/memline.h"
+#include "oot2/texmem.h"
+#include "oot2/vk_image.h"
+#include "oot2/vk_pipeline.h"
 #include "oot2/runtime.h"
 #include "oot2/vk_bindless.h"
 #include "oot2/vk_gpu_time.h"
@@ -421,6 +426,38 @@ static void create_device(uint64_t after) {
 
 void gpu_vk_start_timeline(uint64_t after);   // vk_submit.c
 
+// The device terms of the memory line (oot2/memline.h), on its helper thread. It holds g_open_lock, so a device being closed
+// is never read, and it reads nothing a frame holds longer than the accessor takes. Vulkan heaps 0 and 1 are what
+// VK_EXT_memory_budget reports for this process.
+static void memline_fill(MemTerms *t) {
+    plat_mutex_lock(&g_open_lock);
+    if (g_open) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
+        vkGetPhysicalDeviceMemoryProperties2(gpu_vk.phys, &mp);
+        uint32_t n = mp.memoryProperties.memoryHeapCount;
+        t->vk_heap0_used = n > 0 ? b.heapUsage[0] : 0, t->vk_heap0_budget = n > 0 ? b.heapBudget[0] : 0;
+        t->vk_heap1_used = n > 1 ? b.heapUsage[1] : 0, t->vk_heap1_budget = n > 1 ? b.heapBudget[1] : 0;
+        TexMemStats tm;
+        texmem_stats(&tm);
+        t->tex_ring_chunks = tm.ring_chunks, t->tex_ring_bytes = tm.ring_bytes, t->tex_arena_blocks = tm.arena_blocks;
+        t->tex_arena_bytes = tm.arena_bytes, t->tex_arena_used = tm.arena_used, t->tex_arena_frees = tm.arena_frees;
+        BackingStats bs;
+        backing_stats(&bs);
+        t->bk_blocks = bs.blocks, t->bk_block_bytes = bs.block_bytes, t->bk_extents = bs.extents;
+        t->bk_extent_bytes = bs.extent_bytes, t->bk_imports = bs.imports, t->bk_import_bytes = bs.import_bytes;
+        t->bk_mirrors = bs.mirrors, t->bk_mirror_bytes = bs.mirror_bytes, t->bk_deferred = bs.deferred;
+        VkbImageStats is;
+        vkb_image_stats(&is);
+        t->img_live = is.live, t->img_own = is.unaliased, t->img_own_bytes = is.unaliased_bytes, t->img_arena = is.arena;
+        VkpStats ps;
+        vkp_stats(&ps);
+        t->pipe_resident = ps.resident, t->pipe_libraries = ps.libraries, t->pipe_links = ps.links;
+        t->pipe_cache_bytes = vkp_cache_size();
+    }
+    plat_mutex_unlock(&g_open_lock);
+}
+
 void gpu_vk_open(void) {
     plat_mutex_lock(&g_open_lock);
     if (g_open) {
@@ -449,6 +486,7 @@ void gpu_vk_open(void) {
     vkmb_open();   // the movie chain's stand-in, when the test switch test_movie_blit is on (oot2/vk_movie_blit.h)
     vkw_open();   // the window's surface, the menu's pipeline and the present thread, when a window was asked for
     g_open = 1;
+    memline_set_gpu(memline_fill);
     plat_mutex_unlock(&g_open_lock);
 }
 

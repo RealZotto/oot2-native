@@ -177,10 +177,14 @@ NVN_API(nvnTextureBuilderGetViewOffset) {
 }
 
 // ---- textures
+static uint64_t g_textures_live;   // textures with a serial now
+uint64_t nvn_textures_live(void) { return __atomic_load_n(&g_textures_live, __ATOMIC_RELAXED); }
+
 static void release(tex_t *o) {
     if (o->magic != NVN_TEX_MAGIC || !o->serial) return;
     if (texheap_on()) texheap_texture_end(o);
     gfx_backend()->texture_release(o);
+    __atomic_fetch_sub(&g_textures_live, 1, __ATOMIC_RELAXED);
 }
 
 // NVNboolean nvnTextureInitialize(NVNtexture *t, const NVNtextureBuilder *b): false for storage outside an initialised
@@ -216,6 +220,7 @@ NVN_API(nvnTextureInitialize) {
         gfx_backend()->guest_written((uintptr_t)o->mem, L.size);
     }
     o->serial = new_serial();
+    __atomic_fetch_add(&g_textures_live, 1, __ATOMIC_RELAXED);
     if (texheap_on()) texheap_texture_init(o, s->pkg_data != NULL);
     ret_x(c, 1);
 }

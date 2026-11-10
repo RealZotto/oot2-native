@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "core.h"
+#include "oot2/memline.h"
 #include "plat.h"
 
 #define TABLE_SPAN_LIMIT (1ull << 30)   // guest bytes covered by the table, and its size in bytes
@@ -172,6 +173,7 @@ void rt_dispatch_init(const RtModule *mods, int count) {
     uint64_t slots = (hi - lo) >> 2, bytes = (slots * 4 + 0xFFFF) & ~0xFFFFull;
     uint32_t *slot = plat_alloc_zeroed(bytes);
     if (!slot) rt_fatal("dispatch: cannot allocate a %llu-byte table", (unsigned long long)bytes);
+    memline_note("dispatch-table", bytes);
     for (int i = 0; i < g_nmods; i++) {
         const RtModule *m = g_mods[i];
         for (uint64_t k = 0; k < m->count; k++)

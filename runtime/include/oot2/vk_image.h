@@ -99,6 +99,7 @@ void vkb_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, c
 
 typedef struct VkbImageStats {
     uint64_t made, live, placed, unaliased, destroyed, arena;   // arena: images made in the texture arena
+    uint64_t unaliased_bytes;                  // memory of their own the live unaliased images hold now
     uint64_t skipped_cpu, skipped_format;      // textures with no image: CPU-visible storage; no format
     uint64_t views_made, views_live;
     uint64_t transitions, texel_reads, texel_writes;

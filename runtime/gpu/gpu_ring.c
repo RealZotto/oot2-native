@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "oot2/gpu_ring.h"
+#include "oot2/memline.h"
 #include "oot2/runtime.h"
 #include "plat.h"
 
@@ -52,6 +53,7 @@ GpuRing *gpu_ring_new(size_t bytes) {
         free(r);
         return NULL;
     }
+    memline_note("gpu-ring", bytes);
     r->words = bytes / 8;
     r->mask = r->words - 1;
     r->lock = (PlatMutex)PLAT_MUTEX_INIT;
@@ -61,6 +63,7 @@ GpuRing *gpu_ring_new(size_t bytes) {
 
 void gpu_ring_free(GpuRing *r) {
     if (!r) return;
+    memline_unnote("gpu-ring", (uint64_t)r->words * 8);
     free(r->mem);
     free(r);
 }
