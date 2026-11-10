@@ -16,8 +16,10 @@
 //                              replay it records the replayed input, which writes the same file again in canonical form.
 //                              The file is written as the run goes and its last run is closed when the run stops, so a
 //                              process killed from outside loses that last run.
-//   The two may not name the same file (the replay would be overwritten at start). Both are read once, at start-up
-//   (hos_init), and a file that cannot be read or has a malformed line stops the run there, by name.
+//   The two may not name the same file (the replay would be overwritten at start): two spellings of one file (./, upper
+//   case, a link) are caught by content, since an existing record file with the replay's exact bytes is refused too. Both
+//   are read once, at start-up (hos_init), and a file that cannot be read or has a malformed line stops the run there,
+//   by name.
 //
 // The tick. Tick 0 is the virtual clock's tick in progress when the game first reads the full-key controller's state
 // (nn::hid::GetNpadStates), so a file means the same thing in every run however long start-up took. The state of a tick
@@ -26,7 +28,8 @@
 // A tick in which the game does not read gives nothing to anyone, so a recorded run extends over such ticks.
 //
 // The file. Plain text, one line per held stretch, in any order:
-//   # a comment: from '#' to the end of the line; blank lines and CR LF line ends are fine
+//   # a comment: from '#' to the end of the line; blank lines, CR LF line ends and a UTF-8 byte order mark at the start
+//     of the file are fine
 //   at <tick> for <count> [<held> ...]
 //     <tick>   decimal, 0 to 4294967295: the first tick of the stretch, counted as above
 //     <count>  decimal, 1 to 4294967295: how many ticks it lasts (the ticks tick .. tick+count-1)

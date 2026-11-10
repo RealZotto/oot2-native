@@ -37,6 +37,7 @@ END_SOURCE = ROOT / "tests" / "runtime" / "endmark.c"   # linked after the test:
 MODULE_SIZE = 0x8000
 TIMEOUT = 60
 EXIT_FATAL = 70
+EXIT_KILLED = 3   # the harness's run_then_exit: _Exit(3), a process that stops without any clean-up
 FIRST_TICK = 500   # the virtual tick of the script's first line (hid_replay_test.c): the file's tick 0 is not the clock's
 
 # The nn::hid button bits in bit order (the layout of the controller's state, as the format names them)
@@ -156,7 +157,7 @@ class HidReplayTest(unittest.TestCase):
         path.write_bytes(data)
         return path
 
-    def run_case(self, script: str = "", replay: Path | None = None, record: Path | None = None,
+    def run_case(self, script: str = "", replay: Path | None = None, record: Path | str | None = None,
                  case: str = "run") -> tuple[subprocess.CompletedProcess, Path]:
         folder = self.folder()
         (folder / "script.txt").write_text(script)
@@ -279,6 +280,25 @@ class HidReplayTest(unittest.TestCase):
         self.assertEqual(lines, ["at 1 for 3 a"])   # the run of A, open at the stop, is closed and written
         self.assertIn("4 ticks, closed", self.rows(folder, "input-record")[0][5])
 
+    def test_record_counts_a_held_state_across_unread_ticks(self) -> None:
+        # A is first read at tick 3, B at tick 10: A was held for the seven ticks 3..9, whatever the game read in between
+        reads = [(0, 1, REST), (3, 1, (bits("a"), 0, 0, 0, 0)), (10, 1, (bits("b"), 0, 0, 0, 0))]
+        rec = self.folder() / "record.txt"
+        self.passes(script_text(reads), record=rec)
+        lines = [l for l in rec.read_text().splitlines() if l and not l.startswith("#")]
+        self.assertEqual(lines, ["at 3 for 7 a", "at 10 for 1 b"])
+        self.assertEqual(lines, encode_runs([(t, r) for (t, _, r) in reads]))
+
+    def test_record_keeps_every_closed_run_when_the_process_is_killed(self) -> None:
+        # _Exit: no stop path and no stdio flush. The run of A closed when B was read, so it is in the file; B is open
+        reads = [(0, 1, REST), (1, 1, (bits("a"), 0, 0, 0, 0)), (2, 1, (bits("a"), 0, 0, 0, 0)),
+                 (3, 1, (bits("b"), 0, 0, 0, 0)), (4, 1, (bits("b"), 0, 0, 0, 0))]
+        rec = self.folder() / "record.txt"
+        done, _ = self.run_case(script_text(reads), record=rec, case="run_then_exit")
+        self.assertEqual(done.returncode, EXIT_KILLED, done.stdout + done.stderr)
+        lines = [l for l in rec.read_text().splitlines() if l and not l.startswith("#")]
+        self.assertEqual(lines, ["at 1 for 2 a"])
+
     def test_record_then_replay_gives_the_same_states(self) -> None:
         reads = [(t, 1, (bits(*names), lx, ly, rx, ry)) for t, (names, lx, ly, rx, ry) in enumerate([
             ((), 0, 0, 0, 0), ((), 0, 0, 0, 0), (("a",), 0, 0, 0, 0), (("a", "zr"), 0, 0, 0, 0),
@@ -368,6 +388,35 @@ class HidReplayTest(unittest.TestCase):
         self.assertEqual(fatal, [f"FATAL: input record {path}: it is the input file being replayed"])
         self.assertEqual(path.read_bytes(), TAPE_A, "the input file was left as it was")
 
+    def refuses_record_alias(self, tape: Path, alias: str | Path) -> None:
+        """The record names the replayed file by another spelling: refused by name, and the tape is left as it was."""
+        data = tape.read_bytes()
+        done, _ = self.run_case(ONE_READ, replay=tape, record=alias)   # str: a Path would drop the "./"
+        self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+        fatal = [l for l in done.stderr.splitlines() if l.startswith("FATAL")]
+        self.assertEqual(fatal, [f"FATAL: input record {alias}: it is the input file being replayed"])
+        self.assertEqual(tape.read_bytes(), data, "the input file was left as it was")
+
+    def test_malformed_record_over_the_input_by_a_dot_alias(self) -> None:
+        tape = self.file("tape.txt", b"at 0 for 3 a\nat 10 for 5 b\n")
+        self.refuses_record_alias(tape, f"{tape.parent}{os.sep}.{os.sep}{tape.name}")
+
+    def test_malformed_record_over_the_input_by_an_upper_case_alias(self) -> None:
+        tape = self.file("Tape.txt", b"at 0 for 3 a\nat 10 for 5 b\n")
+        alias = tape.parent / "TAPE.TXT"
+        if not alias.exists():
+            self.skipTest("the file system tells upper case from lower case: that is no alias of the tape")
+        self.refuses_record_alias(tape, alias)
+
+    def test_record_over_another_existing_file_replaces_it(self) -> None:
+        # the counterpart of the refusals: a record file that already exists with other bytes is written over, as ever
+        tape = self.file("tape.txt", b"at 0 for 3 a\nat 10 for 5 b\n")
+        rec = self.file("record.txt", b"old record\n")
+        self.passes(script_text([(t, 1, REST) for t in range(12)]), replay=tape, record=rec)
+        lines = [l for l in rec.read_text().splitlines() if l and not l.startswith("#")]
+        self.assertEqual(lines, ["at 0 for 3 a", "at 10 for 2 b"])
+        self.assertEqual(tape.read_bytes(), b"at 0 for 3 a\nat 10 for 5 b\n")
+
     def test_malformed_record_cannot_be_created(self) -> None:
         target = self.folder() / "no-such-folder" / "record.txt"
         done, _ = self.run_case(ONE_READ, record=target)
@@ -380,6 +429,15 @@ class HidReplayTest(unittest.TestCase):
     def test_empty_file_is_rest(self) -> None:
         states, _ = self.passes(script_text([(0, 1, REST), (1, 1, REST)]), replay=self.file("tape.txt", b""))
         self.assertEqual([held_of(s) for s in states], [(0, 0, 0, 0, 0)] * 2)
+
+    def test_replay_skips_a_byte_order_mark(self) -> None:
+        # Windows tools write EF BB BF at the start of a UTF-8 file
+        spans: list[Span] = [(1, 2, ["a"]), (4, 1, ["b"])]
+        path = self.file("tape.txt", b"\xef\xbb\xbf# a tape\n" + render(spans, "\r\n"))
+        ticks = list(range(0, 6))
+        states, _ = self.passes(script_text([(t, 1, REST) for t in ticks]), replay=path)
+        self.assertEqual([held_of(s) for s in states], [held_at(spans, t) for t in ticks])
+        self.assertTrue(any(any(held_of(s)) for s in states))
 
     def test_empty_variable_is_off(self) -> None:
         folder = self.folder()
@@ -414,6 +472,8 @@ MALFORMED = {
     "stick_too_high": (b"at 1 for 1 lx=32768\n", 1, "lx=32768 is outside -32768..32767"),
     "stick_too_low": (b"at 1 for 1 ly=-32769\n", 1, "ly=-32769 is outside -32768..32767"),
     "binary_file": (b"at 0 for 1 a\nat 1 for 1 b\x00\n", 2, "a NUL byte; the input file is text"),
+    "byte_order_mark_not_at_the_start": (b"at 0 for 1 a\n\xef\xbb\xbfat 1 for 1 b\n", 2,
+                                         'unknown line kind "???at" (a line starts with "at")'),
     "garbage_word_is_shown_safely": (b"at 0 for 1 a\n\xff\xfe\x01 5\n", 2, 'unknown line kind "???" (a line starts with "at")'),
 }
 

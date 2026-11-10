@@ -16,6 +16,9 @@
 //                             with BUTTONS in hex. At the end the report is written (census.tsv) and "ok run" printed.
 //                             A fatal at start-up (a malformed input file) exits with the runtime's code.
 //   hid_replay_test run_then_fatal DIR   the same, ending in a fatal of the case's own instead of the report call
+//   hid_replay_test run_then_exit DIR    the same, ending in a stop with exit code 3 and no clean-up (TerminateProcess;
+//                                        _Exit elsewhere): a process killed from outside, which closes and flushes
+//                                        nothing, so the record holds only what each closed run flushed
 //
 // The driving script and the files are written by tests/test_runtime_hid_replay.py, which computes what every read must
 // give on its own.
@@ -23,6 +26,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "layout.h"
 #include "endmark.h"
@@ -144,6 +150,13 @@ static int run(const char *dir, int fatal) {
         }
     }
     fclose(f);
+    if (fatal == 2) {   // killed from outside: no atexit, no flush of any stream, no stop path
+        fflush(stdout);
+#ifdef _WIN32
+        TerminateProcess(GetCurrentProcess(), 3);   // the C runtime's _Exit flushes the open streams here
+#endif
+        _Exit(3);
+    }
     if (fatal) rt_fatal("the case stopped the run");   // every stop closes the recorder's last run
     hos_census_write("the case ended");   // the report; this is also where the recorder closes its last run
     printf("ok run\n");
@@ -157,6 +170,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "run")) return run(argv[2], 0);
     if (!strcmp(argv[1], "run_then_fatal")) return run(argv[2], 1);
+    if (!strcmp(argv[1], "run_then_exit")) return run(argv[2], 2);
     fprintf(stderr, "unknown case %s\n", argv[1]);
     return 2;
 }

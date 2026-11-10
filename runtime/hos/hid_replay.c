@@ -55,6 +55,7 @@ static char g_replay_path[1024], g_rec_path[1024];
 static Span *g_spans;
 static size_t g_nspans, g_cap;
 static char g_sha_hex[65];
+static size_t g_replay_bytes;   // the size of the replayed file
 
 static int g_anchored;
 static uint64_t g_base;   // the virtual tick that is tick 0 of the file
@@ -217,6 +218,7 @@ static void add_span(int line, const Span *s) {
 }
 
 static void parse_file(char *buf, size_t n) {
+    if (n >= 3 && !memcmp(buf, "\xEF\xBB\xBF", 3)) buf += 3, n -= 3;   // a UTF-8 byte order mark, as Windows tools write
     char *nul = memchr(buf, 0, n);
     if (nul) {
         int line = 1;
@@ -274,8 +276,33 @@ static void load_replay(const char *path) {
     uint8_t digest[32];
     rt_sha256(buf, n, digest);
     for (int i = 0; i < 32; i++) snprintf(g_sha_hex + 2 * i, 3, "%02x", digest[i]);
+    g_replay_bytes = n;
     parse_file(buf, n);
     free(buf);
+}
+
+// Whether path is an existing file with exactly the bytes of the replayed file. The name test cannot tell two spellings
+// of one file apart (./, upper case, a hard link or a symbolic link), and opening the record for writing would truncate
+// the tape; the content can. A different file with the same bytes is refused too: it holds nothing the record would not
+// write again.
+static int has_replay_bytes(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char *buf = malloc(g_replay_bytes + 2);
+    int same = 0;
+    if (buf) {
+        size_t got = fread(buf, 1, g_replay_bytes + 1, f);   // one byte more than the tape: a longer file is not it
+        if (got == g_replay_bytes && !ferror(f)) {
+            uint8_t digest[32];
+            char hex[65];
+            rt_sha256(buf, got, digest);
+            for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+            same = !strcmp(hex, g_sha_hex);
+        }
+        free(buf);
+    }
+    fclose(f);
+    return same;
 }
 
 // ---- the replay: the state of a tick
@@ -412,7 +439,8 @@ void hid_replay_start(void) {
         g_replay_on = 1;
     }
     if (rec) {
-        if (in && !strcmp(in, rec)) rt_fatal("input record %s: it is the input file being replayed", rec);
+        if (in && (!strcmp(in, rec) || has_replay_bytes(rec)))
+            rt_fatal("input record %s: it is the input file being replayed", rec);
         snprintf(g_rec_path, sizeof g_rec_path, "%s", rec);
         g_rec_file = fopen(rec, "wb");
         if (!g_rec_file) rt_fatal("input record %s: cannot be created (%s)", rec, strerror(errno));
