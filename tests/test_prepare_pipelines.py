@@ -803,6 +803,20 @@ class WarmPassTest(unittest.TestCase):
         cache.write_text("")                                                   # an empty cache serves nothing
         self.assertFalse(Pipelines().verify(ctx, ctx.state["steps"]["pipelines"]))
 
+    def test_a_step_limited_to_a_list_is_verified_on_the_listed_programs_only(self) -> None:
+        env = Env(self)
+        listing = env.tmp / "list.txt"
+        listing.write_text("p000000000000003.00000000\nc000000000000001.00000000\n")
+        status, ctx = env.run(env.context(pipelines_list=listing))
+        self.assertEqual(status, "ok", env.say(ctx))
+        record = ctx.state["steps"]["pipelines"]
+        self.assertEqual(record["programs"], 2)
+        self.assertEqual(sorted(i.key for i in pipelines.sample_items(ctx, record)),
+                         ["c000000000000001.00000000", "p000000000000003.00000000"])
+        self.assertTrue(Pipelines().verify(ctx, record))                       # the eight others are not in the cache
+        (env.dest / "pipelines" / "pipeline.cache").write_text("")
+        self.assertFalse(Pipelines().verify(ctx, record))                      # and a cache that serves nothing still fails
+
 
 if __name__ == "__main__":
     unittest.main()

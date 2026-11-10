@@ -471,9 +471,10 @@ def load_work(ctx: Context, pack_path: Path, only: list[str] | None) -> pipesche
 
 
 def sample_items(ctx: Context, record: dict) -> list[pipesched.Item]:
-    """An even spread of SAMPLE modules the step built, in order, for verify."""
+    """An even spread of SAMPLE modules the step built, in order, for verify. A step limited to a list built only those, so
+    only those are sampled: the rest are not in the cache and would be built cold, and verify would call the cache damaged."""
     pack = ctx.dest / translate.SHADERS / cache_pack.BASE_FILE
-    wl = load_work(ctx, pack, None)
+    wl = load_work(ctx, pack, list_keys(getattr(ctx.options, "pipelines_list", None)))
     items = pipesched.order(wl.items)
     step = max(1, len(items) // SAMPLE)
     return items[::step][:SAMPLE]
