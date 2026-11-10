@@ -17,7 +17,7 @@
 static int g_stopping;   // a fatal error is being reported; a second one exits at once
 static void (*g_stop_hook)(int code, const char *line);
 static void (*g_stop_flush)(void);
-#define STOP_WRITERS 6
+#define STOP_WRITERS 8
 static void (*g_stop_writers[STOP_WRITERS])(int code, const char *line);
 static int g_nwriters;
 static int g_hook_ran;

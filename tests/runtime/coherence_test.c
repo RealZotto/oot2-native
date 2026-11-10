@@ -2606,7 +2606,7 @@ static void union_finish(const char *name) {
 }
 
 // The begin joins the import and the mirror: one mirror over both, the table maps it as one run, and the binds that stopped
-// the first runs (one across the boundary, one across the page of the mirror it would cut) are hits.
+// the first game runs (one across the boundary, one across the page of the mirror it would cut) are hits.
 static void case_union_begin_straddle(void) {
     uint64_t p, v = union_world(&p, 0x20000);
     uint64_t version = backing_version();

@@ -2876,6 +2876,11 @@ void backing_stats(BackingStats *out) {
     out->resolve_misses = __atomic_load_n(&g_misses, __ATOMIC_RELAXED);
 }
 
+static int g_exit_done = 1;   // the once-per-run lines are written (or the map is not open); backing_open arms it
+static int g_exit_hooked;     // their stop writer and atexit handler are registered (once per process)
+static void exit_writer(int code, const char *line);
+static void exit_atexit(void);
+
 // ---------- open and close
 void backing_open(const BackingOps *ops) {
     if (g_open) rt_fatal("gfx: vulkan: backing map: opened twice");
@@ -2903,6 +2908,8 @@ void backing_open(const BackingOps *ops) {
     g_adj_version = 0, g_begin_now = 0, g_nleft = 0;
     g_raw_last = g_raw_prev = 0, g_filled = 0, g_pools_version = g_fill_pools = g_fill_epoch = 0;
     g_open = 1;
+    __atomic_store_n(&g_exit_done, 0, __ATOMIC_RELEASE);
+    if (!g_exit_hooked) g_exit_hooked = 1, rt_add_stop_writer(exit_writer), atexit(exit_atexit);
     g_bt_stop = 0, g_bt_want = 1, g_bt_running = 1;
     g_bt = plat_thread_start(bt_main, NULL, BLOCK_THREAD_STACK);
     if (!g_bt) rt_fatal("gfx: vulkan: backing map: the block thread did not start");
@@ -2910,9 +2917,15 @@ void backing_open(const BackingOps *ops) {
 
 int backing_is_open(void) { return g_open; }
 
-void backing_close(void) {
-    if (!g_open) return;
-    if (g_st.raw_begins) {   // once per run that used the raw path: what the candidate growth would have done
+// The once-per-run lines of the counters (the dry evaluation, the caps and unions, the growths), written by whichever comes
+// first: backing_close, a stop of the run (rt_run_stop_hook: a named stop, a guest ExitProcess, the census limit) or the
+// process returning from main. The counters are read as they stand, with no lock: the stopping thread may hold g_lock (a
+// named stop is raised under it), and a line off by a count in flight is better than none. Once a run (g_exit_done). The
+// dry evaluation's line is left to the stop's dump, which holds it, and written by the runs that end on their own.
+
+static void exit_lines(int stop) {
+    if (__atomic_exchange_n(&g_exit_done, 1, __ATOMIC_ACQ_REL)) return;
+    if (g_st.raw_begins && !stop) {   // once per run that used the raw path, and ends on its own: what the candidate growth would have done (the dump of a stop holds it)
         char d[260];
         size_t at = 0;
         for (int i = 0; i < DRY_N; i++)
@@ -2932,6 +2945,18 @@ void backing_close(void) {
         growth_counts(counts, sizeof counts);
         rt_log("gfx: vulkan: backing map: raw growth at exit: %s", counts);
     }
+}
+
+static void exit_writer(int code, const char *line) {
+    (void)line;
+    exit_lines(code != 0);   // a named stop is a nonzero code; a guest ExitProcess is 0
+}
+
+static void exit_atexit(void) { exit_lines(0); }
+
+void backing_close(void) {
+    if (!g_open) return;
+    exit_lines(0);
     plat_mutex_lock(&g_bt_lock);
     g_bt_stop = 1;
     plat_cond_signal(&g_bt_cond);

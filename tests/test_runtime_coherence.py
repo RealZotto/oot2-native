@@ -588,6 +588,22 @@ class CoherenceTest(unittest.TestCase):
                 self.assertIn("(peak 138420224, a promotion leaves at most 134217728, peak overshoot 4202496), growths that "
                               "left it over the cap 1; unions 0 ", found[0])
 
+    def test_a_run_that_ends_on_a_named_stop_prints_the_counters_once_after_it(self) -> None:
+        # The lines belong to backing_close, which a stop never reaches: the stop path writes them (rt_run_stop_hook), once,
+        # after the FATAL line, without a lock (the stop is raised under the map's).
+        for case in ("raw_diag_hull", "raw_grow_cap", "raw_ev_miss"):
+            for level in LEVELS:
+                with self.subTest(case=case, level=level):
+                    done = self.run_case(level, case)
+                    self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+                    lines = done.stderr.splitlines()
+                    fatal_at = [n for n, line in enumerate(lines) if line.startswith("FATAL: ")]
+                    self.assertEqual(len(fatal_at), 1, done.stderr)
+                    found = [n for n, line in enumerate(lines) if line.startswith(TOTALS_LINE)]
+                    self.assertEqual(len(found), 1, done.stderr)
+                    self.assertGreater(found[0], fatal_at[0], done.stderr)
+                    self.assertEqual(done.stderr.count(EXIT_LINE), 0)   # the dump holds the dry evaluation
+
     def test_a_run_that_does_not_stop_prints_the_dry_counters_once_at_exit(self) -> None:
         for case, refusals in DRY_CASES.items():
             for level in LEVELS:

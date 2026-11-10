@@ -34,6 +34,9 @@
 //                stages, the bound views and guest memory agree
 //   grow_guarded_head, grow_guarded_tail   a bound mirror grows beside a GPU-only extent used by the same submission;
 //                the committed chunk beside the bind keeps an import over its other pages, which the raw stage reaches
+//   (the three grow_* cases below commit the pages beside the mirror AFTER the submission's first raw begin: committed before it,
+//   the begin's union pass joins the mirror and the import into one backing and the growth never arises; the game's growths
+//   come from pages committed between two begins of one submission)
 //   heap MIB what the invariant costs over a guest heap of MIB MiB committed in 256 MiB pools, with a 256 MiB pool in the
 //            window: resident bytes and VRAM before and after the first raw-access submission, the invariant's pass and
 //            the table's build timed, then a second submission with the map unchanged (measured, not judged; the full
@@ -885,7 +888,6 @@ static void case_grow_used(const char *spv) {
     backing_resolve(p, 0x100, v0, &m0);
     CHECK(m0.kind == BACKING_MIRROR);
     finish(v0);
-    fill_words(E, 256 * KiB, 0xBBBBBBBBu);   // committed since: an import at the begin of the next raw-access submission
     memcpy(first, e, sizeof first);
     first[0] = (Entry){old + PROBE, old + 0x100, 0, 0, {0}};
     e[0] = (Entry){given + PROBE, given + 0x800, 0, 0, {0}};
@@ -899,8 +901,9 @@ static void case_grow_used(const char *spv) {
     backing_resolve(old, 0x100, v, &small);
     CHECK(small.kind == BACKING_MIRROR);
     uint32_t push1[4], push2[4];
-    gpu_vk_raw_begin(v, push1);   // the import over E is made here; the table of v maps both
+    gpu_vk_raw_begin(v, push1);   // the first begin of v: the mirror stands alone here (the union pass finds no chain)
     stage(cb, first, push1, &entries);
+    fill_words(E, 256 * KiB, 0xBBBBBBBBu);   // committed after the first begin, as the game's pages are: an import beside the mirror
     barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferCopy first_copy = {.srcOffset = entries.offset, .dstOffset = 0, .size = sizeof(Entry)};
     vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)entries.buffer, g_buf, 1, &first_copy);
@@ -990,7 +993,6 @@ static void case_grow_guarded(const char *spv, int head) {
     vkCmdFillBuffer(cb, (VkBuffer)(uintptr_t)blocker.buffer, blocker.offset, 4, 0x11111111u);
     finish(v0);
 
-    fill_words(added + PROBE, 4, 0xBBBBBBBBu);
     memcpy(first, e, sizeof first);
     first[0] = (Entry){old + PROBE, old + PG, 0, 0, {0}};
     e[0] = (Entry){old + PROBE + 4, old + PG, 0, 0, {0}};
@@ -1013,6 +1015,7 @@ static void case_grow_guarded(const char *spv, int head) {
     barrier(cb, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferCopy first_copy = {.srcOffset = entries.offset, .dstOffset = 0, .size = sizeof(Entry)};
     vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)entries.buffer, g_buf, 1, &first_copy);
+    fill_words(added + PROBE, 4, 0xBBBBBBBBu);   // committed after the first begin (the union pass has run): an import beside the mirror
 
     backing_resolve(start, size, v, &big);
     backing_resolve(added, PG, v, &fresh);
