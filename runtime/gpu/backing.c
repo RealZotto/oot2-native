@@ -931,29 +931,42 @@ static int overlaps(uint64_t lo, uint64_t hi, uint64_t a, uint64_t b) {
 
 // A bind takes pages of mirror m that the submission being recorded (value) already resolved, so m cannot give them to
 // an import: what was recorded before reaches m's copy, and what follows would reach the import's. m grows over them in
-// place instead, to the hull of its pages and the bind's, at the same device addresses, so that every bind and every
+// place instead, to the hull of its pages and the bind's only, at the same device addresses, so that every bind and every
 // raw access of the submission keeps reaching the one copy; the pages it takes were not in a mirror before, so no byte
-// has two copies. It grows when: the imports its new range overlaps in this cell are ones no bind of this submission
-// used (they go, whole, and the range reaches their ends) and no backing of another cell overlaps it; no GPU write of
-// this submission is declared over it; the mirrors stay within the raw write-back's cap; the range lies in m's buffer
-// and the block's free list gives the part beyond m's own (the reserved ends of a mirror's allocation,
-// BACKING_MIRROR_GUARD each, are what normally make room); and the write watch covers it. The older submissions that
-// reached the replaced imports are waited for, the new pages are copied in as a sync copies them, and the map's version
-// moves. Else 0, and the caller stops by name. g_lock exclusive.
-static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, uint64_t value) {
+// has two copies. It grows when: the growth adds at most BACKING_MIRROR_GROW_MAX bytes (the size of this growth, not the
+// mirrors' total, which the bind-made mirrors do not keep under any cap; the raw write-back stops by name at the end of
+// a submission whose stores reach more pages than it holds); the imports its new range overlaps in this cell are ones no
+// bind of this submission used (they go, whole, and fill_pool imports their pages outside the range again) and no
+// other mirror of the cell, nor any backing of another cell, overlaps it; no GPU write of this submission is declared
+// over it; the range lies in m's buffer and the block's free list gives the part beyond m's own (the reserved ends of a
+// mirror's allocation, BACKING_MIRROR_GUARD each, are what normally make room); and the write watch covers it. The older
+// submissions that reached the replaced imports are waited for, the new pages are copied in as a sync copies them, and
+// the map's version moves. Else 0 with the reason in why (GROW_WHY bytes, for the named stop), nothing changed, and the
+// caller stops by name. g_lock exclusive.
+#define GROW_WHY 256
+static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, uint64_t value, char *why) {
     uint64_t old_lo = m->gpu_lo, old_hi = m->gpu_hi;
     uint64_t lo = plo < old_lo ? plo : old_lo, hi = phi > old_hi ? phi : old_hi;
-    int moved;
-    do {
-        moved = 0;
-        for (int i = 0; i < c->nimp; i++) {
-            const Backing *b = c->imp[i];
-            if (b == m || !overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) continue;
-            if (b->kind != BACKING_IMPORT || used_by(b) >= value) return 0;
-            if (b->gpu_lo < lo) lo = b->gpu_lo, moved = 1;
-            if (b->gpu_hi > hi) hi = b->gpu_hi, moved = 1;
+    uint64_t added = old_lo - lo + hi - old_hi;
+    if (added > BACKING_MIRROR_GROW_MAX) {
+        snprintf(why, GROW_WHY, "the growth would add %llu KiB, more than the %llu KiB one growth may add",
+                 (ull)(added >> 10), (ull)(BACKING_MIRROR_GROW_MAX >> 10));
+        return 0;
+    }
+    for (int i = 0; i < c->nimp; i++) {
+        const Backing *b = c->imp[i];
+        if (b == m || !overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) continue;
+        if (b->kind != BACKING_IMPORT) {
+            snprintf(why, GROW_WHY, "another mirror, [%#llx, %#llx), lies on the pages it would add", (ull)b->gpu_lo,
+                     (ull)b->gpu_hi);
+            return 0;
         }
-    } while (moved);
+        if (used_by(b) >= value) {
+            snprintf(why, GROW_WHY, "the import [%#llx, %#llx), which this submission bound, lies on the pages it "
+                     "would add", (ull)b->gpu_lo, (ull)b->gpu_hi);
+            return 0;
+        }
+    }
     // Another cell or pool could otherwise resolve the added pages to a different copy.
     for (int i = 0; i < g_index.n; i++) {
         const Rec *other = (const Rec *)g_index.e[i].key;
@@ -963,24 +976,41 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
             if (other == r && cell == c) continue;
             for (int k = 0; k < cell->nimp; k++) {
                 const Backing *b = cell->imp[k];
-                if (overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) return 0;
+                if (!overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) continue;
+                snprintf(why, GROW_WHY, "a backing of another cell, [%#llx, %#llx), lies on the pages it would add",
+                         (ull)b->gpu_lo, (ull)b->gpu_hi);
+                return 0;
             }
         }
     }
-    uint64_t added = old_lo - lo + hi - old_hi;
-    if (g_st.mirror_bytes > BACKING_PROMOTE_MIRROR_MAX ||
-        added > BACKING_PROMOTE_MIRROR_MAX - g_st.mirror_bytes || old_lo - lo > m->offset)
+    if (old_lo - lo > m->offset) {
+        snprintf(why, GROW_WHY, "the %llu KiB it would add before its start reach before the start of its buffer",
+                 (ull)((old_lo - lo) >> 10));
         return 0;
+    }
     uint64_t offset = m->offset - (old_lo - lo);
-    if (hi - lo > m->mem.size - offset) return 0;
+    if (hi - lo > m->mem.size - offset) {
+        snprintf(why, GROW_WHY, "the grown range (%llu KiB) does not fit the rest of its buffer", (ull)((hi - lo) >> 10));
+        return 0;
+    }
     uint64_t part_lo = down(offset, BACKING_EXTENT_ALIGN), part_hi = up(offset + hi - lo, BACKING_EXTENT_ALIGN);
     uint64_t old_part_lo = m->part_at, old_part_hi = m->part_at + m->part;
     if (part_lo > old_part_lo) part_lo = old_part_lo;
     if (part_hi < old_part_hi) part_hi = old_part_hi;
-    if (part_hi > m->mem.size || !block_free_at(m->block, part_lo, old_part_lo) ||
-        !block_free_at(m->block, old_part_hi, part_hi))
+    if (part_hi > m->mem.size || !block_free_at(m->block, old_part_hi, part_hi)) {
+        snprintf(why, GROW_WHY, "its block has no free space after its part for [%#llx, %#llx)", (ull)old_part_hi,
+                 (ull)part_hi);
         return 0;
-    if (pagegen_scan(lo, hi) == UINT64_MAX) return 0;
+    }
+    if (!block_free_at(m->block, part_lo, old_part_lo)) {
+        snprintf(why, GROW_WHY, "its block has no free space before its part for [%#llx, %#llx)", (ull)part_lo,
+                 (ull)old_part_lo);
+        return 0;
+    }
+    if (pagegen_scan(lo, hi) == UINT64_MAX) {
+        snprintf(why, GROW_WHY, "the write watch does not cover [%#llx, %#llx)", (ull)lo, (ull)hi);
+        return 0;
+    }
 
     uint64_t wait = raw_before(value);
     for (int i = 0; i < c->nimp; i++) {
@@ -995,6 +1025,8 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
         if (p->m == m || !overlaps(lo, hi, p->lo, p->hi)) continue;
         if (p->value >= value) {
             plat_mutex_unlock(&g_coh);
+            snprintf(why, GROW_WHY, "this submission declared a GPU write over [%#llx, %#llx) of the pages it would "
+                     "add", (ull)p->lo, (ull)p->hi);
             return 0;
         }
         if (p->value > wait) wait = p->value;
@@ -1045,10 +1077,11 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
 // are the CPU's view in the import once every older submission that wrote them is done, which is waited for here. A
 // mirror this submission already resolved where the bind takes pages cannot give them up, since what was recorded before
 // reaches the mirror's copy and what follows would reach the import's: make() grows that mirror over the bind first
-// (grow_taken), and when it cannot, or when the submission wrote there on the GPU, this is a named fatal.
+// (grow_taken), and when it cannot, or when the submission wrote there on the GPU, this is a named fatal that ends with
+// grow's reason (why, set by grow_taken).
 // *rs and *re, the committed run around the pages [plo, phi) of the bind, are narrowed to what the new backing covers.
 // g_lock exclusive.
-static void beside(Cell *c, uint64_t plo, uint64_t phi, uint64_t *rs, uint64_t *re, uint64_t value) {
+static void beside(Cell *c, uint64_t plo, uint64_t phi, uint64_t *rs, uint64_t *re, uint64_t value, const char *why) {
     int gave = 0;
     for (int i = 0; i < c->nimp; i++) {
         Backing *m = c->imp[i];
@@ -1066,8 +1099,8 @@ static void beside(Cell *c, uint64_t plo, uint64_t phi, uint64_t *rs, uint64_t *
             rt_fatal("gfx: vulkan: backing map: the mirror [%#llx, %#llx) was bound over [%#llx, %#llx) earlier in "
                      "raw-access submission %llu, and a bind over [%#llx, %#llx) now takes pages of it for an import: "
                      "what was recorded before would reach the mirror's copy of the bytes the rest reaches in the "
-                     "import", (ull)m->gpu_lo, (ull)m->gpu_hi, (ull)m->res_lo, (ull)m->res_hi, (ull)value, (ull)cl,
-                     (ull)ch);
+                     "import; the mirror cannot grow over them: %s", (ull)m->gpu_lo, (ull)m->gpu_hi, (ull)m->res_lo,
+                     (ull)m->res_hi, (ull)value, (ull)cl, (ull)ch, why);
         gave = 1;
         if (m->gpu_lo < plo) {   // it keeps its start; the new backing starts at the bind's first page
             g_st.mirror_bytes -= m->gpu_hi - plo;
@@ -1214,20 +1247,23 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
     // A mirror the submission already resolved where the bind takes pages cannot give them up either (beside), so it
     // grows over the bind in place; the committed pages the growth leaves uncovered get their imports (fill_pool).
     if (value && raw_last() == value) {
+        char why[GROW_WHY] = "no growth was tried";
         for (int i = 0; i < c->nimp; i++) {
             Backing *m = c->imp[i];
             if (m->kind != BACKING_MIRROR || m->res_value != value ||
                 !overlaps(plo, phi, m->gpu_lo, m->gpu_hi) ||
                 !overlaps(plo, phi, m->res_lo, m->res_hi))
                 continue;
-            if (grow_taken(r, c, m, plo, phi, value)) {
-                fill_pool(r);   // a newly committed host chunk can extend beyond the pages of the bind
+            if (grow_taken(r, c, m, plo, phi, value, why)) {
+                // The imports it replaced lose their pages outside the bind and a newly committed host chunk can extend
+                // beyond it: the committed pages no backing covers now get their imports.
+                fill_pool(r);
                 return;
             }
             break;
         }
         if (kind == BACKING_MIRROR) kind = BACKING_IMPORT;
-        beside(c, plo, phi, &rs, &re, value);
+        beside(c, plo, phi, &rs, &re, value, why);
     }
     replace_wait(c, rs, re, value, kind == BACKING_MIRROR);
     Backing *b = kind == BACKING_MIRROR ? mirror_admit(r, rs, re) : NULL;

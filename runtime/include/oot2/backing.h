@@ -98,9 +98,12 @@
 // was recorded before and one for what follows): it makes an import, never a mirror, and takes the pages it needs from the
 // mirrors it overlaps, which keep the part outside the bind (or go, when the bind covers all of them), waiting first for
 // the older raw-access submissions that may have stored into them; the import covers the committed run around the bind up
-// to the mirrors that remain. A mirror already resolved where the bind takes pages can instead grow in place when its
-// enlarged range stays write-watched, fits in the block and the mirror budget, and has no conflicting backings or
-// bindings; otherwise it is a named fatal.
+// to the mirrors that remain. A mirror already resolved where the bind takes pages can instead grow in place, over its
+// own pages and the bind's only (an import it overlaps that the submission did not bind goes, and its pages outside the
+// bind get an import again), when the growth adds at most BACKING_MIRROR_GROW_MAX bytes, its enlarged range stays
+// write-watched and fits in the block, and no other mirror, import the submission bound, or backing of another cell lies
+// on the added pages; otherwise it is a named fatal that says which of these held. The mirrors' total is not checked
+// there: the raw path's write-back stops by name at the end of a submission whose stores reach more pages than it holds.
 //
 // An import is never what the rule would give a bind on a discrete device, and the invariant above makes one of every
 // committed page: the GPU reads an import across the bus, so a compute program that works on its buffers stalls on every
@@ -132,6 +135,7 @@
 #define BACKING_EXTENT_ALIGN 0x10000ull       // extents are 64 KiB aligned in their block, as window pages are
 #define BACKING_HOST_PAGE 0x1000ull           // the page of commit and of host import
 #define BACKING_MIRROR_GUARD BACKING_EXTENT_ALIGN   // reserved at either end for in-place growth
+#define BACKING_MIRROR_GROW_MAX (1ull << 20)  // the most one in-place growth of a bound mirror adds (a few pages, not a new mirror)
 #define BACKING_MIRROR_RESERVE 8              // section 8: a mirror leaves an eighth of the VRAM budget free
 #define BACKING_PROMOTE_MIN (64ull << 10)     // a bind larger than a uniform's (maxUniformBufferRange) marks its import hot
 #define BACKING_PROMOTE_MIRROR_MAX (128ull << 20)   // a promotion leaves the mirrors at or under this many bytes (vk_raw.h's write-back)

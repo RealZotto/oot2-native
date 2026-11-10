@@ -45,6 +45,11 @@
 //   raw_grow_taken_layout   the layout of the stop of the first Forest run: a mirror of 700 KiB, a bind of 3 KiB across
 //                a page boundary near its start, then a bind that starts below the mirror and ends past that boundary
 //   raw_grow_guarded_tail, raw_grow_guarded_head   the same when a GPU-only extent blocks the adjacent block space
+//   raw_grow_over_total   the growth is held to its own size, not to the mirrors' total: with 132 MiB of mirrors made by
+//                binds (more than the raw write-back's cap, which only a promotion keeps), one still grows by two pages
+//   raw_grow_head_import, raw_grow_tail_import   an import the growth overlaps goes, but the mirror takes only the bind's
+//                pages and copies only those in; the import's other pages (128 KiB at the head, 16 MiB at the tail) get
+//                an import again
 //   raw_sync_wait   a mirror the CPU wrote is brought current for a raw-access submission after the older one in flight
 //   raw_sync_nowait the same with only a GPU-current page stamped since: no wait, nothing is copied over the older stores
 //   raw_promote, raw_promote_small, raw_promote_wait, raw_promote_cap   an import a raw-access submission binds a range larger than a
@@ -52,7 +57,7 @@
 //                the submission bound it before its raw stage or the admission refuses, never for a small bind, after the older
 //                raw-access submission in flight, and not past the mirrors' cap (the raw write-back's size)
 //   unwritten, replace_written, raw_grow_bound_import, raw_grow_fragmented, raw_grow_guarded_blocked,
-//   raw_grow_untracked   stop by name
+//   raw_grow_untracked, raw_grow_cap   stop by name, each with the reason the mirror could not grow
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1585,6 +1590,165 @@ static void case_raw_grow_taken_layout(void) {
     done("raw_grow_taken_layout");
 }
 
+static int runs_cover(const BackingRun *runs, int n, uint64_t a) {
+    int k = 0;
+    for (int i = 0; i < n; i++) k += runs[i].lo <= a && a < runs[i].hi;
+    return k;
+}
+
+// A growth is held to its own size (BACKING_MIRROR_GROW_MAX), not to a total of the mirrors: the mirrors a bind makes are
+// not held to the raw write-back's cap (only a promotion is), so a run can hold more than that in mirrors and still need
+// one of them to grow by two pages. Three mirrors of 44 MiB, one in each window (132 MiB, over the 128 MiB), then the
+// layout of the stop of the Forest run grows the first.
+static void case_raw_grow_over_total(void) {
+    setup(256 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    const uint64_t win = BACKING_IMPORT_WINDOW, len = 44 * MiB;
+    CHECK(3 * len > BACKING_PROMOTE_MIRROR_MAX && (g_heap & (win - 1)) == 0);
+    const uint64_t run[3] = {g_heap + 1 * MiB, g_heap + win + 1 * MiB, g_heap + 2 * win + 1 * MiB};
+    const uint64_t p = run[0];
+    pool_t pp = pool(g_heap, 3 * win);
+    for (int i = 0; i < 3; i++) cpu_fill(run[i], len, i ? 0xA0A0A0A0u + (uint32_t)i : 0xAAAAAAAAu);
+    uint64_t v0 = sub_begin();
+    for (int i = 0; i < 3; i++) CHECK(resolve(run[i], 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    CHECK(stats().mirrors == 3 && stats().mirror_bytes == 3 * len && stats().mirror_bytes > BACKING_PROMOTE_MIRROR_MAX);
+
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);
+    g_layout_old = resolve(p + LAYOUT_BOUND, 0xC00, v);
+    CHECK(g_layout_old.kind == BACKING_MIRROR);
+    backing_gpu_wrote(p + LAYOUT_BOUND, 4, v);
+    uint64_t start = p - 0x1800;
+    g_layout_big = resolve(start, 0x5800, v);   // pages [p - 0x2000, p + 0x4000): two pages below the first mirror
+    g_layout_delta = p + LAYOUT_BOUND - start;
+    CHECK(g_layout_big.kind == BACKING_MIRROR && g_layout_big.address + g_layout_delta == g_layout_old.address);
+    BackingStats s = stats();
+    CHECK(s.mirrors == 3 && s.mirrors_made == 3 && s.mirror_bytes == 3 * len + 0x2000);
+    BackingRun *runs;
+    uint64_t version;
+    int n = backing_raw_runs(&runs, &version);
+    g_layout_raw = raw_address(runs, n, p + LAYOUT_BOUND);
+    CHECK(g_layout_raw == g_layout_old.address && version == backing_version());
+    for (uint64_t a = p - 0x2000; a < p + 0x10000; a += PG)
+        CHECK(raw_address(runs, n, a) == g_layout_big.address + (a - start) && runs_cover(runs, n, a) == 1);
+    free(runs);
+    sub_end(v);
+    gpu_run(v, gpu_grow_layout);
+    CHECK(*(uint32_t *)(uintptr_t)(p + LAYOUT_BOUND) == 0xDDDDDDDDu);   // written back to where it was declared
+    backing_pool_fini(&pp);
+    done("raw_grow_over_total");
+}
+
+static void gpu_grow_head_import(void) {
+    gpu_grow_layout();
+    CHECK(*(uint32_t *)bytes(&g_layout_big) == 0xBBBBBBBBu);   // a page the mirror took was copied in from guest memory
+}
+
+// The pages a growth takes from an import are the bind's, not the import's: an import of 128 KiB abuts the start of the
+// mirror, more than the 64 KiB its allocation reserves there, and a bind two pages into it needs two. The mirror takes
+// those two pages (and copies only those in), the import goes, and the pages of it outside the bind get an import again.
+static void case_raw_grow_head_import(void) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 8 * MiB;
+    pool_t pp = pool(p - 1 * MiB, 16 * MiB);
+    cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(p - 0x20000, 0x20000, 0xBBBBBBBBu);   // two chunks below the mirror, committed since: an import at the begin
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    BackingPage pg;
+    backing_page(p - 0x20000, &pg);
+    CHECK(s.mirrors == 1 && s.imports == 1 && s.import_bytes == 0x20000 && pg.kind == BACKING_IMPORT);
+
+    g_layout_old = resolve(p + LAYOUT_BOUND, 0xC00, v);
+    CHECK(g_layout_old.kind == BACKING_MIRROR);
+    backing_gpu_wrote(p + LAYOUT_BOUND, 4, v);
+    uint64_t start = p - 0x1800, uploaded = D.upload_bytes;
+    g_layout_big = resolve(start, 0x5800, v);   // pages [p - 0x2000, p + 0x4000)
+    g_layout_delta = p + LAYOUT_BOUND - start;
+    CHECK(D.upload_bytes - uploaded == 0x2000);   // the two pages of the bind, not the import's 128 KiB
+    CHECK(g_layout_big.kind == BACKING_MIRROR && g_layout_big.address + g_layout_delta == g_layout_old.address);
+    s = stats();
+    CHECK(s.mirrors == 1 && s.mirror_bytes == 256 * KiB + 0x2000);
+    CHECK(s.imports == 1 && s.import_bytes == 0x1E000);   // the import's pages below the bind, imported again
+    backing_page(p - 0x20000, &pg);
+    CHECK(pg.kind == BACKING_IMPORT);
+    backing_page(p - 0x3000, &pg);
+    CHECK(pg.kind == BACKING_IMPORT);
+    backing_page(p - 0x2000, &pg);
+    CHECK(pg.kind == BACKING_MIRROR);
+    BackingRun *runs;
+    uint64_t version;
+    int n = backing_raw_runs(&runs, &version);
+    g_layout_raw = raw_address(runs, n, p + LAYOUT_BOUND);
+    CHECK(g_layout_raw == g_layout_old.address && version == backing_version());
+    for (uint64_t a = p - 0x20000; a < p + 0x10000; a += PG) CHECK(runs_cover(runs, n, a) == 1);   // no page twice
+    CHECK(raw_address(runs, n, p - 0x20000) == p - 0x20000 && raw_address(runs, n, p - 0x2000) == g_layout_big.address - 0x800);
+    free(runs);
+    sub_end(v);
+    gpu_run(v, gpu_grow_head_import);
+    CHECK(*(uint32_t *)(uintptr_t)(p + LAYOUT_BOUND) == 0xDDDDDDDDu);
+    backing_pool_fini(&pp);
+    done("raw_grow_head_import");
+}
+
+// The same at the other end: a bind of 20 KiB reaches five pages into an import of 16 MiB that abuts the mirror's end.
+// The mirror grows by five pages and copies in five pages, and the import's other pages keep an import.
+static void case_raw_grow_tail_import(void) {
+    setup(64 * MiB, 0);
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 4 * MiB;
+    pool_t pp = pool(p, 24 * MiB);
+    cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(p + 256 * KiB, 16 * MiB, 0xBBBBBBBBu);   // committed since: an import at the begin
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);
+    CHECK(stats().mirrors == 1 && stats().imports == 1 && stats().import_bytes == 16 * MiB);
+
+    g_taken_old = resolve(p + 0x31000, 0x100, v);
+    CHECK(g_taken_old.kind == BACKING_MIRROR);
+    backing_gpu_wrote(p + 0x31000, 4, v);
+    uint64_t uploaded = D.upload_bytes;
+    g_taken_big = resolve(p + 0x30320, 0x14CE0, v);   // pages [p + 0x30000, p + 0x45000)
+    CHECK(D.upload_bytes - uploaded == 0x5000);   // the five pages of the bind, not the import's 16 MiB
+    CHECK(g_taken_big.kind == BACKING_MIRROR && g_taken_big.address + 0x31000 - 0x30320 == g_taken_old.address);
+    BackingStats s = stats();
+    CHECK(s.mirrors == 1 && s.mirror_bytes == 0x45000);
+    CHECK(s.imports == 1 && s.import_bytes == 16 * MiB - 0x5000);   // the import's pages beyond the bind, imported again
+    BackingPage pg;
+    backing_page(p + 0x44000, &pg);
+    CHECK(pg.kind == BACKING_MIRROR);
+    backing_page(p + 0x45000, &pg);
+    CHECK(pg.kind == BACKING_IMPORT);
+    backing_page(p + 256 * KiB + 16 * MiB - PG, &pg);
+    CHECK(pg.kind == BACKING_IMPORT);
+    BackingRun *runs;
+    uint64_t version;
+    int n = backing_raw_runs(&runs, &version);
+    g_taken_raw = raw_address(runs, n, p + 0x31000);
+    g_taken_fresh = 0x40000;
+    CHECK(g_taken_raw == g_taken_old.address && version == backing_version());
+    for (uint64_t a = p; a < p + 256 * KiB + 16 * MiB; a += 16 * PG) CHECK(runs_cover(runs, n, a) == 1);   // no page twice
+    CHECK(raw_address(runs, n, p + 0x45000) == p + 0x45000);   // the rest of the import still aliases guest memory
+    free(runs);
+    sub_end(v);
+    gpu_run(v, gpu_grow_taken);
+    CHECK(*(uint32_t *)(uintptr_t)(p + 0x31000) == 0xDDDDDDDDu);
+    backing_pool_fini(&pp);
+    done("raw_grow_tail_import");
+}
+
 // ---------- cases that stop by name
 static void case_raw_grow_bound_import(void) {
     setup(64 * MiB, 0);
@@ -1658,6 +1822,17 @@ static void case_raw_grow_untracked(void) {
     printf("returned\n");
 }
 
+// A growth adds at most BACKING_MIRROR_GROW_MAX: a bind that reaches 2 MiB past a mirror is not the few pages it is for.
+static void case_raw_grow_cap(void) {
+    uint64_t p;
+    pool_t pp;
+    BackingRef small;
+    uint64_t v = raw_scene(&p, &pp, &small);
+    resolve(p + 0x31000, 4, v);
+    resolve(p + 0x30320, 2 * MiB, v);
+    printf("returned\n");
+}
+
 static void case_unwritten(void) {
     setup(64 * MiB, 0);
     backing_set_mirror_hook(want_all);
@@ -1716,6 +1891,8 @@ int main(int argc, char **argv) {
         {"raw_grow_bound_import", case_raw_grow_bound_import}, {"raw_grow_fragmented", case_raw_grow_fragmented},
         {"raw_grow_guarded_blocked", case_raw_grow_guarded_blocked},
         {"raw_grow_untracked", case_raw_grow_untracked},
+        {"raw_grow_over_total", case_raw_grow_over_total}, {"raw_grow_head_import", case_raw_grow_head_import},
+        {"raw_grow_tail_import", case_raw_grow_tail_import}, {"raw_grow_cap", case_raw_grow_cap},
     };
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++)
         if (!strcmp(argv[1], cases[i].name)) {

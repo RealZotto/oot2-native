@@ -27,7 +27,8 @@
 //            bytes, and the mirror's kept pages were written back
 //   grow_taken   a bound mirror grows without moving: bound and raw writes before and after the growth, including newly
 //                committed pages outside the bind, reach the same bytes on the device and in guest memory
-//   grow_guarded_head, grow_guarded_tail   a bound mirror grows beside a GPU-only extent used by the same submission
+//   grow_guarded_head, grow_guarded_tail   a bound mirror grows beside a GPU-only extent used by the same submission;
+//                the committed chunk beside the bind keeps an import over its other pages, which the raw stage reaches
 //   heap MIB what the invariant costs over a guest heap of MIB MiB committed in 256 MiB pools, with a 256 MiB pool in the
 //            window: resident bytes and VRAM before and after the first raw-access submission, the invariant's pass and
 //            the table's build timed, then a second submission with the map unchanged (measured, not judged; the full
@@ -794,7 +795,7 @@ static void case_grow_guarded(const char *spv, int head) {
 
     backing_resolve(start, size, v, &big);
     backing_resolve(added, PG, v, &fresh);
-    CHECK(big.kind == BACKING_MIRROR && fresh.kind == BACKING_MIRROR);
+    CHECK(big.kind == BACKING_MIRROR && fresh.kind == BACKING_IMPORT);   // the growth took the bind's pages, not the chunk's
     CHECK(big.address + old - start == small.address);
     gpu_vk_raw_begin(v, push2);
     CHECK(!memcmp(push1, push2, sizeof push1));
