@@ -23,6 +23,7 @@
 #include "oot2/loader.h"
 #include "oot2/nvn_program.h"
 #include "oot2/nvn_tex.h"
+#include "oot2/replay_count.h"
 #include "plat.h"
 
 #ifdef _WIN32
@@ -435,9 +436,22 @@ static void bind_program(LedgerTrack *t, const p_bind_program *p) {
     }
 }
 
+// The counters of a texture bind (oot2/replay_count.h): the handle last bound at each slot, by the thread that binds (the
+// tracker keeps only the type, and a null back end's tracker and the replay's run on different threads).
+static _Thread_local uint64_t t_prev_handle[LEDGER_STAGES][LEDGER_TEX_SLOTS];
+
+static void tex_count(const LedgerTrack *t, int stage, int slot, uint64_t handle, uint8_t type, int *all_same) {
+    rc_add_(RC_TEX_BINDS, 1);
+    if (t_prev_handle[stage][slot] == handle) rc_add_(RC_TEX_SAME_HANDLE, 1);
+    t_prev_handle[stage][slot] = handle;
+    if (t->tex[stage][slot] == type) rc_add_(RC_TEX_SAME_TYPE, 1);
+    else *all_same = 0;
+}
+
 static void bind_tex(LedgerTrack *t, const p_bind_handles *b, int image) {
     if (b->stage < 0 || b->stage >= LEDGER_STAGES) return;
     invalidate_answers_digest(t, b->stage);
+    int all_same = 1;
     for (int i = 0; i < b->n && i < 32; i++) {
         int slot = b->first + i;
         uint8_t type = 0;
@@ -450,8 +464,13 @@ static void bind_tex(LedgerTrack *t, const p_bind_handles *b, int image) {
             // Index 32 to 39 is the image table's range: the translator answers it from "img" only, so a texture
             // bound there is never a "tex" answer
             if (slot < 0 || slot >= LEDGER_TEX_SLOTS || (slot >= 32 && slot < 40)) continue;
+            if (RC_ON()) tex_count(t, b->stage, slot, b->h[i], type, &all_same);
             t->tex[b->stage][slot] = type;
         }
+    }
+    if (!image && RC_ON()) {
+        rc_add_(RC_TEX_OPS, 1);
+        if (all_same) rc_add_(RC_TEX_OPS_SAME_TYPE, 1);
     }
 }
 
@@ -508,13 +527,38 @@ static void emit(const LedgerTrack *t, int s, int raster) {
     add_row(&r);
 }
 
+// The counters of the answers digest (oot2/replay_count.h): by stage (vertex, pixel, any other), and what the last
+// recompute of the thread for that stage had: its inputs and its value. The inputs of two recomputes are equal exactly when
+// their values are (the digest is a function of them), which the counters check.
+static _Thread_local struct {
+    int have;
+    RowBin in;
+    uint8_t digest[32];
+} t_prev_digest[5];
+
+static int digest_kind(int slot) { return slot < 2 ? slot : 2; }
+
+static void digest_count_recompute(int slot, const RowBin *r, const uint8_t out[32]) {
+    int k = digest_kind(slot);
+    rc_add_(RC_DG_RECOMP_VS + k, 1);
+    if (t_prev_digest[slot].have) {
+        if (!memcmp(&t_prev_digest[slot].in, r, sizeof *r)) rc_add_(RC_DG_INSAME_VS + k, 1);
+        if (!memcmp(t_prev_digest[slot].digest, out, 32)) rc_add_(RC_DG_VALSAME_VS + k, 1);
+    }
+    t_prev_digest[slot].in = *r;
+    memcpy(t_prev_digest[slot].digest, out, 32);
+    t_prev_digest[slot].have = 1;
+}
+
 void ledger_track_answers_digest(LedgerTrack *t, int kind, uint8_t out[32]) {
     int slot = tracker_slot(kind);
     if (slot < 0) {
         memset(out, 0, 32);
         return;
     }
+    RC_ADD(RC_DG_CALLS_VS + digest_kind(slot), 1);
     if (t->answers_digest_valid & (1u << slot)) {
+        RC_ADD(RC_DG_HIT_VS + digest_kind(slot), 1);
         memcpy(out, t->answers_digest[slot], 32);
         return;
     }
@@ -527,6 +571,7 @@ void ledger_track_answers_digest(LedgerTrack *t, int kind, uint8_t out[32]) {
     if (s == 0) memcpy(r.attr, t->attr, sizeof r.attr);
     if (s == 1) memcpy(r.fout, t->fout, sizeof r.fout);
     BT_TIME(BT_S1_TEXT, char *text = answers_text(&r, out); free(text));
+    if (RC_ON()) digest_count_recompute(slot, &r, out);
     memcpy(t->answers_digest[slot], out, 32);
     t->answers_digest_valid |= (uint8_t)(1u << slot);
 }

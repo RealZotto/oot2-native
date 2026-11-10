@@ -15,7 +15,12 @@ This driver
     py -3 tests/test_runtime_vk_replay_cost.py --work <a folder for packs and programs> --out results.json
 
 The patterns: a, every draw the same program and bindings; b, before each draw one texture, one uniform range of the vertex
-stage and the program of the next of 64 pairs; c, b and the vertex attributes, streams and buffers of the draw's mesh.
+stage and the program of the next of 64 pairs; c, b and the vertex attributes, streams and buffers of the draw's mesh; d, b and a storage buffer each pixel stage writes; e, ten draws that repeat with fixed program
+pairs and textures, for the counters.
+
+The counters (runtime/include/oot2/replay_count.h, OOT2_REPLAY_COUNTERS) run in their own program runs (--count-patterns), never
+in a timed one: the COUNTS line holds what they counted over the measured frames and the rc lines on stderr what the program
+printed at its exit. The smoke case below checks both against streams whose repeats are known by construction.
 """
 
 from __future__ import annotations
@@ -371,6 +376,7 @@ def foreign_processes() -> list[str]:
 
 
 BUSY_ENV = "OOT2_BENCH_BUSY_FILE"
+COUNTERS_ENV = "OOT2_REPLAY_COUNTERS"
 
 
 def default_busy_file() -> Path | None:
@@ -398,7 +404,7 @@ KV = re.compile(r'(\w+)=("[^"]*"|\S+)')
 
 
 def parse(stdout: str) -> dict:
-    out: dict = {"bench": [], "split": [], "overhead": [], "total": [], "timer": {}}
+    out: dict = {"bench": [], "split": [], "overhead": [], "total": [], "timer": {}, "counts": {}}
     for line in stdout.splitlines():
         kv = {k: v.strip('"') for k, v in KV.findall(line)}
         if line.startswith("BENCH "):
@@ -413,10 +419,21 @@ def parse(stdout: str) -> dict:
             out["timer"] = kv
         elif line.startswith("PROCESS "):
             out["process"] = kv
+        elif line.startswith("COUNTS "):
+            out["counts"] = {k: int(v) if v.isdigit() else v for k, v in kv.items()}
     return out
 
 
-def run_exe(exe: Path, args: list[str], timeout: int = 600) -> tuple[dict, dict]:
+def rc_lines(stderr: str) -> list[dict]:
+    """The counters' lines of a log: "[rt] rc kind=exit group=sub present=0 presents=0 key=value ..." as dicts of strings."""
+    out = []
+    for line in stderr.splitlines():
+        if line.startswith("[rt] rc "):
+            out.append(dict(item.split("=", 1) for item in line[len("[rt] rc "):].split()))
+    return out
+
+
+def run_exe(exe: Path, args: list[str], timeout: int = 600, env: dict | None = None) -> tuple[dict, dict]:
     if GUARD:
         GUARD.wait_ready()
         if GUARD.require_quiet:
@@ -424,7 +441,9 @@ def run_exe(exe: Path, args: list[str], timeout: int = 600) -> tuple[dict, dict]
     idle0, total0 = system_times()
     procs0 = foreign_processes()
     t0 = time.time()
-    done = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=timeout)
+    full_env = {k: v for k, v in os.environ.items() if k != COUNTERS_ENV}
+    full_env.update(env or {})
+    done = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=timeout, env=full_env)
     wall = time.time() - t0
     idle1, total1 = system_times()
     procs1 = foreign_processes()
@@ -432,6 +451,7 @@ def run_exe(exe: Path, args: list[str], timeout: int = 600) -> tuple[dict, dict]
         raise RuntimeError(f"{exe.name} {' '.join(args)} exited {done.returncode}:\n{done.stdout}\n{done.stderr}")
     busy = 100.0 * (1 - (idle1 - idle0) / (total1 - total0)) if total1 > total0 else 0.0
     res = parse(done.stdout)
+    res["rc"] = rc_lines(done.stderr)
     # what the other processes used: the processors' busy time less this program's own CPU time, over the wall time of the run
     mine = float(res.get("process", {}).get("cpu_s", 0.0))
     ncpu = os.cpu_count() or 1
@@ -461,6 +481,9 @@ def run(argv: list[str] | None = None) -> int:
     ap.add_argument("--ns", default="340,500,1000,1500,2000,2500,3000,4000")
     ap.add_argument("--split-ns", default="340,1000,2000,3000", help="sizes for the runs with timers")
     ap.add_argument("--patterns", default="a,b")
+    ap.add_argument("--count-patterns", default="", help="also: runs with the replay's counters on (they are never in a timed "
+                    "run) for these patterns, a to e")
+    ap.add_argument("--count-n", default="60", help="draws a frame of those runs (pattern e wants a multiple of 10)")
     ap.add_argument("--kinds", default="import,mirror")
     ap.add_argument("--frames", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
@@ -533,14 +556,14 @@ def run(argv: list[str] | None = None) -> int:
         return ["--base", str(base), "--variants", str(pack), "--map", str(vmap), "--keys", str(manifest),
                 "--frames", str(a.frames), "--warmup", str(a.warmup), *extra]
 
-    jobs: list[tuple[int, str, Path, list[str], int]] = []   # group, label, program, arguments, repetitions
+    jobs: list[tuple[int, str, Path, list[str], int, dict]] = []   # group, label, program, arguments, repetitions, environment
     group = [0]
 
-    def add(label: str, exe: Path, args: list[str], reps: int = 1) -> None:
-        jobs.append((group[0], label, exe, args, reps))
+    def add(label: str, exe: Path, args: list[str], reps: int = 1, env: dict | None = None) -> None:
+        jobs.append((group[0], label, exe, args, reps, env or {}))
 
-    def record(label: str, exe: Path, args: list[str], rep: int) -> None:
-        res, machine = run_exe(exe, args)
+    def record(label: str, exe: Path, args: list[str], rep: int, env: dict) -> None:
+        res, machine = run_exe(exe, args, env=env)
         results["runs"].append({"label": label, "rep": rep, "exe": exe.name, "args": args, "machine": machine, **res})
         for b in res["bench"]:
             print(f"{label:14} r{rep} {b['pattern']} n={b['n']:>5} {b['kind']:6} {float(b['wall_ns_draw']):8.0f} ns/draw wall "
@@ -558,6 +581,10 @@ def run(argv: list[str] | None = None) -> int:
         for pattern in a.patterns.split(","):
             for kind in a.kinds.split(","):
                 add("split", timed, common(a.variant, ["--pattern", pattern, "--kind", kind, "--n", a.split_ns, *ev]), a.reps)
+    for pattern in filter(None, a.count_patterns.split(",")):
+        for kind in a.kinds.split(","):
+            add("counts", clean, common(a.variant, ["--pattern", pattern, "--kind", kind, "--n", a.count_n, *ev]), 1,
+                {COUNTERS_ENV: "1"})
     group[0] = 1
     if a.hot:   # the same matrix without the cache eviction between frames: every frame starts where the last one ended
         for pattern in a.patterns.split(","):
@@ -585,9 +612,9 @@ def run(argv: list[str] | None = None) -> int:
     for g in sorted({j[0] for j in jobs}):
         mine = [j for j in jobs if j[0] == g]
         for rep in range(max(j[4] for j in mine)):
-            for _, label, exe, args, reps in mine:
+            for _, label, exe, args, reps, env in mine:
                 if rep < reps and (label, tuple(args), rep) not in done:
-                    record(label, exe, args, rep)
+                    record(label, exe, args, rep, env)
     results["holder_end"] = busy_line(a.busy_file)
     if a.out:
         a.out.write_text(json.dumps(results, indent=1), encoding="utf-8")
@@ -696,9 +723,10 @@ class DefaultBuildTest(unittest.TestCase):
 
 
 class SmokeTest(unittest.TestCase):
-    """A few frames of patterns a and b through the driver, with and without the timers."""
+    """A few frames of patterns a and b through the driver, with and without the timers, and of a, b and e with the counters."""
 
     FRAMES, WARMUP, N = 4, 2, 64
+    COUNT_N = 60   # a frame of the counted runs: pattern e repeats every ten draws
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -709,6 +737,7 @@ class SmokeTest(unittest.TestCase):
         out = Path(cls.tmp.name) / "results.json"
         argv = ["--work", str(Path(cls.tmp.name) / "work"), "--no-guard", "--jobs", str(os.cpu_count() or 2),
                 "--ns", str(cls.N), "--split-ns", str(cls.N), "--patterns", "a,b", "--kinds", "import,mirror",
+                "--count-patterns", "a,b,e", "--count-n", str(cls.COUNT_N),
                 "--frames", str(cls.FRAMES), "--warmup", str(cls.WARMUP), "--out", str(out)]
         code = main(argv)
         if code != 0:
@@ -745,6 +774,133 @@ class SmokeTest(unittest.TestCase):
             names = {s["name"] for s in r["split"]}
             self.assertTrue(any(n.startswith("S3 ") for n in names), names)
             self.assertTrue(any(n.startswith("S5 ") for n in names), names)
+
+    # ---- the counters (runtime/include/oot2/replay_count.h) against streams whose repeats are known by construction
+    BANK_C0 = 0xA00       # VKN_BANK_BYTES: what a driver bank copy moves
+    BANK_ROOTS = 2048     # the roots bank: 8 tables of 64 words
+
+    def counted(self) -> dict[tuple[str, str], dict]:
+        got = {}
+        for r in self.results["runs"]:
+            if r["label"] == "counts":
+                b = r["bench"][0]
+                got[(b["pattern"], b["kind"])] = r
+        return got
+
+    def expected(self, pattern: str) -> dict[str, int]:
+        """What each counter must read over the measured frames of pattern a, b or e at COUNT_N draws a frame, derived from the
+        stream (tests/runtime/vk_replay_cost.c build_frame) and the replay's rules, not from a run."""
+        n, f = self.COUNT_N, self.FRAMES
+        e: dict[str, int] = {
+            "sub_n": f, "sub_work": n * f, "sub_h16_63": f, "draw_classic": n * f, "draw_mesh": 0, "dispatch": 0,
+            "d_first": f, "d_cmp": (n - 1) * f, "d_vin_n": n * f, "d_vin_state_same": (n - 1) * f,   # the attributes and streams never change
+            "d_dyn_n": n * f, "d_dyn_same": (n - 1) * f,
+            "content_n": 2 * n * f, "content_miss": 0,
+            # five uniform ranges a draw (the vertex stage's three, the pixel stage's two), every one bound and resolved
+            "uni_calls": 5 * n * f, "uni_zero": 0, "resolve_uniform": 5 * n * f, "resolve_vertex": 2 * n * f,
+            "resolve_storage": 0, "resolve_index": 0, "resolve_indirect": 0,
+            "written_scan_steps": 0, "wrote_calls": 0, "indirect_scan_steps": 0,
+            "bank_c0_calls": 2 * n * f, "bank_c2_calls": 2 * n * f, "bank_roots_calls": 2 * n * f,
+            "bank_c0_equal": (2 * n - 2) * f, "bank_roots_equal": (2 * n - 1) * f,
+            "bank_c0_copied_bytes": 2 * f * self.BANK_C0, "bank_roots_copied_bytes": f * self.BANK_ROOTS,
+            "digest_vs_calls": n * f, "digest_ps_calls": n * f, "digest_other_calls": 0, "digest_vs_recompute": f,
+            "digest_vs_valid_hit": (n - 1) * f, "digest_vs_inputs_same": f, "digest_vs_value_same": f,
+            "digest_other_recompute": 0, "digest_other_valid_hit": 0,
+        }
+        if pattern == "a":
+            e.update(d_vin_layout_same=(n - 1) * f, d_vin_full_same=(n - 1) * f,
+                     d_vs_same=(n - 1) * f, d_ps_same=(n - 1) * f, d_pair_same=(n - 1) * f, d_vsdig_same=(n - 1) * f,
+                     d_psdig_same=(n - 1) * f, d_key_same=(n - 1) * f, d_pipe_same=(n - 1) * f, d_first_pair_xsub=f,
+                     d_tuple_new=f, d_tuple_lru16=(n - 1) * f, content_variant=0,
+                     bank_c2_equal=(2 * n - 2) * f, bank_c2_copied_bytes=2 * f * self.BANK_C0,
+                     tex_binds=f, tex_same_handle=f, tex_same_type=f, tex_bind_ops=f, tex_bind_ops_same_type=f,
+                     digest_ps_recompute=f, digest_ps_valid_hit=(n - 1) * f, digest_ps_inputs_same=f,
+                     digest_ps_value_same=f)
+        elif pattern == "b":
+            # every draw the next of 64 pairs and a new texture and range; 60 draws never come round to a pair again
+            e.update(d_vin_layout_same=0, d_vin_full_same=0,   # a different vertex stage's binds each draw
+                     d_vs_same=0, d_ps_same=0, d_pair_same=0, d_vsdig_same=(n - 1) * f, d_psdig_same=(n - 1) * f,
+                     d_key_same=0, d_pipe_same=0, d_first_pair_xsub=0, d_tuple_new=n * f, d_tuple_lru16=0,
+                     content_variant=4 * f,   # pairs 0 to 3 have a pixel stage that maps to a variant
+                     bank_c2_equal=(n - 1) * f, bank_c2_copied_bytes=(n + 1) * f * self.BANK_C0,
+                     tex_binds=(n + 1) * f, tex_same_handle=f, tex_same_type=(n + 1) * f, tex_bind_ops=(n + 1) * f,
+                     tex_bind_ops_same_type=(n + 1) * f,
+                     digest_ps_recompute=n * f, digest_ps_valid_hit=0, digest_ps_inputs_same=n * f,
+                     digest_ps_value_same=n * f)
+        else:
+            # ten draws repeat: pairs 0 0 1 0 1 1 2 2 2 3 and textures 5 5 6 5 6 6 7 7 7 8; of the 9 steps from a draw to the
+            # next in a period 4 repeat the pair (and the texture), the step from a period's last draw to the next one's first
+            # does not, and the first draw of a frame has no draw before it
+            same = 24 * f
+            e.update(d_vin_layout_same=same, d_vin_full_same=same,
+                     d_vs_same=same, d_ps_same=same, d_pair_same=same, d_vsdig_same=(n - 1) * f, d_psdig_same=(n - 1) * f,
+                     d_key_same=same, d_pipe_same=same, d_first_pair_xsub=0, d_tuple_new=4 * f, d_tuple_lru16=(n - 4) * f,
+                     content_variant=n * f,
+                     bank_c2_equal=(n - 1) * f + same, bank_c2_copied_bytes=(n + 1 - 24) * f * self.BANK_C0,
+                     tex_binds=(n + 1) * f, tex_same_handle=same, tex_same_type=(n + 1) * f, tex_bind_ops=(n + 1) * f,
+                     tex_bind_ops_same_type=(n + 1) * f,
+                     digest_ps_recompute=n * f, digest_ps_valid_hit=0, digest_ps_inputs_same=n * f,
+                     digest_ps_value_same=n * f)
+        return e
+
+    def test_the_counters_read_what_the_known_streams_say(self) -> None:
+        got = self.counted()
+        self.assertEqual(sorted(got), [(p, k) for p in "abe" for k in ("import", "mirror")])
+        for (pattern, kind), run in got.items():
+            counts = run["counts"]
+            wrong = {key: (counts.get(key), value) for key, value in self.expected(pattern).items()
+                     if counts.get(key) != value}
+            self.assertEqual(wrong, {}, f"pattern {pattern} {kind}: counter -> (read, derived)")
+
+    def test_the_counters_agree_with_what_the_replay_already_counted(self) -> None:
+        for (pattern, kind), run in self.counted().items():
+            c, bench = run["counts"], run["bench"][0]
+            what = f"{pattern} {kind}"
+            self.assertEqual(c["draw_classic"] + c["draw_mesh"], int(bench["draws"]), what)   # VkrStats.draws, by another count
+            self.assertEqual(c["dispatch"], c["vkr_dispatches"], what)
+            self.assertEqual(c["uni_snapshot"] + c["uni_live"] + c["uni_zero"], c["uni_calls"], what)
+            self.assertEqual(c["snap_calls"], c["uni_snapshot"], what)
+            self.assertEqual(c["snap_calls"] - c["snap_hit"], c["vkr_snapshots"], what)   # a miss is a copy
+            self.assertEqual(c["uni_live"], c["vkr_live_uniforms"], what)
+            if kind == "mirror":
+                self.assertEqual(c["uni_snapshot"], 0, what)
+            else:
+                self.assertGreater(c["uni_snapshot"], 0, what)
+            for use in ("c0", "c2", "roots"):
+                miss = c[f"bank_{use}_calls"] - c[f"bank_{use}_equal"]
+                self.assertEqual(c[f"bank_{use}_copied_bytes"], miss * (self.BANK_ROOTS if use == "roots" else self.BANK_C0),
+                                 f"{what} {use}")
+            for stage in ("vs", "ps"):   # a digest call is a hit or a recompute; a recompute from equal inputs has an equal value
+                self.assertEqual(c[f"digest_{stage}_calls"], c[f"digest_{stage}_valid_hit"] + c[f"digest_{stage}_recompute"], what)
+                self.assertEqual(c[f"digest_{stage}_inputs_same"], c[f"digest_{stage}_value_same"], what)
+            self.assertLessEqual(c["tex_same_type"], c["tex_binds"], what)
+            self.assertEqual(c["content_variant"] + c["content_miss"] <= c["content_n"], True, what)
+
+    def test_the_exit_line_has_every_group_and_totals_that_agree_with_the_replay_s_statistics(self) -> None:
+        for (pattern, kind), run in self.counted().items():
+            lines = [x for x in run["rc"] if x["kind"] == "exit"]
+            what = f"{pattern} {kind}"
+            self.assertEqual({x["group"] for x in lines},
+                             {"sub", "draw", "bank", "uniform", "ledger", "threads", "vkr", "backing"}, what)
+            flat: dict[str, int] = {}
+            for x in lines:
+                for k, v in x.items():
+                    if k not in ("kind", "group"):
+                        self.assertTrue(v.isdigit(), f"{what}: {k}={v}")   # a script can parse every value
+                        flat[k] = int(v)
+            total = self.FRAMES + self.WARMUP
+            self.assertEqual((flat["sub_n"], flat["vkr_frames"]), (total, total), what)
+            self.assertEqual(flat["draw_classic"] + flat["draw_mesh"], flat["vkr_draws"], what)
+            self.assertEqual(flat["vkr_draws"], self.COUNT_N * total, what)
+            self.assertEqual((flat["vkr_lost"], flat["vkr_skipped"]), (0, 0), what)
+            self.assertGreater(flat["backing_resolves"], 0, what)
+            self.assertEqual(flat["rc_threads"], 1, what)   # the replay thread alone counted
+
+    def test_a_timed_or_plain_run_prints_no_counters(self) -> None:
+        for r in self.results["runs"]:
+            if r["label"] != "counts":
+                self.assertEqual(r["rc"], [], r["label"])
+                self.assertEqual(r["counts"], {}, r["label"])
 
 
 if __name__ == "__main__":

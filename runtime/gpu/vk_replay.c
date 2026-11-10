@@ -14,6 +14,7 @@
 // reports, events, waits and conditions vk_replay_report.c's.
 #include <setjmp.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,7 @@
 #include "oot2/mesh_abi.h"
 #include "oot2/nvn_program.h"
 #include "oot2/nvn_tex.h"
+#include "oot2/replay_count.h"
 #include "oot2/runtime.h"
 #include "oot2/settings.h"
 #include "oot2/shader_desc.h"
@@ -341,6 +343,15 @@ static Bound zero_block(void) {
     return F.zero;
 }
 
+// The counters of a driver bank call (oot2/replay_count.h): which use it is (c[0], c[2] or the roots) by where its cache
+// lies, and whether its bytes were the cache's.
+static void bank_count(const BankCache *c, int equal, uint32_t size) {
+    int k = (c >= F.c0 && c < F.c0 + ST_N) ? 0 : (c >= F.c2 && c < F.c2 + ST_N) ? 1 : 2;
+    rc_add_(RC_BANK_CALLS_C0 + k, 1);
+    if (equal) rc_add_(RC_BANK_EQUAL_C0 + k, 1);
+    else rc_add_(RC_BANK_BYTES_C0 + k, size);
+}
+
 // A driver bank: the bytes of the last bank written for the same use, or a new copy.
 #ifdef OOT2_BENCH_TIMERS
 static Bound bank_body(BankCache *c, const uint8_t *bytes, uint32_t size);
@@ -353,7 +364,11 @@ static Bound bank_body(BankCache *c, const uint8_t *bytes, uint32_t size) {
 #else
 static Bound bank(BankCache *c, const uint8_t *bytes, uint32_t size) {
 #endif
-    if (c->valid && !memcmp(c->bytes, bytes, size)) return c->at;
+    if (c->valid && !memcmp(c->bytes, bytes, size)) {
+        if (RC_ON()) bank_count(c, 1, 0);
+        return c->at;
+    }
+    if (RC_ON()) bank_count(c, 0, size);
     void *p;
     c->at = scratch(size, UNIFORM_ALIGN, &p);
     memcpy(p, bytes, size);
@@ -368,8 +383,13 @@ static int overlaps(Rng a, Rng b) { return a.lo < b.hi && b.lo < a.hi; }
 // 1 when the frame has declared a GPU write over any byte of [addr, addr + size).
 int vkr_written(uint64_t addr, uint64_t size) {
     Rng r = {addr, addr + size};
+    RC_ADD(RC_WRITTEN_CALLS, 1);
     for (uint32_t i = 0; i < F.nwrote; i++)
-        if (overlaps(r, F.wrote[i])) return 1;
+        if (overlaps(r, F.wrote[i])) {
+            RC_ADD(RC_WRITTEN_STEPS, i + 1);
+            return 1;
+        }
+    RC_ADD(RC_WRITTEN_STEPS, F.nwrote);
     return 0;
 }
 
@@ -379,6 +399,10 @@ int vkr_written(uint64_t addr, uint64_t size) {
 // of the submission, so the later write is in it).
 void vkr_wrote(uint64_t addr, uint64_t size, int image, uint32_t draw) {
     Rng r = {addr, addr + size};
+    if (RC_ON()) {
+        rc_add_(RC_WROTE_CALLS, 1);
+        if (!vkr_no_drop) rc_add_(RC_WROTE_DROP_STEPS, F.nsnaps);   // kept plus dropped: one step each
+    }
     if (!vkr_no_drop)
         for (uint32_t i = 0; i < F.nsnaps;) {
             if (!overlaps(r, F.snaps[i])) {
@@ -398,7 +422,11 @@ void vkr_wrote(uint64_t addr, uint64_t size, int image, uint32_t draw) {
     }
     W[k].w[W[k].n++] = (VkrWrite){addr, size, draw, (uint8_t)image};
     for (uint32_t i = 0; i < F.nwrote; i++)
-        if (F.wrote[i].lo <= r.lo && r.hi <= F.wrote[i].hi) return;
+        if (F.wrote[i].lo <= r.lo && r.hi <= F.wrote[i].hi) {
+            RC_ADD(RC_WROTE_COVER_STEPS, i + 1);
+            return;
+        }
+    RC_ADD(RC_WROTE_COVER_STEPS, F.nwrote);
     if (F.nwrote == WRITES_MAX) stop("more than %u GPU writes in one submission", WRITES_MAX);
     F.wrote[F.nwrote++] = r;
     if (!vkr_no_declare) F.ops->gpu_wrote(addr, size, F.value);
@@ -413,6 +441,12 @@ static void note(char kind, uint64_t addr, uint64_t bytes, int write) {
     if (vkgt_enabled && F.noting) vkgt_note(kind, addr, bytes, write);
 }
 
+static void snap_count(uint32_t steps, int hit) {
+    rc_add_(RC_SNAP_CALLS, 1);
+    rc_add_(RC_SNAP_STEPS, steps);
+    if (hit) rc_add_(RC_SNAP_HIT, 1);
+}
+
 static Bound snapshot(uint64_t addr, uint64_t size) {
     Rng r = {addr, addr + size};
 #ifdef OOT2_BENCH_TIMERS
@@ -422,11 +456,16 @@ static Bound snapshot(uint64_t addr, uint64_t size) {
                 found = (int)i;
                 break;
             });
+        if (RC_ON()) snap_count(found >= 0 ? (uint32_t)found + 1 : F.nsnaps, found >= 0);
         if (found >= 0) return F.snap_at[found];
     }
 #else
     for (uint32_t i = 0; i < F.nsnaps; i++)
-        if (F.snaps[i].lo == r.lo && F.snaps[i].hi == r.hi) return F.snap_at[i];
+        if (F.snaps[i].lo == r.lo && F.snaps[i].hi == r.hi) {
+            if (RC_ON()) snap_count(i + 1, 1);
+            return F.snap_at[i];
+        }
+    if (RC_ON()) snap_count(F.nsnaps, 0);
 #endif
     void *p;
     Bound b = scratch((uint32_t)size, UNIFORM_ALIGN, &p);
@@ -439,15 +478,21 @@ static Bound snapshot(uint64_t addr, uint64_t size) {
 // A uniform range: VRAM and mirrors bind as they are (a mirror is a copy taken at submit); host memory the GPU reads
 // live is copied, unless the frame wrote it already (the drop rule: the live memory holds the GPU's write, in order).
 static Bound uniform(VknBuf b) {
-    if (!b.addr || !b.size) return zero_block();
+    RC_ADD(RC_UNI_CALLS, 1);
+    if (!b.addr || !b.size) {
+        RC_ADD(RC_UNI_ZERO, 1);
+        return zero_block();
+    }
     uint64_t size = b.size < UNIFORM_MAX ? b.size : UNIFORM_MAX;
     BackingRef ref;
     BT_TIME(BT_S5_RESOLVE, F.ops->resolve(b.addr, size, F.value, &ref));
+    RC_ADD(RC_RES_UNI, 1);
 #ifdef OOT2_BENCH_TIMERS
     int written = 0;
     if (ref.kind == BACKING_IMPORT && !vkr_no_snapshot && !vkr_no_drop)
         BT_TIME(BT_S5_WRITTEN, written = vkr_written(b.addr, size));
     if (ref.kind == BACKING_IMPORT && !vkr_no_snapshot && !written) {
+        RC_ADD(RC_UNI_SNAPSHOT, 1);
         note('U', b.addr, size, 0);
         Bound snap;
         BT_TIME(BT_S5_SNAPSHOT, snap = snapshot(b.addr, size));
@@ -455,11 +500,13 @@ static Bound uniform(VknBuf b) {
     }
 #else
     if (ref.kind == BACKING_IMPORT && !vkr_no_snapshot && (vkr_no_drop || !vkr_written(b.addr, size))) {
+        RC_ADD(RC_UNI_SNAPSHOT, 1);
         note('U', b.addr, size, 0);
         return snapshot(b.addr, size);
     }
 #endif
     note(backing_letter(ref.kind), b.addr, size, 0);
+    RC_ADD(RC_UNI_LIVE, 1);
     g_stats.live_uniforms++;
     return (Bound){(VkBuffer)(uintptr_t)ref.buffer, ref.offset};
 }
@@ -711,6 +758,20 @@ static void dyn_compute(Dyn *d) {
 }
 
 #define DIFF(field) (!F.dyn_valid || memcmp(&n.field, &o->field, sizeof n.field))
+// 1 when dyn_emit finds nothing to say: the state it computed equals the state the frame's command buffer holds, field by
+// field, as its own comparisons below read them (counters only: nothing here decides a packet).
+#define DSAME(field) (!memcmp(&n->field, &o->field, sizeof n->field))
+static int dyn_all_same(const Dyn *n, const Dyn *o, int mesh) {
+    if (!F.dyn_valid) return 0;
+    if (!(DSAME(vp) && DSAME(sc) && DSAME(nvp) && DSAME(cull) && DSAME(front) && DSAME(mode) && DSAME(bias_en) &&
+          DSAME(bias) && DSAME(line_width) && DSAME(discard) && DSAME(clamp) && DSAME(clip11) && DSAME(dt) && DSAME(dw) &&
+          DSAME(df) && DSAME(bt) && DSAME(bounds) && DSAME(st) && DSAME(sop) && DSAME(sfn) && DSAME(smask) &&
+          DSAME(blend_color) && DSAME(logic)))
+        return 0;
+    if (!mesh && (!DSAME(topo) || !o->restart_valid || !DSAME(restart))) return 0;
+    return !n->ntargets || (DSAME(ntargets) && DSAME(blend_en) && DSAME(eq) && DSAME(wm));
+}
+#undef DSAME
 static void dyn_emit(VkPrimitiveTopology topo, VkBool32 restart, int mesh) {
     Dyn n;
     dyn_compute(&n);
@@ -754,6 +815,7 @@ static void dyn_emit(VkPrimitiveTopology topo, VkBool32 restart, int mesh) {
         vkrec_SetColorBlendEquationEXT(0, n.ntargets, n.eq);
         vkrec_SetColorWriteMaskEXT(0, n.ntargets, n.wm);
     }
+    if (RC_ON()) vkrc_dyn(dyn_all_same(&n, o, mesh));
     if (mesh) n.topo = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM, n.restart_valid = VK_FALSE;
     else n.restart_valid = VK_TRUE;
     *o = n;
@@ -930,6 +992,7 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
         raw_range(b, 's', base, range);
         BackingRef ref;
         F.ops->resolve(base, range, F.value, &ref);
+        RC_ADD(RC_RES_STORAGE, 1);
         put_buffer(s, sb->binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (Bound){(VkBuffer)(uintptr_t)ref.buffer, ref.offset},
                    range);
         note(backing_letter(ref.kind), base, range, sb->write);
@@ -1063,7 +1126,25 @@ typedef struct {
     uint32_t nb, na;
 } VertexInput;
 
+// The state a vertex input is made from, for the counters: the attributes and streams, with the stage's binds, with the
+// buffers' addresses.
+static void vertex_count(const ShaderBinds *vb) {
+    struct {
+        uint32_t vattr[NVN_VERTEX_BINDINGS];
+        vs_st vstream[NVN_VERTEX_BINDINGS];
+        const ShaderBinds *vb;
+        NVNbufferRange vbuf[NVN_VERTEX_BINDINGS];
+    } k;
+    memset(&k, 0, sizeof k);
+    k.vb = vb;
+    memcpy(k.vattr, S.vattr, sizeof k.vattr);
+    memcpy(k.vstream, S.vstream, sizeof k.vstream);
+    memcpy(k.vbuf, S.vbuf, sizeof k.vbuf);
+    vkrc_vin(&k, offsetof(__typeof__(k), vb), offsetof(__typeof__(k), vbuf), sizeof k);
+}
+
 static void vertex_input(const ShaderBinds *vb) {
+    if (RC_ON()) vertex_count(vb);
     VertexInput in;
     memset(&in, 0, sizeof in);
     uint32_t used = 0;   // streams the attributes read
@@ -1111,6 +1192,7 @@ static void vertex_input(const ShaderBinds *vb) {
         BackingRef ref;
         uint64_t size = S.vbuf[s].size ? S.vbuf[s].size : 1;
         BT_TIME(BT_S4_RESOLVE, F.ops->resolve(S.vbuf[s].address, size, F.value, &ref));
+        RC_ADD(RC_RES_VERTEX, 1);
         VkBuffer buf = (VkBuffer)(uintptr_t)ref.buffer;
         VkDeviceSize off = ref.offset;
         BT_TIME(BT_S4_PACK, vkrec_BindVertexBuffers2(s, 1, &buf, &off, NULL, NULL));
@@ -1179,6 +1261,7 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
         g_stats.skipped++;
         return 0;
     }
+    if (RC_ON()) vkrc_draw(0, NULL, &vst, &fst, &F.formats, pipe);
     bind_pipeline(0, pipe);
     BT_TIME(BT_U_STAMPS, stamp_targets());
     bind_set0(0);
@@ -1223,6 +1306,7 @@ static void index_buffer(int itype, uint64_t ibuf, uint64_t count) {
     if (!vkn_index_type(itype, &t, &bytes)) stop("index type %d", itype);
     BackingRef ref;
     F.ops->resolve(ibuf, count ? count * bytes : bytes, F.value, &ref);
+    RC_ADD(RC_RES_INDEX, 1);
     vkrec_BindIndexBuffer((VkBuffer)(uintptr_t)ref.buffer, ref.offset, t);
     if (S.restart_en) {
         uint32_t all = bytes == 1 ? 0xFFu : bytes == 2 ? 0xFFFFu : 0xFFFFFFFFu;
@@ -1246,10 +1330,13 @@ static void op_draw_idx_ind(const p_draw_idx_ind *d) {
     // indirect dispatch does, would have to run outside the pass: left to the title run if a program reads it.
     BackingRef ref;
     F.ops->resolve(d->ind, 20, F.value, &ref);
+    RC_ADD(RC_RES_INDIRECT, 1);
     uint32_t base_instance = 0;
     int readable = ref.kind == BACKING_IMPORT || ref.kind == BACKING_MIRROR;
-    for (uint32_t i = 0; readable && i < F.nwrote; i++)
-        if (overlaps((Rng){d->ind, d->ind + 20}, F.wrote[i])) readable = 0;
+    uint32_t scanned = 0;   // the entries looked at: the loop stops at the first overlap
+    for (; readable && scanned < F.nwrote; scanned++)
+        if (overlaps((Rng){d->ind, d->ind + 20}, F.wrote[scanned])) readable = 0;
+    RC_ADD(RC_IND_SCAN_STEPS, scanned);
     if (readable) memcpy(&base_instance, (const uint8_t *)(uintptr_t)d->ind + 16, 4);
     if (!draw_prepare(d->prim, base_instance, &restart)) return;
     index_buffer(d->itype, d->ibuf, 0);
@@ -1269,6 +1356,7 @@ static Bound mesh_indirect_record(uint64_t indirect) {
         stop("a mesh indirect draw's record address is invalid");
     BackingRef src;
     F.ops->resolve(indirect, MESH_INDIRECT_COMMAND_BYTES - 4, F.value, &src);
+    RC_ADD(RC_RES_INDIRECT, 1);
     void *mapped;
     Bound dst = scratch(MESH_INDIRECT_RECORD_BYTES, 16, &mapped);
     const uint32_t initial[MESH_INDIRECT_RECORD_BYTES / sizeof(uint32_t)] = {0, 1, 1, 0};
@@ -1314,6 +1402,7 @@ static void op_draw_mesh(const p_draw_mesh *d, uint64_t indirect) {
         return;
     }
     if (!F.ops->buffer_address) stop("mesh draws need replay scratch with buffer device addresses");
+    if (RC_ON()) vkrc_draw(1, ts ? &task : NULL, &mesh, &pixel, &F.formats, pipe);
 
     Set1 s, task_set_data;
     memset(&s, 0, sizeof s);
@@ -1514,6 +1603,7 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     Bound patch = {0};
     if (ind) {
         F.ops->resolve(ind, 12, F.value, &ref);
+        RC_ADD(RC_RES_INDIRECT, 1);
         F.c0[ST_CS].valid = 0;   // a bank of its own: stage_resources finds these bytes and binds this copy
         patch = bank(&F.c0[ST_CS], c0, VKN_BANK_BYTES);
     }
@@ -1521,6 +1611,7 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     stage_resources(&s, ST_CS, cs, &P.ps[ST_CS], b, c0, 1);
     vkrec_PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, F.ops->compute_layout, 1, s.n, s.w);
     vkrec_PushConstants(F.ops->compute_layout, vkp_push_range(VKP_COMPUTE).stageFlags, 0, VKP_PUSH_BYTES, s.push);
+    RC_ADD(RC_DRAW_DISPATCH, 1);
     F.draws++, g_stats.dispatches++;
     if (!ind) {
         vkrec_Dispatch(groups[0], groups[1], groups[2]);
@@ -1865,6 +1956,7 @@ uint64_t vkr_submit(const uint64_t *handles, int n) {
     uint64_t value = vkrec_begin(GPU_VK_REPLAY);
     memset(&F, 0, sizeof F);
     F.ops = ops, F.value = value;
+    if (RC_ON()) vkrc_submit_begin();
     if (vkgt_enabled) vkgt_frame_begin(value);
     static uint64_t frames;
     int k = (int)(frames++ % FRAMES_KEPT);
@@ -1877,6 +1969,7 @@ uint64_t vkr_submit(const uint64_t *handles, int n) {
     movie_unclosed("no blit program came before the end of this submission");
     if (ops->frame_end) ops->frame_end(value);
     vkr_report_frame_end();   // after the frame's end: its events and reports follow the backing map's write-backs
+    if (RC_ON()) vkrc_submit_end(F.draws);
     g_stats.frames++;
     if (vkgt_enabled) vkgt_frame_end();   // the last timestamps, and the effect that reads them
     return vkrec_end(NULL, 0);

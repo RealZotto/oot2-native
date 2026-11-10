@@ -17,6 +17,7 @@
 #include "oot2/memory.h"
 #include "oot2/nvn_order.h"
 #include "oot2/nvn_pace.h"
+#include "oot2/replay_count.h"
 #include "oot2/settings.h"
 #include "plat.h"
 
@@ -289,6 +290,7 @@ void nvn_census_present(uint64_t seq) {
     uint64_t now = plat_now_ns();
     if (seq == 1) g_first_ns = now;
     if (seq == 1 || seq % WINDOW == 0) window_line(seq, seq == 1 ? 0.0 : (double)(now - g_first_ns) / 1e9);
+    rc_present(seq);   // the replay's counters (OOT2_REPLAY_COUNTERS): a line group when their window is full
     if (!rt_census_on()) return;
     if (seq == 1 || seq % WINDOW == 0) take(seq);
     if (rt_timer_on()) timer_present(seq);

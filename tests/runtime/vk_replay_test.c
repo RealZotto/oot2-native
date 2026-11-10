@@ -32,6 +32,7 @@
 #include "oot2/nvn_obj.h"
 #include "oot2/nvn_program.h"
 #include "oot2/nvn_tex.h"
+#include "oot2/replay_count.h"
 #include "oot2/runtime.h"
 #include "oot2/shader_desc.h"
 #include "oot2/vk_movie_blit.h"
@@ -1838,5 +1839,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "unknown case %s\n", cs);
         return 2;
     }
+    if (rc_on) rc_print("exit", 0);   // with OOT2_REPLAY_COUNTERS set: the counters' lines, as a run's exit prints them
     return 0;
 }

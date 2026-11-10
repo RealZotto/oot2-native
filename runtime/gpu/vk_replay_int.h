@@ -52,3 +52,18 @@ void vkr_report_pass_end(void);
 void vkr_report_frame_begin(void);
 void vkr_report_frame_end(void);
 void vkr_report_reset(void);
+
+// The workload counters of the replay (vk_replay_count.c, oot2/replay_count.h): each is called only with the counters on.
+// A submission's start and end (work: its draws and dispatches); a graphics draw about to be issued with its stages (task
+// is NULL for a vertex draw), the formats of its pass and its pipeline; the vertex input of a draw (one block, its first
+// state_n bytes the attribute and stream state, the first layout_n those and the stage's binds, all full_n those and the
+// buffers' addresses); and whether the dynamic state of a draw equals the
+// state the draw before it left.
+struct VkpStage;
+struct VkpFormats;
+void vkrc_submit_begin(void);
+void vkrc_submit_end(uint32_t work);
+void vkrc_draw(int mesh, const struct VkpStage *task, const struct VkpStage *vs, const struct VkpStage *ps,
+               const struct VkpFormats *formats, VkPipeline pipe);
+void vkrc_vin(const void *state, size_t state_n, size_t layout_n, size_t full_n);
+void vkrc_dyn(int same);

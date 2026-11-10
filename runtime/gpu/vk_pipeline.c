@@ -38,6 +38,7 @@
 #include "oot2/bench_timers.h"
 #include "oot2/gpu.h"
 #include "oot2/gpu_vk.h"
+#include "oot2/replay_count.h"
 #include "oot2/runtime.h"
 #include "oot2/spirv.h"
 #include "oot2/vk_caps.h"
@@ -117,6 +118,11 @@ void vkp_stage_content_digest(const VkpStage *stage, uint8_t digest[SHC_DIGEST_B
                    ? shc_set_find_ledger(&P.set, stage->key, stage->ledger_digest, &entry, NULL)
                    : shc_set_find(&P.set, stage->key, stage->answers, &entry);
     if (from != SHC_MISS) memcpy(digest, entry.answers, SHC_DIGEST_BYTES);
+    if (RC_ON()) {   // a lookup of a stage by a draw: whether the store answers with a variant of the base module
+        rc_add_(RC_CONTENT_N, 1);
+        if (from == SHC_MISS) rc_add_(RC_CONTENT_MISS, 1);
+        else if (from == SHC_FROM_VARIANTS) rc_add_(RC_CONTENT_VARIANT, 1);
+    }
 }
 
 void vkp_store_close(void) {

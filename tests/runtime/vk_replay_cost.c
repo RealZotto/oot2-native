@@ -48,6 +48,7 @@
 #include "oot2/nvn_obj.h"
 #include "oot2/nvn_program.h"
 #include "oot2/nvn_tex.h"
+#include "oot2/replay_count.h"
 #include "oot2/runtime.h"
 #include "oot2/shader_cache.h"
 #include "oot2/shader_desc.h"
@@ -492,13 +493,19 @@ static p_bind_vbuf vbufs(int slot) {
     v.r[1] = (NVNbufferRange){vbuf_addr(1, slot), 0x1000};
     return v;
 }
-static p_bind_handles texture_handle(int draw) {
+static p_bind_handles texture_id(int id) {
     p_bind_handles h;
     memset(&h, 0, sizeof h);
     h.stage = ST_FS_, h.first = 0, h.n = 1;
-    h.h[0] = nvn_handle_pack((uint32_t)(1 + (draw * 7) % TEX_IDS), 3);
+    h.h[0] = nvn_handle_pack((uint32_t)id, 3);
     return h;
 }
+static p_bind_handles texture_handle(int draw) { return texture_id(1 + (draw * 7) % TEX_IDS); }
+
+// e: the counters' pattern. Ten draws repeat: their program pairs and the texture bound before each are fixed sequences,
+// so that what the counters must say is known by construction (tests/test_runtime_vk_replay_cost.py has the numbers).
+static const int E_PAIR[10] = {0, 0, 1, 0, 1, 1, 2, 2, 2, 3};
+static const int E_TEX[10] = {5, 5, 6, 5, 6, 6, 7, 7, 7, 8};
 
 // One frame of n draws. a: the state is bound once and the draws repeat. b: before each draw, the program of the next pair
 // (cycling through NPAIR), one texture and one uniform range of the vertex stage. c: b, and the vertex attributes, streams and
@@ -526,7 +533,10 @@ static Rec build_frame(char pattern, int n) {
     PUT(&r, OP_BIND_UBO, (p_bind_buf){.stage = ST_FS_, .index = 0, .addr = PS_FIXED_UBO, .size = 512});
     PUT(&r, OP_BIND_TEX, texture_handle(0));
     for (int i = 0; i < n; i++) {
-        if (pattern != 'a') {
+        if (pattern == 'e') {
+            PUT(&r, OP_BIND_PROGRAM, g_prog[E_PAIR[i % 10]]);
+            PUT(&r, OP_BIND_TEX, texture_id(E_TEX[i % 10]));
+        } else if (pattern != 'a') {
             PUT(&r, OP_BIND_PROGRAM, g_prog[i % NPAIR]);
             PUT(&r, OP_BIND_TEX, texture_handle(i));
             PUT(&r, OP_BIND_UBO, (p_bind_buf){.stage = ST_VS_, .index = 0, .addr = ubo_addr(i), .size = UBO_BYTES});
@@ -621,11 +631,13 @@ static void run_config(const Cfg *cfg, int n) {
     uint64_t *wall = calloc((size_t)total, sizeof *wall), *cpu = calloc((size_t)total, sizeof *cpu);
     CHECK(wall && cpu);
     VkrStats before = {0};
+    uint64_t counts0[RC_N] = {0};
     uint64_t primed0 = vkp_bench_primed;
     for (int f = 0; f < total; f++) {
         if (cfg->evict_mb) evict_caches();
         if (f == cfg->warmup) {
             vkr_stats(&before);
+            rc_sum(counts0);
 #ifdef OOT2_BENCH_TIMERS
             memset(bench_acc, 0, sizeof bench_acc), memset(bench_n, 0, sizeof bench_n);
 #endif
@@ -666,6 +678,15 @@ static void run_config(const Cfg *cfg, int n) {
                 (ull)ms.graphics_misses);
         exit(3);
     }
+    if (rc_on) {   // the counters' change over the measured frames, and the replay's own statistics beside them
+        uint64_t counts1[RC_N];
+        rc_sum(counts1);
+        printf("COUNTS pattern=%c n=%d kind=%s frames=%d", cfg->pattern, n, cfg->kind_mirror ? "mirror" : "import", cfg->frames);
+        for (int i = 0; i < RC_N; i++) printf(" %s=%llu", rc_name(i), (ull)(counts1[i] - counts0[i]));
+        printf(" vkr_snapshots=%llu vkr_live_uniforms=%llu vkr_dispatches=%llu vkr_passes=%llu\n",
+               (ull)(after.snapshots - before.snapshots), (ull)(after.live_uniforms - before.live_uniforms),
+               (ull)(after.dispatches - before.dispatches), (ull)(after.passes - before.passes));
+    }
     const uint64_t *w = wall + cfg->warmup, *c = cpu + cfg->warmup;
     uint64_t lo = w[0], hi = w[0];
     for (int f = 1; f < cfg->frames; f++) lo = w[f] < lo ? w[f] : lo, hi = w[f] > hi ? w[f] : hi;
@@ -693,7 +714,7 @@ static void run_config(const Cfg *cfg, int n) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: vk_replay_cost --base B --variants V --map M --keys K [--pattern a|b|c|d] [--n 340,1000,...] "
+    fprintf(stderr, "usage: vk_replay_cost --base B --variants V --map M --keys K [--pattern a|b|c|d|e] [--n 340,1000,...] "
             "[--kind import|mirror] [--frames 20] [--warmup 5] [--evict-mb 64] [--filler 6000]\n");
     exit(2);
 }
@@ -721,7 +742,7 @@ int main(int argc, char **argv) {
         } else usage();
     }
     if (!cfg.base || !cfg.map || !cfg.keys || cfg.frames < 1 ||
-        (cfg.pattern != 'a' && cfg.pattern != 'b' && cfg.pattern != 'c' && cfg.pattern != 'd'))
+        (cfg.pattern != 'a' && cfg.pattern != 'b' && cfg.pattern != 'c' && cfg.pattern != 'd' && cfg.pattern != 'e'))
         usage();
     g_start_ns = plat_now_ns();
     calibrate_tsc();
@@ -763,6 +784,7 @@ int main(int argc, char **argv) {
         printf("PROCESS cpu_s=%.3f wall_s=%.3f\n", (double)(k + u) / 1e7, (double)(plat_now_ns() - g_start_ns) / 1e9);
     }
 #endif
+    if (rc_on) rc_print("exit", 0);   // the exit line a run prints through the stop path, here by hand: this program leaves by return
     fflush(stdout);
     return 0;
 }
