@@ -270,7 +270,9 @@ static void require_idle(const char *what, const char *key, const int *late) {
     }
 }
 
-static void check_capabilities(const VkpStage *s, const VkpModule *m) {
+// Returns 1 when a compute pipeline of the module has to be created with the full-subgroups requirement
+// (spv_needs_full_subgroups); the graphics and mesh callers have no use for it.
+static int check_capabilities(const VkpStage *s, const VkpModule *m) {
     SpvDecl d;
     char why[256], shape[256];
     if (!spv_declarations(m->code, m->bytes / 4, &d, why, sizeof why)) {
@@ -282,10 +284,12 @@ static void check_capabilities(const VkpStage *s, const VkpModule *m) {
         rt_fatal("gfx: vulkan: stage %s declares something the device's required list does not give: %s (%s)", s->key, why,
                  shape);
     }
+    return spv_needs_full_subgroups(&d);
 }
 
-// What a creation tells note: bit 0 the module was padded, bit 1 the library holds a shader stage.
-enum { LIB_PADDED = 1, LIB_SHADER = 2 };
+// What a creation tells note: bit 0 the module was padded, bit 1 the library holds a shader stage, bit 2 the compute pipeline
+// was created with the full-subgroups requirement.
+enum { LIB_PADDED = 1, LIB_SHADER = 2, CS_FULL_SUBGROUPS = 4 };
 
 static void note(int kind, const VkPipelineCreationFeedback *fb, uint64_t ns, int flags) {
     int hit = (fb->flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
@@ -301,6 +305,7 @@ static void note(int kind, const VkPipelineCreationFeedback *fb, uint64_t ns, in
         P.stats.computes++, P.stats.compute_hits += hit;
     }
     P.stats.padded += (flags & LIB_PADDED) != 0;
+    P.stats.full_subgroups += (flags & CS_FULL_SUBGROUPS) != 0;
     plat_mutex_unlock(&P.lock);
 }
 
@@ -748,7 +753,10 @@ static VkPipeline build_compute(void *c) {
         }
         if (helper) m.code = helper, m.bytes = (uint32_t)(hwords * 4);
     }
-    check_capabilities(s, &m);
+    // A module that still has its cooperative matrices (the native form) is created with the full-subgroups requirement,
+    // which Vulkan asks of a pipeline with a SPIR-V 1.3 module that declares them (spv_needs_full_subgroups); the helper form
+    // declares none and is created as every compute pipeline was.
+    int full = check_capabilities(s, &m);
     // A compute module's workgroup memory starts as the null value of its type when the device was made with the
     // zero-initialization feature (spv_zero_workgroup says why): the module made from the pack's differs from it only in
     // that, and the pipeline cache keys on what is created.
@@ -772,8 +780,9 @@ static VkPipeline build_compute(void *c) {
                                                 .pPipelineStageCreationFeedbacks = &stage_fb};
     VkComputePipelineCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .pNext = &fbi,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                  .module = sm, .pName = "main"},
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .flags = full ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT : 0,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sm, .pName = "main"},
         .layout = P.lay.compute};
     uint64_t t0 = plat_now_ns();
     VkPipeline p;
@@ -781,7 +790,8 @@ static VkPipeline build_compute(void *c) {
     uint64_t ns = plat_now_ns() - t0;
     if (r != VK_SUCCESS) gpu_vk_failed(r, "vkCreateComputePipelines");
     vkDestroyShaderModule(gpu_vk.device, sm, NULL);
-    note(K_COMPUTE, &fb, ns, 0);
+    // counted from the create info that was handed to the driver, so that the count says what the driver was given
+    note(K_COMPUTE, &fb, ns, (ci.stage.flags & VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT) ? CS_FULL_SUBGROUPS : 0);
     return p;
 }
 

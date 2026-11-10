@@ -9,7 +9,10 @@
 // measured on NVIDIA (below), and at start-up this probe decides whether the device runs that form:
 //
 //   the gate   the device lists a 16x8x16 subgroup matrix with f16 A, B, C and result, for compute, and was made with
-//              16-bit floats (the optional feature shader_float16) and the Vulkan memory model (an item);
+//              16-bit floats (the optional feature shader_float16), the Vulkan memory model (an item) and full subgroups in
+//              compute (an item: the pipeline of a module that keeps the native function is created with the
+//              full-subgroups requirement, which Vulkan asks of a SPIR-V 1.3 module with cooperative matrices, and the
+//              feature computeFullSubgroups it needs);
 //   the order  a probe loads row-major matrices whose components are their positions and reads back every lane's
 //              components: each console element of every lane must sit in the component the translator's order names;
 //   the result the same lanes' fragments of small integers, whose every sum f16 holds exactly whatever the order or the

@@ -260,6 +260,7 @@ typedef struct VkpStats {
     uint64_t links, link_hits;            // fast links
     uint64_t computes, compute_hits;
     uint64_t padded;                      // vertex libraries made from a padded module
+    uint64_t full_subgroups;              // compute pipelines created with the full-subgroups requirement (cooperative matrices)
     uint64_t resident;                    // objects held now
     uint64_t build_ns[3];                 // wall time in the driver: libraries, links, computes
     uint64_t map_missing, map_unknown_rows;  // full ledger digests without an available map or map entry

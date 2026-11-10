@@ -14,6 +14,8 @@
 // The job file, one directive per line (paths have no spaces):
 //   validation on|off       module PATH      groups X Y Z
 //   warmup N                reps N           chunk N (dispatches per submit)
+//   full_subgroups on|off   (create the pipeline with the full-subgroups requirement, as the game's builder does for a
+//                            module with cooperative matrices; off by default)
 //   buffer SET BINDING ubo|ssbo SIZE [in=PATH] [out=PATH]
 //   push PATH               (push constant bytes for the compute stage)
 // A buffer is device-local; `in` fills it once through a staging copy (a short
@@ -118,7 +120,7 @@ typedef struct {
 } Buffer;
 
 typedef struct {
-    int validation;
+    int validation, full_subgroups;
     char module[MAX_PATH_LEN], push[MAX_PATH_LEN];
     uint32_t groups[3], warmup, reps, chunk;
     Buffer b[MAX_BUFFERS];
@@ -144,6 +146,7 @@ static void job_read(const char *path, Job *job) {
         memset(t, 0, sizeof t);
         int k = sscanf(line, "%63s %1023s %1023s %1023s %1023s %1023s %1023s", w, t[0], t[1], t[2], t[3], t[4], t[5]);
         if (!strcmp(w, "validation") && k == 2) job->validation = !strcmp(t[0], "on");
+        else if (!strcmp(w, "full_subgroups") && k == 2) job->full_subgroups = !strcmp(t[0], "on");
         else if (!strcmp(w, "module") && k == 2) snprintf(job->module, sizeof job->module, "%s", t[0]);
         else if (!strcmp(w, "push") && k == 2) snprintf(job->push, sizeof job->push, "%s", t[0]);
         else if (!strcmp(w, "groups") && k == 4) for (int i = 0; i < 3; i++) job->groups[i] = (uint32_t)strtoul(t[i], NULL, 0);
@@ -500,8 +503,9 @@ static int cmd_run(const char *path) {
     VK_CHECK(vkCreateShaderModule(dev, &smi, NULL, &sm));
     VkComputePipelineCreateInfo cpci = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                  .module = sm, .pName = "main"},
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .flags = job.full_subgroups ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT : 0,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sm, .pName = "main"},
         .layout = pl};
     VkPipeline pipe;
     double t0 = now_ms();

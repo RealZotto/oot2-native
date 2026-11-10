@@ -16,6 +16,8 @@
 //   meshpayload FILE             the task payload bytes a mesh stage's description declares
 //   binds FILE                   a description's bindings parsed (shd_parse_binds), or the refusal
 //   spvdecl MODULE               the capabilities and extensions a module declares
+//   spvfull MODULE               whether a compute pipeline of the module needs the full-subgroups requirement
+//                                (spv_needs_full_subgroups): "full_subgroups 1" when it declares cooperative matrices
 //   spvpad IN OUT SPEC           a module with outputs added (SPEC "location:component:components:type,...")
 //   spvmeshpad IN OUT SPEC [MAX_BYTES MAX_COMPONENTS [MAX_PAYLOAD_AND_OUTPUT PAYLOAD_BYTES]]   a mesh module with outputs
 //                                added and stored (a ":p" after a run: read per primitive), held to the device's mesh output
@@ -62,7 +64,9 @@
 //   synth_absent PACK            a stage the pack lacks: a named fatal with its shape
 //   hmma_probe [FAULT]           the device and the builder opened and closed: the start-up probe's decision on HMMA
 //                                (oot2/vk_hmma.h), with a fault in its read-back when named (lengths, helper, sums)
-//   hmma_build PACK KEY          a translated compute module with HMMA built in the form the probe chose
+//   hmma_build PACK KEY          a translated compute module with HMMA built in the form the probe chose, and how many
+//                                pipelines were created with the full-subgroups requirement (1 for the native form, 0 for
+//                                the helper)
 // Cases on the player's own pack (the desktop, never in continuous integration):
 //   firstdraw DRAW PACK VKEY PKEY OUT   tools/firstdraw's draw, built from the pack through the builder
 //   corpus_pairs PACK PAIRS THREADS CACHE [save]   pairs built and linked for two formats
@@ -283,6 +287,16 @@ static void case_spvdecl(const char *path) {
         printf("cap %u %s\n", d.caps[i], name ? name : "?");
     }
     for (uint32_t i = 0; i < d.nexts; i++) printf("ext %s\n", d.exts[i]);
+    free(w);
+}
+
+static void case_spvfull(const char *path) {
+    size_t n;
+    uint32_t *w = read_all(path, &n);
+    SpvDecl d;
+    char why[256];
+    if (!spv_declarations(w, n / 4, &d, why, sizeof why)) printf("refused: %s\n", why);
+    else printf("full_subgroups %d\n", spv_needs_full_subgroups(&d));
     free(w);
 }
 
@@ -1175,6 +1189,12 @@ static void case_hmma_build(const char *pack, const char *key) {
     VkpStage cs = {.key = key};
     CHECK(vkp_compute(&cs));
     print_stats("hmma");
+    // The native form's pipeline is created with the full-subgroups requirement and the helper form's is not. The count is
+    // taken from the create info handed to the driver: the validation layer (1.4.357) says nothing of a native pipeline made
+    // without the requirement (measured: 0 errors with it removed), so the layer cannot be the check.
+    VkpStats made;
+    vkp_stats(&made);
+    printf("full_subgroups %llu\n", (unsigned long long)made.full_subgroups);
     close_and_report();
     printf("ok hmma_build\n");
 }
@@ -1466,6 +1486,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "meshlink") && argc >= 4) case_meshlink(argv[2], argv[3]);
     else if (!strcmp(cs, "binds") && argc >= 3) case_binds(argv[2]);
     else if (!strcmp(cs, "spvdecl") && argc >= 3) case_spvdecl(argv[2]);
+    else if (!strcmp(cs, "spvfull") && argc >= 3) case_spvfull(argv[2]);
     else if (!strcmp(cs, "spvpad") && argc >= 5) case_spvpad(argv[2], argv[3], argv[4]);
     else if (!strcmp(cs, "spvmeshpad") && argc >= 5)
         case_spvmeshpad(argv[2], argv[3], argv[4], argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 10) : 0,

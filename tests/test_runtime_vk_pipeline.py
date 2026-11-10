@@ -931,6 +931,16 @@ class SpirvTest(unittest.TestCase):
                                                     "cap 25 ImageGatherExtended", "cap 5347 PhysicalStorageBufferAddresses",
                                                     "ext SPV_KHR_storage_buffer_storage_class", "ext SPV_KHR_foo"])
 
+    def test_only_a_module_with_cooperative_matrices_needs_the_full_subgroups_requirement(self) -> None:
+        # VUID-RuntimeSpirv-OpTypeCooperativeMatrixKHR-10770: a pipeline of a module that declares CooperativeMatrixKHR (6022)
+        # is created with VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT (the module here is SPIR-V 1.3, as the
+        # translator's are). Nothing else asks for it, and the helper form of a module declares no matrix.
+        for caps, want in (((6022,), 1), ((10, 6022, 5347), 1), ((), 0), ((10, 5347), 0), ((9,), 0)):
+            with self.subTest(caps=caps):
+                done = run("spvfull", self.write("f.spv", vertex_module(caps)))
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual(done.stdout.splitlines(), [f"full_subgroups {want}"])
+
     def test_a_module_that_is_not_spirv_is_refused(self) -> None:
         bad = bytearray(vertex_module())
         bad[0] ^= 1

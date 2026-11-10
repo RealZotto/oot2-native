@@ -32,6 +32,17 @@ int spv_declarations(const uint32_t *words, size_t nwords, SpvDecl *out, char *w
 // does not name it.
 const char *spv_capability_name(uint32_t cap);
 
+// 1 when a compute pipeline made of the module has to be created with the full-subgroups requirement
+// (VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT): the module declares CooperativeMatrixKHR. The Vulkan
+// valid usage for any pipeline with a cooperative matrix (VUID-RuntimeSpirv-OpTypeCooperativeMatrixKHR-10770) reads "must be
+// created with the VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT flag or the shader module must be version 1.6
+// or greater", and the translator writes SPIR-V 1.3. The flag needs the computeFullSubgroups feature (VUID-VkPipeline
+// ShaderStageCreateInfo-flags-02785) and, with no varying subgroup size or required size in the create info, a local size
+// X that is a multiple of the subgroup size (flags-02759 and module-08987): the device's subgroup size is fixed at 32 (an
+// item of oot2/vk_required.h) and the translator keeps the helper where X is not a multiple of 32. A module the helper
+// replaced (spv_hmma_fallback) declares no cooperative matrix and needs nothing.
+int spv_needs_full_subgroups(const SpvDecl *d);
+
 // One variable to add: Output storage class, `components` consecutive components starting at `component` of
 // `location`, of a 32-bit scalar type (0 float, 1 signed int, 2 unsigned int; the numbering of oot2/shader_desc.h).
 enum { SPV_PAD_FLOAT, SPV_PAD_SINT, SPV_PAD_UINT };

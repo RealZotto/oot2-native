@@ -122,6 +122,9 @@ static const char *gate(void) {
         return "the device was made without cooperative matrices";
     if (!en.f12.shaderFloat16) return "the device has no 16-bit floats in shaders";
     if (!en.f12.vulkanMemoryModel) return "the device was made without the Vulkan memory model";
+    // A pipeline of a SPIR-V 1.3 module with cooperative matrices is created with the full-subgroups requirement
+    // (VUID-RuntimeSpirv-OpTypeCooperativeMatrixKHR-10770), which needs this feature (VUID-VkPipelineShaderStageCreateInfo-flags-02785).
+    if (!en.f13.computeFullSubgroups) return "the device was made without full subgroups in compute";
     VkPhysicalDeviceCooperativeMatrixPropertiesKHR stages = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR};
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &stages};
@@ -192,9 +195,12 @@ static int run_probe(uint32_t *words, const Push *push_in, char *why, size_t cap
                                      .pPushConstantRanges = &pr};
     VkPipelineLayout layout;
     GPU_VK_OK(vkCreatePipelineLayout(gpu_vk.device, &li, NULL, &layout), "vkCreatePipelineLayout (the HMMA probe)");
-    // the probe's 32 lanes are one subgroup (the subgroup_32 item fixes the size at 32), created as the game's programs are
+    // the probe's 32 lanes are one subgroup (the subgroup_32 item fixes the size at 32), created as the game's programs with
+    // cooperative matrices are: with the full-subgroups requirement (vk_pipeline.c, spv_needs_full_subgroups). The probe's
+    // own module is SPIR-V 1.6, which Vulkan excuses from it, so the flag is here for the probe to run what the game runs.
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
                                       .layout = layout};
     VkPipeline pipe;

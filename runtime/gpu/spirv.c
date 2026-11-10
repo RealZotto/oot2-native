@@ -60,6 +60,12 @@ int spv_declarations(const uint32_t *w, size_t n, SpvDecl *out, char *why, size_
     return 1;
 }
 
+int spv_needs_full_subgroups(const SpvDecl *d) {
+    for (uint32_t i = 0; i < d->ncaps; i++)
+        if (d->caps[i] == 6022u) return 1;   // CooperativeMatrixKHR
+    return 0;
+}
+
 const char *spv_capability_name(uint32_t cap) {
     static const struct { uint32_t v; const char *name; } names[] = {
         {0, "Matrix"}, {1, "Shader"}, {2, "Geometry"}, {3, "Tessellation"}, {4, "Addresses"}, {5, "Linkage"},

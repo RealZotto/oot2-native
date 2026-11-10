@@ -324,6 +324,22 @@ class FallbackTest(unittest.TestCase):
     def test_a_module_without_matrices_is_left_as_it_is(self):
         self.assertEqual(self.turn("helper")[0], ["unchanged"])
 
+    def test_only_the_native_form_needs_the_full_subgroups_requirement(self):
+        """VUID-RuntimeSpirv-OpTypeCooperativeMatrixKHR-10770: a pipeline of a module with cooperative matrices is created
+        with the full-subgroups requirement unless the module is SPIR-V 1.6 or later. The translator's module is 1.3, so the
+        native form needs it; the helper form, and the native module turned into the helper, declare no matrix."""
+        def full(path: Path) -> str:
+            done = run("spvfull", str(path))
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            return done.stdout.strip()
+
+        native = (self.dir / "native.spv").read_bytes()
+        self.assertEqual(struct.unpack_from("<I", native, 4)[0], 0x00010300)    # the premise: older than 1.6
+        self.assertIn(CAP_COOPERATIVE_MATRIX, Module(native).caps)
+        self.assertEqual(full(self.dir / "native.spv"), "full_subgroups 1")
+        self.assertEqual(full(self.turn("native")[1]), "full_subgroups 0")
+        self.assertEqual(full(self.dir / "helper.spv"), "full_subgroups 0")
+
     def test_a_module_with_matrices_but_no_helper_is_refused_by_name(self):
         data = (self.dir / "native.spv").read_bytes().replace(HELPER.encode(), b"dmsh_hmma16816_zzz")   # same length
         lines, _ = self.turn("nohelper", data)
@@ -390,7 +406,10 @@ class DeviceTest(unittest.TestCase):
         (work / "c0.bin").write_bytes(hc.c0_bank(len(inp), out_size))
         sb, sbufs = res["support_buffer"], {b["cb_byte_offset"]: b for b in res["sbufs"]}
         (c0,) = [c for c in res["cbufs"] if c["slot"] == 0]
-        lines = ["validation on", f"module {work / 'k.spv'}", f"groups {self.GROUPS} 1 1", "warmup 0", "reps 1", "chunk 1",
+        # the native form's pipeline is created as the game's builder creates it, with the full-subgroups requirement
+        # (VUID-RuntimeSpirv-OpTypeCooperativeMatrixKHR-10770); the helper form declares no matrix and is not
+        lines = ["validation on", f"full_subgroups {'off' if hmma == 'helper' else 'on'}", f"module {work / 'k.spv'}",
+                 f"groups {self.GROUPS} 1 1", "warmup 0", "reps 1", "chunk 1",
                  f"buffer {sb['set']} {sb['binding']} ubo {sb['size']}",
                  f"buffer {c0['set']} {c0['binding']} ubo 65536 in={work / 'c0.bin'}",
                  f"buffer {sbufs[hc.SB_IN]['set']} {sbufs[hc.SB_IN]['binding']} ssbo {len(inp)} in={work / 'in.bin'}",
@@ -464,8 +483,9 @@ class ProbeTest(unittest.TestCase):
 
     def test_the_gate_reasons_are_read_from_the_probe(self):
         reasons = gate_reasons()
-        self.assertEqual(len(reasons), 6, reasons)
+        self.assertEqual(len(reasons), 7, reasons)
         self.assertIn("the device lists no 16x8x16 subgroup matrix with f16 A, B, C and result", reasons)
+        self.assertIn("the device was made without full subgroups in compute", reasons)
 
     def test_the_probe_measures_the_translators_order_and_keeps_the_native_form(self):
         out, err = self.probe()
@@ -506,6 +526,11 @@ class ProbeTest(unittest.TestCase):
                 self.assertEqual(verdict(done.stdout)[0], native, done.stdout)
                 self.assertIn("ok hmma_build", done.stdout)
                 self.assertIn("validation errors 0 warnings 0", done.stdout)
+                # VUID-RuntimeSpirv-OpTypeCooperativeMatrixKHR-10770: the native form's pipeline (a SPIR-V 1.3 module with
+                # cooperative matrices) is created with the full-subgroups requirement and the helper form's is not. The
+                # validation layer (1.4.357) reports nothing for a native pipeline made without it (measured, 0 errors), so
+                # the count of pipelines whose create info carried the flag is what makes this case able to fail.
+                self.assertIn(f"full_subgroups {native}\n", done.stdout)
 
 
 if __name__ == "__main__":
