@@ -170,7 +170,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
             Operand src,
             int rd,
             bool absolute,
-            bool negate)
+            bool negate,
+            bool toByte = false)
         {
             if (dstType == IDstFmt.U64)
             {
@@ -184,7 +185,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             Operand srcB = context.FPAbsNeg(src, absolute, negate, fpType);
 
-            Operand isNan = srcType == DstFmt.F32 ? context.IsNan(srcB, fpType) : null;
+            if (srcType != DstFmt.F64)
+            {
+                // oot2-native: a single or a half source is bounded before it is converted (FP32ToIntSaturated). What follows is the double source, which no instruction of the
+                // console reaches and which is as it was: its NaN and its values outside the range are still left to the driver.
+                context.Copy(GetDest(rd), FP32ToIntSaturated(context, srcB, roundingMode, isSignedInt, toByte ? 8 : isSmallInt ? 16 : 32));
+
+                return;
+            }
 
             srcB = roundingMode switch
             {
@@ -226,13 +234,6 @@ namespace Ryujinx.Graphics.Shader.Instructions
                     : context.IClampU32(srcB, Const(min), Const(max));
             }
 
-            if (srcType == DstFmt.F32)
-            {
-                // oot2-native: a NaN single source gives 0, as the console's conversion does (OpConvertFToS and OpConvertFToU leave it undefined).
-                // A NaN double source is still left to the driver: the console gives the integer's top bit there (Inference from PTX's cvt rule)
-                srcB = context.ConditionalSelect(isNan, Const(0), srcB);
-            }
-
             Operand dest = GetDest(rd);
 
             context.Copy(dest, srcB);
@@ -240,11 +241,48 @@ namespace Ryujinx.Graphics.Shader.Instructions
             // TODO: CC.
         }
 
+        // oot2-native: F2I from a single (a half is widened first) to an integer of 32, 16 or 8 bits, as the console converts: the float is rounded as the instruction says, a value
+        // outside the integer's range gives the nearest bound (an infinity too) and a NaN gives 0. OpConvertFToS and OpConvertFToU are undefined for a NaN, an infinity and a value
+        // outside the range, and a select after the conversion does not take that back, so the rounded float is clamped between two floats inside the range first and the conversion
+        // only ever sees a number the integer holds. What it costs is what the clamp cannot give:
+        //   - the lower bound (-2^31, -32768, -128, 0) is a float, so the clamp alone saturates below;
+        //   - 32767, 65535, 127 and 255 are floats, so the clamp alone saturates a 16-bit or an 8-bit integer above, and no integer clamp follows the conversion;
+        //   - 2^31 - 1 and 2^32 - 1 are not floats (as float literals they round up to 2^31 and 2^32, which are outside): the clamp stops at the largest float below, 2147483520 or
+        //     4294967040, and the integer's top value is selected where the source is above that float, which is where it is 2^31 or 2^32 and up. The source and the rounded float are
+        //     on the same side of it, every float that large being a whole number, so the comparison reads the source and the rounded float keeps a single use;
+        //   - NClamp gives its lower bound for a NaN: that is the 0 of an unsigned integer, and a signed one selects its 0.
+        // So: unsigned 16 and 8 bits, a clamp; unsigned 32 bits, a clamp, a comparison and a select; signed 16 and 8 bits, a clamp, a NaN test and a select; signed 32 bits, both.
+        // No branch, and a value in range converts to what it did.
+        private static Operand FP32ToIntSaturated(EmitterContext context, Operand value, RoundMode2 roundingMode, bool signed, int bits)
+        {
+            Operand rounded = roundingMode switch
+            {
+                RoundMode2.Round => context.FPRound(value),
+                RoundMode2.Floor => context.FPFloor(value),
+                RoundMode2.Ceil => context.FPCeiling(value),
+                _ => context.FPTruncate(value),
+            };
+
+            float low = signed ? -(float)(1L << (bits - 1)) : 0f;
+            float top = bits == 32 ? (signed ? 2147483520f : 4294967040f) : (1 << (signed ? bits - 1 : bits)) - 1;
+
+            Operand bounded = context.Add(Instruction.FP32 | Instruction.Clamp, Local(), rounded, ConstF(low), ConstF(top));
+            Operand res = signed ? context.FP32ConvertToS32(bounded) : context.FP32ConvertToU32(bounded);
+
+            if (bits == 32)
+            {
+                res = context.ConditionalSelect(context.FPCompareLess(ConstF(top), value), Const(signed ? int.MaxValue : -1), res);
+            }
+
+            return signed ? context.ConditionalSelect(context.IsNan(value), Const(0), res) : res;
+        }
+
         // oot2-native: a float to a signed 32-bit integer for the conversions the translator adds itself (a level of detail in fixed point, a coordinate or a size times the render
         // scale), whose float is whatever the driver or the host gave. OpConvertFToS is undefined for a NaN, an infinity and a value outside the integer's range, and a select after it
         // does not take that back, so the float is bounded before it is converted. Both bounds are floats inside the range: -2^31 is one, and 2147483520 is the largest below 2^31 (the
         // literal 2147483647 would round up to 2^31, which is outside). NClamp gives its lower bound for a NaN, so a NaN is 0 at no cost where the caller knows the value is not
-        // negative (nonNegative, which makes 0 the lower bound) and costs a test and a select otherwise. Nothing changes for a value in range. F2I itself does not come through here.
+        // negative (nonNegative, which makes 0 the lower bound) and costs a test and a select otherwise. Nothing changes for a value in range. F2I itself does not come through here:
+        // it has its rounding and its smaller integers, and its top value is exact (FP32ToIntSaturated).
         public static Operand FP32ToS32Bounded(EmitterContext context, Operand value, bool nonNegative = false)
         {
             Operand bounded = context.Add(Instruction.FP32 | Instruction.Clamp, Local(), value, ConstF(nonNegative ? 0f : -2147483648f), ConstF(2147483520f));

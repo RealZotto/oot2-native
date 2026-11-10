@@ -286,14 +286,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 src = x.Bits(60, 62) is 1 or 3 ? context.UnpackHalf2x16High(src) : context.UnpackHalf2x16Low(src);
             }
 
-            EmitF2I(context, DstFmt.F32, dst, (RoundMode2)x.Bits(78, 80), src, x.Rd, s.Abs, s.Neg);
-
-            if (size == 0 && x.Rd != RegisterConsts.RegisterZeroIndex)
-            {
-                // 8 bits: the 16-bit conversion's result saturated to the byte's range
-                Operand r = Register(x.Rd, RegisterType.Gpr);
-                context.Copy(r, signed ? context.IClampS32(r, Const(-128), Const(127)) : context.IClampU32(r, Const(0), Const(255)));
-            }
+            // oot2-native: 8 bits is the 16-bit form with the byte's bounds, which the conversion's own float clamp takes (it was an integer clamp of the 16-bit result)
+            EmitF2I(context, DstFmt.F32, dst, (RoundMode2)x.Bits(78, 80), src, x.Rd, s.Abs, s.Neg, toByte: size == 0);
         }
 
         // I2F: source signed (74) and size (84..86), destination size (75..77), byte / half select of a narrow source (60..62)

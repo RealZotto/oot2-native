@@ -8,7 +8,9 @@ The console's rules (checked against NVIDIA's PTX documentation for the same ope
   NMax may return either zero unless the module asks for signed zeros, so that rule is not checked here.)
 * A saturated result (.SAT) that is NaN is 0.
 * F2I of NaN is 0 for a 32-bit integer (or smaller) from a single, 1 << 63 for a 64-bit integer.
-* A conversion to an integer saturates: the 64-bit one gives 0 below zero and all ones from 2^64 up.
+* A conversion to an integer saturates to the integer's own range, an infinity included: -2^31 and 2^31 - 1 for a
+  signed 32-bit integer, 0 and 2^32 - 1 for an unsigned one, the 16-bit and the 8-bit bounds for those, and 0 and all
+  ones for the unsigned 64-bit one.
 * HFMA2 and HMUL2 with .RELU leave a NaN a NaN.
 
 Vulkan leaves the result of FMin, FMax and FClamp with a NaN operand to the driver. The programs here are assembled
@@ -26,8 +28,14 @@ tells them apart. The conversions the translator adds around a texture instructi
 point, the render scale of a texel coordinate and of a size, the level of a size query) and the 64-bit conversion bound
 the float before they convert it, and the cases below give each of them a NaN, both infinities, the floats just past the
 range, the bounds themselves and an ordinary value. Those programs are pixel programs: what they read from the pipeline
-(the queried level of detail, the size, the render scale) is the evaluator's to give. F2I's own sequence is the one
-exception: it converts a NaN and selects 0 afterwards, so its NaN case alone is run with that tolerated.
+(the queried level of detail, the size, the render scale) is the evaluator's to give.
+
+F2I does the same for every integer it can give (signed and unsigned, 32, 16 and 8 bits) from a single or a half: the
+rounded float is clamped to two floats inside the integer's range before the one conversion, so what is converted is
+always a number the integer holds. The largest float below 2^31 is 2^31 - 128 and the largest below 2^32 is 2^32 - 256,
+so a 32-bit result takes its top value from a select on the source being above that float; the bounds of the smaller
+integers are floats themselves and need nothing after the conversion. NClamp gives its lower bound for a NaN, which is
+the 0 of an unsigned result; a signed one selects its 0.
 
 Run: python -m unittest discover -s tests -v   (skipped without a built oot2-xlate, see test_xlate_host)
 """
@@ -46,7 +54,8 @@ INF = float("inf")
 
 # GLSL.std.450 instruction numbers
 GLSL = {1: "Round", 2: "RoundEven", 3: "Trunc", 4: "FAbs", 8: "Floor", 9: "Ceil", 37: "FMin", 38: "UMin", 40: "FMax",
-        43: "FClamp", 50: "Fma", 58: "PackHalf2x16", 62: "UnpackHalf2x16", 79: "NMin", 80: "NMax", 81: "NClamp"}
+        43: "FClamp", 44: "UClamp", 45: "SClamp", 50: "Fma", 58: "PackHalf2x16", 62: "UnpackHalf2x16", 79: "NMin",
+        80: "NMax", 81: "NClamp"}
 OPEN_FOR_NAN = {"FMin", "FMax", "FClamp"}   # a NaN operand: which operand is the result is left open
 
 
@@ -146,8 +155,8 @@ class Evaluator:
 
     An OpConvertFToS or OpConvertFToU of a NaN, an infinity, a value outside the integer's range or an undefined value
     raises Undefined where it runs: no select after it makes the module defined. `tolerate_open_conversion` gives the
-    older reading, an undefined value that a select may drop, for the one sequence that still converts first (F2I of a
-    NaN)."""
+    older reading, an undefined value that a select may drop, which shows what a module that converts first would
+    store."""
 
     tolerate_open_conversion = False
     lod = (0.0, 0.0)
@@ -383,8 +392,11 @@ class Evaluator:
             raise AssertionError(f"the evaluator does not know Op {op}")
 
     def ext(self, name: str, a: list):
-        if name == "Trunc":
-            return a[0] if math.isnan(a[0]) or math.isinf(a[0]) else float(math.trunc(a[0]))
+        if name in ("Trunc", "RoundEven", "Floor", "Ceil"):
+            if math.isnan(a[0]) or math.isinf(a[0]):
+                return a[0]
+            whole = {"Trunc": math.trunc, "RoundEven": round, "Floor": math.floor, "Ceil": math.ceil}[name](a[0])
+            return math.copysign(float(whole), a[0])              # a zero result keeps the operand's sign
         if name in ("FMin", "NMin"):
             return nmin(a[0], a[1])
         if name in ("FMax", "NMax"):
@@ -395,6 +407,10 @@ class Evaluator:
             return abs(a[0])
         if name == "UMin":
             return min(a[0], a[1])
+        if name == "UClamp":
+            return min(max(a[0], a[1]), a[2])
+        if name == "SClamp":
+            return min(max(as_signed(a[0]), as_signed(a[1])), as_signed(a[2])) & 0xFFFFFFFF
         if name == "Fma":
             return f32(a[0] * a[1] + a[2])
         if name == "UnpackHalf2x16":
@@ -451,9 +467,36 @@ FMUL_SAT = scheduled(ampere(0x220, rd=OUT, ra=10, rb=11, high_bits=bit(77) | bit
 FFMA_SAT = scheduled(ampere(0x223, rd=OUT, ra=10, rb=11, rc=12, high_bits=bit(77)))
 
 
-def f2i(signed: bool) -> bytes:
-    """F2I.S32 / .U32 R20, R10, truncating: signedness bit 72, 32 bits (75..77 = 2), rounding 78..80 = 3, an F32 source (84..86 = 2)."""
-    return scheduled(ampere(0x305, rd=OUT, ra=255, rb=10, high_bits=(bit(72) if signed else 0) | bit(75, 2) | bit(78, 3) | bit(84, 2)))
+NEAREST, DOWN, UP, TOWARD_ZERO = range(4)      # F2I's rounding field
+
+
+def f2i(signed: bool, size: int = 2, rounding: int = TOWARD_ZERO, half: int | None = None, absolute: bool = False,
+        negate: bool = False) -> bytes:
+    """F2I R20, R10: signedness in bit 72, the integer's size in 75..76 (0, 1, 2: 8, 16, 32 bits), the rounding in 78..79,
+    the source's size in 84..85 (1 a half, 2 a single). A half source is the low (`half` 0) or the high (1) half of the
+    register, 60..61; bit 62 takes the source's magnitude and bit 63 negates it."""
+    low = (half or 0) << 60 | int(absolute) << 62 | int(negate) << 63
+    high = (bit(72) if signed else 0) | bit(75, size) | bit(78, rounding) | bit(84, 2 if half is None else 1)
+    return scheduled(ampere(0x305, rd=OUT, ra=255, rb=10, low_bits=low, high_bits=high))
+
+
+# The integers F2I gives: a key, signed, the size field, the bits. And its roundings: the field, a key, what rounds.
+F2I_FORMS = [("s32", True, 2, 32), ("u32", False, 2, 32), ("s16", True, 1, 16), ("u16", False, 1, 16),
+             ("s8", True, 0, 8), ("u8", False, 0, 8)]
+ROUNDINGS = [(NEAREST, "nearest", "RoundEven"), (DOWN, "down", "Floor"), (UP, "up", "Ceil"), (TOWARD_ZERO, "toward_zero", "Trunc")]
+
+
+def f2i_rule(x: float, signed: bool, bits: int, rounding: int = TOWARD_ZERO) -> int:
+    """What the console's conversion leaves in the register, as a 32-bit word: 0 for a NaN, otherwise the single rounded
+    as the instruction says and brought to the nearest bound of the integer (a signed result is sign extended)."""
+    x = f32(x)
+    if math.isnan(x):
+        return 0
+    low, top = (-(1 << bits - 1), (1 << bits - 1) - 1) if signed else (0, (1 << bits) - 1)
+    if math.isinf(x):
+        return (top if x > 0 else low) & 0xFFFFFFFF
+    whole = (round, math.floor, math.ceil, math.trunc)[rounding](x)        # round: an exact half to the even integer
+    return min(max(whole, low), top) & 0xFFFFFFFF
 
 
 F2I_U64 = scheduled(ampere(0x311, rd=OUT, ra=255, rb=10, high_bits=bit(75, 3) | bit(78, 3) | bit(84, 2)))
@@ -495,6 +538,9 @@ BELOW_TWO_31 = 2147483520.0
 PAST_MINUS_TWO_31 = -2147483904.0       # the next float below -2^31
 INT_MIN = 0x80000000                    # what -2^31 converts to
 INT_TOP = 0x7FFFFF80                    # what 2147483520.0 converts to
+# And to an unsigned one: 2^32 is out of range, the largest float below it is 2^32 - 256.
+TWO_32 = 4294967296.0
+BELOW_TWO_32 = 4294967040.0
 
 
 def mov_imm(rd: int, value: int) -> bytes:
@@ -609,13 +655,11 @@ class NanRulesTest(Harness):
     def test_a_float_to_signed_integer_conversion_of_a_nan_is_zero(self):
         spirv = self.module("f2i_s32", f2i(True), store(OUT))
         for x, want in [(NAN, 0), (2.7, 2), (-2.7, -2 & 0xFFFFFFFF), (0.0, 0), (1000.0, 1000)]:
-            # F2I converts the NaN and selects 0 after it (test_the_conversion_itself_keeps_its_instructions has the
-            # sequence), which is the one conversion of an open value this file lets through
-            self.assertEqual(evaluate(spirv, f32_bits(x), tolerate_open_conversion=math.isnan(x)).stores, [want], x)
+            self.assertEqual(evaluate(spirv, f32_bits(x)).stores, [want], x)
 
     def test_a_float_to_unsigned_integer_conversion_of_a_nan_is_zero(self):
         spirv = self.module("f2i_u32", f2i(False), store(OUT))
-        only_numeric_forms(self, spirv, "NMax")     # the clamp below zero; the NaN select alone would hide an FMax
+        only_numeric_forms(self, spirv, "NClamp")   # a NaN lands on the clamp's lower bound; an FClamp would leave it open
         for x, want in [(NAN, 0), (3.9, 3), (-1.0, 0), (4000000000.0, 4000000000)]:
             self.assertEqual(evaluate(spirv, f32_bits(x)).stores, [want], x)
 
@@ -630,19 +674,164 @@ class NanRulesTest(Harness):
         for x, want in [(NAN, 0), (300.0, 255), (-4.0, 0), (17.9, 17)]:
             self.assertEqual(evaluate(spirv, f32_bits(x)).stores, [want], x)
 
-    def test_the_conversion_itself_keeps_its_instructions(self):
-        """The bounds of the cases below are for the conversions around F2I. F2I's own sequence is the one it had: the
-        NaN test, the rounding (and the maximum with zero of an unsigned result), one conversion and the NaN select,
-        with no clamp and no comparison against a bound."""
-        for key, signed, convert, rounding in (("f2i_s32_shape", True, 110, ["Trunc"]), ("f2i_u32_shape", False, 109, ["Trunc", "NMax"])):
-            with self.subTest(key):
-                ev = evaluate(self.module(key, f2i(signed), store(OUT)), f32_bits(2.5))
-                shape = [GLSL[w[3]] if op == 12 else op for op, w in ev.body if op in (12, 109, 110, 156, 169) or 180 <= op <= 191]
-                self.assertEqual(shape, [156, *rounding, convert, 169])
-                self.assertEqual(ev.stores, [2])
-        # which is why the signed NaN case above needs the conversion of a NaN tolerated: the sequence converts it
-        with self.assertRaisesRegex(Undefined, "OpConvertFToS of nan"):
-            evaluate(self.module("f2i_s32_nan", f2i(True), store(OUT)), f32_bits(NAN))
+    # -- F2I: the float is bounded before it is converted, for every integer it can give --
+
+    def check_f2i(self, form: tuple, cases: list[tuple[str, float, int]]):
+        """One truncating F2I to the integer `form` names (a row of F2I_FORMS), run for each (name, source, result). The
+        expected results are written out; f2i_rule must agree with each, which is what lets the cases of the other
+        roundings, the modifiers and the half sources take theirs from it."""
+        key, signed, size, bits = form
+        spirv = self.module(f"f2i_{key}_range", f2i(signed, size), store(OUT))
+        for name, x, want in cases:
+            with self.subTest(name, x=x):
+                self.assertEqual(f2i_rule(x, signed, bits), want & 0xFFFFFFFF, "the test's own statement of the rule")
+                self.assertEqual(evaluate(spirv, f32_bits(x)).stores, [want & 0xFFFFFFFF])
+
+    def test_a_conversion_to_a_signed_32_bit_integer_saturates(self):
+        self.check_f2i(F2I_FORMS[0], [
+            ("NaN", NAN, 0), ("a NaN with its sign set", bits_f32(0xFFC00001), 0),
+            ("+Inf", INF, 0x7FFFFFFF), ("-Inf", -INF, INT_MIN),
+            ("2^31, just past the top", TWO_31, 0x7FFFFFFF), ("just past the bottom", PAST_MINUS_TWO_31, INT_MIN),
+            ("far past the top", 3e9, 0x7FFFFFFF), ("far past the top", 1e30, 0x7FFFFFFF),
+            ("far past the bottom", -3e9, INT_MIN), ("far past the bottom", -1e30, INT_MIN),
+            ("the largest float below 2^31", BELOW_TWO_31, INT_TOP), ("-2^31, the bottom bound", -TWO_31, INT_MIN),
+            ("the float above -2^31", -BELOW_TWO_31, 0x80000080),
+            ("in range", 2.7, 2), ("in range", -2.7, -2), ("in range", 0.0, 0), ("in range", -0.0, 0),
+            ("in range", -0.5, 0), ("in range", 16777217.0, 16777216), ("in range", -1000.0, -1000)])
+
+    def test_a_conversion_to_an_unsigned_32_bit_integer_saturates(self):
+        self.check_f2i(F2I_FORMS[1], [
+            ("NaN", NAN, 0), ("a NaN with its sign set", bits_f32(0xFFC00001), 0),
+            ("+Inf", INF, 0xFFFFFFFF), ("-Inf", -INF, 0),
+            ("2^32, just past the top", TWO_32, 0xFFFFFFFF), ("far past the top", 1e30, 0xFFFFFFFF),
+            ("a negative number", -1.0, 0), ("a negative number", -5.5, 0), ("the smallest negative number", bits_f32(0x80000001), 0),
+            ("far below zero", -3e9, 0), ("far below zero", -1e30, 0),
+            ("the largest float below 2^32", BELOW_TWO_32, 0xFFFFFF00), ("zero, the bottom bound", 0.0, 0),
+            ("in range", -0.0, 0), ("in range", -0.5, 0), ("in range", 3.9, 3), ("in range", TWO_31, 0x80000000),
+            ("in range", BELOW_TWO_31, INT_TOP), ("in range", 4000000000.0, 4000000000)])
+
+    def test_a_conversion_to_a_signed_16_bit_integer_saturates(self):
+        self.check_f2i(F2I_FORMS[2], [
+            ("NaN", NAN, 0), ("+Inf", INF, 32767), ("-Inf", -INF, -32768),
+            ("just past the top", 32768.0, 32767), ("just past the bottom", -32769.0, -32768),
+            ("far past the top", TWO_31, 32767), ("far past the top", 1e30, 32767),
+            ("far past the bottom", PAST_MINUS_TWO_31, -32768), ("far past the bottom", -1e30, -32768),
+            ("the top bound", 32767.0, 32767), ("a fraction above the top bound", 32767.5, 32767),
+            ("the bottom bound", -32768.0, -32768), ("a fraction below the bottom bound", -32768.5, -32768),
+            ("in range", 2.7, 2), ("in range", -2.7, -2), ("in range", 12345.0, 12345), ("in range", -0.0, 0)])
+
+    def test_a_conversion_to_an_unsigned_16_bit_integer_saturates(self):
+        self.check_f2i(F2I_FORMS[3], [
+            ("NaN", NAN, 0), ("a NaN with its sign set", bits_f32(0xFFC00001), 0), ("+Inf", INF, 65535), ("-Inf", -INF, 0),
+            ("just past the top", 65536.0, 65535), ("far past the top", TWO_32, 65535), ("far past the top", 1e30, 65535),
+            ("a negative number", -1.0, 0), ("a negative number", -40000.0, 0), ("far below zero", -1e30, 0),
+            ("the top bound", 65535.0, 65535), ("a fraction above the top bound", 65535.5, 65535),
+            ("zero, the bottom bound", 0.0, 0),
+            ("in range", 3.9, 3), ("in range", 40000.0, 40000), ("in range", -0.5, 0)])
+
+    def test_a_conversion_to_a_signed_8_bit_integer_saturates(self):
+        self.check_f2i(F2I_FORMS[4], [
+            ("NaN", NAN, 0), ("+Inf", INF, 127), ("-Inf", -INF, -128),
+            ("just past the top", 128.0, 127), ("just past the bottom", -129.0, -128),
+            ("past the 16-bit range", 40000.0, 127), ("past the 16-bit range", -40000.0, -128),
+            ("far past the top", TWO_31, 127), ("far past the bottom", -1e30, -128),
+            ("the top bound", 127.0, 127), ("a fraction above the top bound", 127.5, 127),
+            ("the bottom bound", -128.0, -128), ("a fraction below the bottom bound", -128.5, -128),
+            ("in range", 2.7, 2), ("in range", -2.7, -2), ("in range", -100.0, -100)])
+
+    def test_a_conversion_to_an_unsigned_8_bit_integer_saturates(self):
+        self.check_f2i(F2I_FORMS[5], [
+            ("NaN", NAN, 0), ("+Inf", INF, 255), ("-Inf", -INF, 0),
+            ("just past the top", 256.0, 255), ("past the 16-bit range", 70000.0, 255), ("far past the top", 1e30, 255),
+            ("a negative number", -1.0, 0), ("far below zero", -1e30, 0),
+            ("the top bound", 255.0, 255), ("a fraction above the top bound", 255.5, 255), ("zero, the bottom bound", 0.0, 0),
+            ("in range", 3.9, 3), ("in range", 200.0, 200)])
+
+    # what every rounding is given: the classes of the cases above, and the halves that tell the roundings apart
+    ROUNDED = [NAN, INF, -INF, TWO_31, BELOW_TWO_31, -TWO_31, PAST_MINUS_TWO_31, TWO_32, BELOW_TWO_32, 1e30, -1e30,
+               65535.5, 65534.5, 65535.0, 32767.5, -32768.5, 255.5, 254.5, 127.5, -128.5, -1.0, -0.5, -0.25, 0.0, 0.25,
+               0.5, 1.5, 2.5, 3.5, -1.5, -2.5, 2.7, -2.7, 8388607.5, -8388607.5]
+
+    def test_every_rounding_of_a_conversion_saturates(self):
+        """The float is rounded as the instruction says (to the nearest, an exact half to the even one; down; up; toward
+        zero) and the rounded value is what saturates: 65535.5 to the nearest is 65536, past an unsigned 16-bit integer."""
+        for key, signed, size, bits in F2I_FORMS:
+            for rounding, name, _ in ROUNDINGS:
+                spirv = self.module(f"f2i_{key}_{name}", f2i(signed, size, rounding), store(OUT))
+                for x in self.ROUNDED:
+                    with self.subTest(key, rounding=name, x=x):
+                        self.assertEqual(evaluate(spirv, f32_bits(x)).stores, [f2i_rule(x, signed, bits, rounding)])
+
+    def test_the_rule_the_rounding_cases_use_rounds_as_the_console_does(self):
+        self.assertEqual([f2i_rule(x, True, 32, NEAREST) for x in (0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 2.7)], [0, 2, 2, 0, 0xFFFFFFFE, 0xFFFFFFFE, 3])
+        self.assertEqual([f2i_rule(x, True, 32, DOWN) for x in (2.7, -2.7, -0.25)], [2, 0xFFFFFFFD, 0xFFFFFFFF])
+        self.assertEqual([f2i_rule(x, True, 32, UP) for x in (2.2, -2.7, 0.25)], [3, 0xFFFFFFFE, 1])
+        self.assertEqual([f2i_rule(x, False, 16, NEAREST) for x in (65535.5, 65534.5, -0.5, INF, NAN)], [65535, 65534, 0, 65535, 0])
+        self.assertEqual([f2i_rule(x, True, 8, DOWN) for x in (-128.5, 127.5, -INF)], [0xFFFFFF80, 127, 0xFFFFFF80])
+
+    def test_a_conversion_of_a_magnitude_or_a_negation_saturates(self):
+        """The instruction's own |x| and -x are applied before anything else: the magnitude of -Inf is past the top, the
+        negation of 2^31 is the bottom bound itself, and neither makes a NaN a number."""
+        values = [NAN, INF, -INF, TWO_31, -TWO_31, BELOW_TWO_31, PAST_MINUS_TWO_31, TWO_32, -TWO_32, 2.7, -2.7, 5.5, -5.5, 0.0]
+        for key, signed, size, bits in (F2I_FORMS[0], F2I_FORMS[1], F2I_FORMS[3]):
+            for absolute, negate in ((True, False), (False, True), (True, True)):
+                spirv = self.module(f"f2i_{key}_abs{absolute:d}_neg{negate:d}", f2i(signed, size, absolute=absolute, negate=negate), store(OUT))
+                for x in values:
+                    y = abs(x) if absolute else x
+                    with self.subTest(key, absolute=absolute, negate=negate, x=x):
+                        self.assertEqual(evaluate(spirv, f32_bits(x)).stores, [f2i_rule(-y if negate else y, signed, bits)])
+        self.assertEqual(f2i_rule(abs(-INF), True, 32), 0x7FFFFFFF)
+        self.assertEqual(f2i_rule(-TWO_31, True, 32), INT_MIN)
+        self.assertEqual(f2i_rule(-5.5, False, 32), 0)
+
+    def test_a_conversion_of_a_half_saturates(self):
+        """A half source is one half of the register, widened. Every finite half is inside a 32-bit integer, so only its
+        infinities and its NaN meet a 32-bit bound; the 16-bit and the 8-bit integers saturate from 32768 or 256 up."""
+        largest = 65504.0
+        values = [NAN, INF, -INF, largest, -largest, 32768.0, -32768.0, 300.0, -300.0, 2.5, -2.5, 0.0]
+        for key, signed, size, bits in F2I_FORMS:
+            for half in (0, 1):
+                spirv = self.module(f"f2i_{key}_half{half}", f2i(signed, size, half=half), store(OUT))
+                for x in values:
+                    other = 1.0 if math.isnan(x) else NAN          # the half the instruction does not read
+                    pair = (half_bits(x), half_bits(other)) if half == 0 else (half_bits(other), half_bits(x))
+                    with self.subTest(key, half=half, x=x):
+                        self.assertEqual(evaluate(spirv, pair[0] | pair[1] << 16).stores, [f2i_rule(x, signed, bits)])
+        self.assertEqual([f2i_rule(x, True, 32) for x in (INF, -INF, NAN, largest)], [0x7FFFFFFF, INT_MIN, 0, 65504])
+        self.assertEqual([f2i_rule(x, False, 16) for x in (INF, -INF, NAN, largest, -2.5)], [65535, 0, 0, 65504, 0])
+        self.assertEqual([f2i_rule(x, True, 8) for x in (INF, -INF, NAN, largest, -300.0)], [127, 0xFFFFFF80, 0, 127, 0xFFFFFF80])
+
+    def test_the_conversion_is_one_clamp_and_the_selects_the_clamp_cannot_give(self):
+        """What a conversion costs, as the instructions of its module that compute something: the rounding, one NClamp,
+        one conversion; then, for a 32-bit integer, a comparison of the source with the clamp's upper bound and a select
+        of the integer's top value (no float is that value); then, for a signed integer, a NaN test and a select of 0 (a
+        NaN lands on the clamp's lower bound, which is 0 only for an unsigned one). No integer clamp follows a 16-bit or
+        an 8-bit conversion, and none of them branches."""
+        top, nan = [184, 169], [156, 169]       # OpFOrdLessThan, OpSelect; OpIsNan, OpSelect
+        after = {"s32": top + nan, "u32": top, "s16": nan, "u16": [], "s8": nan, "u8": []}
+        for key, signed, size, bits in F2I_FORMS:
+            for rounding, name, instruction in ROUNDINGS:
+                with self.subTest(key, rounding=name):
+                    ev = evaluate(self.module(f"f2i_{key}_{name}_shape", f2i(signed, size, rounding), store(OUT)), f32_bits(2.5))
+                    shape = [GLSL[w[3]] if op == 12 else op for op, w in ev.body
+                             if op in (12, 109, 110, 156, 169, 245, 250, 251) or 164 <= op <= 168 or 180 <= op <= 191]
+                    self.assertCountEqual(shape, [instruction, "NClamp", 110 if signed else 109] + after[key])
+                    self.assertEqual(ev.stores, [f2i_rule(2.5, signed, bits, rounding)])
+
+    def test_a_conversion_reading_the_unclamped_float_fails_whatever_is_selected_after_it(self):
+        """What the cases above rest on: each module with its conversion made to read the rounded float itself, not the
+        clamped one, keeps every select and still stores the right word for a number in range, and the evaluator fails
+        at the conversion of anything else."""
+        outside = {"s32": (NAN, INF, -INF, TWO_31, PAST_MINUS_TWO_31), "u32": (NAN, INF, -INF, TWO_32, -1.0),
+                   "s16": (NAN, INF, -INF, 1e30), "u16": (NAN, INF, -INF, -1.0, 1e30),
+                   "s8": (NAN, INF, -INF, -1e30), "u8": (NAN, INF, -INF, -1.0, 1e30)}
+        for key, signed, size, bits in F2I_FORMS:
+            spirv, changed = without_the_bound(self.module(f"f2i_{key}_unbounded", f2i(signed, size), store(OUT)))
+            self.assertEqual(changed, 1, key)
+            self.assertEqual(evaluate(spirv, f32_bits(2.7)).stores, [2], key)
+            for x in outside[key]:
+                with self.subTest(key, x=x), self.assertRaisesRegex(Undefined, "OpConvertFTo[SU] of"):
+                    evaluate(spirv, f32_bits(x))
 
     # -- the conversions around F2I: the float is bounded before it is converted --
 

@@ -238,6 +238,30 @@ Changes of this project:
   float below 2^64 and saturates as the console's does: 0 for a negative value,
   all ones from 2^64 up, the top bit for a NaN. A value in range converts as
   before. F2I's own sequence (`EmitF2I`) is not part of this change.
+- `Instructions/InstEmitConversion.cs`, `EmitF2I` and `FP32ToIntSaturated`
+  (new); `Instructions/InstEmitAmpereAlu.cs`, `AF2i`: F2I of a single or of a
+  half bounds its float before it converts it. Its select of 0 for a NaN came
+  after the conversion, and a select does not take back a conversion that was
+  undefined: a NaN, an infinity or a value outside the integer's range still
+  went into `OpConvertFToS` or `OpConvertFToU`. The console saturates such a
+  value to the integer's range and gives 0 for a NaN. The rounded float is now
+  clamped (`NClamp`) between two floats the integer holds and then converted:
+  -2^31 and 2147483520 for a signed 32-bit integer, 0 and 4294967040 for an
+  unsigned one (the largest floats below 2^31 and 2^32, since 2^31 - 1 and
+  2^32 - 1 are not floats), and the integer's own bounds for 16 and 8 bits,
+  which takes the place of the integer clamp those had after the conversion.
+  A 32-bit result then takes its top value by a select where the source is
+  above the clamp's upper bound, which is where it is 2^31 or 2^32 and up; a
+  signed result takes 0 by a select where the source is NaN, and an unsigned
+  one has its 0 from the clamp's lower bound, with no NaN test. There is no
+  branch, and a value in range converts to what it did. The double source,
+  which no instruction of the console reaches, is as it was. On synthetic
+  modules that convert a computed value, the function has 4 instructions more
+  for a signed 32-bit integer (a load of the source, the clamp, a comparison,
+  a select), as many as before for an unsigned 32-bit and for a signed 16-bit
+  one, 1 fewer for a signed 8-bit one, 9 fewer for an unsigned 16-bit one and
+  10 fewer for an unsigned 8-bit one. No pass over the corpus was made with
+  this change.
 - `CodeGen/Spirv/CoopHmma.cs` (new), `CodeGen/Spirv/SpirvGenerator.cs`,
   `Generate` and `GenerateCoopHmma`, `CodeGen/Spirv/CodeGenContext.cs`,
   `GetArgumentPointer`; `Translation/HelperFunctionManager.cs`,
