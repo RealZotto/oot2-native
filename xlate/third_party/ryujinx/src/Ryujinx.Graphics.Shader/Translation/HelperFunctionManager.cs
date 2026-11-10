@@ -1,3 +1,4 @@
+using Ryujinx.Graphics.Shader.Instructions;
 using Ryujinx.Graphics.Shader.IntermediateRepresentation;
 using System;
 using System.Collections.Generic;
@@ -484,7 +485,8 @@ namespace Ryujinx.Graphics.Shader.Translation
                 Operand inputBias = context.FPModulo(fragCoord, negScale);
                 Operand inputWithBias = context.FPAdd(inputScaled, inputBias);
 
-                context.Return(context.FP32ConvertToS32(inputWithBias));
+                // oot2-native: the scale is the host's, so the scaled coordinate is bounded before the conversion (a NaN gives 0), here and below
+                context.Return(InstEmit.FP32ToS32Bounded(context, inputWithBias));
                 context.MarkLabel(lblScaleGreaterOrEqualZero);
 
                 inArgumentsCount = 3;
@@ -496,7 +498,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             Operand inputScaled2 = context.FPMultiply(context.IConvertS32ToFP32(input), scale);
 
-            context.Return(context.FP32ConvertToS32(inputScaled2));
+            context.Return(InstEmit.FP32ToS32Bounded(context, inputScaled2));
 
             return new Function(ControlFlowGraph.Create(context.GetOperations()).Blocks, "TexelFetchScale", true, inArgumentsCount, 0);
         }
@@ -520,7 +522,9 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             Operand inputUnscaled = context.FPDivide(context.IConvertS32ToFP32(input), scale);
 
-            context.Return(context.FP32ConvertToS32(inputUnscaled));
+            // oot2-native: bounded before the conversion. A size is not negative and the scale is a magnitude, so the quotient is not negative either, and 0 is the lower bound
+            // (which is also what a NaN, 0 / 0, becomes)
+            context.Return(InstEmit.FP32ToS32Bounded(context, inputUnscaled, nonNegative: true));
 
             return new Function(ControlFlowGraph.Create(context.GetOperations()).Blocks, "TextureSizeUnscale", true, 2, 0);
         }

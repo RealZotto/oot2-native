@@ -1070,7 +1070,9 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 }
 
                 Operand res = context.Lod(type, flags, setAndBinding, comp ^ 1, sources);
-                context.Copy(results[r++], context.FP32ConvertToS32(context.FPMultiply(res, ConstF(256.0f))));
+
+                // oot2-native: the level is what the driver's query returns, so it is bounded before the conversion (a NaN gives 0)
+                context.Copy(results[r++], FP32ToS32Bounded(context, context.FPMultiply(res, ConstF(256.0f))));
             }
         }
 

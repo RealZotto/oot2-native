@@ -214,6 +214,30 @@ Changes of this project:
   also by a select around each float to integer conversion; all of them pass
   spirv-val and none of their descriptions changes but the module's hash and
   size.
+- `Instructions/InstEmitAmpereAlu.cs`, `AFmnmx`: a FMNMX word with one of bits
+  74 to 79 or 81 to 86 is refused by name. Those bits select modes that are not
+  translated (the minimum and maximum that give a NaN for a NaN operand among
+  them, at bit 81 by the reading of other lowerers, which no word seen
+  confirms), and the word was translated as the plain minimum or maximum. Bit
+  80, `.FTZ`, is on every FMNMX word of the corpus and stays dropped; none of
+  those words has a refused bit.
+- `Instructions/InstEmitConversion.cs`, `FP32ToS32Bounded` (new, beside
+  `EmitF2I`, which is unchanged); `Instructions/InstEmitAmpereMem.cs`, `ATmml`;
+  `Instructions/InstEmitAmpereAlu.cs`, `AF2i64`;
+  `Translation/HelperFunctionManager.cs`, `GenerateTexelFetchScaleFunction`,
+  `GenerateTextureSizeUnscaleFunction`; `Translation/Transforms/TexturePass.cs`,
+  `InsertTextureLod`: the float to integer conversions around F2I bound their
+  float before they convert it. `OpConvertFToS` and `OpConvertFToU` are
+  undefined for a NaN, an infinity and a value outside the integer's range, and
+  these floats are a driver's level of detail query, a product or quotient with
+  the host's render scale, or the program's own operand. Each is clamped
+  (`NClamp`) between floats that are inside the range, -2^31 or 0 below and
+  2147483520, the largest float below 2^31, above; a NaN gives 0, by the
+  clamp's lower bound where the value cannot be negative (a size, a level) and
+  by a select otherwise. The 64-bit conversion clamps from 0 to the largest
+  float below 2^64 and saturates as the console's does: 0 for a negative value,
+  all ones from 2^64 up, the top bit for a NaN. A value in range converts as
+  before. F2I's own sequence (`EmitF2I`) is not part of this change.
 - `CodeGen/Spirv/CoopHmma.cs` (new), `CodeGen/Spirv/SpirvGenerator.cs`,
   `Generate` and `GenerateCoopHmma`, `CodeGen/Spirv/CodeGenContext.cs`,
   `GetArgumentPointer`; `Translation/HelperFunctionManager.cs`,

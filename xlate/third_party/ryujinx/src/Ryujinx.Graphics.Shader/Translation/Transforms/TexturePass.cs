@@ -614,6 +614,14 @@ namespace Ryujinx.Graphics.Shader.Translation.Transforms
                     0,
                     [lod],
                     lodSources));
+
+                // oot2-native: the level is what the driver's query gives, and its conversion to an integer below (GenerateF2i) is undefined for a NaN, an infinity and a value out of
+                // range. A level is not negative, so it is clamped once (NClamp, which gives its lower bound, 0, for a NaN) from 0 to the largest float below 2^31
+                Operand bounded = Local();
+
+                node.List.AddBefore(node, new Operation(Instruction.FP32 | Instruction.Clamp, bounded, lod, ConstF(0f), ConstF(2147483520f)));
+
+                lod = bounded;
             }
             else
             {

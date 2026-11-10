@@ -8,6 +8,7 @@ The console's rules (checked against NVIDIA's PTX documentation for the same ope
   NMax may return either zero unless the module asks for signed zeros, so that rule is not checked here.)
 * A saturated result (.SAT) that is NaN is 0.
 * F2I of NaN is 0 for a 32-bit integer (or smaller) from a single, 1 << 63 for a 64-bit integer.
+* A conversion to an integer saturates: the 64-bit one gives 0 below zero and all ones from 2^64 up.
 * HFMA2 and HMUL2 with .RELU leave a NaN a NaN.
 
 Vulkan leaves the result of FMin, FMax and FClamp with a NaN operand to the driver, and of OpConvertFToS and
@@ -16,6 +17,14 @@ from constant bank 1 so that nothing is folded, and are translated by the real e
 executes the straight-line module on the CPU with the SPIR-V specification's meaning of each instruction, and treats
 an instruction the specification leaves open for the operands it is given (FMin with a NaN, a conversion of a NaN) as an
 undefined value that must not reach the stored result, so a module that relies on a driver's luck is red here.
+
+OpConvertFToS and OpConvertFToU are undefined for an infinity and for a value outside the integer's range as well, and a
+select after the conversion does not take that back. The conversions the translator adds around a texture instruction
+(the level of detail query's fixed point, the render scale of a texel coordinate and of a size, the level of a size
+query) and the 64-bit conversion therefore bound the float before they convert it, and the cases below give each of them
+a NaN, both infinities, the floats just past the range, the bounds themselves and an ordinary value. Those programs are
+pixel programs: what they read from the pipeline (the queried level of detail, the size, the render scale) is the
+evaluator's to give.
 
 Run: python -m unittest discover -s tests -v   (skipped without a built oot2-xlate, see test_xlate_host)
 """
@@ -33,8 +42,8 @@ NAN = float("nan")
 INF = float("inf")
 
 # GLSL.std.450 instruction numbers
-GLSL = {1: "Round", 2: "RoundEven", 3: "Trunc", 8: "Floor", 9: "Ceil", 37: "FMin", 40: "FMax", 43: "FClamp",
-        50: "Fma", 58: "PackHalf2x16", 62: "UnpackHalf2x16", 79: "NMin", 80: "NMax", 81: "NClamp"}
+GLSL = {1: "Round", 2: "RoundEven", 3: "Trunc", 4: "FAbs", 8: "Floor", 9: "Ceil", 37: "FMin", 38: "UMin", 40: "FMax",
+        43: "FClamp", 50: "Fma", 58: "PackHalf2x16", 62: "UnpackHalf2x16", 79: "NMin", 80: "NMax", 81: "NClamp"}
 OPEN_FOR_NAN = {"FMin", "FMax", "FClamp"}   # a NaN operand: which operand is the result is left open
 
 
@@ -92,6 +101,24 @@ def nmin(x: float, y: float) -> float:
     return y if y < x else x
 
 
+def fdiv(x: float, y: float) -> float:
+    if y == 0:
+        return NAN if x == 0 or math.isnan(x) else math.copysign(INF, x) * math.copysign(1, y)
+    return x / y
+
+
+def fmod(x: float, y: float) -> float:
+    """OpFMod: the remainder that has the sign of y."""
+    if math.isnan(x) or math.isnan(y) or math.isinf(x) or y == 0:
+        return NAN
+    r = math.fmod(x, y)
+    return r + y if r and (r < 0) != (y < 0) else r
+
+
+def as_signed(x: int) -> int:
+    return x - (1 << 32) if x & 0x80000000 else x
+
+
 def half_bits(x: float) -> int:
     return struct.unpack("<H", struct.pack("<e", x))[0]
 
@@ -101,9 +128,21 @@ def half_value(b: int) -> float:
 
 
 class Evaluator:
-    """Runs the entry point of a straight-line compute module for the operations the programs of this file use.
+    """Runs the entry point of a module for the operations the programs of this file use: straight-line code, and the
+    branches and the calls of the translator's own helper functions.
     Constant bank 1 reads come from `bank1` (word index to 32-bit pattern); every other constant buffer word reads zero.
-    The words stored to the storage buffer are collected, in order, in `stores`."""
+    The words stored to the storage buffer, or to a pixel program's colour, are collected, in order, in `stores`.
+
+    What a pixel program reads from the pipeline is the test's to give: `lod` is the pair an OpImageQueryLod returns,
+    `size` what an OpImageQuerySizeLod returns, `render_scale` the support buffer's scale of every texture and
+    `frag_coord` the fragment's position. The texel coordinates of each OpImageFetch are collected in `fetches` and the
+    level asked of each OpImageQuerySizeLod in `levels`; an undefined value there makes the instruction's result
+    undefined."""
+
+    lod = (0.0, 0.0)
+    size = (0, 0)
+    render_scale = 1.0
+    frag_coord = (0.5, 0.5, 0.0, 1.0)
 
     def __init__(self, spirv: bytes, bank1: dict[int, int]):
         words = struct.unpack(f"<{len(spirv) // 4}I", spirv)
@@ -114,12 +153,15 @@ class Evaluator:
         self.vals: dict[int, object] = {}
         self.cells: dict[int, object] = {}
         self.stores: list[int] = []
+        self.fetches: list[tuple] = []
+        self.levels: list[int] = []
+        self.functions: dict[int, list[tuple[int, list[int]]]] = {}
+        self.frag_coord_id = None
         self.ext_names: dict[int, str] = {}
         self.ext_used: set[str] = set()
         self.ops_used: set[int] = set()
         entry = None
-        body: list[tuple[int, list[int]]] = []
-        in_entry = False
+        body = None                                                # the function being read
         i = 5
         while i < len(words):
             n, op = words[i] >> 16, words[i] & 0xFFFF
@@ -140,6 +182,12 @@ class Evaluator:
                 self.types[w[0]] = ("b",)
             elif op == 23:
                 self.types[w[0]] = ("v", w[2])
+            elif op in (25, 26, 27):                               # OpTypeImage, OpTypeSampler, OpTypeSampledImage
+                self.types[w[0]] = ("o",)
+            elif op == 71 and w[1:] == [11, 15]:                   # OpDecorate BuiltIn FragCoord
+                self.frag_coord_id = w[0]
+            elif op == 44:                                         # OpConstantComposite
+                self.vals[w[1]] = tuple(self.vals[x] for x in w[2:])
             elif op == 32:                                         # OpTypePointer: result, storage class, pointee
                 self.pointee[w[0]] = w[2]
             elif op == 43:                                         # OpConstant
@@ -150,30 +198,57 @@ class Evaluator:
             elif op == 42:
                 self.vals[w[1]] = False
             elif op == 54:                                         # OpFunction
-                in_entry = w[1] == entry
+                body = self.functions.setdefault(w[1], [])
             elif op == 56:
-                in_entry = False
-            elif in_entry:
+                body = None
+            elif body is not None:
                 body.append((op, w))
             i += n
-        self.body = body
+        self.entry = entry
+        self.body = self.functions[entry]
 
     def run(self) -> list[int]:
-        for op, w in self.body:
-            self.ops_used.add(op)
-            self.step(op, w)
-            if op == 253:
-                break
+        self.call(self.entry, [])
         return self.stores
+
+    def call(self, function: int, args: list):
+        """Runs one function: its parameters (pointers to the caller's variables) are bound in order, a branch goes to
+        its label, and the value of the OpReturnValue it reaches is the result."""
+        body = self.functions[function]
+        labels = {w[0]: n for n, (op, w) in enumerate(body) if op == 248}
+        args = list(args)
+        at = 0
+        while at < len(body):
+            op, w = body[at]
+            at += 1
+            self.ops_used.add(op)
+            if op == 253:                                          # OpReturn
+                return None
+            if op == 254:                                          # OpReturnValue
+                return self.vals[w[0]]
+            if op == 55:                                           # OpFunctionParameter
+                self.vals[w[1]] = args.pop(0)
+            elif op == 57:                                         # OpFunctionCall
+                self.vals[w[1]] = self.call(w[2], [self.vals[x] for x in w[3:]])
+            elif op == 249:                                        # OpBranch
+                at = labels[w[0]]
+            elif op == 250:                                        # OpBranchConditional
+                if self.vals[w[0]] is POISON:
+                    raise Undefined("a branch on an undefined value")
+                at = labels[w[1] if self.vals[w[0]] else w[2]]
+            elif op != 247:                                        # OpSelectionMerge says nothing to run
+                self.step(op, w)
+        return None
 
     def kind(self, type_id: int) -> str:
         return self.types[type_id][0]
 
     def step(self, op: int, w: list[int]):
         v = self.vals
-        if op in (248, 253):                                       # OpLabel, OpReturn
+        if op == 248:                                              # OpLabel
             return
-        if op in (124, 109, 110, 112, 129, 131, 133, 128, 130, 194, 196, 197, 199, 156, 80, 81)                 and any(v.get(x) is POISON for x in w[2:]):
+        if op in (124, 109, 110, 111, 112, 127, 129, 131, 133, 136, 141, 128, 130, 194, 196, 197, 199, 202, 156, 171, 180, 184,
+                  79, 80, 81, 87, 95, 100, 103, 105) and any(v.get(x) is POISON for x in w[2:]):
             v[w[1]] = POISON
             return
         if op == 59:                                               # OpVariable
@@ -182,10 +257,14 @@ class Evaluator:
         elif op == 65:                                             # OpAccessChain
             base = self.names.get(w[2], "")
             idx = [v[x] for x in w[3:]]
-            if base == "cp_c1":
+            if base in ("cp_c1", "fp_c1"):
                 v[w[1]] = ("c1", idx[1] * 4 + idx[2])
-            elif base.startswith("cp_c"):
+            elif base.startswith(("cp_c", "fp_c")):
                 v[w[1]] = ("c0",)
+            elif base == "support_buffer" and idx[0] == 5:         # the render scales, one a texture
+                v[w[1]] = ("scale",)
+            elif w[2] == self.frag_coord_id:
+                v[w[1]] = ("frag", idx[0])
             else:
                 v[w[1]] = ("store", base)
         elif op == 61:                                             # OpLoad
@@ -195,6 +274,10 @@ class Evaluator:
             elif ptr[0] == "c1":
                 b = self.bank1.get(ptr[1], 0)
                 v[w[1]] = bits_f32(b) if self.kind(w[0]) == "f" else b
+            elif ptr[0] == "scale":
+                v[w[1]] = self.render_scale
+            elif ptr[0] == "frag":
+                v[w[1]] = self.frag_coord[ptr[1]]
             else:
                 v[w[1]] = 0.0 if self.kind(w[0]) == "f" else 0
         elif op == 62:                                             # OpStore
@@ -222,18 +305,50 @@ class Evaluator:
                 v[w[1]] = r & 0xFFFFFFFF
         elif op == 112:                                            # OpConvertUToF
             v[w[1]] = f32(float(v[w[2]]))
-        elif op in (129, 131, 133):                                # OpFAdd, OpFSub, OpFMul
+        elif op == 111:                                            # OpConvertSToF
+            v[w[1]] = f32(float(as_signed(v[w[2]])))
+        elif op == 127:                                            # OpFNegate
+            v[w[1]] = -v[w[2]]
+        elif op in (129, 131, 133, 136, 141):                      # OpFAdd, OpFSub, OpFMul, OpFDiv, OpFMod
             a, b = v[w[2]], v[w[3]]
-            v[w[1]] = f32({129: lambda: a + b, 131: lambda: a - b, 133: lambda: a * b}[op]())
+            v[w[1]] = f32({129: lambda: a + b, 131: lambda: a - b, 133: lambda: a * b, 136: lambda: fdiv(a, b),
+                           141: lambda: fmod(a, b)}[op]())
+        elif op in (171, 180, 184):                                # OpINotEqual, OpFOrdEqual, OpFOrdLessThan
+            a, b = v[w[2]], v[w[3]]
+            v[w[1]] = a != b if op == 171 else a == b if op == 180 else a < b
+        elif op == 202:                                            # OpBitFieldSExtract: base, offset, count
+            field = v[w[2]] >> v[w[3]] & (1 << v[w[4]]) - 1
+            v[w[1]] = (field - (1 << v[w[4]]) if field >> v[w[4]] - 1 else field) & 0xFFFFFFFF
         elif op in (128, 130, 194, 196, 197, 199):                 # IAdd, ISub, shifts, Or, And
             a, b = v[w[2]], v[w[3]]
             r = {128: lambda: a + b, 130: lambda: a - b, 194: lambda: a >> b, 196: lambda: a << b,
                  197: lambda: a | b, 199: lambda: a & b}[op]()
             v[w[1]] = r & 0xFFFFFFFF
         elif op == 156:                                            # OpIsNan
-            v[w[1]] = math.isnan(v[w[2]])
+            x = v[w[2]]
+            v[w[1]] = tuple(math.isnan(e) for e in x) if isinstance(x, tuple) else math.isnan(x)
         elif op == 169:                                            # OpSelect
-            v[w[1]] = v[w[3]] if v[w[2]] else v[w[4]]
+            c, a, b = v[w[2]], v[w[3]], v[w[4]]
+            if c is POISON:
+                v[w[1]] = POISON
+            elif isinstance(c, tuple):
+                v[w[1]] = POISON if a is POISON or b is POISON else tuple(x if k else y for k, x, y in zip(c, a, b))
+            else:
+                v[w[1]] = a if c else b
+        elif op == 79:                                             # OpVectorShuffle
+            both = v[w[2]] + v[w[3]]
+            v[w[1]] = tuple(both[c] for c in w[4:])
+        elif op in (86, 100):                                      # OpSampledImage, OpImage: nothing to compute
+            v[w[1]] = None
+        elif op == 105:                                            # OpImageQueryLod
+            v[w[1]] = self.lod
+        elif op == 103:                                            # OpImageQuerySizeLod: image, level
+            self.levels.append(v[w[3]])
+            v[w[1]] = self.size
+        elif op in (87, 95):                                       # OpImageSampleImplicitLod, OpImageFetch: image, coordinates
+            if op == 95:
+                self.fetches.append(v[w[3]])
+            v[w[1]] = (0.0, 0.0, 0.0, 0.0)
         elif op == 80:                                             # OpCompositeConstruct
             v[w[1]] = tuple(v[x] for x in w[2:])
         elif op == 81:                                             # OpCompositeExtract
@@ -262,6 +377,10 @@ class Evaluator:
             return nmax(a[0], a[1])
         if name in ("FClamp", "NClamp"):
             return nmin(nmax(a[0], a[1]), a[2])
+        if name == "FAbs":
+            return abs(a[0])
+        if name == "UMin":
+            return min(a[0], a[1])
         if name == "Fma":
             return f32(a[0] * a[1] + a[2])
         if name == "UnpackHalf2x16":
@@ -271,9 +390,12 @@ class Evaluator:
         raise AssertionError(f"the evaluator does not know {name}")
 
 
-def evaluate(spirv: bytes, *operands: int) -> Evaluator:
-    """Runs the module with the operands (32-bit patterns) in words 4, 5, 6 of bank 1 (c[1][0x10], c[1][0x14], c[1][0x18])."""
+def evaluate(spirv: bytes, *operands: int, **pipeline) -> Evaluator:
+    """Runs the module with the operands (32-bit patterns) in words 4, 5, 6 of bank 1 (c[1][0x10], c[1][0x14], c[1][0x18])
+    and what the pipeline gives a pixel program (the evaluator's lod, size, render_scale, frag_coord)."""
     ev = Evaluator(spirv, {4 + n: o for n, o in enumerate(operands)})
+    for name, value in pipeline.items():
+        setattr(ev, name, value)
     ev.run()
     return ev
 
@@ -324,6 +446,42 @@ F2IP_B = scheduled(ampere(0x243, rd=OUT, ra=255, rb=10, high_bits=bit(74) | bit(
 HMUL2_RELU = scheduled(ampere(0x232, rd=OUT, ra=10, rb=11, high_bits=bit(79)))
 
 
+# Pixel programs that sample. The texture's handle is the first of the table in c[2] (c[2][0x20]: the word offset in bits
+# 40..53, the bank in 54..58), a 2D texture (61..63 = 1), no residency predicate (81..83 = PT); the result mask is 72..75.
+HANDLE = (0x20 // 4) << 40 | 2 << 54
+TEX_2D = HANDLE | 1 << 61
+NO_RESIDENCY = bit(81, 7)
+# TMML R0, R10: the level of detail a sample at (R10, R11) would use, two results
+TMML = scheduled(ampere(0xB69, rd=0, ra=10, rb=255, low_bits=TEX_2D, high_bits=bit(72, 0x3) | NO_RESIDENCY))
+# TLD R0, R10: the texel at the integer coordinates (R10, R11) of level zero (87..89 = 1), four results
+TLD = scheduled(ampere(0xB66, rd=0, ra=10, rb=255, low_bits=TEX_2D, high_bits=bit(72, 0xF) | NO_RESIDENCY | bit(87, 1)))
+# TXQ R0, RZ: the size of level zero (the query, 62..63, is 0), two results
+TXQ = scheduled(ampere(0xB6F, rd=0, ra=255, rb=255, low_bits=HANDLE, high_bits=bit(72, 0x3)))
+# TEX R0, R10, R12: a sample at (R10, R11) with the texel offset of R12 (AOFFI, bit 76), four results. The translator makes
+# the offset a part of the coordinates: it divides it by the size of the level the sample would use.
+TEX_OFFSET = scheduled(ampere(0xB60, rd=0, ra=10, rb=12, low_bits=TEX_2D, high_bits=bit(72, 0xF) | bit(76) | NO_RESIDENCY))
+
+
+def pixel_program(*instructions: bytes) -> bytes:
+    """A pixel program: its header (the two type fields of a pixel program in word 0, one colour target with its four
+    components in word 18), three operands from c[1] into R10, R11 and R12, the instructions, an exit. R0 to R3 are the
+    colour."""
+    header = bytearray(0x80)
+    struct.pack_into("<I", header, 0, 2 | 5 << 10)
+    struct.pack_into("<I", header, 18 * 4, 0xF)
+    head = [mov_cbuf(10, 1, 0x10), mov_cbuf(11, 1, 0x14), mov_cbuf(12, 1, 0x18)]
+    return bytes(header) + b"".join(head + list(instructions)) + EXIT
+
+
+# A float on its way to a signed 32-bit integer. 2^31 is a float and is out of range; the largest float below it is
+# 2^31 - 128, and -2^31 is a float and is in range.
+TWO_31 = 2147483648.0
+BELOW_TWO_31 = 2147483520.0
+PAST_MINUS_TWO_31 = -2147483904.0       # the next float below -2^31
+INT_MIN = 0x80000000                    # what -2^31 converts to
+INT_TOP = 0x7FFFFF80                    # what 2147483520.0 converts to
+
+
 def mov_imm(rd: int, value: int) -> bytes:
     """MOV Rd, imm32 (0x002 in operand form 4, the immediate in bits 32..63)."""
     return scheduled(ampere(0x802, rd=rd, ra=0, rb=value & 0xFF, low_bits=(value >> 8) << 40))
@@ -345,7 +503,15 @@ class NanRulesTest(Harness):
     def module(self, key: str, *instructions: bytes) -> bytes:
         code = self.dir / f"{key}.bin"
         code.write_bytes(program(*instructions))
-        got = self.run_jobs([compute_job(key, code)])[key]
+        return self.translated(key, compute_job(key, code))
+
+    def pixel(self, key: str, *instructions: bytes) -> bytes:
+        code = self.dir / f"{key}.bin"
+        code.write_bytes(pixel_program(*instructions))
+        return self.translated(key, {"key": key, "stage": "ps", "arch": "sm86", "code": str(code), "c1": ""})
+
+    def translated(self, key: str, job: dict) -> bytes:
+        got = self.run_jobs([job])[key]
         self.assertEqual((got.status, got.message), ("ok", ""))
         if SPIRV_VAL:
             v = validate.validate_one(SPIRV_VAL, key, self.out / f"{key}.spv")
@@ -424,6 +590,106 @@ class NanRulesTest(Harness):
         only_numeric_forms(self, spirv, "NMax")     # its NaN select predates the change, so the stored value cannot tell
         for x, want in [(NAN, 0), (300.0, 255), (-4.0, 0), (17.9, 17)]:
             self.assertEqual(evaluate(spirv, f32_bits(x)).stores, [want], x)
+
+    def test_the_conversion_itself_keeps_its_instructions(self):
+        """The bounds of the cases below are for the conversions around F2I. F2I's own sequence is the one it had: the
+        NaN test, the rounding (and the maximum with zero of an unsigned result), one conversion and the NaN select,
+        with no clamp and no comparison against a bound."""
+        for key, signed, convert, rounding in (("f2i_s32_shape", True, 110, ["Trunc"]), ("f2i_u32_shape", False, 109, ["Trunc", "NMax"])):
+            with self.subTest(key):
+                ev = evaluate(self.module(key, f2i(signed), store(OUT)), f32_bits(2.5))
+                shape = [GLSL[w[3]] if op == 12 else op for op, w in ev.body if op in (12, 109, 110, 156, 169) or 180 <= op <= 191]
+                self.assertEqual(shape, [156, *rounding, convert, 169])
+                self.assertEqual(ev.stores, [2])
+
+    # -- the conversions around F2I: the float is bounded before it is converted --
+
+    def test_the_64_bit_conversion_saturates_and_converts_nothing_out_of_range(self):
+        spirv = self.module("f2i_u64_range", F2I_U64, store(OUT), store(OUT + 1, 1))
+        ones = [0xFFFFFFFF, 0xFFFFFFFF]
+        cases = [("NaN", NAN, [0, 0x80000000]), ("+Inf", INF, ones), ("-Inf", -INF, [0, 0]),
+                 ("2^64, just past the top", 2.0 ** 64, ones), ("past the top", 3e19, ones),
+                 ("-1, just past the bottom", -1.0, [0, 0]), ("past the bottom", -3e19, [0, 0]),
+                 ("the largest float below 2^64", bits_f32(0x5F7FFFFF), [0, 0xFFFFFF00]), ("zero, the bottom bound", 0.0, [0, 0]),
+                 ("in range", 5.0, [5, 0]), ("in range", 2.0 ** 63, [0, 0x80000000]), ("in range", 2.0 ** 40 + 2.0 ** 20, [1 << 20, 1 << 8])]
+        for name, x, want in cases:
+            with self.subTest(name, x=x):
+                self.assertEqual(evaluate(spirv, f32_bits(x)).stores, want)
+
+    def test_the_level_of_detail_query_bounds_its_fixed_point_results(self):
+        """TMML gives the two levels of detail a sample would use, times 256, as signed integers. Either can be anything a
+        driver's query returns, so each is bounded on both sides: a NaN gives 0, the rest the nearest bound."""
+        spirv = self.pixel("tmml", TMML)
+        cases = [("NaN", NAN, 0), ("+Inf", INF, INT_TOP), ("-Inf", -INF, INT_MIN),
+                 ("just past the top", 8388608.0, INT_TOP),             # times 256: 2^31
+                 ("just past the bottom", -8388609.0, INT_MIN),         # times 256: the next float below -2^31
+                 ("the top bound", 8388607.5, INT_TOP),                 # times 256: 2147483520
+                 ("the bottom bound", -8388608.0, INT_MIN),
+                 ("in range", 1.5, 0x180), ("in range", -0.75, -192 & 0xFFFFFFFF)]
+        for name, x, want in cases:
+            for component in (0, 1):        # of the query's pair; the program's two results are in the other order
+                with self.subTest(name, x=x, component=component):
+                    stores = evaluate(spirv, lod=(x, 2.25) if component == 0 else (2.25, x)).stores
+                    self.assertEqual(stores, [0x240, want, 0, 0] if component == 0 else [want, 0x240, 0, 0])
+
+    def texel(self, spirv: bytes, coordinate: int, **pipeline) -> tuple:
+        """The coordinates the texel fetch of TLD's module is given, for the same integer in both of the program's."""
+        (fetched,) = evaluate(spirv, coordinate & 0xFFFFFFFF, coordinate & 0xFFFFFFFF, **pipeline).fetches
+        return fetched
+
+    def test_a_scaled_texel_coordinate_is_bounded(self):
+        """With a render scale other than 1 the integer coordinates of a texel fetch are multiplied by it and converted
+        back, in a helper function of the translator's own."""
+        spirv = self.pixel("tld", TLD)
+        cases = [("NaN", 1, NAN, 0), ("NaN", 0, INF, 0), ("+Inf", 1, INF, INT_TOP), ("-Inf", -1, INF, INT_MIN),
+                 ("just past the top", 1, TWO_31, INT_TOP), ("just past the bottom", -1, -PAST_MINUS_TWO_31, INT_MIN),
+                 ("the top bound", 1, BELOW_TWO_31, INT_TOP), ("the bottom bound", -1, TWO_31, INT_MIN),
+                 ("in range", 5, 2.0, 10), ("in range", -3, 2.5, -7 & 0xFFFFFFFF), ("no scale", 7, 1.0, 7)]
+        for name, coordinate, scale, want in cases:
+            with self.subTest(name, coordinate=coordinate, scale=scale):
+                self.assertEqual(self.texel(spirv, coordinate, render_scale=scale), (want, want))
+
+    def test_a_scaled_texel_coordinate_of_a_negative_scale_is_bounded(self):
+        """A negative render scale takes the helper's other path, in a pixel program: the coordinate times the scale's
+        magnitude, plus the fragment's own position within the scaled texel."""
+        spirv = self.pixel("tld_negative", TLD)
+        cases = [("NaN", 0, -INF, 0), ("+Inf", 1, -INF, INT_TOP), ("-Inf", -1, -INF, INT_MIN),
+                 ("just past the top", 1, -TWO_31, INT_TOP), ("just past the bottom", -1, PAST_MINUS_TWO_31, INT_MIN),
+                 ("the top bound", 1, -BELOW_TWO_31, INT_TOP), ("the bottom bound", -1, -TWO_31, INT_MIN),
+                 ("in range", 5, -2.0, 10), ("in range", -3, -2.5, -7 & 0xFFFFFFFF)]
+        for name, coordinate, scale, want in cases:
+            with self.subTest(name, coordinate=coordinate, scale=scale):
+                self.assertEqual(self.texel(spirv, coordinate, render_scale=scale), (want, want))
+        # x of the fragment's position for the first coordinate, y for the second
+        self.assertEqual(self.texel(spirv, 5, render_scale=-2.0, frag_coord=(3.0, 6.5, 0.0, 1.0)), (11, 10))
+
+    def test_an_unscaled_texture_size_is_bounded(self):
+        """With a render scale other than 1 a queried size is divided by the scale's magnitude and converted back, in a
+        helper function. A size is not negative, so the quotient is not either: zero is the lower bound, which is also
+        where a NaN (0 / 0) goes, and there is no -Inf to give."""
+        spirv = self.pixel("txq", TXQ)
+        cases = [("NaN", (0, 0), 0.0, [0, 0]), ("NaN", (16, 8), NAN, [0, 0]), ("+Inf", (16, 8), 0.0, [INT_TOP, INT_TOP]),
+                 ("just past the top", (16, 8), 2.0 ** -27, [INT_TOP, 1 << 30]),
+                 ("the top bound", (16777215, 1), 2.0 ** -7, [INT_TOP, 128]),
+                 ("zero, the bottom bound", (0, 4), 0.5, [0, 8]),
+                 ("in range", (16, 8), 2.0, [8, 4]), ("in range", (16, 8), -2.0, [8, 4]), ("in range", (16, 9), INF, [0, 0]),
+                 ("no scale", (16, 9), 1.0, [16, 9])]
+        for name, size, scale, want in cases:
+            with self.subTest(name, size=size, scale=scale):
+                self.assertEqual(evaluate(spirv, size=size, render_scale=scale).stores, want + [0, 0])
+
+    def test_the_level_of_a_size_query_is_bounded(self):
+        """A sample with a texel offset asks which level the sample would use, converts it to an integer and asks that
+        level's size, once a coordinate. A level is not negative, so zero is the lower bound (and a NaN's value)."""
+        spirv = self.pixel("tex_offset", TEX_OFFSET)
+        cases = [("NaN", NAN, 0), ("+Inf", INF, INT_TOP), ("-Inf", -INF, 0),
+                 ("just past the top", TWO_31, INT_TOP), ("past the bottom", PAST_MINUS_TWO_31, 0),
+                 ("the top bound", BELOW_TWO_31, INT_TOP), ("zero, the bottom bound", 0.0, 0),
+                 ("in range", 2.0, 2), ("in range", 3.75, 3)]
+        for name, x, want in cases:
+            with self.subTest(name, x=x):
+                ev = evaluate(spirv, f32_bits(0.5), f32_bits(0.5), 0x21, lod=(x, 0.0), size=(16, 8))
+                self.assertEqual(ev.levels, [want, want])
 
     # -- half pairs with .RELU --
 

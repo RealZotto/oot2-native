@@ -240,6 +240,19 @@ namespace Ryujinx.Graphics.Shader.Instructions
             // TODO: CC.
         }
 
+        // oot2-native: a float to a signed 32-bit integer for the conversions the translator adds itself (a level of detail in fixed point, a coordinate or a size times the render
+        // scale), whose float is whatever the driver or the host gave. OpConvertFToS is undefined for a NaN, an infinity and a value outside the integer's range, and a select after it
+        // does not take that back, so the float is bounded before it is converted. Both bounds are floats inside the range: -2^31 is one, and 2147483520 is the largest below 2^31 (the
+        // literal 2147483647 would round up to 2^31, which is outside). NClamp gives its lower bound for a NaN, so a NaN is 0 at no cost where the caller knows the value is not
+        // negative (nonNegative, which makes 0 the lower bound) and costs a test and a select otherwise. Nothing changes for a value in range. F2I itself does not come through here.
+        public static Operand FP32ToS32Bounded(EmitterContext context, Operand value, bool nonNegative = false)
+        {
+            Operand bounded = context.Add(Instruction.FP32 | Instruction.Clamp, Local(), value, ConstF(nonNegative ? 0f : -2147483648f), ConstF(2147483520f));
+            Operand res = context.FP32ConvertToS32(bounded);
+
+            return nonNegative ? res : context.ConditionalSelect(context.IsNan(value), Const(0), res);
+        }
+
         private static void EmitI2F(
             EmitterContext context,
             ISrcFmt srcType,

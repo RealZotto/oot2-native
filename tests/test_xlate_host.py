@@ -382,6 +382,36 @@ class AmpereHandlersTest(Harness):
                 self.assertEqual(got.status, "fail")
                 self.assertIn("F2IP other than", got.message)
 
+    # F2I (0x305): the source's size is bits 84..85; a 64-bit float (3) is not converted, so no rule for it is needed.
+    def test_f2i_from_a_64_bit_float_is_refused(self):
+        code = self.program("f2id", ampere(0x305, rd=0, rb=2, high_bits=bit(72) | bit(75, 2) | bit(78, 3) | bit(84, 3)))
+        got = self.translate("f2id", compute_job("f2id", code))
+        self.assertEqual(got.status, "fail")
+        self.assertTrue(got.message.startswith("unsupported_opcode:"), got.message)
+        self.assertIn("F2I from a float that is neither 16-bit nor 32-bit", got.message)
+
+    # FMNMX (0x209): the predicate that picks the minimum is bits 87..90 and .FTZ is bit 80. The other bits of 74..86 select
+    # modes the translator does not have, the minimum and maximum that give a NaN for a NaN operand among them: a word
+    # with one of them is refused by name, never translated as the plain minimum or maximum.
+    def test_fmnmx_mode_bits_are_refused(self):
+        for n in (*range(74, 80), *range(81, 87)):
+            with self.subTest(bit=n):
+                key = f"fmnmx{n}"
+                code = self.program(key, ampere(0x209, rd=0, ra=1, rb=2, high_bits=bit(87, 7) | bit(n)))
+                got = self.translate(key, compute_job(key, code))
+                self.assertEqual(got.status, "fail")
+                self.assertTrue(got.message.startswith("unsupported_opcode:"), got.message)
+                self.assertIn("FMNMX mode bits 74..79, 81..86", got.message)
+
+    def test_fmnmx_without_a_mode_bit_translates(self):
+        """.FTZ (bit 80) is no mode bit, and bit 91 belongs to the form whose second operand is a uniform register (0xc09)."""
+        words = (("fmnmx", 0x209, 0), ("fmnmx_ftz", 0x209, bit(80)), ("fmnmx_ur", 0xC09, bit(91)), ("fmnmx_ur_ftz", 0xC09, bit(80) | bit(91)))
+        for key, op, high in words:
+            with self.subTest(key=key):
+                code = self.program(key, ampere(op, rd=0, ra=1, rb=2, high_bits=bit(87, 7) | high))
+                got = self.translate(key, compute_job(key, code))
+                self.assertEqual((got.status, got.message), ("ok", ""))
+
     # ATOMG.CAS (0x3a9): .E (64-bit address pair) is bit 72, the type 73..75, the uniform form bit 91.
     def test_atomg_cas(self):
         code = self.program("cas", ampere(0x3a9, rd=0, ra=2, rb=4, rc=5, high_bits=bit(72)))

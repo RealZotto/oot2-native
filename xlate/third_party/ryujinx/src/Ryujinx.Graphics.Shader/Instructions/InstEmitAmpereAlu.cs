@@ -163,6 +163,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
         public static void AFmnmx(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
+
+            // oot2-native: bits 74..79 and 81..86 select modes that are not translated, the minimum and maximum that give a NaN for a NaN operand (.NAN, bit 81 by the other lowerers'
+            // reading) among them; a word with one of them is refused instead of becoming the plain minimum or maximum. Bit 80 is .FTZ, which every word seen has and which is dropped
+            if (x.Bits(74, 80) != 0 || x.Bits(81, 87) != 0)
+            {
+                throw AFail(context, "FMNMX mode bits 74..79, 81..86 (.NAN among them)");
+            }
+
             (ASrc a, ASrc b) = ASecond(context, x);
 
             Operand srcA = AFloat(context, a);
@@ -326,14 +334,21 @@ namespace Ryujinx.Graphics.Shader.Instructions
             }
 
             Operand f = AFloat(context, s);
-            Operand hi = context.FP32ConvertToU32(context.FPMultiply(f, ConstF(1.0f / 4294967296.0f)));
-            Operand lo = context.FP32ConvertToU32(context.FPSubtract(f, context.FPMultiply(context.IConvertU32ToFP32(hi), ConstF(4294967296.0f))));
 
-            // oot2-native: a NaN gives the 64-bit integer's top bit, 1 << 63, where a conversion to a 32-bit integer gives 0
-            Operand nan = context.IsNan(f);
+            // oot2-native: OpConvertFToU is undefined for a NaN, an infinity and a value outside the integer's range, so the float is bounded before the two conversions: from 0 to the
+            // largest float below 2^64 (2^64 - 2^40), which leaves both words in range and a value in range as it was. The conversion saturates: a negative value gives 0 (the clamp's
+            // lower bound) and a value of 2^64 or more gives all ones in both words (no float lies between the upper bound and 2^64, so "above the bound" is that test)
+            float top = BitConverter.Int32BitsToSingle(0x5F7FFFFF);
+            Operand bounded = context.Add(Instruction.FP32 | Instruction.Clamp, Local(), f, ConstF(0), ConstF(top));
+            Operand hi = context.FP32ConvertToU32(context.FPMultiply(bounded, ConstF(1.0f / 4294967296.0f)));
+            Operand lo = context.FP32ConvertToU32(context.FPSubtract(bounded, context.FPMultiply(context.IConvertU32ToFP32(hi), ConstF(4294967296.0f))));
+            Operand saturated = context.FPCompareLess(ConstF(top), f);
 
-            hi = context.ConditionalSelect(nan, Const(int.MinValue), hi);
-            lo = context.ConditionalSelect(nan, Const(0), lo);
+            hi = context.ConditionalSelect(saturated, Const(-1), hi);
+            lo = context.ConditionalSelect(saturated, Const(-1), lo);
+
+            // oot2-native: a NaN gives the 64-bit integer's top bit, 1 << 63, where a conversion to a 32-bit integer gives 0. The clamp has made its low word 0 already
+            hi = context.ConditionalSelect(context.IsNan(f), Const(int.MinValue), hi);
 
             if (x.Rd < RegisterConsts.RegisterZeroIndex)
             {
