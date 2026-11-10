@@ -29,6 +29,7 @@
 // committed run around its bind instead of the pool, needs no import (its copies go through staging), is brought current
 // at its first resolve in a submission rather than by 2 MiB snapshots per submission, and a new backing over older ones
 // waits for the submissions that used them.
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,18 @@ _Static_assert(BACKING_IMPORT_WINDOW == PLAT_PIECE, "an import window is one pie
 _Static_assert(BACKING_BLOCK % BACKING_EXTENT_ALIGN == 0, "blocks hold whole extent pages");
 
 typedef unsigned long long ull;
+
+// snprintf for a line built piece by piece: returns the characters it stored (at most size - 1), never the length it
+// wanted, so that `at += sn(buf + at, sizeof buf - at, ...)` cannot pass the end of the buffer and size - at cannot wrap.
+static size_t sn(char *buf, size_t size, const char *fmt, ...) {
+    if (!size) return 0;
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf, size, fmt, ap);
+    va_end(ap);
+    if (r < 0) return 0;
+    return (size_t)r < size ? (size_t)r : size - 1;
+}
 
 enum { CLS_CPU, CLS_GPU, CLS_VIRTUAL };   // a pool the CPU sees; one in the window with storage; a virtual one
 
@@ -93,6 +106,9 @@ typedef struct Backing {
     // it had before the cut or growth that gave it its present one. Written under the exclusive lock, read by the dump.
     uint64_t born_value, born_lo, born_hi;
     int born_by;
+    // The first record born() made for the backing and never overwritten: how it started, whatever cut or grew it since.
+    uint64_t born0_value, born0_lo, born0_hi;
+    int born0_by;
     // An import's: a bind larger than a uniform's resolved into it (atomic). The next raw-access submission's begin gives
     // such an import the mirror the rule would have made for the bind (promote_hot).
     int hot;
@@ -955,6 +971,7 @@ static uint64_t g_born_value;
 // beside_front: a mirror that kept its start (the bind took its end); beside_end: one that kept its end. born_lo/born_hi
 // are the range the backing had before that cut or growth.
 static void born(Backing *b, int by, uint64_t value, uint64_t lo, uint64_t hi) {
+    if (b->born0_by == BORN_NONE) b->born0_by = by, b->born0_value = value, b->born0_lo = lo, b->born0_hi = hi;
     b->born_by = by, b->born_value = value, b->born_lo = lo, b->born_hi = hi;
 }
 
@@ -1046,11 +1063,12 @@ static void diag_backing(const Backing *b, const Backing *m) {
                  (ull)b->mem.size);
     }
     rt_log(DIAG "backing %s [%#llx, %#llx) offset %#llx part [%#llx, %#llx) last_use %llu written %llu hot %d res (value "
-           "%llu, %s, n %llu) born %s for %llu was [%#llx, %#llx)%s%s", kind_name(b->kind), (ull)b->gpu_lo,
+           "%llu, %s, n %llu) born %s for %llu was [%#llx, %#llx) born0 %s for %llu was [%#llx, %#llx)%s%s", kind_name(b->kind), (ull)b->gpu_lo,
            (ull)b->gpu_hi, (ull)b->offset, (ull)b->part_at, (ull)(b->part_at + b->part),
            (ull)__atomic_load_n(&b->last_use, __ATOMIC_ACQUIRE), (ull)__atomic_load_n(&b->written, __ATOMIC_ACQUIRE),
            __atomic_load_n(&b->hot, __ATOMIC_RELAXED), (ull)b->res_value, hull, (ull)b->res_n, k_born[b->born_by],
-           (ull)b->born_value, (ull)b->born_lo, (ull)b->born_hi, room, b == m ? " <- the mirror the bind reaches" : "");
+           (ull)b->born_value, (ull)b->born_lo, (ull)b->born_hi, k_born[b->born0_by], (ull)b->born0_value,
+           (ull)b->born0_lo, (ull)b->born0_hi, room, b == m ? " <- the mirror the bind reaches" : "");
 }
 
 static void guard_line(const char *tag, int refuses, const char *detail) {
@@ -1188,6 +1206,288 @@ static void diag_refusal(const Backing *m, uint64_t plo, uint64_t phi, uint64_t 
            (ull)plo, (ull)phi, (ull)m->gpu_lo, (ull)m->gpu_hi, hull, k_born[m->born_by], why);
 }
 
+// ---------- the event ring and the dry evaluation of the candidate growth
+// The ring of binds above takes every hit, so a long submission pushes the misses out of it. This ring takes none: only the
+// events that change what the map holds or decide it (a raw-access begin, the fill and promotion passes, a miss with the
+// rule's answer, the cut a bind gives a mirror, what a bind made or grew, and the verdict of the dry growth). Every event of
+// the bind being served carries the number of its miss, so a verdict is tied to the miss it belongs to; the verdict is
+// written right after the miss, with nothing between. Written under g_lock exclusive only (every writer holds it), read by
+// the dump and by nothing else; a decision never reads it.
+#define EV_N 256
+#define EV_IMP 4    // the backings an event records in full; the rest are counted
+#define EV_VAL 32   // the submissions whose events are counted, to say how many the ring lost
+enum { EV_BEGIN, EV_PROMOTE, EV_FILL, EV_MISS, EV_MADE, EV_GREW, EV_CUT, EV_VERDICT };
+static const char *const k_ev[] = {"begin", "promote", "fill", "miss", "made", "grew", "cut", "verdict"};
+
+// A backing as an event saw it, read before anything freed or replaced it.
+typedef struct EvImp {
+    uint64_t lo, hi, used, res_value, res_lo, res_hi, res_n, born_value, born0_value, born0_lo, born0_hi;
+    int kind, born_by, born0_by;
+} EvImp;
+typedef struct EvSnap { EvImp imp[EV_IMP]; int n, more; } EvSnap;
+
+typedef struct EvEnt {
+    uint64_t seq, value, miss;   // miss: the number of the bind being served (0: none)
+    uint64_t x[14];              // numbers, as each kind of event says (ev_line)
+    int what, kind, phase;
+    uint32_t mask;               // a verdict's refusals: bit i is k_dry[i]
+    EvImp mir;                   // a cut's mirror, a verdict's mirror
+    EvSnap s;                    // the backings a made, a grew or a verdict replaces
+} EvEnt;
+
+// The names of the verdict's refusals, in the order of the counters (BackingStats raw_dry_g) and of the mask's bits. G8,
+// the write watch, is never evaluated: its query resets the marks it reports, which a dry evaluation must not do.
+enum { DRY_KIND, DRY_G1, DRY_G2, DRY_G3, DRY_G4, DRY_G5, DRY_G6, DRY_G7A, DRY_G7B, DRY_G8, DRY_G9, DRY_CAP, DRY_N };
+static const char *const k_dry[DRY_N] = {"rule_kind", "G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G8", "G9", "cap"};
+_Static_assert(DRY_N == sizeof ((BackingStats *)0)->raw_dry_g / sizeof ((BackingStats *)0)->raw_dry_g[0],
+               "the counters and the verdict's refusals are the same list");
+
+static EvEnt g_ev[EV_N];
+static EvEnt g_ev_null;       // where an event with no submission goes (value 0): never read
+static uint64_t g_ev_seq;     // events written so far
+static uint64_t g_ev_misses;  // misses numbered so far
+static uint64_t g_ev_cur;     // the miss being served now (0: none)
+typedef struct EvCount { uint64_t value, n; } EvCount;
+static EvCount g_evc[EV_VAL];   // events written per submission, the lowest value dropped when full
+static struct { uint64_t evals, would, refused, mutated, g[DRY_N]; } g_dry;
+
+static void ev_imp_of(EvImp *o, const Backing *b) {
+    *o = (EvImp){b->gpu_lo, b->gpu_hi, used_by(b), b->res_value, b->res_lo, b->res_hi, b->res_n, b->born_value,
+                 b->born0_value, b->born0_lo, b->born0_hi, b->kind, b->born_by, b->born0_by};
+}
+
+// The backings of c inside [lo, hi), except skip, into s (the first EV_IMP in full, the rest counted).
+static void ev_snap(EvSnap *s, const Cell *c, uint64_t lo, uint64_t hi, const Backing *skip) {
+    *s = (EvSnap){0};
+    for (int i = 0; i < c->nimp; i++) {
+        const Backing *b = c->imp[i];
+        if (b == skip || !overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) continue;
+        if (s->n < EV_IMP) ev_imp_of(&s->imp[s->n++], b);
+        else s->more++;
+    }
+}
+
+static void ev_count(uint64_t value) {
+    EvCount *at = NULL;
+    for (int i = 0; i < EV_VAL; i++) {
+        if (g_evc[i].value == value) {
+            at = &g_evc[i];
+            break;
+        }
+        if (!at || g_evc[i].value < at->value) at = &g_evc[i];
+    }
+    if (at->value != value) *at = (EvCount){value, 0};
+    at->n++;
+}
+
+// A new event of submission value, in the ring (g_lock exclusive).
+static EvEnt *ev_new(uint64_t value, int what) {
+    if (!value) return &g_ev_null;
+    EvEnt *e = &g_ev[g_ev_seq % EV_N];
+    uint64_t last = raw_last();
+    *e = (EvEnt){.seq = g_ev_seq++, .value = value, .miss = g_ev_cur, .what = what,
+                 .phase = value < last ? PHASE_NEWER : value == last ? PHASE_AFTER : PHASE_BEFORE};
+    ev_count(value);
+    return e;
+}
+
+// The candidate growth of a mirror m the bind [plo, phi) of a raw-access submission cut instead of growing it, evaluated
+// and written as an event, acted on by nothing. Each guard of grow_taken is evaluated on its own (as diag_guards does),
+// plus the rule's own kind and the cap on the mirrors' total; no write watch query (G8), no wait, no span taken, nothing
+// deferred, no counter of the map moved, the version unchanged. g_lock exclusive, in the miss, before beside() and before
+// any import is replaced.
+static void dry_growth(const Rec *rec, const Cell *c, const Backing *m, uint64_t plo, uint64_t phi, uint64_t value,
+                       int kind, uint64_t others) {
+    EvEnt *e = ev_new(value, EV_VERDICT);
+    uint64_t digest = diag_digest();   // the map before: the evaluation must leave it so (counted, and printed)
+    uint64_t old_lo = m->gpu_lo, old_hi = m->gpu_hi;
+    uint64_t lo = plo < old_lo ? plo : old_lo, hi = phi > old_hi ? phi : old_hi;
+    uint64_t added = old_lo - lo + hi - old_hi, before, after;
+    uint32_t mask = 0;
+    ev_snap(&e->s, c, lo, hi, m);
+    if (kind != BACKING_MIRROR) mask |= 1u << DRY_KIND;
+    if (added > BACKING_MIRROR_GROW_MAX) mask |= 1u << DRY_G1;
+    for (int i = 0; i < c->nimp; i++) {
+        const Backing *b = c->imp[i];
+        if (b == m || !overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) continue;
+        if (b->kind != BACKING_IMPORT) mask |= 1u << DRY_G2;
+        else if (used_by(b) >= value) mask |= 1u << DRY_G4;
+    }
+    for (int i = 0; i < g_index.n; i++) {
+        const Rec *other = (const Rec *)g_index.e[i].key;
+        if (other->cls != CLS_CPU) continue;
+        for (int j = 0; j < other->ncells; j++) {
+            const Cell *cell = &other->cells[j];
+            if (other == rec && cell == c) continue;
+            for (int k = 0; k < cell->nimp; k++)
+                if (overlaps(lo, hi, cell->imp[k]->gpu_lo, cell->imp[k]->gpu_hi)) mask |= 1u << DRY_G3;
+        }
+    }
+    uint64_t old_part_lo = m->part_at, old_part_hi = m->part_at + m->part;
+    block_room(m->block, old_part_lo, old_part_hi, &before, &after);
+    if (old_lo - lo > m->offset) {
+        mask |= 1u << DRY_G5;
+    } else {
+        uint64_t offset = m->offset - (old_lo - lo);
+        if (hi - lo > m->mem.size - offset) mask |= 1u << DRY_G6;
+        uint64_t part_lo = down(offset, BACKING_EXTENT_ALIGN), part_hi = up(offset + hi - lo, BACKING_EXTENT_ALIGN);
+        if (part_lo > old_part_lo) part_lo = old_part_lo;
+        if (part_hi < old_part_hi) part_hi = old_part_hi;
+        if (part_hi > m->mem.size || !block_free_at(m->block, old_part_hi, part_hi)) mask |= 1u << DRY_G7A;
+        if (!block_free_at(m->block, part_lo, old_part_lo)) mask |= 1u << DRY_G7B;
+    }
+    plat_mutex_lock(&g_coh);
+    for (int i = 0; i < g_npend; i++) {
+        const Pending *p = &g_pend[i];
+        if (p->m != m && overlaps(lo, hi, p->lo, p->hi) && p->value >= value) mask |= 1u << DRY_G9;
+    }
+    plat_mutex_unlock(&g_coh);
+    if (g_st.mirror_bytes + added > BACKING_PROMOTE_MIRROR_MAX) mask |= 1u << DRY_CAP;
+    ev_imp_of(&e->mir, m);
+    e->kind = kind, e->mask = mask;
+    e->x[0] = old_lo, e->x[1] = old_hi, e->x[2] = lo, e->x[3] = hi, e->x[4] = added, e->x[5] = g_st.mirror_bytes;
+    e->x[6] = old_lo - lo, e->x[7] = m->offset, e->x[8] = before, e->x[9] = after, e->x[10] = old_part_lo;
+    e->x[11] = old_part_hi, e->x[12] = others;
+    e->x[13] = diag_digest() != digest;
+    g_dry.mutated += e->x[13];
+    g_dry.evals++;
+    if (mask) g_dry.refused++;
+    else g_dry.would++;
+    for (int i = 0; i < DRY_N; i++) g_dry.g[i] += (mask >> i) & 1u;
+}
+
+static void ev_miss(uint64_t value, uint64_t addr, uint64_t size, uint64_t plo, uint64_t phi, uint64_t rs, uint64_t re,
+                    int kind) {
+    EvEnt *e = ev_new(value, EV_MISS);
+    e->kind = kind;
+    e->x[0] = addr, e->x[1] = size, e->x[2] = plo, e->x[3] = phi, e->x[4] = rs, e->x[5] = re;
+}
+
+// why: 0 the import became a mirror, 1 the cap on the mirrors held it back, 2 the admission refused the mirror.
+static void ev_promote(uint64_t value, uint64_t lo, uint64_t hi, int why) {
+    EvEnt *e = ev_new(value, EV_PROMOTE);
+    e->x[0] = lo, e->x[1] = hi, e->x[2] = (uint64_t)why, e->x[3] = g_st.mirror_bytes;
+}
+
+static void ev_hull(char *out, size_t n, const EvImp *o) {
+    if (!o->res_n || o->res_lo >= o->res_hi) snprintf(out, n, "empty");
+    else snprintf(out, n, "[%#llx, %#llx) of submission %llu", (ull)o->res_lo, (ull)o->res_hi, (ull)o->res_value);
+}
+
+static void ev_imp_line(const EvEnt *e, const char *role, const EvImp *o) {
+    char hull[112];
+    ev_hull(hull, sizeof hull, o);
+    rt_log(DIAG "event %llu: %s %s [%#llx, %#llx) used_by %llu (%s submission %llu) hull %s res_n %llu born %s for %llu "
+           "born0 %s for %llu was [%#llx, %#llx)", (ull)e->seq, role, kind_name(o->kind), (ull)o->lo, (ull)o->hi,
+           (ull)o->used, o->used >= e->value ? "reached by" : "before", (ull)e->value, hull, (ull)o->res_n,
+           k_born[o->born_by], (ull)o->born_value, k_born[o->born0_by], (ull)o->born0_value, (ull)o->born0_lo,
+           (ull)o->born0_hi);
+}
+
+static void ev_snap_lines(const EvEnt *e, const char *role) {
+    for (int i = 0; i < e->s.n; i++) ev_imp_line(e, role, &e->s.imp[i]);
+    if (e->s.more) rt_log(DIAG "event %llu: %d more not recorded in full", (ull)e->seq, e->s.more);
+}
+
+static void ev_line(const EvEnt *e) {
+    char d[640] = "";
+    const uint64_t *x = e->x;
+    switch (e->what) {
+    case EV_BEGIN:
+        snprintf(d, sizeof d, "mirror_bytes %llu mirrors %llu", (ull)x[0], (ull)x[1]);
+        break;
+    case EV_PROMOTE:
+        snprintf(d, sizeof d, "import [%#llx, %#llx) %s; mirror_bytes %llu, a promotion leaves at most %llu", (ull)x[0],
+                 (ull)x[1], x[2] == 0 ? "made a mirror" : x[2] == 1 ? "not made: over the cap" : "not made: refused",
+                 (ull)x[3], (ull)BACKING_PROMOTE_MIRROR_MAX);
+        break;
+    case EV_FILL:
+        snprintf(d, sizeof d, "import [%#llx, %#llx) made for the page table's invariant", (ull)x[0], (ull)x[1]);
+        break;
+    case EV_MISS:
+        snprintf(d, sizeof d, "addr %#llx size %#llx pages [%#llx, %#llx) committed run [%#llx, %#llx) rule says %s",
+                 (ull)x[0], (ull)x[1], (ull)x[2], (ull)x[3], (ull)x[4], (ull)x[5], kind_name(e->kind));
+        break;
+    case EV_MADE:
+        snprintf(d, sizeof d, "%s [%#llx, %#llx), replacing %d recorded and %d more backings", kind_name(e->kind),
+                 (ull)x[0], (ull)x[1], e->s.n, e->s.more);
+        break;
+    case EV_GREW:
+        snprintf(d, sizeof d, "mirror [%#llx, %#llx) grew to [%#llx, %#llx), replacing %d recorded and %d more imports",
+                 (ull)x[0], (ull)x[1], (ull)x[2], (ull)x[3], e->s.n, e->s.more);
+        break;
+    case EV_CUT:
+        snprintf(d, sizeof d, "mirror [%#llx, %#llx) %s: now [%#llx, %#llx)", (ull)x[0], (ull)x[1],
+                 x[4] == 0 ? "kept its start (the bind took its end)" : x[4] == 1 ? "kept its end (the bind took its start)"
+                                                                                  : "taken whole (deferred)",
+                 (ull)x[2], (ull)x[3]);
+        break;
+    default: {
+        char list[96] = "";
+        size_t at = 0;
+        for (int i = 0; i < DRY_N; i++)
+            if (e->mask >> i & 1u) at += sn(list + at, sizeof list - at, "%s%s", at ? "," : "", k_dry[i]);
+        snprintf(d, sizeof d, "the mirror [%#llx, %#llx) would grow to [%#llx, %#llx), adding %#llx bytes (head %#llx, "
+                 "its offset %#llx); rule says %s; mirror_bytes %llu, at most %llu; block room before its part [%#llx, "
+                 "%#llx) %#llx after %#llx; %llu other mirrors of the cell on the bind; G8 not evaluated; the evaluation left the map %s; refuses: %s",
+                 (ull)x[0], (ull)x[1], (ull)x[2], (ull)x[3], (ull)x[4], (ull)x[6], (ull)x[7], kind_name(e->kind),
+                 (ull)x[5], (ull)BACKING_PROMOTE_MIRROR_MAX, (ull)x[10], (ull)x[11], (ull)x[8], (ull)x[9], (ull)x[12],
+                 x[13] ? "CHANGED" : "unchanged", e->mask ? list : "nothing (it would grow)");
+    }
+    }
+    rt_log(DIAG "event %llu: submission %llu %s %s [bind %llu]: %s", (ull)e->seq, (ull)e->value, k_phase[e->phase],
+           k_ev[e->what], (ull)e->miss, d);
+    if (e->what == EV_CUT) ev_imp_line(e, "the mirror cut", &e->mir);
+    if (e->what == EV_MADE || e->what == EV_GREW) ev_snap_lines(e, "replaced");
+    if (e->what == EV_VERDICT) {
+        ev_imp_line(e, "the mirror it would grow", &e->mir);
+        ev_snap_lines(e, "would be replaced");
+    }
+}
+
+// Events written for submission value, or UINT64_MAX when the count was dropped.
+static uint64_t ev_written(uint64_t value) {
+    for (int i = 0; i < EV_VAL; i++)
+        if (g_evc[i].value == value) return g_evc[i].n;
+    return UINT64_MAX;
+}
+
+// The events of submission value and of the raw-access submission before it, oldest first, and how many of them the ring
+// already lost. g_lock exclusive.
+static void diag_events(uint64_t value) {
+    uint64_t n = g_ev_seq, first = n > EV_N ? n - EV_N : 0, before = raw_before(value);
+    rt_log(DIAG "events of submission %llu and of the raw-access submission before it (%llu), oldest first (the ring holds "
+           "the last %d of %llu events, none of them a hit)", (ull)value, (ull)before, EV_N, (ull)n);
+    uint64_t held[2] = {0, 0};
+    for (uint64_t i = first; i < n; i++) {
+        const EvEnt *e = &g_ev[i % EV_N];
+        if (e->value != value && !(before && e->value == before)) continue;
+        held[e->value == value]++;
+        ev_line(e);
+    }
+    uint64_t want[2] = {before ? ev_written(before) : 0, ev_written(value)};
+    char d[240];
+    size_t at = 0;
+    uint64_t lost = 0;
+    int known = 1;
+    for (int i = 0; i < 2; i++) {
+        uint64_t v = i ? value : before;
+        if (!v) continue;
+        if (want[i] == UINT64_MAX) {
+            known = 0;
+            at += sn(d + at, sizeof d - at, "%ssubmission %llu: unknown (its count was dropped)", at ? "; " : "",
+                                   (ull)v);
+        } else {
+            lost += want[i] - held[i];
+            at += sn(d + at, sizeof d - at, "%ssubmission %llu: %llu of %llu", at ? "; " : "", (ull)v,
+                                   (ull)(want[i] - held[i]), (ull)want[i]);
+        }
+    }
+    if (known && !lost) rt_log(DIAG "event ring overwritten: none of the events of these two submissions (%s)", d);
+    else rt_log(DIAG "event ring overwritten: %llu events of these two submissions%s (%s)", (ull)lost,
+                known ? "" : " at least", d);
+}
+
 // Everything the stop of beside() needs to be read, printed before it: the bind, the submission's state, every backing of
 // the cell within 2 MiB of the bind, the growth's guards evaluated on their own, the ring. g_lock exclusive.
 static void diag_stop(const Cell *c, const Backing *m, uint64_t plo, uint64_t phi, uint64_t rs, uint64_t re,
@@ -1211,6 +1511,7 @@ static void diag_stop(const Cell *c, const Backing *m, uint64_t plo, uint64_t ph
            d0 == d1 ? "unchanged" : "CHANGED", (ull)d0, (ull)d1);
     g_st.raw_straddle_stops++;
     diag_ring(value);
+    diag_events(value);
     rt_log(DIAG "stop %llu of this run follows", (ull)g_st.raw_straddle_stops);
 }
 
@@ -1390,18 +1691,26 @@ static void beside(Cell *c, uint64_t plo, uint64_t phi, uint64_t *rs, uint64_t *
                      (ull)m->res_hi, (ull)value, (ull)cl, (ull)ch, why);
         }
         gave = 1;
+        EvEnt *ev = ev_new(value, EV_CUT);
+        ev_imp_of(&ev->mir, m);   // as it was: born() and the cut below change it
+        ev->x[0] = m->gpu_lo, ev->x[1] = m->gpu_hi, ev->x[2] = ev->x[3] = 0;
         if (m->gpu_lo < plo) {   // it keeps its start; the new backing starts at the bind's first page
+            ev->x[4] = 0;
             born(m, BORN_BESIDE_FRONT, value, m->gpu_lo, m->gpu_hi);
             g_st.mirror_bytes -= m->gpu_hi - plo;
             m->gpu_hi = plo;
             if (*rs < plo) *rs = plo;
+            ev->x[2] = m->gpu_lo, ev->x[3] = m->gpu_hi;
         } else if (m->gpu_hi > phi) {   // it keeps its end
+            ev->x[4] = 1;
             born(m, BORN_BESIDE_END, value, m->gpu_lo, m->gpu_hi);
             g_st.mirror_bytes -= phi - m->gpu_lo;
             m->offset += phi - m->gpu_lo;
             m->gpu_lo = phi;
             if (*re > phi) *re = phi;
+            ev->x[2] = m->gpu_lo, ev->x[3] = m->gpu_hi;
         } else {   // the bind covers it all: it goes now, and is freed once the raw-access submission is done
+            ev->x[4] = 2;
             defer(m);
             memmove(c->imp + i, c->imp + i + 1, (size_t)(c->nimp - i - 1) * sizeof *c->imp);
             c->nimp--;
@@ -1522,9 +1831,13 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
     ring_note(value, addr, size, RING_MISS, BACKING_NONE, 0, 0);
     BackingAsk ask = {addr, size, r->flags};
     int kind = backing_rule(&ask);
+    g_ev_cur = ++g_ev_misses;
     if (kind == BACKING_EXTENT) {
         if (!r->ext) r->ext = extent_new(r), changed();
         ring_note(value, addr, size, RING_MADE, BACKING_EXTENT, r->ext->gpu_lo, r->ext->gpu_hi);
+        ev_miss(value, addr, size, 0, 0, 0, 0, kind);
+        EvEnt *xe = ev_new(value, EV_MADE);
+        xe->kind = BACKING_EXTENT, xe->x[0] = r->ext->gpu_lo, xe->x[1] = r->ext->gpu_hi;
         return;
     }
     if (kind == BACKING_MIRROR && !has_mirrors())
@@ -1537,6 +1850,7 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
     Cell *c = cell_get(r, addr / WINDOW, (addr + size - 1) / WINDOW, 1);
     uint64_t rs, re;
     committed_run(c->lo, c->hi, plo, phi, &rs, &re);
+    ev_miss(value, addr, size, plo, phi, rs, re, kind);
     // In the raw-access submission being recorded, the page table is rewritten at its end to map what this bind makes, so
     // its raw accesses reach it however early they were recorded. That is the same copy as the earlier binds' only where
     // the new backing aliases the guest's memory, as an import does: a mirror made here would be filled in the prologue,
@@ -1546,13 +1860,20 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
     if (value && raw_last() == value) {
         g_bind.r = r, g_bind.addr = addr, g_bind.size = size, g_bind.kind = kind;
         char why[GROW_WHY] = "no growth was tried";
+        int refused = 0;
         for (int i = 0; i < c->nimp; i++) {
             Backing *m = c->imp[i];
             if (m->kind != BACKING_MIRROR || m->res_value != value ||
                 !overlaps(plo, phi, m->gpu_lo, m->gpu_hi) ||
                 !overlaps(plo, phi, m->res_lo, m->res_hi))
                 continue;
+            EvSnap pre;
+            uint64_t old_lo = m->gpu_lo, old_hi = m->gpu_hi;
+            ev_snap(&pre, c, plo < old_lo ? plo : old_lo, phi > old_hi ? phi : old_hi, m);
             if (grow_taken(r, c, m, plo, phi, value, why)) {
+                EvEnt *ge = ev_new(value, EV_GREW);
+                ge->kind = BACKING_MIRROR, ge->s = pre;
+                ge->x[0] = old_lo, ge->x[1] = old_hi, ge->x[2] = m->gpu_lo, ge->x[3] = m->gpu_hi;
                 // The imports it replaced lose their pages outside the bind and a newly committed host chunk can extend
                 // beyond it: the committed pages no backing covers now get their imports.
                 fill_pool(r);
@@ -1560,8 +1881,21 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
                 return;
             }
             diag_refusal(m, plo, phi, value, why);
+            refused = 1;
             break;
         }
+        // The candidate fix, evaluated and not acted on: a mirror the bind cuts that the submission did not resolve there.
+        const Backing *dm = NULL;
+        uint64_t others = 0;
+        for (int i = 0; i < c->nimp && !refused; i++) {
+            const Backing *um = c->imp[i];
+            if (um->kind != BACKING_MIRROR || !overlaps(plo, phi, um->gpu_lo, um->gpu_hi) ||
+                (um->res_value == value && overlaps(plo, phi, um->res_lo, um->res_hi)))
+                continue;
+            if (!dm) dm = um;
+            else others++;
+        }
+        if (dm) dry_growth(r, c, dm, plo, phi, value, kind, others);
         if (kind == BACKING_MIRROR) kind = BACKING_IMPORT;
         beside(c, plo, phi, &rs, &re, value, why);
     }
@@ -1574,6 +1908,9 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
     }
     born(b, BORN_BIND, value, b->gpu_lo, b->gpu_hi);
     ring_note(value, addr, size, RING_MADE, b->kind, b->gpu_lo, b->gpu_hi);
+    EvEnt *me = ev_new(value, EV_MADE);   // the backings cell_put replaces, read before it does
+    me->kind = b->kind, me->x[0] = b->gpu_lo, me->x[1] = b->gpu_hi;
+    ev_snap(&me->s, c, rs, re, NULL);
     cell_put(c, rs, re, b);
 }
 
@@ -1588,6 +1925,7 @@ void backing_resolve(uint64_t addr, uint64_t size, uint64_t value, BackingRef *o
     __atomic_fetch_add(&g_misses, 1, __ATOMIC_RELAXED);
     plat_lock(&g_lock);
     make(addr, size, value);
+    g_ev_cur = 0;
     g_ring_skip = 1;   // the bind is in the ring already, written by make
     int found = lookup(addr, size, value, out);
     g_ring_skip = 0;
@@ -1852,6 +2190,8 @@ static void fill_pool(Rec *r) {
             born(nb, BORN_FILL_POOL, g_born_value, a, e);
             cell_put(cell, a, e, nb);
             g_st.raw_fill_imports++, g_st.raw_fill_bytes += e - a;
+            EvEnt *fe = ev_new(g_born_value, EV_FILL);
+            fe->x[0] = a, fe->x[1] = e;
             a = e;
         }
         a = end;
@@ -1889,6 +2229,7 @@ static void promote_hot(uint64_t value) {
                 if (g_st.mirror_bytes + up(hi - lo, BACKING_EXTENT_ALIGN) > BACKING_PROMOTE_MIRROR_MAX) {
                     // the raw path writes back across the bus every page its stores reach and keeps a sink over each mirror: bounded
                     __atomic_store_n(&b->hot, 0, __ATOMIC_RELAXED);
+                    ev_promote(value, lo, hi, 1);
                     if (!r->mirror_logged) {
                         r->mirror_logged = 1;
                         rt_log("gfx: vulkan: backing map: the mirror of [%#llx, %#llx) (%llu KiB) in pool [%#llx, %#llx) is not made: "
@@ -1900,11 +2241,13 @@ static void promote_hot(uint64_t value) {
                 Backing *m = mirror_admit(r, lo, hi);
                 if (!m) {   // no room (or no write watch): it stays an import, and the rest wait for the next begin
                     __atomic_store_n(&b->hot, 0, __ATOMIC_RELAXED);
+                    ev_promote(value, lo, hi, 2);
                     return;
                 }
                 replace_wait(c, lo, hi, value, 1);
                 born(m, BORN_PROMOTE, value, lo, hi);
                 cell_put(c, lo, hi, m);   // the import is deferred and the mirror takes its place in the cell
+                ev_promote(value, lo, hi, 0);
                 g_st.raw_promoted++, g_st.raw_promote_bytes += hi - lo;
             }
         }
@@ -1922,6 +2265,8 @@ void backing_raw_begin(uint64_t value) {
     stamp(&g_raw_last, value);
     g_born_value = value;
     g_st.raw_begins++;
+    EvEnt *be = ev_new(value, EV_BEGIN);
+    be->x[0] = g_st.mirror_bytes, be->x[1] = g_st.mirrors;
     if (!g_filled || e != g_fill_epoch || g_pools_version != g_fill_pools) {
         g_filled = 1, g_fill_epoch = e, g_fill_pools = g_pools_version;   // read before the pass, as backing_sync does
         g_st.raw_passes++;
@@ -2052,6 +2397,8 @@ void backing_stats(BackingStats *out) {
     out->writebacks_skipped = g_cst.writebacks_skipped, out->reads_in_flight = g_cst.reads_in_flight;
     out->pending = (uint64_t)g_npend, out->raw_waits = g_cst.raw_waits;
     plat_mutex_unlock(&g_coh);
+    out->raw_dry_evals = g_dry.evals, out->raw_dry_would_grow = g_dry.would, out->raw_dry_refused = g_dry.refused, out->raw_dry_mutated = g_dry.mutated;
+    memcpy(out->raw_dry_g, g_dry.g, sizeof out->raw_dry_g);
     out->resolves = __atomic_load_n(&g_resolves, __ATOMIC_RELAXED);
     out->resolve_misses = __atomic_load_n(&g_misses, __ATOMIC_RELAXED);
 }
@@ -2073,6 +2420,10 @@ void backing_open(const BackingOps *ops) {
     g_resolves = g_misses = 0;
     g_seen_epoch = rt_mem_ready() ? rt_mem_commit_epoch() : 0;
     memset(g_ring, 0, sizeof g_ring);
+    memset(g_ev, 0, sizeof g_ev);
+    memset(g_evc, 0, sizeof g_evc);
+    memset(&g_dry, 0, sizeof g_dry);
+    g_ev_seq = g_ev_misses = g_ev_cur = 0;
     g_ring_seq = 0, g_ring_skip = 0, g_born_value = 0;
     g_raw_last = g_raw_prev = 0, g_filled = 0, g_pools_version = g_fill_pools = g_fill_epoch = 0;
     g_open = 1;
@@ -2085,6 +2436,15 @@ int backing_is_open(void) { return g_open; }
 
 void backing_close(void) {
     if (!g_open) return;
+    if (g_st.raw_begins) {   // once per run that used the raw path: what the candidate growth would have done
+        char d[200];
+        size_t at = 0;
+        for (int i = 0; i < DRY_N; i++)
+            at += sn(d + at, sizeof d - at, "%s%s %llu", i ? ", " : "", k_dry[i], (ull)g_dry.g[i]);
+        rt_log("gfx: vulkan: backing map: dry growth at exit: %llu raw-access submissions, %llu binds cut a mirror the "
+               "submission had not resolved there, %llu would have grown it, %llu refused (refusals: %s), the evaluation changed the map %llu times",
+               (ull)g_st.raw_begins, (ull)g_dry.evals, (ull)g_dry.would, (ull)g_dry.refused, d, (ull)g_dry.mutated);
+    }
     plat_mutex_lock(&g_bt_lock);
     g_bt_stop = 1;
     plat_cond_signal(&g_bt_cond);

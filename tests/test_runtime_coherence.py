@@ -44,7 +44,8 @@ PASSING = ("generations", "upload", "admission", "guarded_admission", "writeback
            "raw_grow_taken_wait", "raw_grow_taken_head", "raw_grow_taken_layout", "raw_grow_trimmed",
            "raw_grow_guarded_head", "raw_grow_guarded_tail", "raw_grow_over_total", "raw_grow_head_import",
            "raw_grow_tail_import", "raw_grow_wait", "raw_sync_wait", "raw_sync_nowait",
-           "raw_promote", "raw_promote_small", "raw_promote_wait", "raw_promote_cap")
+           "raw_promote", "raw_promote_small", "raw_promote_wait", "raw_promote_cap",
+           "raw_dry_grow", "raw_dry_g4", "raw_dry_cap", "raw_dry_kind", "raw_dry_none")
 
 # case: text the one FATAL line must hold
 FAILING = {
@@ -64,7 +65,17 @@ FAILING = {
     "raw_diag_hull": "which this submission bound, lies on the pages it would add",
     "raw_diag_dry": "which this submission bound, lies on the pages it would add",
     "raw_diag_birth": "which this submission bound, lies on the pages it would add",
+    # The same stop with the event ring in the dump (test_the_event_ring_*).
+    "raw_ev_miss": "which this submission bound, lies on the pages it would add",
+    "raw_ev_survives_hits": "which this submission bound, lies on the pages it would add",
+    "raw_ev_lost": "which this submission bound, lies on the pages it would add",
+    "raw_ev_origin": "which this submission bound, lies on the pages it would add",
 }
+
+# The dry growth's refusals, in the order of BackingStats raw_dry_g, as the exit line names them; the case that has each.
+DRY_REFUSALS = ["rule_kind", "G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G8", "G9", "cap"]
+DRY_CASES = {"raw_dry_grow": None, "raw_dry_g4": "G4", "raw_dry_cap": "cap", "raw_dry_kind": "rule_kind"}
+EXIT_LINE = "[rt] gfx: vulkan: backing map: dry growth at exit: "
 
 # The dump's lines, as the log writes them: one prefix, the text after it.
 DUMP = "[rt] gfx: vulkan: backing map: straddle dump: "
@@ -95,6 +106,25 @@ def printed(stdout: str, case: str) -> dict[str, int]:
 
 def hx(n: int) -> str:
     return f"{n:#x}"
+
+
+EVENT = re.compile(r"event (\d+): submission (\d+) (\w+) (\w+) \[bind (\d+)\]: (.*)$")
+
+
+def events(lines: list[str]) -> list[dict]:
+    """The dump's events in the order printed: seq, value, phase, what, bind (the number of the bind it was made for), the
+    text, and the lines that follow it for the same seq (the backings it recorded)."""
+    found: list[dict] = []
+    for line in lines:
+        m = EVENT.match(line)
+        if m:
+            found.append({"seq": int(m[1]), "value": int(m[2]), "phase": m[3], "what": m[4], "bind": int(m[5]),
+                          "text": m[6], "sub": []})
+            continue
+        m = re.match(r"event (\d+): (.*)$", line)
+        if m and found and found[-1]["seq"] == int(m[1]):
+            found[-1]["sub"].append(m[2])
+    return found
 
 
 class WriteWatchOwnerTest(unittest.TestCase):
@@ -261,6 +291,122 @@ class CoherenceTest(unittest.TestCase):
                 head = next(i for i, line in enumerate(lines) if line.startswith("the last "))
                 self.assertEqual(lines[head], f"the last 1 binds of the raw-access submission before it ({v1})")
                 self.assertIn(f"submission {v1} after_begin hit import addr {hx(P)} size 0x20000 ", lines[head + 1])
+
+    def test_the_event_ring_holds_the_bind_that_cut_the_mirror_and_its_verdict(self) -> None:
+        """B0 is a miss, not a hit: its event, the dry verdict right after it, the cut and what it made are all in the dump,
+        tied by the number of the bind, with the backings the growth would have replaced as they were before the cut."""
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, lines = self.stop_with_dump(level, "raw_ev_miss")
+                k = printed(done.stdout, "raw_ev_miss")
+                p, v0, v = k["p"], k["v0"], k["v"]
+                evs = [e for e in events(lines) if e["value"] == v]
+                self.assertEqual([e["what"] for e in evs], ["begin", "fill", "miss", "verdict", "cut", "made", "miss"])
+                miss, verdict, cut, made = evs[2:6]
+                self.assertEqual({miss["bind"], verdict["bind"], cut["bind"], made["bind"]}, {miss["bind"]})
+                self.assertGreater(miss["bind"], 0)
+                self.assertEqual(evs[6]["bind"], miss["bind"] + 1)
+                self.assertEqual(miss["phase"], "after_begin")
+                self.assertEqual(miss["text"], f"addr {hx(k['b0_addr'])} size 0x1000 pages [{hx(p - 0x1000)}, "
+                                               f"{hx(p + 0x1000)}) committed run [{hx(p - 0x20000)}, {hx(p + 0x40000)}) "
+                                               f"rule says mirror")
+                self.assertIn(f"the mirror [{hx(p)}, {hx(p + 0x40000)}) would grow to [{hx(p - 0x1000)}, "
+                              f"{hx(p + 0x40000)}), adding 0x1000 bytes (head 0x1000, ", verdict["text"])
+                self.assertIn("rule says mirror;", verdict["text"])
+                self.assertIn("G8 not evaluated; the evaluation left the map unchanged; refuses: nothing (it would grow)",
+                              verdict["text"])
+                self.assertEqual(len(verdict["sub"]), 2, verdict["sub"])
+                self.assertTrue(verdict["sub"][0].startswith(
+                    f"the mirror it would grow mirror [{hx(p)}, {hx(p + 0x40000)}) used_by {v0} (before submission {v})"),
+                    verdict["sub"][0])
+                self.assertIn(f"born0 bind for {v0} was [{hx(p)}, {hx(p + 0x40000)})", verdict["sub"][0])
+                self.assertTrue(verdict["sub"][1].startswith(
+                    f"would be replaced import [{hx(p - 0x20000)}, {hx(p)}) used_by 0 (before submission {v}) hull empty "
+                    f"res_n 0 "), verdict["sub"][1])
+                self.assertIn(f"born0 fill_pool for {v} was [{hx(p - 0x20000)}, {hx(p)})", verdict["sub"][1])
+                self.assertEqual(cut["text"], f"mirror [{hx(p)}, {hx(p + 0x40000)}) kept its end (the bind took its start): "
+                                              f"now [{hx(p + 0x1000)}, {hx(p + 0x40000)})")
+                self.assertIn(f"born0 bind for {v0} ", cut["sub"][0])
+                self.assertEqual(made["text"], f"import [{hx(p - 0x20000)}, {hx(p + 0x1000)}), replacing 1 recorded and "
+                                               f"0 more backings")
+                self.assertTrue(made["sub"][0].startswith(f"replaced import [{hx(p - 0x20000)}, {hx(p)}) used_by 0 "),
+                                made["sub"][0])
+                # the import it made is the one the dump lists, and the event is as old as the miss, not the stop
+                self.assertIn(f"born bind for {v} ", self.backing_line(lines, "import", p - 0x20000, p + 0x1000))
+                self.assertIn(f"event ring overwritten: none of the events of these two submissions (submission {v}: 0 of "
+                              f"7)", lines[-2])
+                self.assertEqual(done.stderr.count(EXIT_LINE), 0)
+
+    def test_the_event_ring_keeps_the_miss_when_a_thousand_hits_follow_it(self) -> None:
+        """The ring of binds takes every hit and loses B0; the event ring takes none and keeps it."""
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, lines = self.stop_with_dump(level, "raw_ev_survives_hits")
+                k = printed(done.stdout, "raw_ev_survives_hits")
+                p, v = k["p"], k["v"]
+                b0 = f"addr {hx(k['b0_addr'])} size 0x1000 "
+                ring = [line for line in lines if line.startswith("ring ")]
+                self.assertEqual(len(ring), 512, len(ring))
+                self.assertFalse([line for line in ring if "miss none " + b0 in line], "B0 should have left the bind ring")
+                evs = [e for e in events(lines) if e["value"] == v]
+                self.assertEqual([e["what"] for e in evs], ["begin", "fill", "miss", "verdict", "cut", "made", "miss"])
+                self.assertIn(b0, evs[2]["text"])
+                self.assertIn("refuses: nothing (it would grow)", evs[3]["text"])
+                self.assertIn(f"now [{hx(p + 0x1000)}, {hx(p + 0x40000)})", evs[4]["text"])
+
+    def test_the_event_ring_says_how_many_events_it_already_lost(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, lines = self.stop_with_dump(level, "raw_ev_lost")
+                k = printed(done.stdout, "raw_ev_lost")
+                v = k["v"]
+                evs = [e for e in events(lines) if e["value"] == v]
+                m = re.fullmatch(rf"event ring overwritten: (\d+) events of these two submissions \(submission {v}: "
+                                 rf"(\d+) of (\d+)\)", lines[-2])
+                self.assertTrue(m, lines[-2])
+                lost, lost_v, total = int(m[1]), int(m[2]), int(m[3])
+                self.assertEqual(lost, lost_v)
+                self.assertGreater(lost, 0)
+                self.assertEqual(len(evs), 256)   # the ring is full of this submission's events
+                self.assertEqual(lost + len(evs), total)
+                self.assertNotEqual(evs[0]["what"], "begin")   # the oldest ones are the lost ones
+                self.assertEqual(evs[-1]["what"], "miss")
+                self.assertIn(f"of {total + 2} events", next(line for line in lines if line.startswith("events of ")))
+
+    def test_the_event_ring_keeps_the_origin_of_a_cut_mirror(self) -> None:
+        """A mirror a promotion made, then cut: the dump says both. The events of the raw submission before come first."""
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done, lines = self.stop_with_dump(level, "raw_ev_origin")
+                k = printed(done.stdout, "raw_ev_origin")
+                P, v1, v = k["P"], k["v1"], k["v"]
+                evs = events(lines)
+                self.assertEqual([(e["value"], e["what"]) for e in evs],
+                                 [(v1, "begin"), (v1, "fill"), (v, "begin"), (v, "fill"), (v, "promote"), (v, "miss"),
+                                  (v, "verdict"), (v, "cut"), (v, "made"), (v, "miss")])
+                self.assertIn(f"import [{hx(P)}, {hx(P + 0x20000)}) made a mirror", evs[4]["text"])
+                cut = evs[7]
+                self.assertIn(f"now [{hx(P + 0x1000)}, {hx(P + 0x20000)})", cut["text"])
+                self.assertIn(f"born promote for {v} born0 promote for {v} was [{hx(P)}, {hx(P + 0x20000)})", cut["sub"][0])
+                mirror = self.backing_line(lines, "mirror", P + 0x1000, P + 0x20000)
+                self.assertIn(f"born beside_end for {v} was [{hx(P)}, {hx(P + 0x20000)}) born0 promote for {v} was "
+                              f"[{hx(P)}, {hx(P + 0x20000)})", mirror)
+                self.assertIn(f"(submission {v1}: 0 of 2; submission {v}: 0 of 8)", lines[-2])
+
+    def test_a_run_that_does_not_stop_prints_the_dry_counters_once_at_exit(self) -> None:
+        for case, refusal in DRY_CASES.items():
+            for level in LEVELS:
+                with self.subTest(case=case, level=level):
+                    done = self.run_case(level, case)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    found = [line for line in done.stderr.splitlines() if line.startswith(EXIT_LINE)]
+                    self.assertEqual(len(found), 1, done.stderr)
+                    refused = 0 if refusal is None else 1
+                    want = ", ".join(f"{name} {int(name == refusal)}" for name in DRY_REFUSALS)
+                    self.assertEqual(found[0][len(EXIT_LINE):],
+                                     f"1 raw-access submissions, 1 binds cut a mirror the submission had not resolved "
+                                     f"there, {1 - refused} would have grown it, {refused} refused (refusals: {want}), "
+                                     f"the evaluation changed the map 0 times")
 
 
 if __name__ == "__main__":
