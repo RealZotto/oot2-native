@@ -254,7 +254,8 @@ void vkb_open(void) {
                               .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxAnisotropy = 1.0f, .maxLod = 0.25f};
     GPU_VK_OK(vkCreateSampler(gpu_vk.device, &sc, NULL, &g.sampler), "vkCreateSampler (the placeholder)");
     uint32_t limit = gpu_vk.facts.props.limits.maxSamplerAllocationCount;
-    BindlessConfig cfg = {.images = VKP_GLOBAL_IMAGES, .samplers = VKP_GLOBAL_SAMPLERS, .second = VKB_SECOND_SLOTS,
+    // images - second is the game's pool: VKP_POOL_IMAGES IDs at their own indices, the second views after them
+    BindlessConfig cfg = {.images = VKP_GLOBAL_IMAGES, .samplers = VKP_GLOBAL_SAMPLERS, .second = VKP_SECOND_IMAGES,
                           .max_copies = VKB_MAX_COPIES, .max_samplers = limit > 160 ? limit - 128 : 32};
     g.open = 1;
     plat_mutex_unlock(&g_mu);

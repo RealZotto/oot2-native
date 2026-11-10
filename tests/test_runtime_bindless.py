@@ -13,7 +13,8 @@ Two groups, by what they need:
   changes one entry, the same registration again none, an ID registered again under a pending submission takes another
   copy and leaves the pending one as it was, a released serial clears no entry, 4,096 sampler registrations with 300
   distinct states hold 300 host samplers, second views, two pools, a copy far behind the log, retirement, a pool remade at the
-  same address getting views of its own; and what an image of
+  same address getting views of its own; all 33,025 IDs of the game's pool (0 to 33,024) accepted by the table at the size
+  the layout gives it, with the second views in the slots past them and the ID past the pool a named fatal; and what an image of
   ASTC decoded to RGBA8 may do (it never stands in its pool's extent, and a storage view or a texel copy of one is refused
   by name), over every ASTC format.
 - On a device with every item of oot2/vk_required.h (the desktop; the device is the RTX 3060 Ti): images stand at their
@@ -373,6 +374,47 @@ class TablesTest(unittest.TestCase):
         lines = fatal_lines(done.stderr)
         self.assertEqual(len(lines), 1, done.stderr)
         self.assertIn("bindless tables: a texture registered at ID 1008 of pool 0x100000", lines[0])
+
+
+class GameIdsTest(unittest.TestCase):
+    """The tables at the size the layout gives them (VKP_GLOBAL_IMAGES slots, the last VKP_SECOND_IMAGES of them for second
+    views). The game's texture pool has 33,025 IDs, 0 to 33,024, and each needs a slot of its own: a table the size of the pool
+    that takes its second views from its own end refused the IDs 32,513 to 33,024. The numbers here are the game's, not the
+    headers', so a header that makes the table too small fails these tests. Each ID is run in a process of its own: a refusal
+    is a named fatal that ends the process, so one process for all of them would hide which were refused."""
+
+    GAME_IDS = 33025
+
+    def test_the_games_last_ids_are_accepted(self) -> None:
+        for id_ in (32512, 32513, self.GAME_IDS - 1):
+            with self.subTest(id=id_):
+                done = run("game_ids", str(id_))
+                self.assertEqual(fatal_lines(done.stderr), [])
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn(f"ID {id_} registered: the copy shows its texture at index {id_}", done.stdout)
+
+    def test_the_id_past_the_pool_is_a_named_fatal(self) -> None:
+        done = run("game_ids", str(self.GAME_IDS))
+        self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+        self.assertNotIn("registered:", done.stdout)
+        lines = fatal_lines(done.stderr)
+        self.assertEqual(len(lines), 1, done.stderr)
+        self.assertIn(f"bindless tables: a texture registered at ID {self.GAME_IDS} of pool 0x100000", lines[0])
+
+    def test_every_id_of_the_pool_and_the_second_views_past_it(self) -> None:
+        done = run("game_range")
+        self.assertEqual(fatal_lines(done.stderr), [])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(f"a texture registered at each of the {self.GAME_IDS} IDs of the game's pool, 0 to {self.GAME_IDS - 1}: "
+                      "the copy shows each at its own index", done.stdout)
+        m = re.search(rf"the last (\d+) IDs read as a 2D array took (\d+) second slots, one each, from {self.GAME_IDS} to (\d+): "
+                      "past the pool, and every game ID still shows its own 2D view", done.stdout)
+        self.assertIsNotNone(m, done.stdout)
+        second = int(m.group(1))
+        self.assertGreater(second, 0)
+        self.assertEqual((int(m.group(2)), int(m.group(3))), (second, self.GAME_IDS + second - 1))
+        self.assertRegex(done.stdout, r"close freed \d+ views")
+        self.assertIn("ok game_range", done.stdout)
 
 
 def require_gpu() -> bool:

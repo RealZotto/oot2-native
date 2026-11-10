@@ -109,7 +109,11 @@ internal sealed class JobOptions
 /// </summary>
 internal sealed class Job
 {
-    public const int DefaultHeapImages = 33025;
+    // The length of binding 0 of set 0, which every module declares for the game's texture pool: the pool's 33,025 IDs and then
+    // 512 slots for the second views the runtime makes (runtime/include/oot2/vk_pipeline.h VKP_GLOBAL_IMAGES, which
+    // tests/test_runtime_vk_pipeline.py keeps equal to this number). It is part of the executable, so changing it changes
+    // the translator's identity and with it the keys of the translate, ledger and pipelines steps of prepare
+    public const int DefaultHeapImages = 33537;
     public const int DefaultHeapSamplers = 4096;
     private const int MaxSharedBytes = 1 << 20;
 

@@ -19,6 +19,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -434,6 +435,19 @@ class StepKeyTest(unittest.TestCase):
             os.environ["OOT2_VK_HMMA"] = "helper"
             self.assertNotEqual(base, self.key(host(device())))         # a cache in the helper's form is another cache
         self.assertTrue({"vk_hmma.c", "vk_hmma.h", "hmma_probe.comp"} <= {p.name for p in pipelines.key_files()})
+
+    def test_the_headers_that_set_the_images_of_set_zero_are_in_the_key(self) -> None:
+        # Binding 0 of set 0 holds the game's texture pool and the slots for second views: its length is the descriptor count
+        # every pipeline layout is created with and the array length the translator declares, so a pipeline cache built for
+        # another length is of no use to the layout. The header that defines each of those numbers is one the step's key reads: a
+        # number moved to a header it does not read would leave an old prepared folder looking current.
+        include = pipelines.RUNTIME / "include" / "oot2"
+        names = {p.name for p in pipelines.key_files()}
+        for macro in ("VKP_POOL_IMAGES", "VKP_SECOND_IMAGES", "VKP_GLOBAL_IMAGES"):
+            definers = {p.name for p in include.glob("*.h")
+                        if re.search(rf"^#define {macro}\b", p.read_text(encoding="utf-8"), re.M)}
+            self.assertEqual(len(definers), 1, f"{macro} is defined in {sorted(definers)}")
+            self.assertTrue(definers <= names, f"{macro} is defined in {sorted(definers)}, which the step's key does not read")
 
 
 class ProgressFileTest(unittest.TestCase):

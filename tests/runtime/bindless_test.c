@@ -22,6 +22,11 @@
 //                    same description (also their second view types) get views of their own, not the finalized pool's views a copy
 //                    still shows; the views over other storage stay shared; the old views go once no copy shows them
 //   id_fatal         a texture registered past the game's part of the array is a named fatal (exit 70)
+//   game_ids <id>... the tables at the size the layout gives them (VKP_GLOBAL_IMAGES slots, VKP_SECOND_IMAGES of them second):
+//                    a texture registered at each ID given is accepted and shown at that index; an ID past the game's pool of
+//                    33,025 is the named fatal of id_fatal
+//   game_range       a texture at every one of the pool's 33,025 IDs, then a second view of the last 512: the second views take
+//                    the slots past the pool, one each, and no game ID loses its own view
 // On a device with every item of oot2/vk_required.h (the driver skips them without one):
 //   device           ...
 // Every case prints what it checked; a failed check prints its line and exits 1.
@@ -156,11 +161,12 @@ static void case_decoded(void) {
 #define FAKE_COPIES 4
 
 typedef struct FakeSet {
-    void *img[FAKE_IMAGES], *smp[FAKE_SAMPLERS];
+    void **img, **smp;   // what the copy shows at each slot of binding 0 and of binding 1
     int live;
 } FakeSet;
 
 static struct {
+    uint32_t images;   // the slots of binding 0 the open table has
     uint64_t done;
     int views_made, views_freed, samplers_made, samplers_freed, sets_made, sets_freed, writes, releases;
     int last_type;
@@ -213,6 +219,9 @@ static void fk_sampler_free(void *s) {
 }
 static void *fk_set_make(void) {
     FakeSet *s = calloc(1, sizeof *s);
+    s->img = calloc(fk.images, sizeof *s->img);
+    s->smp = calloc(FAKE_SAMPLERS, sizeof *s->smp);
+    CHECK(s->img && s->smp);
     s->live = 1;
     fk.sets[fk.sets_made++] = s;
     return s;
@@ -224,7 +233,7 @@ static void fk_set_free(void *set) {
 static void fk_write(void *set, const BindlessWrite *w, int n) {
     FakeSet *s = set;
     for (int i = 0; i < n; i++) {
-        CHECK(w[i].index < (w[i].kind == BW_IMAGE ? FAKE_IMAGES : FAKE_SAMPLERS));
+        CHECK(w[i].index < (w[i].kind == BW_IMAGE ? fk.images : FAKE_SAMPLERS));
         (w[i].kind == BW_IMAGE ? s->img : s->smp)[w[i].index] = w[i].object;
     }
     fk.writes += n;
@@ -244,12 +253,15 @@ static const BindlessOps k_fake_ops = {.view_make = fk_view_make, .view_free = f
                                        .view_use = fk_view_use};
 static const BindlessClock k_fake_clock = {fk_done, fk_wait};
 
-static void fake_open(void) {
+static void fake_open_with(uint32_t images, uint32_t second) {
     memset(&fk, 0, sizeof fk);
-    BindlessConfig cfg = {.images = FAKE_IMAGES, .samplers = FAKE_SAMPLERS, .second = FAKE_SECOND, .max_copies = FAKE_COPIES,
+    fk.images = images;
+    BindlessConfig cfg = {.images = images, .samplers = FAKE_SAMPLERS, .second = second, .max_copies = FAKE_COPIES,
                           .max_samplers = 400};
     bindless_open(&k_fake_ops, &cfg, &k_fake_clock);
 }
+
+static void fake_open(void) { fake_open_with(FAKE_IMAGES, FAKE_SECOND); }
 
 static tex_t tex_at(uint64_t storage, int target, int format, uint32_t w, uint32_t h, uint32_t d, uint32_t levels) {
     tex_t t;
@@ -555,6 +567,75 @@ static void case_id_fatal(void) {
     tex_t t = tex_at(0x1000000, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
     bindless_texture_register(&pool, FAKE_IMAGES - FAKE_SECOND, &t, NULL);
     printf("not reached\n");
+}
+
+// ---------- the tables at the layout's own size
+
+// The game's texture pool has 33,025 descriptors, the IDs 0 to 33,024. That is the game's number and not one of the back end's,
+// so it stays a literal here: what these cases find is a layout whose table is too small to give every one of those IDs its
+// own slot (the second views once took the last 512 of the pool's own).
+#define GAME_IDS 33025u
+
+// The storage a texture registered at `id` stands on: one for each ID, so that every entry has a view of its own.
+static uint64_t game_storage(uint32_t id) { return 0x10000000ull + (uint64_t)id * 0x10000ull; }
+
+// The tables as the device opens them (vk_bindless.c, vkb_open): the layout's count of image slots, the last
+// VKP_SECOND_IMAGES of them for second views.
+static void layout_open(void) { fake_open_with(VKP_GLOBAL_IMAGES, VKP_SECOND_IMAGES); }
+
+// game_ids <id>...: a texture registered at each of the IDs given is accepted, and a copy shows it at that index. An ID the
+// table refuses is a named fatal (exit 70) that ends the process, so each ID the test cares about is run by itself.
+static void case_game_ids(int argc, char **argv) {
+    const dpool_ref pool = {0x100000, GAME_IDS, 0}, spool_ref = {0x200000, FAKE_SAMPLERS, 0};
+    layout_open();
+    for (int i = 2; i < argc; i++) {
+        uint32_t id = (uint32_t)strtoul(argv[i], NULL, 10);
+        tex_t t = tex_at(game_storage(id), NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+        bindless_texture_register(&pool, (int)id, &t, NULL);
+        fk.done = g_val;
+        void *set = acq(&pool, &spool_ref);
+        CHECK(shows(set, id) == game_storage(id));
+        printf("ID %u registered: the copy shows its texture at index %u\n", id, id);
+    }
+    bindless_close();
+}
+
+// Every ID of the game's pool registered at once, then a second view of each of the last VKP_SECOND_IMAGES IDs (the ones the
+// second views and the game's IDs once shared): the second views take slots past the pool, one each, and the game's own
+// entries are as they were.
+static void case_game_range(void) {
+    const dpool_ref pool = {0x100000, GAME_IDS, 0}, spool_ref = {0x200000, FAKE_SAMPLERS, 0};
+    layout_open();
+    for (uint32_t id = 0; id < GAME_IDS; id++) {
+        tex_t t = tex_at(game_storage(id), NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+        bindless_texture_register(&pool, (int)id, &t, NULL);
+    }
+    BindlessStats st;
+    bindless_stats(&st);
+    CHECK(st.registrations == GAME_IDS && st.unchanged == 0 && st.views_live == GAME_IDS);
+    void *set = acq(&pool, &spool_ref);
+    for (uint32_t id = 0; id < GAME_IDS; id++) CHECK(shows(set, id) == game_storage(id));
+    printf("a texture registered at each of the %u IDs of the game's pool, 0 to %u: the copy shows each at its own index\n",
+           GAME_IDS, GAME_IDS - 1);
+
+    uint8_t *taken = calloc(VKP_GLOBAL_IMAGES, 1);
+    CHECK(taken);
+    for (uint32_t id = GAME_IDS - VKP_SECOND_IMAGES; id < GAME_IDS; id++) {
+        uint32_t slot = bindless_image_slot(id, BV_2D_ARRAY);
+        CHECK(slot >= GAME_IDS && slot < VKP_GLOBAL_IMAGES && !taken[slot]);
+        taken[slot] = 1;
+        CHECK(shows(set, slot) == game_storage(id) && ((uint64_t *)((FakeSet *)set)->img[slot])[1] == BV_2D_ARRAY);
+    }
+    free(taken);
+    bindless_stats(&st);
+    CHECK(st.second_live == VKP_SECOND_IMAGES);
+    for (uint32_t id = 0; id < GAME_IDS; id++)
+        CHECK(shows(set, id) == game_storage(id) && ((uint64_t *)((FakeSet *)set)->img[id])[1] == BV_2D);
+    printf("the last %u IDs read as a 2D array took %u second slots, one each, from %u to %u: past the pool, and every game ID "
+           "still shows its own 2D view\n", VKP_SECOND_IMAGES, VKP_SECOND_IMAGES, GAME_IDS, VKP_GLOBAL_IMAGES - 1);
+    bindless_close();
+    CHECK(fk.views_made == fk.views_freed);
+    printf("close freed %d views\n", fk.views_freed);
 }
 
 // ---------- on a device
@@ -885,6 +966,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "demand")) case_demand(), printf("ok demand\n");
     else if (!strcmp(cs, "remade")) case_remade();
     else if (!strcmp(cs, "id_fatal")) case_id_fatal();
+    else if (!strcmp(cs, "game_ids")) case_game_ids(argc, argv);
+    else if (!strcmp(cs, "game_range")) case_game_range();
     else if (!strcmp(cs, "usable")) case_usable();
     else if (!strcmp(cs, "device")) {
         if (volkInitialize() != VK_SUCCESS) {

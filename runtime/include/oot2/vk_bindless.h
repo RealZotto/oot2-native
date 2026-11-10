@@ -17,7 +17,8 @@
 
 #include "oot2/bindless.h"
 
-#define VKB_SECOND_SLOTS 512u   // the last slots of binding 0, for second views (oot2/bindless.h)
+// Binding 0 of a copy is the game's texture pool at its own indices (VKP_POOL_IMAGES of them), then VKP_SECOND_IMAGES slots for
+// second views (oot2/vk_pipeline.h, oot2/bindless.h): a game ID is never taken by a second view.
 #define VKB_MAX_COPIES 16u      // copies of set 0: submissions with a different table in flight at once
 
 void vkb_open(void);    // after the backing map; gpu_vk_open calls it

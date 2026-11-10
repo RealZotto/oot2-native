@@ -229,7 +229,7 @@ class UniPlacesTest(Harness):
         struct.pack_into("<I", header, 0, (1 << 10) | 3)
         code_file.write_bytes(bytes(header) + b"".join(code) + EXIT)
         res = self.translate({"key": "pool", "stage": "vs", "arch": "sm86", "code": str(code_file), "c1": ""})
-        self.assertEqual([(t["via"], t["array_length"]) for t in res["textures"]], [("pool", 33025), ("pool", 4096)])
+        self.assertEqual([(t["via"], t["array_length"]) for t in res["textures"]], [("pool", 33537), ("pool", 4096)])
         declared = declared_capabilities((self.out / "pool.spv").read_bytes())
         self.assertIn(CAP_SAMPLED_IMAGE_ARRAY_NON_UNIFORM, declared)
         self.assertNotIn(CAP_STORAGE_IMAGE_ARRAY_NON_UNIFORM, declared)

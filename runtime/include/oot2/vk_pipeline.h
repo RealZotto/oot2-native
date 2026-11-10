@@ -22,8 +22,9 @@
 //
 // Layout of the one pipeline layout (the pipeline cost and stage bindings studies; xlate/host/UniLayout.cs is the source
 // the tables here are tested against):
-//   set 0  the global arrays, update-after-bind and partially bound: binding 0 the 33,025 sampled images, binding 1 the
-//          4,096 samplers; the same set layout for graphics and compute (the bindless ticket fills it)
+//   set 0  the global arrays, update-after-bind and partially bound: binding 0 the 33,537 sampled images (the game's
+//          33,025 texture IDs at their own indices, then 512 slots for second views), binding 1 the 4,096 samplers; the
+//          same set layout for graphics and compute (the bindless ticket fills it)
 //   set 1  push descriptors, 32 at most: binding 0 the support buffer; graphics: vertex and mesh uniform 1 to 8 and
 //          storage 9 to 13, pixel uniform 14 to 24, storage 25 to 29, storage images 30 and 31; compute: uniform 1 to 8,
 //          storage 9 to 24, storage images 25 to 31
@@ -44,7 +45,15 @@
 #include "oot2/vk_required.h"
 
 // ---- the layout's tables (no device needed)
-#define VKP_GLOBAL_IMAGES 33025u
+// Binding 0 holds the game's texture pool, whose IDs are the array indices (a shader reads the ID it was handed), and
+// after it the slots the bindless tables give to second views (oot2/bindless.h): an image read as a type other than its
+// own takes one. The sum is the descriptor count of binding 0 and the array length the translator declares
+// (xlate/host/Job.cs DefaultHeapImages, which tests/test_runtime_vk_pipeline.py keeps equal to it). A change to it changes
+// this header, which the pipelines step of prepare reads for its key, and the translator's executable, whose hash is the
+// key of the translate and ledger steps: an old prepared folder is built again, not mixed with the new layout.
+#define VKP_POOL_IMAGES 33025u      // the game's texture pool: IDs 0 to 33,024
+#define VKP_SECOND_IMAGES 512u      // the slots of second views, the last of binding 0
+#define VKP_GLOBAL_IMAGES (VKP_POOL_IMAGES + VKP_SECOND_IMAGES)
 #define VKP_GLOBAL_SAMPLERS 4096u
 #define VKP_PUSH_BYTES 128u
 #define VKP_SET1_MAX 32u

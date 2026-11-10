@@ -30,8 +30,10 @@
 //   at its ID. A program declares one variable per image type at binding 0 (the translator defects study) and a descriptor must
 //   have the view type of the variable that reads it, so a read as another type (a 2D array read of a 2D texture) takes a
 //   second slot, one of the last `second` slots of the array, which holds a view of that type over the same image
-//   (bindless_image_slot). The slot is allocated at the first such read, lives until the entry changes, and appears in
-//   every copy through the log like any other entry. A handle a shader reads from memory has no second view.
+//   (bindless_image_slot). The slots are past every ID of the game's pool (the array is the pool's IDs and then the second
+//   slots), so a second view never takes an ID the game can register. The slot is allocated at the first such read,
+//   lives until the entry changes, and appears in every copy through the log like any other entry. A handle a shader
+//   reads from memory has no second view.
 //
 //   Samplers. A host sampler is shared by its state (the samp_par bytes): the sampler pool's 4,096 IDs against the
 //   device's 4,000 sampler allocations (D13). A state no entry and no copy holds any more is freed.
@@ -98,9 +100,10 @@ typedef struct BindlessOps {
 } BindlessOps;
 
 typedef struct BindlessConfig {
-    uint32_t images;        // slots of binding 0 (VKP_GLOBAL_IMAGES)
+    uint32_t images;        // slots of binding 0 (VKP_GLOBAL_IMAGES): the game's pool and then the second views
     uint32_t samplers;      // slots of binding 1 (VKP_GLOBAL_SAMPLERS)
-    uint32_t second;        // the last `second` image slots are for second views: IDs below images - second are the game's
+    uint32_t second;        // the last `second` image slots are for second views (VKP_SECOND_IMAGES): IDs below
+                            // images - second are the game's, so the pool's own size (VKP_POOL_IMAGES) is images - second
     uint32_t max_copies;    // copies of the arrays at most
     uint32_t max_samplers;  // host samplers live at most (the device's allocation limit less what the rest of the back end holds)
 } BindlessConfig;

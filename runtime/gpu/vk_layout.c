@@ -14,6 +14,10 @@
 #define PRE_RASTER_STAGES (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_MESH_BIT_EXT)
 #define ALL_STAGES (GFX_STAGES | VK_SHADER_STAGE_COMPUTE_BIT)
 
+// A device is required to give a set 1,048,576 update-after-bind sampled images (oot2/vk_required.h, the item
+// update_after_bind_images), which is all that is checked of binding 0's size: it must stay inside that number.
+_Static_assert(VKP_GLOBAL_IMAGES <= (1u << 20), "binding 0 is larger than the update_after_bind_images item of oot2/vk_required.h asks of a device");
+
 uint32_t vkp_set0_bindings(VkDescriptorSetLayoutBinding out[2], VkDescriptorBindingFlags flags[2]) {
     out[0] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VKP_GLOBAL_IMAGES, ALL_STAGES, NULL};
     out[1] = (VkDescriptorSetLayoutBinding){1, VK_DESCRIPTOR_TYPE_SAMPLER, VKP_GLOBAL_SAMPLERS, ALL_STAGES, NULL};
