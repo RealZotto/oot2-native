@@ -52,6 +52,7 @@ SCRATCH = "temp"                                       # tools/prepare/check.py 
 STEP_LABELS = {
     "check": "Check this PC and the dump",
     "extract": "Extract the game from the dump",
+    "font": "Place the font for the game's text",
     "translate": "Translate the shaders",
     "ledger": "Translate the shader variants the game recorded",
     "pipelines": "Build the GPU pipelines",

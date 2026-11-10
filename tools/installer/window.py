@@ -254,7 +254,7 @@ class App:
         f.rowconfigure(1, weight=3)
         f.rowconfigure(5, weight=2)
         self.heading(f, "Steps", 0, pad=18)
-        self.steps = self.text_box(f, 10)
+        self.steps = self.text_box(f, len(logic.STEP_ORDER) + 1)   # every step, and the running one's detail line
         self.steps.grid(row=1, column=0, sticky="nsew", padx=20)
         self.bar_label = tk.Label(f, font=self.f_small, fg=MUTED, bg=PANEL, anchor="w")
         self.bar_label.grid(row=2, column=0, sticky="we", padx=20, pady=(8, 2))
@@ -266,7 +266,7 @@ class App:
         pc.grid(row=5, column=0, sticky="nsew", padx=(20, 8), pady=(0, 16))
         pc.columnconfigure(0, weight=1)
         pc.rowconfigure(0, weight=1)
-        self.checks = self.text_box(pc, 7)
+        self.checks = self.text_box(pc, 6)
         scroll = tk.Scrollbar(pc, command=self.checks.yview, bg=PANEL, troughcolor=PANEL, relief="flat", width=10)
         self.checks.configure(yscrollcommand=scroll.set)
         self.checks.grid(row=0, column=0, sticky="nsew")
@@ -522,8 +522,8 @@ class App:
 SAMPLE_DEST = r"D:\Games\oot2"
 SAMPLE_DUMP = r"D:\Dumps\my-dump.nup"
 SAMPLE_CHECK = [
-    f"[    0.0 s] oot2 prepare: first run in {SAMPLE_DEST}; steps: check, extract, translate, ledger, pipelines, "
-    "modules, lift, compile, link",
+    f"[    0.0 s] oot2 prepare: first run in {SAMPLE_DEST}; steps: check, extract, font, translate, ledger, "
+    "pipelines, modules, lift, compile, link",
     "[    0.0 s] check: started (runs every time)",
     f"[    0.0 s] check: disk of {SAMPLE_DEST}: 412.6 GiB free, 38.0 GiB needed",
     "[    1.9 s] check: CPU AMD Ryzen 5 5600X 6-Core Processor: x86-64-v3",
@@ -535,15 +535,17 @@ SAMPLE_CHECK = [
     "[    2.4 s] check: NVIDIA GeForce RTX 3060 Ti: has 32 of the 32 features the renderer will rely on",
     "[   95.0 s] check: dump my-dump.nup: 25,104,384,000 bytes, SHA-256 as recorded",
     "[   95.0 s] check: done in 95.0 s",
-] + [f"[   95.0 s] {s}: would run (not done yet)" for s in ("extract", "translate", "ledger", "pipelines", "modules",
-                                                           "lift", "compile", "link")] + [
+] + [f"[   95.0 s] {s}: would run (not done yet)" for s in ("extract", "font", "translate", "ledger", "pipelines",
+                                                           "modules", "lift", "compile", "link")] + [
     "[   95.0 s] oot2 prepare: ok"]
 SAMPLE_RUN = SAMPLE_CHECK[:10] + [
     "[   95.0 s] check: done in 95.0 s",
     "[   95.0 s] extract: started (not done yet)",
     "[  412.3 s] extract: done in 317.3 s",
-    "[  412.3 s] translate: started (not done yet)",
-    "[  930.1 s] translate: done in 517.8 s",
+    "[  412.3 s] font: started (not done yet)",
+    "[  414.0 s] font: done in 1.7 s",
+    "[  414.0 s] translate: started (not done yet)",
+    "[  930.1 s] translate: done in 516.1 s",
     "[  930.1 s] ledger: kept (done, inputs unchanged)",
     "[  930.1 s] pipelines: started (not done yet)",
     "[ 1504.6 s] pipelines: 41,200 of 118,000 (3.1 per second)",

@@ -9,13 +9,16 @@ compile. The ledger step reads what the game recorded on its last run and transl
 after the translate step and no later step reads its output. The pipelines step builds every pipeline library and compute
 pipeline of the shader cache with the player's GPU into the application pipeline cache; it reads only the translate
 step's pack and comes before the lift, so that a GPU that cannot build stops the run early and the long step is the one
-a stopped run resumes first.
+a stopped run resumes first. The font step places the font the runtime serves for the console's shared font calls; it
+reads no other step's output and comes right after the extraction, so that a machine that cannot fetch the font stops
+the run in minutes too.
 """
 
 from __future__ import annotations
 
 from .check import Check
 from .extract import Extract
+from .font import Font
 from .ledger import Ledger
 from .modules import Modules
 from .pipelines import Pipelines
@@ -25,4 +28,4 @@ from .translate import Translate
 
 
 def all_steps() -> list[Step]:
-    return [Check(), Extract(), Translate(), Ledger(), Pipelines(), Modules(), Lift(), Compile(), Link()]
+    return [Check(), Extract(), Font(), Translate(), Ledger(), Pipelines(), Modules(), Lift(), Compile(), Link()]

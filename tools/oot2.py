@@ -173,6 +173,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--imgui", type=Path,
                    help="Dear ImGui folder made by tools/fetch_imgui.py, for the menu (default: the OOT2_IMGUI "
                         "variable, else fetched/imgui, which prepare fetches itself when it is not there)")
+    p.add_argument("--shared-font", type=Path,
+                   help="a TrueType or OpenType font of your own for the game's text, placed as fonts/shared-font.ttf "
+                        "(default: BIZ UDPGothic, SIL Open Font License 1.1, from fetched/font or downloaded at its "
+                        "pinned commit)")
     p.add_argument("--runtime-lib", type=Path,
                    help="a runtime library built before (liboot2rt.a) to link instead of building one (default: the "
                         "OOT2_RUNTIME_LIB variable, else the release bundle's, else the runtime is built from runtime/)")

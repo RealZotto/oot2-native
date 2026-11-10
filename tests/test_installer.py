@@ -128,7 +128,7 @@ class PrepareLinesTest(TempCase):
         marks = dict((text, mark) for mark, text in m.checks)
         self.assertEqual(marks["memory: 15.9 GiB installed, 9.0 GiB free"], OK)
         self.assertEqual(marks["Test GPU lacks memory budget (architecture section 1; not required yet)"], WARN)
-        self.assertEqual(m.summary(), "The check passed. Prepare would run 8 of 9 steps.")
+        self.assertEqual(m.summary(), "The check passed. Prepare would run 9 of 10 steps.")
 
     def test_resume_keeps_the_finished_steps(self):
         self.world["stop"]["lift"] = "interrupt"

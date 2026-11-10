@@ -1221,7 +1221,7 @@ HOS_OVERRIDE("_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTaskD1Ev", ov_netc
 
 // ==== nn::pl shared fonts. The console's system fonts are never shipped and never read from a dump. The runtime serves
 // one open-licence TrueType or OpenType font that the player's game folder holds (fonts/shared-font.ttf, which oot2
-// prepare is to place there) or that OOT2_SHARED_FONT names, for every shared font type, as the console serves its
+// prepare places there, tools/prepare/font.py) or that OOT2_SHARED_FONT names, for every shared font type, as the console serves its
 // standard font when a language's own font is missing. The game hands the address and size it gets to a font loader
 // that recognises a plain sfnt (TrueType, OpenType or collection) by its first four bytes, so the file is served as it
 // is. The load state is Loaded though no file may be there: the game spins until it is, so a missing file stops by name at
@@ -1257,7 +1257,8 @@ static void font_load(Cpu *c, const char *fn, int32_t t) {
     FILE *f = fopen(path, "rb");
     if (!f)
         hos_gap(c, "pl", "nn::pl::%s(%d) from %s: no shared font file at %s. The console's fonts are not part of this "
-                "program: place an open-licence TrueType or OpenType font there, or name one with OOT2_SHARED_FONT",
+                "program: oot2 prepare places an open-licence font there (its font step); run it again, place a TrueType or "
+                "OpenType font there yourself, or name one with OOT2_SHARED_FONT",
                 fn, t, hos_caller(c, at, (int)sizeof at), path);
     uint8_t *data = NULL;
     size_t len = 0;
