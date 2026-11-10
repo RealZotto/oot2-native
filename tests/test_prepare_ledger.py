@@ -55,7 +55,7 @@ import test_shader_cache_pack as shct  # noqa: E402  (the C reader's build and i
 import test_xlate_host as xlatet  # noqa: E402  (EXE)
 from prepare import check, extract, ledger, translate  # noqa: E402
 from prepare import state as statefile  # noqa: E402
-from prepare.runner import Context, Reporter, run_steps  # noqa: E402
+from prepare.runner import Context, PrepareError, Reporter, run_steps  # noqa: E402
 
 EXIT = trt.EXIT
 
@@ -739,6 +739,183 @@ class RealTranslatorTest(LedgerBase):
         self.assertEqual(got[self.key].status, "ok", got[self.key])
         self.assertTrue(ledger.same_as_base(pack, self.key, got[self.key].module, got[self.key].description))
         self.assertEqual(got[self.key].module, self.base_module(self.key))
+
+
+# --- absorb: the ledgers of other runs merged into the prepared folder's ---------------------------------------------
+
+def write_ledger(path: Path, rows: list[dict], reorder: bool = False) -> Path:
+    """A ledger file in the writer's shape; reorder gives each row's keys in reverse order (the same row, other text)."""
+    lines = [json.dumps(ledger.HEADER, separators=(",", ":"))]
+    for r in rows:
+        r = dict(reversed(list(r.items()))) if reorder else r
+        lines.append(json.dumps(r, separators=(",", ":")))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+    return path
+
+
+class AbsorbTest(unittest.TestCase):
+    A = row(KEY["vs"], "vs", tex={"3": "3d"})
+    B = row(KEY["cs"], "cs", img={"1": IMG_3D})
+    C = row(KEY["vs"], "vs", tex={"4": "cube"})
+    D = row(KEY["ps"], "ps", tex={"0": "2darray"})
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="oot2-absorb-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.prepared = self.tmp / "game" / ledger.LEDGER_FILE
+
+    def run_file(self, name: str, rows: list[dict], **kw) -> Path:
+        return write_ledger(self.tmp / name / ledger.LEDGER_FILE, rows, **kw)
+
+    def lines(self) -> list[dict]:
+        return [json.loads(t) for t in self.prepared.read_text(encoding="utf-8").splitlines()[1:]]
+
+    def test_union_keeps_the_prepared_rows_first_then_each_run_in_order(self):
+        write_ledger(self.prepared, [self.B])
+        r1 = self.run_file("r1", [self.A, self.B])
+        r2 = self.run_file("r2", [self.D, self.A, self.C])
+        rep = ledger.absorb(self.prepared, [r1, r2])
+        self.assertEqual(self.lines(), [self.B, self.A, self.D, self.C])
+        self.assertEqual([(n, f) for _, n, f in rep.per_file], [(2, 1), (3, 2)])
+        self.assertEqual((rep.new_rows, rep.total_rows, rep.written), (3, 4, True))
+        self.assertEqual(rep.new_variants, 3)
+        read_ledger_rows, _ = ledger.read_ledger(self.prepared)
+        self.assertEqual(len(read_ledger_rows), 4)
+
+    def test_a_same_program_with_other_answers_is_a_row_but_a_new_attachment_is_not_a_new_variant(self):
+        other = dict(self.D, attach={"color": [38], "depth": None, "samples": 1})
+        write_ledger(self.prepared, [self.D])
+        rep = ledger.absorb(self.prepared, [self.run_file("r", [other])])
+        self.assertEqual((rep.new_rows, rep.new_variants), (1, 0))
+
+    def test_a_missing_prepared_ledger_is_created(self):
+        rep = ledger.absorb(self.prepared, [self.run_file("r", [self.A, self.C])])
+        self.assertEqual(self.lines(), [self.A, self.C])
+        self.assertEqual((rep.new_rows, rep.backup), (2, None))
+        self.assertFalse(self.prepared.with_name(self.prepared.name + ".bak").exists())
+
+    def test_a_row_with_the_keys_in_another_order_counts_once(self):
+        write_ledger(self.prepared, [self.A])
+        rep = ledger.absorb(self.prepared, [self.run_file("r", [self.A], reorder=True)])
+        self.assertEqual((rep.new_rows, rep.written), (0, False))
+        self.assertEqual(self.lines(), [self.A])
+        # and the same inside one run, and across two runs
+        rep = ledger.absorb(self.prepared, [self.run_file("r1", [self.C, self.C], reorder=True),
+                                            self.run_file("r2", [self.C])])
+        self.assertEqual([f for _, _, f in rep.per_file], [1, 0])
+
+    def test_the_prepared_ledger_among_the_inputs_and_repeated_inputs_are_harmless(self):
+        write_ledger(self.prepared, [self.A])
+        r = self.run_file("r", [self.B])
+        rep = ledger.absorb(self.prepared, [self.prepared, r, r])
+        self.assertEqual(self.lines(), [self.A, self.B])
+        self.assertEqual([f for _, _, f in rep.per_file], [0, 1, 0])
+
+    def test_a_bad_file_stops_everything_and_writes_nothing(self):
+        write_ledger(self.prepared, [self.A])
+        before = self.prepared.read_bytes()
+        good = self.run_file("good", [self.B])
+        broken = self.run_file("bad", [self.C])
+        bad_digest = dict(self.D, digest="1" * 64)
+        cases = {
+            "answer outside the vocabulary": (json.dumps(dict(self.D, answers={"tex": {"0": "4d"}})), "line 3"),
+            "digest": (json.dumps(bad_digest), "line 3"),
+            "not json": ("{oops", "line 3"),
+        }
+        for name, (text, where) in cases.items():
+            with self.subTest(name):
+                broken.write_text(broken.read_text(encoding="utf-8") + text + "\n", encoding="utf-8")
+                with self.assertRaises(PrepareError) as cm:
+                    ledger.absorb(self.prepared, [good, broken])
+                self.assertIn(str(broken), str(cm.exception))
+                self.assertIn(where, str(cm.exception))
+                self.assertEqual(self.prepared.read_bytes(), before)
+                self.assertEqual(sorted(p.name for p in self.prepared.parent.iterdir()), [ledger.LEDGER_FILE])
+                write_ledger(broken, [self.C])
+
+    def test_a_crlf_a_blank_line_a_bad_header_and_a_missing_file_are_refused(self):
+        write_ledger(self.prepared, [self.A])
+        before = self.prepared.read_bytes()
+        head = json.dumps(ledger.HEADER, separators=(",", ":"))
+        a = json.dumps(self.B, separators=(",", ":"))
+        texts = {"crlf": (f"{head}\r\n{a}\r\n", "line 1"), "blank": (f"{head}\n{a}\n\n{a}\n", "line 3"),
+                 "header": (f'{{"oot2_ledger":2}}\n{a}\n', "line 1")}
+        for name, (text, where) in texts.items():
+            with self.subTest(name):
+                f = self.tmp / name / "ledger.jsonl"
+                f.parent.mkdir()
+                f.write_bytes(text.encode("utf-8"))
+                with self.assertRaises(PrepareError) as cm:
+                    ledger.absorb(self.prepared, [f])
+                self.assertIn(where, str(cm.exception))
+                self.assertEqual(self.prepared.read_bytes(), before)
+        with self.assertRaises(PrepareError):
+            ledger.absorb(self.prepared, [self.tmp / "nowhere" / "ledger.jsonl"])
+        # a damaged prepared ledger is refused too
+        self.prepared.write_text("not a ledger\n", encoding="utf-8")
+        with self.assertRaises(PrepareError):
+            ledger.absorb(self.prepared, [self.run_file("r", [self.B])])
+
+    def test_a_write_that_fails_leaves_the_prepared_ledger_and_no_temp_file(self):
+        write_ledger(self.prepared, [self.A])
+        before = self.prepared.read_bytes()
+        with mock.patch("os.replace", side_effect=OSError(13, "denied")):
+            with self.assertRaises(PrepareError):
+                ledger.absorb(self.prepared, [self.run_file("r", [self.B])])
+        self.assertEqual(self.prepared.read_bytes(), before)
+        self.assertFalse(self.prepared.with_name(self.prepared.name + ".new").exists())
+
+    def test_the_new_file_goes_through_a_temp_name_and_a_replace(self):
+        write_ledger(self.prepared, [self.A])
+        with mock.patch("os.replace", wraps=os.replace) as rep:
+            ledger.absorb(self.prepared, [self.run_file("r", [self.B])])
+        rep.assert_called_once_with(self.prepared.with_name(self.prepared.name + ".new"), self.prepared)
+
+    def test_the_backup_is_made_once_and_never_overwritten(self):
+        write_ledger(self.prepared, [self.A])
+        first = self.prepared.read_bytes()
+        bak = self.prepared.with_name(self.prepared.name + ".bak")
+        rep = ledger.absorb(self.prepared, [self.run_file("r1", [self.B])])
+        self.assertEqual((rep.backup, bak.read_bytes()), (bak, first))
+        rep = ledger.absorb(self.prepared, [self.run_file("r2", [self.C])])
+        self.assertEqual((rep.backup, bak.read_bytes()), (None, first))
+        self.assertEqual(self.lines(), [self.A, self.B, self.C])
+
+    def test_a_dry_run_counts_and_writes_nothing(self):
+        write_ledger(self.prepared, [self.A])
+        before = self.prepared.read_bytes()
+        rep = ledger.absorb(self.prepared, [self.run_file("r", [self.B, self.C])], dry_run=True)
+        self.assertEqual((rep.new_rows, rep.total_rows, rep.written), (2, 3, False))
+        self.assertEqual(self.prepared.read_bytes(), before)
+        self.assertEqual([p.name for p in self.prepared.parent.iterdir()], [ledger.LEDGER_FILE])
+        gone = self.tmp / "other" / ledger.LEDGER_FILE
+        ledger.absorb(gone, [self.run_file("r", [self.B])], dry_run=True)
+        self.assertFalse(gone.parent.exists())
+
+
+class AbsorbKeyTest(LedgerBase):
+    """The ledger step's key is the ledger file's SHA-256, so absorb moves it exactly when it adds a row."""
+
+    def test_the_step_runs_again_after_a_new_row_and_not_after_rows_already_held(self):
+        path = self.ledger_path()
+        write_ledger(path, [row(KEY["vs"], "vs", tex={"3": "3d"})])     # LF bytes, as the writer makes them
+        self.go()
+        elsewhere = self.dest.parent / "elsewhere" / ledger.LEDGER_FILE
+        write_ledger(elsewhere, [row(KEY["vs"], "vs", tex={"3": "3d"})], reorder=True)
+        sha = ledger.ledger_digest(path)
+        ledger.absorb(path, [elsewhere])
+        self.assertEqual(ledger.ledger_digest(path), sha)
+        self.assertIn("ledger: kept (done, inputs unchanged)", self.go())
+
+        write_ledger(elsewhere, [row(KEY["cs"], "cs", img={"1": IMG_3D})])
+        rep = ledger.absorb(path, [elsewhere])
+        self.assertEqual(rep.new_variants, 1)
+        self.assertNotEqual(ledger.ledger_digest(path), sha)
+        text = self.go()
+        self.assertIn("ledger: started (its inputs changed)", text)
+        self.assertIn("translate: kept", text)
+        self.assertEqual(len(self.variants().rows), 2)
 
 
 if __name__ == "__main__":

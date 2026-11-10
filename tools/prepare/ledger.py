@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import struct
@@ -215,6 +216,107 @@ def read_ledger(path: Path) -> tuple[list[Row], str]:
         except ValueError as e:
             raise bad(n, str(e)) from None
     return rows, digest
+
+
+@dataclass
+class AbsorbReport:
+    """What absorb found (and, unless it was a dry run, wrote)."""
+    target: Path
+    per_file: list              # [(path, rows, new rows)] for each run ledger given, in the order given
+    new_rows: int               # rows added to the prepared ledger
+    new_variants: int           # of them, the (program, answers) pairs the prepared ledger did not hold
+    total_rows: int             # rows the prepared ledger holds after the merge
+    written: bool
+    backup: Path | None         # the .bak made by this call, if any
+
+
+def _strict_lines(path: Path) -> list[tuple[int, str]]:
+    """The rows of a ledger as (line number, text), once read_ledger has accepted the file and the bytes hold nothing
+    the writer does not produce: no CR, no blank line. PrepareError names the file and the line."""
+    read_ledger(path)           # the step's own check: header, shape, vocabulary, digests
+    text = path.read_bytes().decode("utf-8")
+    if "\r" in text:
+        line = text[:text.index("\r")].count("\n") + 1
+        raise PrepareError(f"the ledger {path}, line {line}: it has a carriage return (CRLF line ends); oot2.exe "
+                           "writes LF only, so a tool changed this file.")
+    pieces = text.split("\n")
+    if pieces[-1] == "":
+        pieces.pop()
+    out = []
+    for n, line in enumerate(pieces, 1):
+        if not line.strip():
+            raise PrepareError(f"the ledger {path}, line {n}: the line is blank; oot2.exe writes none.")
+        if n > 1:
+            out.append((n, line))
+    return out
+
+
+def _row_forms(line: str) -> tuple[str, tuple[str, str]]:
+    """The canonical text of a whole row (attachment included, any key order or spacing) and its (key, answers)."""
+    obj = json.loads(line)
+    return canonical(obj), (obj["key"], canonical(obj["answers"]))
+
+
+def absorb(prepared: Path, runs: list[Path], dry_run: bool = False) -> AbsorbReport:
+    """Add to the prepared folder's ledger the rows of other ledgers (the files runs of oot2.exe leave in their own
+    game folders). Every input is read with the ledger step's own validator before anything is written, so a bad file
+    stops the call with its name and line and leaves the prepared ledger as it was. The rows the prepared ledger
+    already holds keep their text and place; the new ones follow in the order of the inputs, a row counting once by
+    its canonical form. The write goes through a temp name and os.replace, the old file is kept once as .bak (never
+    overwritten), a prepared ledger that does not exist yet is created, and nothing is written when no row is new
+    (the ledger step's key is the file's SHA-256, so it then stays and the step does not run again)."""
+    existing = prepared.exists()
+    held = _strict_lines(prepared) if existing else []
+    seen: set[str] = set()
+    pairs: set[tuple[str, str]] = set()
+    for _, text in held:
+        form, pair = _row_forms(text)
+        seen.add(form)
+        pairs.add(pair)
+    added: list[str] = []
+    new_pairs = 0
+    per_file = []
+    target = prepared.resolve()
+    for path in runs:
+        if not path.exists():
+            raise PrepareError(f"the ledger {path} does not exist.")
+        lines = _strict_lines(path)
+        if path.resolve() == target:
+            per_file.append((path, len(lines), 0))
+            continue
+        fresh = 0
+        for _, text in lines:
+            form, pair = _row_forms(text)
+            if form in seen:
+                continue
+            seen.add(form)
+            added.append(text)
+            fresh += 1
+            if pair not in pairs:
+                pairs.add(pair)
+                new_pairs += 1
+        per_file.append((path, len(lines), fresh))
+    rows = [text for _, text in held] + added
+    write = bool(added) or not existing
+    backup = None
+    if write and not dry_run:
+        body = "\n".join([json.dumps(HEADER, separators=(",", ":")), *rows]) + "\n"
+        tmp = prepared.with_name(prepared.name + ".new")
+        try:
+            prepared.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(body.encode("utf-8"))
+            bak = prepared.with_name(prepared.name + ".bak")
+            if existing and not bak.exists():
+                shutil.copyfile(prepared, bak)
+                backup = bak
+            os.replace(tmp, prepared)
+        except OSError as e:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise PrepareError(f"the ledger {prepared} cannot be written: {e.strerror or e}. It is as it was.") from None
+    return AbsorbReport(prepared, per_file, len(added), new_pairs, len(rows), write and not dry_run, backup)
 
 
 def _is_header(text: str) -> bool:

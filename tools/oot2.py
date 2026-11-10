@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 The oot2-native contributors
-"""The oot2 command line. Two commands:
+"""The oot2 command line. Three commands:
 
     py -3 tools/oot2.py prepare --dump FILE --dest DIR [--check] [--verify] [--cc CC] [--vulkan-sdk DIR] [--jobs N]
                                 [--xlate FILE] [--translate-jobs N] [--plain-modules DIR] [--zbic-archive FILE]
@@ -53,6 +53,16 @@ game's. Without the option no such file is written and nothing else changes (too
 
 Exit codes: 0 done, 1 failed (the message says why), 2 bad command line,
 3 cancelled.
+
+    py -3 tools/oot2.py ledger-absorb --out DIR [--dry-run] RUN_LEDGER [RUN_LEDGER ...]
+
+ledger-absorb adds to DIR/ledger.jsonl (the prepared folder's ledger, which the ledger step translates variants from)
+the rows of the ledger.jsonl files other runs of the game left, so that several collection runs feed one prepare. Each
+input is checked as the ledger step checks it (header, shape, answers, digests, LF endings, no blank line), and one bad
+file stops the command, naming file and line, with nothing written. A row counts once by its content, whatever its key
+order or spacing. Rows already in DIR/ledger.jsonl keep their place; new ones follow in the order given. The old file
+is kept once as ledger.jsonl.bak. --dry-run prints the counts and writes nothing. A following `prepare --dest DIR`
+runs the ledger step again only when a row was new. Exit codes: 0 done, 1 failed.
 
     py -3 tools/oot2.py census --game DIR --rules FILE [--out DIR] [--image FILE]
 
@@ -145,6 +155,26 @@ def prepare(args: argparse.Namespace) -> int:
     return EXIT[result]
 
 
+def ledger_absorb_command(args: argparse.Namespace) -> int:
+    from prepare import ledger
+    from prepare.runner import PrepareError
+    target = args.out / ledger.LEDGER_FILE
+    try:
+        rep = ledger.absorb(target, args.runs, dry_run=args.dry_run)
+    except PrepareError as e:
+        print(f"oot2 ledger-absorb: {e}", file=sys.stderr)
+        return EXIT["failed"]
+    for path, rows, fresh in rep.per_file:
+        print(f"{path}: {rows} rows, {fresh} new")
+    verb = "would add" if args.dry_run else "added"
+    tail = "." if rep.new_rows or args.dry_run else " (unchanged, nothing written)."
+    print(f"oot2 ledger-absorb: {verb} {rep.new_rows} rows ({rep.new_variants} new program and answers variants) to "
+          f"{rep.target}; it holds {rep.total_rows} rows{tail}")
+    if rep.backup:
+        print(f"the old file is kept as {rep.backup}")
+    return EXIT["ok"]
+
+
 def census_command(args: argparse.Namespace) -> int:
     import census as censusmod
     try:
@@ -208,6 +238,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--names", type=Path,
                    help="your own file of `role = name` lines (outside the repository): adds the store step, which lets "
                         "lines of an input file wait for a state value of the game")
+    a = sub.add_parser("ledger-absorb", help="merge the ledgers of other runs into the prepared folder's ledger",
+                       description="Add the rows of other runs' ledger.jsonl files to DIR/ledger.jsonl, checked as the "
+                                   "ledger step checks them; one bad file stops it with nothing written.")
+    a.add_argument("--out", type=Path, required=True, help="the prepared folder (its ledger.jsonl is created if absent)")
+    a.add_argument("--dry-run", action="store_true", help="print the counts and write nothing")
+    a.add_argument("runs", type=Path, nargs="+", metavar="RUN_LEDGER", help="a ledger.jsonl an oot2.exe run wrote")
     c = sub.add_parser("census", help="list the game's scenes from your own RomFS",
                        description="List the game's scenes, entrances, events and menus from the RomFS of a prepared "
                                    "folder, into files that stay on your disk.")
@@ -218,6 +254,8 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.command == "census":
         return census_command(args)
+    if args.command == "ledger-absorb":
+        return ledger_absorb_command(args)
     if power.wanted():
         power.install()   # children of this run are not throttled either
     # Ctrl+Break and a terminate request end the run the way Ctrl+C does: the finished steps stay recorded.
