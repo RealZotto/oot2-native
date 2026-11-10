@@ -112,6 +112,20 @@ static int dev_target(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarg
     VkvWant vw = {VKV_PICK, level, base_layer, layers, want_usage};
     VkvPlan plan;
     const char *refusal;
+    // An image made without the usage (its format gives none: the driver took such views before) is no target: skipped, the
+    // way an unusable format is, and named once per kind of usage.
+    if (vkv_usage_gap(&vim, want_usage)) {
+        static unsigned logged;
+        unsigned kind = storage ? 1u : aspect == VK_IMAGE_ASPECT_COLOR_BIT ? 2u : 4u;
+        if (!(logged & kind)) {
+            logged |= kind;
+            vkv_plan(&vim, &vw, &plan, &refusal);
+            rt_log("gfx: vulkan: the %s view of the texture at %#llx (NVN format %#x) is skipped: %s (usage %#x)",
+                   storage ? "storage" : "render target", (unsigned long long)(uintptr_t)t->tex.mem, fmt, refusal,
+                   (unsigned)sh.usage);
+        }
+        return 0;
+    }
     if (!vkv_plan(&vim, &vw, &plan, &refusal))
         rt_fatal("gfx: vulkan: the %s view of the texture at %#llx (NVN format %#x, level %u, layers %u..%u) cannot be made: "
                  "%s (the image has %u levels, %u layers, a depth of %u and usage %#x)",

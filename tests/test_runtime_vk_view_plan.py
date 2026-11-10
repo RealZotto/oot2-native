@@ -94,7 +94,8 @@ class VolumeViewTest(ViewPlanKind):
         r = results()
         for name in ("volume_storage_slice_is_a_2d_view_with_the_feature",
                      "volume_storage_slice_refused_without_the_feature",
-                     "volume_storage_slice_refused_when_the_device_feature_is_off"):
+                     "volume_storage_slice_refused_when_the_device_feature_is_off",
+                     "volume_storage_array_view_of_one_slice_is_a_2d_view", "volume_storage_run_of_slices_refused"):
             self.assertEqual(r[name], "ok", name)
 
     def test_the_other_view_types(self) -> None:
@@ -131,7 +132,7 @@ class UsageTest(ViewPlanKind):
         for name in ("usage_color_attachment_refused_on_an_image_without_it",
                      "usage_depth_attachment_refused_on_an_image_without_it",
                      "usage_storage_refused_on_an_image_without_it", "usage_subset_accepted",
-                     "usage_volume_without_color_attachment_refused"):
+                     "usage_volume_without_color_attachment_refused", "usage_gap_names_the_missing_bits"):
             self.assertEqual(r[name], "ok", name)
 
 

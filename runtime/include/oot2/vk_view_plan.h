@@ -42,6 +42,10 @@ typedef struct VkvPlan {
     uint32_t base_layer, layers;
 } VkvPlan;
 
+// The bits of `usage` the image was made without (0: it has them all). A caller whose target the image cannot serve skips
+// the target by name instead of asking for a plan.
+VkImageUsageFlags vkv_usage_gap(const VkvImage *im, VkImageUsageFlags usage);
+
 // 1 and *plan when the image gives the view; 0 and *why (a sentence that completes "the view cannot be made: ") when it
 // cannot. A refusal is a stop for the caller, never a clamp.
 int vkv_plan(const VkvImage *im, const VkvWant *w, VkvPlan *plan, const char **why);

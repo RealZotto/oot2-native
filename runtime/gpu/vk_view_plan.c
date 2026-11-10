@@ -13,6 +13,8 @@ VkImageCreateFlags vkv_image_flags(VkImageType type, int view2d_of_3d) {
     return VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | (view2d_of_3d ? VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT : 0);
 }
 
+VkImageUsageFlags vkv_usage_gap(const VkvImage *im, VkImageUsageFlags usage) { return usage & ~im->usage; }
+
 int vkv_plan(const VkvImage *im, const VkvWant *w, VkvPlan *plan, const char **why) {
     static const char *const none = "";
     *why = none;
@@ -76,10 +78,13 @@ int vkv_plan(const VkvImage *im, const VkvWant *w, VkvPlan *plan, const char **w
                    "VK_EXT_image_2d_view_of_3d";
             return 0;
         }
-        if (n != 1 || w->type == BV_2D_ARRAY) {
-            *why = "a storage view of a slice of a 3D image takes one slice, as a 2D view";
+        // a storage view of a slice is a 2D view of one slice; an array view of one slice is that same slice
+        if (n != 1) {
+            *why = "a storage view of a 3D image takes one slice, as a 2D view";
             return 0;
         }
+        *plan = (VkvPlan){VK_IMAGE_VIEW_TYPE_2D, w->base_layer, 1};
+        return 1;
     } else if (!(im->flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)) {
         *why = "a 2D view of a 3D image needs the image made 2D-array compatible";
         return 0;

@@ -81,6 +81,10 @@ static void volume_checks(void) {
           plan(&w, VKV_PICK, 0, 5, 1, STORE, &p) && p.type == VK_IMAGE_VIEW_TYPE_2D && p.base_layer == 5 && p.layers == 1);
     CHECK("volume_storage_slice_refused_without_the_feature",
           !plan(&v, VKV_PICK, 0, 5, 1, STORE, &p) && has(why_of(&v, VKV_PICK, 0, 5, 1, STORE), "VK_EXT_image_2d_view_of_3d"));
+    // an array view of one slice is the 2D view of that slice; a run of slices has no storage view
+    CHECK("volume_storage_array_view_of_one_slice_is_a_2d_view",
+          plan(&w, BV_2D_ARRAY, 0, 5, 1, STORE, &p) && p.type == VK_IMAGE_VIEW_TYPE_2D && p.base_layer == 5 && p.layers == 1);
+    CHECK("volume_storage_run_of_slices_refused", !plan(&w, BV_2D_ARRAY, 0, 5, 2, STORE, &p) && !plan(&w, VKV_PICK, 0, 5, 2, STORE, &p));
     VkvImage nodev = volume(16, 1, 1, ALL_USAGE);
     nodev.view2d_of_3d = 0;   // the flag on an image, the feature off on the device
     CHECK("volume_storage_slice_refused_when_the_device_feature_is_off", !plan(&nodev, VKV_PICK, 0, 5, 1, STORE, &p));
@@ -127,6 +131,9 @@ static void usage_checks(void) {
     VkvImage no_store = plain2d(1, 1, COLOR | SAMPLE);
     CHECK("usage_storage_refused_on_an_image_without_it",
           !plan(&no_store, VKV_PICK, 0, 0, 1, STORE, &p) && has(why_of(&no_store, VKV_PICK, 0, 0, 1, STORE), "storage usage"));
+    // the gap the replay's render target reads to skip a target by name instead of stopping
+    CHECK("usage_gap_names_the_missing_bits", vkv_usage_gap(&no_color, COLOR) == COLOR && vkv_usage_gap(&no_color, STORE | SAMPLE) == 0 &&
+                                                  vkv_usage_gap(&no_color, COLOR | STORE) == COLOR);
     CHECK("usage_subset_accepted", plan(&no_store, VKV_PICK, 0, 0, 1, COLOR, &p) && plan(&no_color, VKV_PICK, 0, 0, 1, STORE, &p));
     // the volume of the forest run: usage without colour attachment and a slice view of it
     VkvImage vol_no_color = volume(8, 1, 1, SAMPLE | STORE);
