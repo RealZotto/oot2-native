@@ -316,12 +316,14 @@ void nvn_census_stats(NvnStatRow emit, void *ctx) {
     emit(ctx, "waitevents", waits, why);
     GfxNullWaitClasses w;
     gfx_null_wait_classes(&w);
+    // A wait behind a parked wait of its own queue is judged after that release: it has a class of its own, so that
+    // the counts "before" are the ones a signal made before the wait's place, not the ones the release drain reached.
     snprintf(why, sizeof why, "by a GPU signal in order %llu, by a CPU signal before %llu, already satisfied %llu, "
-             "unsatisfied %llu (later by GPU %llu, later by CPU %llu, not satisfied by the end %llu, dropped from the "
-             "full list %llu); GPU signals in order: of its own queue %llu, of another %llu", (ull)w.by_gpu, (ull)w.by_cpu,
-             (ull)w.initial, (ull)w.unsatisfied, (ull)w.later_gpu, (ull)w.later_cpu, (ull)w.pending, (ull)w.dropped,
-             (ull)w.by_gpu_same, (ull)w.by_gpu_other);
-    emit(ctx, "waitclasses", w.by_gpu + w.by_cpu + w.initial + w.unsatisfied, why);
+             "reached after a release %llu, unsatisfied %llu (later by GPU %llu, later by CPU %llu, not satisfied by the "
+             "end %llu); GPU signals in order: of its own queue %llu, of another %llu", (ull)w.by_gpu, (ull)w.by_cpu,
+             (ull)w.initial, (ull)w.after_release, (ull)w.unsatisfied, (ull)w.later_gpu, (ull)w.later_cpu,
+             (ull)w.pending, (ull)w.by_gpu_same, (ull)w.by_gpu_other);
+    emit(ctx, "waitclasses", w.by_gpu + w.by_cpu + w.initial + w.after_release + w.unsatisfied, why);
     // WaitEvent per call site, the same classes: one row per site, then the bucket of the sites past the
     // table's 64, so the rows sum to the row above. The site is the guest function the wait was recorded from.
     {
@@ -330,15 +332,16 @@ void nvn_census_stats(NvnStatRow emit, void *ctx) {
         int ns = gfx_null_wait_sites(sites, 64, &other);
         for (int i = 0; i <= ns; i++) {
             const NvnWaitSite *s = i < ns ? &sites[i] : &other;
-            if (i == ns && !s->c.by_gpu && !s->c.by_cpu && !s->c.initial && !s->c.unsatisfied) break;
+            if (i == ns && !s->c.by_gpu && !s->c.by_cpu && !s->c.initial && !s->c.after_release && !s->c.unsatisfied)
+                break;
             char key[160], at[120];
             if (i < ns) snprintf(key, sizeof key, "waitsite %s", rt_guest_name(s->caller, at, sizeof at));
             else snprintf(key, sizeof key, "waitsite other sites");
             snprintf(why, sizeof why, "by a GPU signal in order %llu, by a CPU signal before %llu, already satisfied %llu, "
-                     "unsatisfied %llu (later by GPU %llu, later by CPU %llu, not satisfied by the end %llu, dropped from "
-                     "the full list %llu)", (ull)s->c.by_gpu, (ull)s->c.by_cpu, (ull)s->c.initial, (ull)s->c.unsatisfied,
-                     (ull)s->c.later_gpu, (ull)s->c.later_cpu, (ull)s->c.pending, (ull)s->c.dropped);
-            emit(ctx, key, s->c.by_gpu + s->c.by_cpu + s->c.initial + s->c.unsatisfied, why);
+                     "reached after a release %llu, unsatisfied %llu (later by GPU %llu, later by CPU %llu, not satisfied "
+                     "by the end %llu)", (ull)s->c.by_gpu, (ull)s->c.by_cpu, (ull)s->c.initial, (ull)s->c.after_release,
+                     (ull)s->c.unsatisfied, (ull)s->c.later_gpu, (ull)s->c.later_cpu, (ull)s->c.pending);
+            emit(ctx, key, s->c.by_gpu + s->c.by_cpu + s->c.initial + s->c.after_release + s->c.unsatisfied, why);
         }
         // The same waits by the queue pair: a GPU signal's queue against the waiting queue's, and a CPU signal's release.
         snprintf(why, sizeof why, "GPU signal in order: of the waiting queue itself %llu, of another queue %llu; GPU signal of "

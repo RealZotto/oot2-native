@@ -6,7 +6,8 @@
 //
 // Queues. Every queue's submissions share the back end's one numbering of fence values (gfx.h): QueueSubmitCommands hands
 // the recordings over with the queue's serial (nvn_submit_recordings, nvn_cmd.c), so that the back end knows which queue a
-// WaitEvent and a SignalEvent belong to, and keeps the fence value it got as the queue's newest; QueueFlush has nothing
+// WaitEvent and a SignalEvent belong to (only the null back end orders the queues' records by it so far; the Vulkan back
+// end takes the serial and replays in submission order), and keeps the fence value it got as the queue's newest; QueueFlush has nothing
 // left to send; QueueFinish waits until everything this queue submitted so far is done (never another queue's work, which
 // a WaitEvent may hold), with its virtual core given up. A queue's
 // memory is only accounted: the game allocates what QueueBuilderGetQueueMemorySize answers, and nothing is written there.
@@ -101,8 +102,8 @@ NVN_API(nvnQueueBuilderSetQueueMemory) {
     b->mem = arg_p(c, 1), b->mem_sz = arg_x(c, 2);
 }
 // void nvnQueueBuilderSetPrimaryQueue(NVNqueueBuilder *b, NVNqueue *primary) (NVN2): a queue tied to another. Every
-// queue already shares one order of fence values here and the back end orders their WaitEvents by queue, so nothing is
-// kept; the first call is logged.
+// queue already shares one order of fence values here and the null back end orders their WaitEvents by queue (the Vulkan
+// back end does not yet), so nothing is kept; the first call is logged.
 NVN_API(nvnQueueBuilderSetPrimaryQueue) {
     static int logged;
     if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))

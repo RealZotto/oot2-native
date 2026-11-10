@@ -687,7 +687,7 @@ static void case_wait_events(void) {
     NVN(nvnEventSignal, ev, WRITE, 9);
     CHECK(gfx_null_parked() == 0);
     gfx_null_wait_classes(&k);
-    CHECK(k.later_cpu == 1 && k.later_gpu == 0 && k.by_cpu == 2 && k.pending == 0);
+    CHECK(k.later_cpu == 1 && k.later_gpu == 0 && k.by_cpu == 1 && k.after_release == 1 && k.pending == 0);
     // A wait that a GPU signal of another queue satisfies: the queue is held, and the other queue's submission releases it.
     uint64_t evd = event_object(g_pool, RESULTS + 0xC0);
     NVN(nvnCommandBufferBeginRecording, cb);
@@ -715,16 +715,16 @@ static void case_wait_events(void) {
     CHECK(k.unsatisfied == 3 && k.pending == 1 && gfx_null_wait_events(&unsatisfied) == 8);
     NVN(nvnEventSignal, eve, WRITE, 1);
     gfx_null_wait_classes(&k);
-    printf("released unsatisfied %llu later_cpu %llu by_cpu %llu dropped %llu pending %llu\n", (ull)k.unsatisfied,
-           (ull)k.later_cpu, (ull)k.by_cpu, (ull)k.dropped, (ull)k.pending);
+    printf("released unsatisfied %llu later_cpu %llu by_cpu %llu after_release %llu pending %llu\n", (ull)k.unsatisfied,
+           (ull)k.later_cpu, (ull)k.by_cpu, (ull)k.after_release, (ull)k.pending);
     // A wait on a word nobody signals stays unresolved: counted as pending, and the row for it says so.
     uint64_t evf = event_object(g_pool, RESULTS + 0x140);
     NVN(nvnCommandBufferBeginRecording, cb);
     NVN_AT(MB + 0x5000, nvnCommandBufferWaitEvent, cb, evf, EQUAL, 1);
     submit(q, NVN(nvnCommandBufferEndRecording, cb));
     gfx_null_wait_classes(&k);
-    CHECK(k.unsatisfied == k.later_gpu + k.later_cpu + k.pending + k.dropped);
-    printf("unresolved unsatisfied %llu pending %llu dropped %llu\n", (ull)k.unsatisfied, (ull)k.pending, (ull)k.dropped);
+    CHECK(k.unsatisfied == k.later_gpu + k.later_cpu + k.pending);
+    printf("unresolved unsatisfied %llu pending %llu\n", (ull)k.unsatisfied, (ull)k.pending);
     // a second pool, for a window range and no GPU access, made and ended: the pool rows tell made from live
     NVN(nvnMemoryPoolFinalize, memory_pool(0x10000, CPU_NO_ACCESS | GPU_NO_ACCESS, NULL));
     nvn_census_stats(print_stat, NULL);
@@ -766,22 +766,24 @@ static void case_wait_sites(void) {
     for (int i = 0; i < n; i++) {
         const GfxNullWaitClasses *s = &sites[i].c;
         sum.by_gpu += s->by_gpu, sum.by_cpu += s->by_cpu, sum.initial += s->initial, sum.unsatisfied += s->unsatisfied;
-        sum.later_gpu += s->later_gpu, sum.later_cpu += s->later_cpu, sum.dropped += s->dropped, sum.pending += s->pending;
+        sum.later_gpu += s->later_gpu, sum.later_cpu += s->later_cpu, sum.after_release += s->after_release;
+        sum.pending += s->pending;
     }
-    sum_waits = sum.by_gpu + sum.by_cpu + sum.initial + sum.unsatisfied;
+    sum_waits = sum.by_gpu + sum.by_cpu + sum.initial + sum.after_release + sum.unsatisfied;
     CHECK(n == 64 && waits == 4 + 1 + 70 && sum_waits == waits);
     CHECK(sum.by_gpu == k.by_gpu && sum.by_cpu == k.by_cpu && sum.initial == k.initial && sum.unsatisfied == k.unsatisfied);
-    CHECK(sum.later_gpu == k.later_gpu && sum.later_cpu == k.later_cpu && sum.dropped == k.dropped && sum.pending == k.pending);
+    CHECK(sum.later_gpu == k.later_gpu && sum.later_cpu == k.later_cpu && sum.after_release == k.after_release &&
+          sum.pending == k.pending);
     for (int i = 0; i < 2; i++) {
         const GfxNullWaitClasses *s = &sites[i].c;
         printf("site %s gpu %llu cpu %llu initial %llu unsatisfied %llu later_gpu %llu later_cpu %llu\n",
                site_name(sites[i].caller, name, sizeof name), (ull)s->by_gpu, (ull)s->by_cpu, (ull)s->initial,
                (ull)s->unsatisfied, (ull)s->later_gpu, (ull)s->later_cpu);
     }
-    printf("other caller %llu initial %llu unsatisfied %llu\n", (ull)other.caller, (ull)other.c.initial,
-           (ull)other.c.unsatisfied);
-    printf("totals waits %llu unsatisfied %llu initial %llu later_cpu %llu\n", (ull)waits, (ull)unsatisfied,
-           (ull)k.initial, (ull)k.later_cpu);
+    printf("other caller %llu initial %llu after_release %llu unsatisfied %llu\n", (ull)other.caller, (ull)other.c.initial,
+           (ull)other.c.after_release, (ull)other.c.unsatisfied);
+    printf("totals waits %llu unsatisfied %llu initial %llu after_release %llu later_cpu %llu\n", (ull)waits,
+           (ull)unsatisfied, (ull)k.initial, (ull)k.after_release, (ull)k.later_cpu);
     nvn_census_stats(print_stat, NULL);
     printf("ok wait_sites\n");
 }

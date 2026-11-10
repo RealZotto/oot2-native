@@ -48,6 +48,7 @@ typedef struct {
     int writer;           // WO_WRITER_*: who wrote the word last (NONE: it held the value from the start)
     uint64_t signaller;   // writer GPU: the queue of that signal
     int parked;           // the wait did not hold at its place: its queue was held for it
+    int released;         // the wait is reached while a queue goes on after a release: behind the wait it was held at (parked: that one)
     uint32_t seen;        // the word's value, as replay left it, when the wait was judged
 } WoWait;
 
@@ -78,6 +79,7 @@ typedef struct {
     const volatile uint32_t *cpu_recent[WO_RECENT];   // words the CPU wrote before any wait or signal named them
     uint64_t parks, releases;    // waits that parked, and that were released after
     uint64_t longest_hold;       // the most submissions (of any queue) made while one queue was held at one wait, once released
+    int in_release;              // a released queue is going on (a wait shown now is judged after a park of its queue)
 } WoOrder;
 
 // Start (or restart) an engine; frees what an earlier one kept.

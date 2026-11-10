@@ -40,7 +40,12 @@
 //   5. A wait nothing releases is a named stop and not a hang: when more than WO_BOUND_SUBMITS further submissions
 //      have been made, and, for a wait with no timeout on a fence value of the held queue, or on that queue's
 //      finish, after WO_STALL_NS from the start of that wait. A fence_wait with a timeout still answers 0 when the
-//      timeout passes.
+//      timeout passes, so a SyncWait retry loop with a timeout, on a queue held at a wait nothing releases, never
+//      reaches a stop and polls for as long as the game lets it (by design: the stop is for a wait that cannot end,
+//      and a poll with a timeout is not one).
+//      Only the null back end orders the records this way so far: the Vulkan back end replays in submission order and
+//      checks a wait at completion (runtime/gpu/vk_submit.c), so rules 2 to 5 describe the null back end, and the
+//      Vulkan back end does not keep them yet.
 //
 // Presents and pacing. The front end's window rotates through the window's textures and hands each present to
 // present() below, which returns at once; the swap interval stays in the window, where the front end answers it. The
@@ -133,8 +138,10 @@ uint64_t gfx_null_records(void);    // records the null back end has walked
 // condition of conditional rendering, as the replay decided them).
 int gfx_null_render_enabled(void);
 // Completion held, for tests and for a run that wants work in flight: while on, a submission is replayed at submit and
-// completed later, by gfx_null_complete or when the hold ends, always in submission order. gfx_null_complete completes
-// the held submissions up to fence value `value` (0: all of them) and returns the newest fence value done.
+// completed later, by gfx_null_complete or when the hold ends, in the order replay finished them (submission order unless
+// a wait held a queue). gfx_null_complete completes the whole submissions up to fence value `value` (0: all of them) and
+// returns the newest fence value done. While completion is held nothing is written at a park either: what a held queue
+// kept before its wait is written when its submission completes.
 void gfx_null_hold(int on);
 uint64_t gfx_null_complete(uint64_t value);
 // WaitEvents the null back end met, and how many of them did not hold at their place in the replay so far (*unsatisfied,
@@ -142,12 +149,13 @@ uint64_t gfx_null_complete(uint64_t value);
 uint64_t gfx_null_wait_events(uint64_t *unsatisfied);
 // The same waits sorted by what answered them (gfx_null.c): a GPU signal replayed before it, a CPU signal made before, by
 // neither (the word held the value from the start), not holding at its place, and of those later released by a GPU
-// signal of another queue or by a CPU signal. unsatisfied = later_gpu + later_cpu + pending (parked now). dropped stays
-// 0: a parked queue holds one wait, so nothing is left out. by_gpu_same and by_gpu_other split by_gpu by whether the
-// signal was made by the waiting queue itself (the only kind of GPU signal a queue can find before its own wait) or by
-// another one; later_gpu is always another queue's.
+// signal of another queue or by a CPU signal. unsatisfied = later_gpu + later_cpu + pending (parked now). A wait that sits
+// behind a parked wait of its own queue is not judged where it was recorded but after that release, and is counted
+// apart (after_release) whatever the word held then: sorting it by the word would credit the release to a signal that
+// came "before" it. by_gpu_same and by_gpu_other split by_gpu by whether the signal was made by the waiting queue itself
+// (the only kind of GPU signal a queue can find before its own wait) or by another one; later_gpu is always another queue's.
 typedef struct {
-    uint64_t by_gpu, by_cpu, initial, unsatisfied, later_gpu, later_cpu, dropped, pending;
+    uint64_t by_gpu, by_cpu, initial, after_release, unsatisfied, later_gpu, later_cpu, pending;
     uint64_t by_gpu_same, by_gpu_other;
 } GfxNullWaitClasses;
 void gfx_null_wait_classes(GfxNullWaitClasses *out);

@@ -169,8 +169,7 @@ class QueueTest(unittest.TestCase):
                     self.assertEqual(done.returncode, 0 if case == "census_at_draw" else nvn.EXIT_FATAL,
                                      done.stdout + done.stderr)
                     self.assertIn("stat| waitevents 1 WaitEvents met 1, unsatisfied at their place 1\n", done.stdout)
-                    self.assertIn("unsatisfied 1 (later by GPU 0, later by CPU 0, not satisfied by the end 1, "
-                                  "dropped from the full list 0)", done.stdout)
+                    self.assertIn("unsatisfied 1 (later by GPU 0, later by CPU 0, not satisfied by the end 1)", done.stdout)
                     self.assertIn("stat| waitsite ", done.stdout)
                     if case == "census_at_draw":
                         self.assertIn("draw| census complete\nok census_at_draw\n", done.stdout)
@@ -189,9 +188,10 @@ class QueueTest(unittest.TestCase):
             # copied by CallCommands), the unsatisfied one is satisfied later by the CPU's signal
             self.assertRegex(out, r"(?m)^site 0x\w+ \(main\+0x6000\) gpu 0 cpu 0 initial 4 unsatisfied 0 later_gpu 0 later_cpu 0$")
             self.assertRegex(out, r"(?m)^site 0x\w+ \(main\+0x7000\) gpu 0 cpu 0 initial 0 unsatisfied 1 later_gpu 0 later_cpu 1$")
-            # 72 sites met, 64 in the table: the other 8 (each wait satisfied by the word's own value) share a bucket
-            self.assertIn("other caller 0 initial 8 unsatisfied 0\n", out)
-            self.assertIn("totals waits 75 unsatisfied 1 initial 74 later_cpu 1\n", out)
+            # 72 sites met, 64 in the table: the other 8 (each wait behind the parked one, so judged after its release)
+            # share a bucket; the 4 waits before the park are judged where they were recorded
+            self.assertIn("other caller 0 initial 0 after_release 8 unsatisfied 0\n", out)
+            self.assertIn("totals waits 75 unsatisfied 1 initial 4 after_release 70 later_cpu 1\n", out)
             self.assertRegex(out, r"(?m)^stat\| waitsite 0x\w+ \(main\+0x6000\) 4 by a GPU signal in order 0, by a CPU signal before 0, already satisfied 4,")
             self.assertIn("stat| waitsite other sites 8 ", out)
 
@@ -232,14 +232,16 @@ class QueueTest(unittest.TestCase):
             # sorted by what answered them: the GPU in order (the waiting queue's own signal), a CPU signal before, the
             # word's own value; the two waits that did not hold at their place held their queue: one is released
             # later by the CPU, one by the GPU of another queue
-            self.assertIn("classes gpu 2 cpu 2 initial 1 unsatisfied 2 later_gpu 1 later_cpu 1\n", done.stdout)
+            self.assertIn("classes gpu 2 cpu 1 initial 1 unsatisfied 2 later_gpu 1 later_cpu 1\n", done.stdout)
             # the census rows of the same counters: kind nvn-stat, one per key, the count then the words
             self.assertIn("stat| waitevents 7 WaitEvents met 7, unsatisfied at their place 2\n", done.stdout)
-            self.assertIn("stat| waitclasses 7 by a GPU signal in order 2, by a CPU signal before 2, already satisfied 1, "
-                          "unsatisfied 2 (later by GPU 1, later by CPU 1, not satisfied by the end 0, dropped from the "
-                          "full list 0); GPU signals in order: of its own queue 2, of another 0\n", done.stdout)
+            # the wait behind the parked one (GEQUAL 4 on the word the CPU then wrote) is judged after the release: it is
+            # "reached after a release", not a CPU signal "before"
+            self.assertIn("stat| waitclasses 7 by a GPU signal in order 2, by a CPU signal before 1, already satisfied 1, "
+                          "reached after a release 1, unsatisfied 2 (later by GPU 1, later by CPU 1, not satisfied by the "
+                          "end 0); GPU signals in order: of its own queue 2, of another 0\n", done.stdout)
             self.assertIn("stat| waitqueues 3 GPU signal in order: of the waiting queue itself 2, of another queue 0; GPU "
-                          "signal of another queue after the wait parked its queue 1; CPU signal: before 2, after the wait "
+                          "signal of another queue after the wait parked its queue 1; CPU signal: before 1, after the wait "
                           "parked its queue 1\n", done.stdout)
             # how long a queue was held: the CPU's release came with no submission between, the other queue's after one
             self.assertIn("stat| waitholds 2 queues held at a wait 2; longest hold 1 submissions made meanwhile (a stop at "
@@ -248,13 +250,15 @@ class QueueTest(unittest.TestCase):
                           "1024, or 10 s for a wait with no timeout); held now 1\n", done.stdout)
             self.assertIn("stat| recordings 5 inline 0, slow 5, ended with a handle 5, ended empty 0\n", done.stdout)
             # 70 waits on one word nobody signalled hold the queue at the first; the CPU's signal releases it and finds
-            # the other 69 satisfied, so nothing is left out of a list: dropped stays 0
-            self.assertIn("released unsatisfied 3 later_cpu 2 by_cpu 71 dropped 0 pending 0\n", done.stdout)
+            # the other 69 satisfied. Those 69 are judged after the release, so they are "reached after a release" (70 with
+            # the wait behind the first release) and not "CPU signal before": by_cpu stays at the one wait that was
+            # judged at its place
+            self.assertIn("released unsatisfied 3 later_cpu 2 by_cpu 1 after_release 70 pending 0\n", done.stdout)
             # a wait on a word nobody signals is pending
-            self.assertIn("unresolved unsatisfied 4 pending 1 dropped 0\n", done.stdout)
-            self.assertIn("stat| waitclasses 78 by a GPU signal in order 2, by a CPU signal before 71, already satisfied 1, "
-                          "unsatisfied 4 (later by GPU 1, later by CPU 2, not satisfied by the end 1, dropped from the "
-                          "full list 0); GPU signals in order: of its own queue 2, of another 0\n", done.stdout)
+            self.assertIn("unresolved unsatisfied 4 pending 1\n", done.stdout)
+            self.assertIn("stat| waitclasses 78 by a GPU signal in order 2, by a CPU signal before 1, already satisfied 1, "
+                          "reached after a release 70, unsatisfied 4 (later by GPU 1, later by CPU 2, not satisfied by the "
+                          "end 1); GPU signals in order: of its own queue 2, of another 0\n", done.stdout)
             # the pool rows tell pools made from pools live: the case's 4 MiB pool, and a second one (64 KiB, a window range, no
             # GPU access) that it made and ended
             self.assertIn("stat| pools 2 memory pools made 2, live 1 (most at once 2), 4194304 bytes live (most 4259840); "

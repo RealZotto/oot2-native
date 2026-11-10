@@ -417,6 +417,111 @@ static void case_order_pending(void) {
     printf("ok order_pending\n");
 }
 
+
+// A queue's pending ADD dropped by a reset: the event is initialised again while a GPU ADD of the old one is replayed and
+// not written. The write then lands in memory without the engine owing it (the old code took it off a count that was
+// already zero, which wrapped below 0, and a CPU write of 5 was then read as 3).
+static void case_order_reset_pending(void) {
+    static volatile uint32_t H;
+    static Rec r1, r2;
+    eng_start();
+    begin(&r1), sig(&r1, &H, ADD, 2), end(&r1);
+    sub1(1, 1, &r1);
+    wo_word_reset(&g_o, &H);
+    H += 2;
+    wo_signal_written(&g_o, &H, ADD, 2);
+    H = 5;
+    wo_cpu_write(&g_o, &H);
+    begin(&r2), waitev(&r2, &H, EQUAL, 5, 0x1000), mark(&r2, 1), end(&r2);
+    sub1(2, 2, &r2);
+    put_out("reset-pending", take());
+    CHECK(wo_parked(&g_o) == 0 && g_last_wait.parked == 0 && g_last_wait.seen == 5);
+    wo_end(&g_o);
+    printf("ok order_reset_pending\n");
+}
+
+// An event initialised again over a word with a parked wait releases the wait when the word now holds its value.
+static void case_order_reset_release(void) {
+    static volatile uint32_t E = 9;
+    static Rec r1;
+    eng_start();
+    begin(&r1), mark(&r1, 1), waitev(&r1, &E, EQUAL, 0, 0x1000), mark(&r1, 2), end(&r1);
+    sub1(1, 1, &r1);
+    CHECK(wo_parked(&g_o) == 1 && g_last_wait.seen == 0);
+    put_out("held", take());
+    E = 0;   // the storage is initialised again: no CPU write is reported for it
+    wo_word_reset(&g_o, &E);
+    put_out("released", take());
+    CHECK(wo_parked(&g_o) == 0 && wo_whole_through(&g_o) == 1 && g_last_wait.parked == 1 && g_last_wait.seen == 0 &&
+          g_last_wait.writer == WO_WRITER_NONE);
+    wo_end(&g_o);
+    printf("ok order_reset_release\n");
+}
+
+// The table of event words grows past 512 words (1024 slots, doubling at half full): a word met before the growth is still
+// the same word after it.
+#define MANY 700
+static volatile uint32_t g_many[MANY];
+static void case_order_words(void) {
+    static Rec rs[MANY / 50], rq1, rq2;
+    eng_start();
+    for (int k = 0; k < MANY / 50; k++) {
+        begin(&rs[k]);
+        for (int i = 0; i < 50; i++) sig(&rs[k], &g_many[50 * k + i], WRITE, (uint32_t)(50 * k + i + 1));
+        end(&rs[k]);
+        sub1(1, (uint64_t)k + 1, &rs[k]);
+    }
+    printf("words %zu cap %zu\n", g_o.word_count, g_o.word_cap);
+    CHECK(g_o.word_count == MANY && g_o.word_cap == 2048);
+    // memory holds 0 everywhere: a word the table lost would be read from memory again and a wait for its value would park
+    begin(&rq1), waitev(&rq1, &g_many[3], EQUAL, 4, 0x1000), end(&rq1);
+    sub1(2, 100, &rq1);
+    CHECK(wo_parked(&g_o) == 0 && g_last_wait.seen == 4 && g_last_wait.writer == WO_WRITER_GPU && g_last_wait.signaller == 1);
+    begin(&rq2), waitev(&rq2, &g_many[MANY - 1], EQUAL, MANY, 0x1100), end(&rq2);
+    sub1(2, 101, &rq2);
+    CHECK(wo_parked(&g_o) == 0 && g_last_wait.seen == MANY && g_parked_calls == 0);
+    wo_end(&g_o);
+    printf("ok order_words\n");
+}
+
+// Submissions of several recordings: a wait in the second parks the queue there; a second submission of two recordings
+// queues behind; two waits in the second recording are released one at a time, then the third recording and the queued
+// submission follow. The stop query names the recording the wait is in.
+static void case_order_recordings(void) {
+    static volatile uint32_t E, F;
+    static Rec a, b, c, d, e, s1, s2;
+    eng_start();
+    g_clock = 100;
+    begin(&a), mark(&a, 1), end(&a);
+    begin(&b), mark(&b, 2), waitev(&b, &E, EQUAL, 1, 0x1000), mark(&b, 3), waitev(&b, &F, EQUAL, 1, 0x1100), mark(&b, 4), end(&b);
+    begin(&c), mark(&c, 5), end(&c);
+    uint64_t h1[3] = {handle(&a), handle(&b), handle(&c)};
+    wo_submit(&g_o, 1, 1, h1, 3);
+    put_out("parked-in-second", take());
+    WoStall st;
+    g_clock = 100 + WO_STALL_NS + 1;
+    CHECK(stalled(0, WO_STALL_NS, 0, 1, 0, &st) && st.index == 1 && st.wait.val == &E);
+    begin(&d), mark(&d, 6), end(&d);
+    begin(&e), mark(&e, 7), end(&e);
+    uint64_t h2[2] = {handle(&d), handle(&e)};
+    wo_submit(&g_o, 1, 2, h2, 2);
+    CHECK(!take()[0] && wo_parked(&g_o) == 1);
+    begin(&s1), sig(&s1, &E, WRITE, 1), end(&s1);
+    begin(&s2), sig(&s2, &F, WRITE, 1), end(&s2);
+    g_clock = 200;
+    sub1(2, 3, &s1);
+    put_out("first-release", take());
+    CHECK(wo_parked(&g_o) == 1 && wo_whole_through(&g_o) == 0);
+    g_clock = 200 + WO_STALL_NS + 1;
+    CHECK(stalled(0, WO_STALL_NS, 0, 1, 0, &st) && st.index == 1 && st.wait.val == &F);
+    sub1(2, 4, &s2);
+    put_out("second-release", take());
+    put_out("whole", whole_take());
+    CHECK(wo_parked(&g_o) == 0 && wo_whole_through(&g_o) == 4);
+    wo_end(&g_o);
+    printf("ok order_recordings\n");
+}
+
 // ---------- the null back end through its table
 static const GfxBackend *B(void) { return &gfx_null_backend; }
 static void op_log(uint64_t fence, int index, const op_hdr *r, void *ctx) {
@@ -433,7 +538,7 @@ static uint64_t nsubmit(uint64_t queue, Rec *r) {
     return B()->submit(queue, &h, 1);
 }
 
-// (a), (d) in the null back end: the replay order, the fence value done only in order, the results written in fence order
+// (a), (d) in the null back end: the replay order, the fence value done only in order, the results written in replay order
 static void case_null_hold(void) {
     static volatile uint32_t E, F;
     static Rec r1, r2;
@@ -450,7 +555,8 @@ static void case_null_hold(void) {
     CHECK(gfx_null_parked() == 0 && gfx_null_whole_through() == 2);
     // both are replayed, neither is complete: completion is held
     CHECK(B()->fence_done() == 0 && E == 0 && F == 0);
-    // fence value 1 completes first, though its signal was replayed after fence value 2's: the CPU sees F, not E
+    // the hook completes what it is told to, up to fence value 1: fence value 1 alone (null_result_order has the writes
+    // of a value that covers both, which follow replay order)
     CHECK(gfx_null_complete(1) == 1);
     printf("after-1 E %u F %u done %llu\n", E, F, (ull)B()->fence_done());
     CHECK(gfx_null_complete(2) == 2);
@@ -511,6 +617,11 @@ static void case_null_classes(void) {
     begin(&r5), waitev(&r5, G, EQUAL, 1, 0xD000), end(&r5);                          // held until the CPU signals
     begin(&r6), waitev(&r6, H, GEQUAL, 0, 0xE000), end(&r6);                         // the word's own value
     begin(&r7), sig(&r7, H, ADD, 2), end(&r7);
+    volatile uint32_t *J = &g_ev[4];
+    static Rec r8, r9, r10;
+    begin(&r8), sig(&r8, J, WRITE, 1), end(&r8);                                    // queue 3's signal
+    begin(&r9), waitev(&r9, J, EQUAL, 1, 0xF000), end(&r9);                         // queue 3's own signal, in order
+    begin(&r10), waitev(&r10, J, EQUAL, 1, 0xF100), end(&r10);                      // queue 3's signal, awaited by queue 2
     nsubmit(1, &r1);
     nsubmit(2, &r2);
     nsubmit(3, &r3);
@@ -518,6 +629,9 @@ static void case_null_classes(void) {
     nsubmit(4, &r5);
     nsubmit(5, &r6);
     nsubmit(6, &r7);
+    nsubmit(3, &r8);   // queue 3 is released by r4 above
+    nsubmit(3, &r9);
+    nsubmit(2, &r10);
     GfxNullWaitClasses k;
     gfx_null_wait_classes(&k);
     printf("before-cpu gpu %llu (same %llu other %llu) cpu %llu initial %llu unsatisfied %llu later_gpu %llu later_cpu %llu "
@@ -660,6 +774,157 @@ static void case_null_timeout(void) {
     printf("ok null_timeout\n");
 }
 
+
+// Results are written in the order replay finished the submissions, not in fence order: queue 1 (fence value 1) waits for E,
+// then writes X = 7; queue 2 (fence value 2) writes X = 3 and then signals E. The console ends at X = 7 (queue 1's write
+// follows E, which follows X = 3). Once with completion at once, once with completion held and then asked for, up to
+// fence value 4, which covers both: queue 2's results are written first, as replay finished it first.
+static volatile uint32_t g_x1, g_e1, g_x2, g_e2;
+static void case_null_result_order(void) {
+    static Rec r1, r2, r3, r4;
+    gfx_null_log_ops(NULL, NULL);
+    begin(&r1), waitev(&r1, &g_e1, EQUAL, 1, 0x1000), sig(&r1, &g_x1, WRITE, 7), end(&r1);
+    begin(&r2), sig(&r2, &g_x1, WRITE, 3), sig(&r2, &g_e1, WRITE, 1), end(&r2);
+    CHECK(nsubmit(1, &r1) == 1);
+    CHECK(nsubmit(2, &r2) == 2);
+    CHECK(B()->fence_done() == 2);
+    printf("released x %u e %u done %llu\n", g_x1, g_e1, (ull)B()->fence_done());
+    begin(&r3), waitev(&r3, &g_e2, EQUAL, 1, 0x1100), sig(&r3, &g_x2, WRITE, 7), end(&r3);
+    begin(&r4), sig(&r4, &g_x2, WRITE, 3), sig(&r4, &g_e2, WRITE, 1), end(&r4);
+    gfx_null_hold(1);
+    CHECK(nsubmit(1, &r3) == 3);
+    CHECK(nsubmit(2, &r4) == 4);
+    CHECK(g_x2 == 0 && g_e2 == 0);
+    CHECK(gfx_null_complete(4) == 4);
+    printf("held x %u e %u done %llu\n", g_x2, g_e2, (ull)B()->fence_done());
+    gfx_null_hold(0);
+    printf("ok null_result_order\n");
+}
+
+// What a submission kept before a wait that parks its queue is written at the park, not when the whole submission
+// completes: queue 1 writes X = 1 and waits for E, which nobody signals; queue 2 waits for X = 1 and writes Y = 1. The CPU
+// sees X and Y. With completion held nothing is written at a park.
+static volatile uint32_t g_px, g_pe, g_py, g_qx, g_qe;
+static void case_null_park_writes(void) {
+    static Rec r1, r2, r3;
+    gfx_null_log_ops(NULL, NULL);
+    begin(&r1), sig(&r1, &g_px, WRITE, 1), waitev(&r1, &g_pe, EQUAL, 1, 0x1000), end(&r1);
+    begin(&r2), waitev(&r2, &g_px, EQUAL, 1, 0x1100), sig(&r2, &g_py, WRITE, 1), end(&r2);
+    CHECK(nsubmit(1, &r1) == 1);
+    CHECK(__atomic_load_n(&g_px, __ATOMIC_ACQUIRE) == 1);   // written at the park
+    CHECK(nsubmit(2, &r2) == 2);
+    printf("x %u y %u parked %d done %llu\n", g_px, g_py, gfx_null_parked(), (ull)B()->fence_done());
+    CHECK(B()->fence_wait(2, 0) == 1 && B()->fence_wait(1, 0) == 0);
+    begin(&r3), sig(&r3, &g_qx, WRITE, 1), waitev(&r3, &g_qe, EQUAL, 1, 0x1200), end(&r3);
+    gfx_null_hold(1);
+    CHECK(nsubmit(3, &r3) == 3);
+    printf("held x %u parked %d\n", g_qx, gfx_null_parked());
+    CHECK(g_qx == 0);
+    gfx_null_hold(0);
+    printf("ok null_park_writes\n");
+}
+
+// finish(0) is every queue: two queues held at once, released out of order (the later fence value first), and the finish
+// returns only when both are done.
+static volatile uint32_t g_fa, g_fc;
+static void finish_releaser(void *arg) {
+    (void)arg;
+    plat_sleep_ns(100000000u);
+    __atomic_store_n(&g_fc, 1, __ATOMIC_RELEASE);
+    B()->guest_written((uint64_t)(uintptr_t)&g_fc, 4);
+    plat_sleep_ns(200000000u);
+    __atomic_store_n(&g_fa, 1, __ATOMIC_RELEASE);
+    B()->guest_written((uint64_t)(uintptr_t)&g_fa, 4);
+}
+static void case_null_finish_all(void) {
+    static Rec r1, r2;
+    gfx_null_log_ops(NULL, NULL);
+    gfx_null_wait_bounds(0, 3000000000u);
+    begin(&r1), waitev(&r1, &g_fa, EQUAL, 1, 0x1000), end(&r1);
+    begin(&r2), waitev(&r2, &g_fc, EQUAL, 1, 0x1100), end(&r2);
+    CHECK(nsubmit(1, &r1) == 1);
+    CHECK(nsubmit(2, &r2) == 2);
+    CHECK(plat_thread_start(finish_releaser, NULL, 1ull << 20));
+    uint64_t t0 = plat_now_ns();
+    B()->finish(0);
+    uint64_t waited = plat_now_ns() - t0;
+    printf("finish(0) parked %d done %llu\n", gfx_null_parked(), (ull)B()->fence_done());
+    CHECK(waited >= 250000000u && gfx_null_parked() == 0 && B()->fence_done() == 2);
+    printf("ok null_finish_all\n");
+}
+
+// A wait behind a parked wait of its own queue is judged after the release and counted as such, not as a signal "before":
+// queue 2's wait on a word the CPU wrote is by_cpu; queue 1 parks at E, with behind it a wait on a word that holds its
+// value, one on the word the CPU wrote, and, in a second submission queued behind, one more.
+static volatile uint32_t g_ar[4];
+static void case_null_after_release(void) {
+    static Rec r0, r1, r2;
+    gfx_null_log_ops(NULL, NULL);
+    volatile uint32_t *E = &g_ar[0], *G = &g_ar[1], *H = &g_ar[2];
+    __atomic_store_n(H, 5, __ATOMIC_RELEASE);
+    B()->guest_written((uint64_t)(uintptr_t)H, 4);
+    begin(&r0), waitev(&r0, H, EQUAL, 5, 0xA000), end(&r0);
+    begin(&r1), waitev(&r1, E, EQUAL, 1, 0xB000), waitev(&r1, G, GEQUAL, 0, 0xB100), waitev(&r1, H, EQUAL, 5, 0xB200), end(&r1);
+    begin(&r2), waitev(&r2, G, GEQUAL, 0, 0xB300), end(&r2);
+    nsubmit(2, &r0);
+    nsubmit(1, &r1);
+    nsubmit(1, &r2);
+    GfxNullWaitClasses k;
+    gfx_null_wait_classes(&k);
+    printf("held cpu %llu initial %llu after_release %llu unsatisfied %llu later_cpu %llu pending %llu\n", (ull)k.by_cpu,
+           (ull)k.initial, (ull)k.after_release, (ull)k.unsatisfied, (ull)k.later_cpu, (ull)k.pending);
+    __atomic_store_n(E, 1, __ATOMIC_RELEASE);
+    B()->guest_written((uint64_t)(uintptr_t)E, 4);
+    gfx_null_wait_classes(&k);
+    printf("released cpu %llu initial %llu after_release %llu unsatisfied %llu later_cpu %llu pending %llu\n", (ull)k.by_cpu,
+           (ull)k.initial, (ull)k.after_release, (ull)k.unsatisfied, (ull)k.later_cpu, (ull)k.pending);
+    uint64_t unsatisfied = 0, waits = gfx_null_wait_events(&unsatisfied);
+    printf("waits %llu unsatisfied %llu\n", (ull)waits, (ull)unsatisfied);
+    printf("ok null_after_release\n");
+}
+
+// The default bounds, with no gfx_null_wait_bounds call: 1024 further submissions are within, the 1025th is a stop; and a
+// wait with no timeout for the held queue's work stops after WO_STALL_NS (10 s).
+static void case_null_stop_default_submits(void) {
+    static volatile uint32_t E;
+    static Rec r1, rm;
+    gfx_null_log_ops(NULL, NULL);
+    begin(&r1), waitev(&r1, &E, EQUAL, 1, 0x1000), end(&r1);
+    begin(&rm), mark(&rm, 1), end(&rm);
+    nsubmit(1, &r1);
+    for (int i = 0; i < (int)WO_BOUND_SUBMITS; i++) nsubmit(2, &rm);
+    printf("within\n");
+    nsubmit(2, &rm);
+    printf("not stopped\n");
+}
+static void case_null_stop_default_time(void) {
+    static volatile uint32_t E;
+    static Rec r1;
+    gfx_null_log_ops(NULL, NULL);
+    begin(&r1), waitev(&r1, &E, EQUAL, 1, 0x1000), end(&r1);
+    nsubmit(1, &r1);
+    printf("waiting\n");
+    B()->fence_wait(1, UINT64_MAX);
+    printf("not stopped\n");
+}
+
+// A wait in a recording above index 0: the stop names recording 1
+static void case_null_stop_recording(void) {
+    static volatile uint32_t E;
+    static Rec r1, r2, rm;
+    gfx_null_log_ops(NULL, NULL);
+    gfx_null_wait_bounds(8, 0);
+    begin(&r1), mark(&r1, 1), end(&r1);
+    begin(&r2), mark(&r2, 2), waitev(&r2, &E, EQUAL, 1, 0x1000), end(&r2);
+    begin(&rm), mark(&rm, 3), end(&rm);
+    uint64_t h[2] = {handle(&r1), handle(&r2)};
+    B()->submit(1, h, 2);
+    for (int i = 0; i < 8; i++) nsubmit(2, &rm);
+    printf("within\n");
+    nsubmit(2, &rm);
+    printf("not stopped\n");
+}
+
 static void watchdog(void *arg) {
     (void)arg;
     plat_sleep_ns(20000000000ull);
@@ -681,7 +946,12 @@ int main(int argc, char **argv) {
         {"null_stop_time", case_null_stop_time}, {"null_stop_finish", case_null_stop_finish},
         {"null_timeout", case_null_timeout}, {"order_add", case_order_add}, {"order_pending", case_order_pending},
         {"null_cross_queue", case_null_cross_queue}, {"null_late_wait", case_null_late_wait},
-        {"null_unrelated_park", case_null_unrelated_park},
+        {"null_unrelated_park", case_null_unrelated_park}, {"order_reset_pending", case_order_reset_pending},
+        {"order_reset_release", case_order_reset_release}, {"order_words", case_order_words},
+        {"order_recordings", case_order_recordings}, {"null_result_order", case_null_result_order},
+        {"null_park_writes", case_null_park_writes}, {"null_finish_all", case_null_finish_all},
+        {"null_after_release", case_null_after_release}, {"null_stop_default_submits", case_null_stop_default_submits},
+        {"null_stop_default_time", case_null_stop_default_time}, {"null_stop_recording", case_null_stop_recording},
     };
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++)
         if (!strcmp(argv[1], cases[i].name)) {

@@ -7,12 +7,15 @@
 //
 // A submission is replayed when it is made, unless a WaitEvent holds its queue (below), and completed after: at once, or,
 // while completion is held (gfx_null_hold), when gfx_null_complete or the end of the hold completes it. Queues complete
-// independently, each in its own order, and in fence order among the submissions that are whole at the same time. Replay checks that each recording is whole (OP_BEGIN first,
+// independently, each in its own order, and the submissions that are whole at the same time complete in the order replay
+// finished them (not in fence order: a held queue's earlier fence value is whole after a later one's, and its writes
+// follow the signal that released it, as on the console). Replay checks that each recording is whole (OP_BEGIN first,
 // sizes that stay 8-byte aligned, known ops, no call or jump, OP_END last), walks every record in the order the queues'
 // waits allow, decides conditional rendering, shows the record to the op log a test installs, and copies each record
 // with a CPU-visible result, since the recording is not the back end's once submit returns. Completion writes those
 // results in op-stream order (event signals, counter reports, buffer copies and clears, uniform updates), then marks the
-// fence value done: a fence value is done once its submission and the queue's earlier ones are written, whatever another
+// fence value done (a submission that parks at a wait writes what it kept before the wait at once, since the replay
+// has already let other queues act on it; the rest is written when it is whole): a fence value is done once its submission and the queue's earlier ones are written, whatever another
 // queue is held at (fence_done is the highest value with every submission up to it done).
 //
 // Counter reports are {counter, timestamp}: the timestamp is the guest's system tick (31.25 MHz, rt_ticks) read from
@@ -30,7 +33,8 @@
 // engine, which shows a queue's records in that queue's order and parks the queue at a wait that the replay so far does
 // not satisfy, until a signal replayed on another queue, or the CPU's signal (guest_written of the word), satisfies it.
 // Replay order can then differ from fence order. Results are copied per fence value at replay and written once the
-// submission is whole, and so is its fence value done; a queue's submissions are whole in the queue's order, and another
+// submission is whole (those kept before a wait that parks the queue are written at the park), and so is its fence value
+// done; a queue's submissions are whole in the queue's order, and another
 // queue's held wait is no condition (a thread that finishes or waits on one queue is never held by another's wait, gfx.h
 // rule 3). A fence value behind a parked wait of its own queue is not done; a wait nothing releases is a named stop (after
 // WO_BOUND_SUBMITS further submissions, or, for a wait with no timeout on a fence value of the queue or on the queue's
@@ -113,9 +117,11 @@ typedef struct results {
     uint8_t *buf;
     size_t used, size;
     int whole, done;
+    uint64_t seq;   // 1, 2, 3 in the order replay finished the submissions (set when whole): the order their results are written in
 } results;
 static results *g_res, **g_res_tail = &g_res;
 static int g_hold;
+static uint64_t g_whole_seq;
 
 static WoOrder g_wo;                         // the order the queues' records are replayed in (g_lock)
 static uint64_t g_bound_submits, g_bound_ns; // the bounds of a wait nothing releases; 0: WO_BOUND_SUBMITS, WO_STALL_NS
@@ -326,8 +332,16 @@ static void log_wait(const p_wait_event *p, const WoWait *how, int ok) {
 }
 
 // A wait that does not hold at its place: counted once, here, and its queue is parked.
+static void complete_ready(uint64_t value);
+static void write_results(results *k);
 static void sink_parked(void *ctx, uint64_t queue, uint64_t fence, int index, const p_wait_event *p, const WoWait *how) {
-    (void)ctx, (void)fence, (void)index;
+    (void)ctx, (void)index;
+    // What this submission kept before the wait is already visible to the queues that go on: write it now, after the
+    // submissions that were whole before (replay order), unless completion is held.
+    if (!g_hold) {
+        complete_ready(0);
+        write_results(results_for(fence));
+    }
     int first;
     int s = site_of(p->caller, &first);
     GfxNullWaitClasses *sc = site_classes(s);
@@ -361,6 +375,11 @@ static void sink_wait(uint64_t queue, const p_wait_event *p, const WoWait *how) 
         return;
     }
     g_waits++;
+    if (how->released) {   // judged after its queue was released from an earlier wait, not at the place it was recorded
+        g_classes.after_release++, sc->after_release++;
+        if (s >= 0 && first) log_wait(p, how, 1);
+        return;
+    }
     if (how->writer == WO_WRITER_GPU) {
         g_classes.by_gpu++, sc->by_gpu++;
         if (how->signaller == queue) g_classes.by_gpu_same++, sc->by_gpu_same++;
@@ -386,10 +405,12 @@ static void sink_record(void *ctx, uint64_t queue, uint64_t fence, int index, co
 
 static void sink_whole(void *ctx, uint64_t queue, uint64_t fence) {
     (void)ctx, (void)queue;
-    results_for(fence)->whole = 1;
+    results *k = results_for(fence);
+    k->whole = 1, k->seq = ++g_whole_seq;
 }
 
-static void complete(results *k) {
+// Write the results kept so far to memory, in op-stream order, and forget them.
+static void write_results(results *k) {
     for (size_t at = 0; at < k->used;) {
         const op_hdr *r = (const op_hdr *)(const void *)(k->buf + at);
         const void *a = r + 1;
@@ -432,19 +453,32 @@ static void complete(results *k) {
         default: break;
         }
     }
+    k->used = 0;
+}
+
+static void complete(results *k) {
+    write_results(k);
     if (texheap_on()) texheap_complete(k->fence);
     free(k->buf);
-    k->buf = NULL, k->used = k->size = 0;
+    k->buf = NULL, k->size = 0;
     k->done = 1;
 }
 
-// Complete the submissions that are whole, oldest first, up to fence value `value` (0: all of them). A submission held at
-// a wait, or behind one of its queue, is not whole and is skipped, not waited for: the queues that are not held complete
-// (a queue's own submissions are whole in its own order, so none completes ahead of an earlier one of its queue). The
-// done prefix then moves up over the values that are done.
+// Complete the submissions that are whole, up to fence value `value` (0: all of them), in the order replay finished
+// them: the one with the smallest seq first, until none is left. A submission held at a wait, or behind one of its
+// queue, is not whole and is skipped, not waited for: the queues that are not held complete (a queue's own submissions
+// are whole in its own order, so none completes ahead of an earlier one of its queue). Without a wait, replay order is
+// fence order. `value` (a test's hook, gfx_null_complete) names which submissions are completed and is not widened: a
+// value that leaves out one replay finished earlier shows the later one's writes without it. The done prefix then moves
+// up over the values that are done.
 static void complete_ready(uint64_t value) {
-    for (results *k = g_res; k && (!value || k->fence <= value); k = k->next)
-        if (k->whole && !k->done) complete(k);
+    for (;;) {
+        results *next = NULL;
+        for (results *k = g_res; k && (!value || k->fence <= value); k = k->next)
+            if (k->whole && !k->done && (!next || k->seq < next->seq)) next = k;
+        if (!next) break;
+        complete(next);
+    }
     while (g_res && g_res->done) {
         results *k = g_res;
         g_res = k->next;
@@ -602,14 +636,20 @@ static uint64_t null_present_shown(uint64_t seq) {
 }
 
 // Every submission so far of `queue` (0: of every queue) is done.
+static int finish_pending(uint64_t queue, uint64_t target) {
+    for (const results *k = g_res; k && k->fence <= target; k = k->next)
+        if (!k->done && (!queue || k->queue == queue)) return 1;
+    return 0;
+}
+
 static void null_finish(uint64_t queue) {
     null_lock();
     uint64_t target = 0, start = plat_now_ns();
     for (const results *k = g_res; k; k = k->next)
         if (!k->done && (!queue || k->queue == queue)) target = k->fence;
-    for (;;) {
-        const results *k = target ? results_find(target) : NULL;
-        if (!k || k->done) break;
+    // every matching submission up to the newest at the call, not the newest alone: with two queues held at once, a
+    // later fence value can be released first
+    while (finish_pending(queue, target)) {
         wait_done(start, UINT64_MAX);
         check_stall(queue ? queue : WO_ANY_QUEUE, target, start);
     }

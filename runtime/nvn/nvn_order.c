@@ -203,6 +203,7 @@ static int sub_run(WoOrder *o, WoLane *l, WoSub *s, const uint64_t *handles, int
                      (ull)s->fence, h.size, s->at);
         const op_hdr *r = (const op_hdr *)(const void *)(p + s->at);
         WoWait how = {0};
+        how.released = o->in_release;
         if (h.op == OP_WAIT_EVENT) {
             const p_wait_event *w = (const p_wait_event *)(const void *)(r + 1);
             WoWord *wd = word_get(o, w->val);
@@ -265,7 +266,9 @@ static void release_all(WoOrder *o) {
             if (!l->parked) continue;
             WoWord *wd = word_find(o, l->wait.val);
             if (!l->latched && (!wd || !holds(&l->wait, wd->v))) continue;
+            o->in_release = 1;
             lane_run(o, l);
+            o->in_release = 0;
             moved = 1;
         }
     }
@@ -334,9 +337,15 @@ void wo_word_reset(WoOrder *o, const volatile uint32_t *val) {
     release_all(o);
 }
 
+// An ADD written to memory. What the engine still owes of it is taken off pend_add; the part it does not owe (a reset
+// dropped the ADD from pend_add while it was replayed and not written, so the word was read without it) lands in the
+// engine's copy now, as it lands in memory.
 void wo_signal_written(WoOrder *o, const volatile uint32_t *val, uint32_t mode, uint32_t value) {
     WoWord *w = word_find(o, val);
-    if (w && mode == NVN_EVENT_SIGNAL_MODE_ADD) w->pend_add -= value;
+    if (!w || mode != NVN_EVENT_SIGNAL_MODE_ADD) return;
+    uint32_t d = value < w->pend_add ? value : w->pend_add;
+    w->pend_add -= d;
+    w->v += value - d;
 }
 
 uint64_t wo_whole_through(const WoOrder *o) { return o->first ? o->first->fence - 1 : o->last_fence; }
