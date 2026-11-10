@@ -174,6 +174,23 @@ static void hash_remove(Res *r) {
         }
 }
 
+// Take every shared view over storage [lo, hi) out of the hash, so that no registration or bind finds it again. The views
+// stay alive for whoever holds them: a copy that shows one keeps it until the copy is brought up to date, and a pending
+// submission may still read it. Only sampled views are shared this way (samplers have no storage).
+static void hash_detach_storage(uint64_t lo, uint64_t hi) {
+    for (uint32_t b = 0; b < HASH_BUCKETS; b++) {
+        Res **p = &g.hash[b];
+        while (*p) {
+            Res *r = *p;
+            if (!r->sampler && r->key.view.storage >= lo && r->key.view.storage < hi) {
+                *p = r->next;
+                continue;
+            }
+            p = &r->next;
+        }
+    }
+}
+
 // The shared view of (t, v) as `type`; NULL when the host makes none. No reference is taken. demand: the replay binds the
 // texture now, so a host that made no view at registration (view_make) is asked again with view_demand.
 static Res *view_get(const tex_t *t, const view_t *v, int type, int demand) {
@@ -523,6 +540,10 @@ void bindless_texture_release(const tex_t *t) {
 
 void bindless_storage_gone(uint64_t lo, uint64_t hi) {
     plat_mutex_lock(&g_mu);
+    // A pool remade at the same address holds textures at the same storage with the same shape, whose registrations would
+    // find the views of the finalized pool's textures by their key while a copy still shows them, and stand on images whose
+    // memory went back to the backing map with the pool. Those views are no longer shared.
+    hash_detach_storage(lo, hi);
     for (int i = 0; i < g.ntp; i++) {
         TexPool *p = g.tp[i];
         for (uint32_t c = 0; c < p->nchunks; c++) {

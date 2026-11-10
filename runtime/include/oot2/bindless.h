@@ -122,7 +122,10 @@ void bindless_texture_register(const dpool_ref *pool, int id, const tex_t *t, co
 void bindless_sampler_register(const dpool_ref *pool, int id, const samp_par *s);
 // A texture the game finalized (gfx.h texture_release): the host objects of its serial may go; no entry changes.
 void bindless_texture_release(const tex_t *t);
-// The storage [lo, hi) is gone (its pool was finalized): every entry whose view is over it shows the placeholder.
+// The storage [lo, hi) is gone (its pool was finalized): every entry whose view is over it shows the placeholder, and no
+// view over it is shared with a registration made later: a pool remade at the same address registers textures at the same
+// storage with the same description, which must stand on new images, not on the finalized pool's (whose memory is freed
+// while a copy may still show the old view).
 void bindless_storage_gone(uint64_t lo, uint64_t hi);
 
 // ---- the replay's side: one submission at a time (the caller holds the back end's submission lock)

@@ -18,6 +18,9 @@
 //                    replay binds the texture: registering takes nothing, the first bind asks the host (view_demand) and tells it which
 //                    submission reads the view (view_use), every copy gets the view through the log, a second view type is asked for
 //                    too, and registering another texture at the ID puts the placeholder back until the next bind
+//   remade           a pool finalized and remade at the same address: the textures registered again over the same storage with the
+//                    same description (also their second view types) get views of their own, not the finalized pool's views a copy
+//                    still shows; the views over other storage stay shared; the old views go once no copy shows them
 //   id_fatal         a texture registered past the game's part of the array is a named fatal (exit 70)
 // On a device with every item of oot2/vk_required.h (the driver skips them without one):
 //   device           ...
@@ -493,6 +496,59 @@ static void case_demand(void) {
     bindless_close();
 }
 
+// A pool finalized and remade at the same address (the game's render-target pool at the New Game load): its textures are
+// registered again at the same storage with the same description. The copies are brought up to date only by the next
+// submission, so the finalized pool's views are still held (and found by their key) when the registration comes; the entry
+// must stand on a view of its own, whose image is the remade pool's, never on the old one, whose image's memory went back to
+// the backing map with the pool (a device loss in the first draw to sample it).
+static void case_remade(void) {
+    const dpool_ref pool = {0x100000, 1000, 0}, spool_ref = {0x200000, FAKE_SAMPLERS, 0};
+    fake_open();
+    tex_t ta = tex_at(0x1000000, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);   // in the pool that goes
+    tex_t tb = tex_at(0x2000000, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);   // in a pool that stays
+    tex_t tb2 = tex_at(0x2000000, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);  // the same storage and description again
+    bindless_texture_register(&pool, 5, &ta, NULL);
+    bindless_texture_register(&pool, 6, &tb, NULL);
+    bindless_texture_register(&pool, 7, &tb2, NULL);
+    CHECK(fk.views_made == 2);   // IDs 6 and 7 share a view
+    void *s1 = acq(&pool, &spool_ref);   // pending from here on: done stays below its value
+    CHECK(shows(s1, 5) == 0x1000000 && shows(s1, 6) == 0x2000000 && shows(s1, 7) == 0x2000000);
+    void *old_first = ((FakeSet *)s1)->img[5];
+    uint32_t old_slot = bindless_image_slot(5, BV_2D_ARRAY);   // its second view type, in a second slot
+    CHECK(old_slot >= FAKE_IMAGES - FAKE_SECOND && fk.views_made == 3);
+    void *old_second = ((FakeSet *)s1)->img[old_slot];
+    CHECK(old_first && old_second && old_first != old_second);
+    printf("before: ID 5 stands on a view and a second view of the pool that goes; IDs 6 and 7 share a view\n");
+
+    // the pool [0x1000000, 0x1800000) is finalized and remade at the same address
+    bindless_storage_gone(0x1000000, 0x1800000);
+    tex_t ta2 = tex_at(0x1000000, NVN_TEXTURE_TARGET_2D, 0x25, 64, 64, 1, 1);
+    int made = fk.views_made;
+    bindless_texture_register(&pool, 5, &ta2, NULL);
+    CHECK(fk.views_made == made + 1);   // not the finalized pool's view, which the pending copy still holds
+    void *s2 = acq(NULL, NULL);
+    CHECK(s2 != s1);
+    CHECK(((FakeSet *)s1)->img[5] == old_first && ((FakeSet *)s1)->img[old_slot] == old_second);   // the pending copy is as it was
+    CHECK(shows(s2, 5) == 0x1000000 && ((FakeSet *)s2)->img[5] != old_first);
+    CHECK(shows(s2, 6) == 0x2000000 && shows(s2, 7) == 0x2000000 && ((FakeSet *)s2)->img[6] == ((FakeSet *)s1)->img[6]);
+    printf("ID 5 registered again over the same storage and description took a view of its own; the views of the pool that stays are still shared\n");
+
+    // its second view type is made again too
+    made = fk.views_made;
+    uint32_t slot = bindless_image_slot(5, BV_2D_ARRAY);
+    CHECK(slot != UINT32_MAX && slot != old_slot && fk.views_made == made + 1);
+    CHECK(((FakeSet *)s2)->img[slot] != old_second && ((uint64_t *)((FakeSet *)s2)->img[slot])[1] == BV_2D_ARRAY);
+    printf("its second view type was made again, in another slot than the finalized pool's\n");
+
+    // the finalized pool's views go once no copy that a pending submission reads shows them
+    CHECK(fk.views_freed == 0);
+    fk.done = g_val;
+    for (int i = 0; i < 8; i++) acq(NULL, NULL);
+    CHECK(fk.views_freed == 2);
+    printf("the two views of the finalized pool were freed after the submission that could read them\n");
+    bindless_close();
+}
+
 static void case_id_fatal(void) {
     fake_open();
     const dpool_ref pool = {0x100000, 2000, 0};
@@ -757,6 +813,37 @@ static void case_device(int argc, char **argv) {
     printf("4096 sampler registrations with 300 distinct states: %llu host samplers live, and entry 100 samples\n",
            (ull)s1.samplers_live);
 
+    // A pool finalized and remade at the same address, as the game's render-target pool is at a load. It is larger than a
+    // VRAM block, so its extent is a block of its own, which goes back to the driver at pool_fini. No submission runs between
+    // the two, so the copy that showed the texture still holds its view when the texture is registered again: the entry must
+    // stand on an image of the remade pool's extent, not on the finalized pool's, whose memory is freed (the first draw to
+    // sample such a view loses the device).
+    pool_t big = {.magic = MAGIC('P', 'O', 'O', 'L'), .flags = NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS,
+                  .mem = (uint8_t *)(uintptr_t)(WIN + 1024 * MiB), .size = 288 * MiB};
+    DRAW_CHECK(backing_pool_init(&big));
+    tex_t te = tex_at(WIN + 1024 * MiB, NVN_TEXTURE_TARGET_2D, 0x25, 256, 256, 1, 1);
+    fill_rgba(texels, 256, 256, 0, 0, 40);
+    vkb_write_texels(&te, NULL, &all, texels, 256 * 4, 256 * 256 * 4);
+    bindless_texture_register(&r.pool, 21, &te, NULL);
+    v = submit_read(&r, r.pipe_2d, 21, BV_NONE, 3, 3, 4, 0, NULL, &out1);
+    wait_done(v);
+    CHECK(texel_is(&out1, 3, 4, 40, 255));
+    gfx_vulkan_backend.pool_fini(&big);
+    DRAW_CHECK(backing_pool_init(&big));
+    tex_t te2 = tex_at(WIN + 1024 * MiB, NVN_TEXTURE_TARGET_2D, 0x25, 256, 256, 1, 1);
+    vkb_image_stats(&is);
+    uint64_t made_before = is.made;
+    bindless_texture_register(&r.pool, 21, &te2, NULL);
+    vkb_image_stats(&is);
+    CHECK(is.made == made_before + 1);
+    fill_rgba(texels, 256, 256, 0, 0, 41);
+    vkb_write_texels(&te2, NULL, &all, texels, 256 * 4, 256 * 256 * 4);
+    v = submit_read(&r, r.pipe_2d, 21, BV_NONE, 3, 3, 4, 0, NULL, &out1);
+    wait_done(v);
+    CHECK(texel_is(&out1, 3, 4, 41, 255));
+    printf("a 288 MiB pool finalized and remade at its address: the texture registered again stands on an image of the new extent and reads (3, 4, 41)\n");
+    gfx_vulkan_backend.pool_fini(&big);
+
     // The pool is finalized: its entries show the placeholder and its images go.
     gfx_vulkan_backend.pool_fini(&pool);
     v = submit_read(&r, r.pipe_2d, 5, BV_NONE, 100, 7, 8, 0, NULL, &out1);
@@ -796,6 +883,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "decoded")) case_decoded();
     else if (!strcmp(cs, "tables")) case_tables();
     else if (!strcmp(cs, "demand")) case_demand(), printf("ok demand\n");
+    else if (!strcmp(cs, "remade")) case_remade();
     else if (!strcmp(cs, "id_fatal")) case_id_fatal();
     else if (!strcmp(cs, "usable")) case_usable();
     else if (!strcmp(cs, "device")) {

@@ -12,14 +12,16 @@ Two groups, by what they need:
   (nvn_fmt_bpb); and the mapping of (texture pool, ID) to the global arrays with stand-ins for the host: one registration
   changes one entry, the same registration again none, an ID registered again under a pending submission takes another
   copy and leaves the pending one as it was, a released serial clears no entry, 4,096 sampler registrations with 300
-  distinct states hold 300 host samplers, second views, two pools, a copy far behind the log, retirement; and what an image of
+  distinct states hold 300 host samplers, second views, two pools, a copy far behind the log, retirement, a pool remade at the
+  same address getting views of its own; and what an image of
   ASTC decoded to RGBA8 may do (it never stands in its pool's extent, and a storage view or a texel copy of one is refused
   by name), over every ASTC format.
 - On a device with every item of oot2/vk_required.h (the desktop; the device is the RTX 3060 Ti): images stand at their
   pool offsets in the pool's extent and the texel copies return what they wrote; a registration changes one entry; an ID
   registered again while a gated earlier submission reads the old image leaves that submission's result right; an entry
   read as 2D and as 2D array samples right both ways; two textures over one storage range see each other's GPU writes;
-  4,096 sampler registrations with 300 distinct states hold 300 host samplers; a finalized pool's entries read the
+  4,096 sampler registrations with 300 distinct states hold 300 host samplers; a pool of 288 MiB finalized and remade at its
+  address stands the texture registered again on an image of the new extent; a finalized pool's entries read the
   placeholder; the validation layer (with synchronization validation) reports nothing.
 
 Without clang or the Vulkan SDK the program tests skip, unless OOT2_REQUIRE_CLANG or OOT2_REQUIRE_VULKAN is set; without a
@@ -350,6 +352,20 @@ class TablesTest(unittest.TestCase):
             self.assertIn(line, done.stdout)
         self.assertRegex(done.stdout, r"a second view type of a demanded entry was demanded too and got slot \d+")
 
+    def test_a_pool_remade_at_the_same_address_does_not_get_the_finalized_pools_views(self) -> None:
+        done = run("remade")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(fatal_lines(done.stderr), [])
+        for line in (
+            "before: ID 5 stands on a view and a second view of the pool that goes; IDs 6 and 7 share a view",
+            "ID 5 registered again over the same storage and description took a view of its own; "
+            "the views of the pool that stays are still shared",
+            "its second view type was made again, in another slot than the finalized pool's",
+            "the two views of the finalized pool were freed after the submission that could read them",
+            "ok remade",
+        ):
+            self.assertIn(line, done.stdout)
+
     def test_a_texture_past_the_games_part_of_the_array_is_a_named_fatal(self) -> None:
         done = run("id_fatal")
         self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
@@ -410,6 +426,8 @@ class DeviceTest(unittest.TestCase):
             "ID 5 registered again under a held submission: the held one read the old image (3, 4, 7), the next the new (4, 5, 9)",
             "one entry sampled right as 2D (its own view) and as 2D array (a second slot)",
             "an array texture sampled as array (layer 1 is (5, 6, 21)) and as 2D (layer 0 is (5, 6, 20))",
+            "a 288 MiB pool finalized and remade at its address: the texture registered again stands on an image of the "
+            "new extent and reads (3, 4, 41)",
             "after pool_fini the entries over its storage read the placeholder",
             "ok device",
         ):
