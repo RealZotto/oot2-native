@@ -19,6 +19,15 @@ Where the files come from, in this order:
     --shared-font FILE   a TrueType or OpenType font of the player's own choice, placed as it is. Its licence is the
                          player's matter, and no licence text is written. The runtime's own limits are checked here: a
                          plain sfnt (by its first four bytes) of at most 16 MiB.
+    DEST/fonts/          what is already in place. The two pinned files, unchanged, are taken as they are, so a run
+                         after the first asks the network nothing. Any other font the runtime would take is kept, and
+                         the run says so: it is the player's own (given with --shared-font before, or put there by
+                         hand), and the choice holds for later runs without the option, which is how the setup window
+                         runs. No run without the option writes over such a font; deleting the file brings the
+                         pinned font back. The pinned font without its licence text gets both again from the two
+                         sources below, and is kept as it is when neither gives them. Two files are replaced, and
+                         the run says why: one the runtime would not take, and the pinned font this step placed
+                         when the full check (--verify) finds its bytes changed at the same size.
     fetched/font/        beside tools/, when it holds the two pinned files (BIZUDPGothic-Regular.ttf and OFL.txt) with
                          the pinned hashes: a machine without network access gets them there by hand.
     the network          the two files at the pinned commit, each checked by size and SHA-256 before anything is written.
@@ -64,11 +73,12 @@ def download(url: str, limit: int) -> bytes:
         return r.read(limit + 1)
 
 
-def kit_files(kit: Path, pin: dict) -> dict[str, bytes] | None:
-    """The pinned files of a kit folder by kit name, or None when one is missing or is not the pinned file."""
+def kit_files(kit: Path, pin: dict, placed: bool = False) -> dict[str, bytes] | None:
+    """The pinned files of a kit folder by kit name, or None when one is missing or is not the pinned file. With
+    placed the folder is DEST/fonts, where the files have the names they are placed under."""
     out: dict[str, bytes] = {}
-    for name, (_, size, sha, _) in pin.items():
-        path = kit / name
+    for name, (_, size, sha, as_placed) in pin.items():
+        path = kit / (as_placed if placed else name)
         try:
             if path.stat().st_size != size:
                 return None
@@ -94,13 +104,15 @@ def fetch(pin: dict, base: str, kit: Path, get=None) -> dict[str, bytes]:
                 f"the shared font could not be downloaded from {url} ({getattr(e, 'reason', None) or e!r}). The game asks the "
                 f"console for a font and this program ships none. Download {', '.join(base + p[0] for p in pin.values())} "
                 f"yourself into {kit} (as {', '.join(pin)}), or give an open-licence TrueType or OpenType font of your "
-                "own with --shared-font FILE.") from None
+                f"own: with --shared-font FILE, or put into the game folder as fonts/{FONT_FILE}.") from None
         got = hashlib.sha256(data).hexdigest()
         if len(data) != size or got != sha:
             raise PrepareError(
-                f"the file at {url} is not the pinned one: {len(data):,} bytes with SHA-256 {got}, the tools expect "
-                f"{size:,} bytes with {sha}. Nothing was placed. Give an open-licence TrueType or OpenType font of "
-                "your own with --shared-font FILE.")
+                f"what {url} answered is not the pinned file: {len(data):,} bytes were read, with SHA-256 {got}; the "
+                f"tools expect {size:,} bytes with {sha}. Nothing was placed. A download that was cut short reads "
+                f"like this too: run prepare again. If it stays, put the pinned files into {kit} yourself (as "
+                f"{', '.join(pin)}), or give an open-licence TrueType or OpenType font of your own: with "
+                f"--shared-font FILE, or put into the game folder as fonts/{FONT_FILE}.")
         out[name] = data
     return out
 
@@ -108,6 +120,8 @@ def fetch(pin: dict, base: str, kit: Path, get=None) -> dict[str, bytes]:
 def own_font(path: Path) -> bytes:
     """The player's own font file, refused by name when the runtime would refuse it."""
     try:
+        if path.is_dir():
+            raise PrepareError(f"the font {path} is a folder; name the font file itself")
         size = path.stat().st_size
         if size > MAX_FONT:
             raise PrepareError(f"the font {path} has {size:,} bytes; the runtime serves at most {MAX_FONT >> 20} MiB")
@@ -118,6 +132,17 @@ def own_font(path: Path) -> bytes:
         raise PrepareError(f"the font {path} is not a TrueType or OpenType font (it has {len(data):,} bytes and starts "
                            f"with {data[:4].hex() or 'nothing'}); the game's font loader takes no other form")
     return data
+
+
+def font_in_place(path: Path) -> bytes | None:
+    """The font file already where the runtime reads it, when the runtime would take it; else None."""
+    try:
+        if not path.is_file() or path.stat().st_size > MAX_FONT:
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    return data if is_sfnt(data) else None
 
 
 def write(path: Path, data: bytes) -> None:
@@ -134,14 +159,25 @@ class Font(Step):
     base = BASE
     kit = KIT
     get = None   # tests: a function in place of download
+    placed_pinned = False   # the full check failed on a record of the pinned font (verify)
 
     def named(self, ctx: Context) -> Path | None:
         return getattr(ctx.options, "shared_font", None)
 
     def key(self, ctx: Context) -> str:
         named = self.named(ctx)
-        pin = sorted((n, *v) for n, v in self.pin.items())
-        return fingerprint("font", Path(__file__), named if named else f"pin {COMMIT} {pin}")
+        if not named:
+            pin = sorted((n, *v) for n, v in self.pin.items())
+            return fingerprint("font", Path(__file__), f"pin {COMMIT} {pin}")
+        # Only a file run() could take is hashed: a folder, a file past the limit or one that cannot be read is
+        # refused there by name, and must not be walked, hashed in full or raise here first.
+        named = Path(named)
+        try:
+            if named.is_file() and named.stat().st_size <= MAX_FONT:
+                return fingerprint("font", Path(__file__), named)
+        except OSError:
+            pass
+        return fingerprint("font", Path(__file__), f"own {named}: not a font file the step takes")
 
     def outputs(self, record: dict) -> dict[str, tuple[int, str]]:
         return {name: (int(size), sha) for name, (size, sha) in record.get("files", {}).items()}
@@ -155,30 +191,71 @@ class Font(Step):
         except OSError:
             return False
 
+    def pinned_font(self) -> str:
+        return next(sha for _, _, sha, as_placed in self.pin.values() if as_placed == FONT_FILE)
+
     def verify(self, ctx: Context, record: dict) -> bool:
+        outs = self.outputs(record)
         try:
-            return all(file_sha256(ctx.dest / "fonts" / n) == sha for n, (_, sha) in self.outputs(record).items())
+            good = all(file_sha256(ctx.dest / "fonts" / n) == sha for n, (_, sha) in outs.items())
         except OSError:
-            return False
+            good = False
+        # run() does not see the record: what it needs of it is that this step placed the pinned font there
+        self.placed_pinned = not good and outs.get(FONT_FILE, (0, ""))[1] == self.pinned_font()
+        return good
+
+    def pinned(self, ctx: Context) -> tuple[dict[str, bytes], str, bool]:
+        """The files of a run without --shared-font by their placed names, where they came from, and whether they are
+        to be written (not when they are what is in place already)."""
+        rep, folder = ctx.reporter, ctx.dest / "fonts"
+        files = kit_files(folder, self.pin, placed=True)
+        if files is not None:
+            rep.say(f"font: {NAME} and its licence text are in place already, unchanged")
+            return {self.pin[name][3]: data for name, data in files.items()}, str(folder), False
+        path = folder / FONT_FILE
+        there = font_in_place(path)
+        files = kit_files(self.kit, self.pin)
+        alone = there is not None and hashlib.sha256(there).hexdigest() == self.pinned_font()
+        if there is not None and not alone:   # a font of the player's own is not written over without --shared-font
+            if not self.placed_pinned:
+                rep.say(f"font: keeping the font already at {path}, a font of your own; its licence is yours to "
+                        f"keep. Delete the file for {NAME}"
+                        + (f". The {LICENCE_FILE} beside it is {NAME}'s licence text and says nothing about this font"
+                           if (folder / LICENCE_FILE).exists() else ""))
+                return {FONT_FILE: there}, str(path), False
+            rep.say(f"font: the font at {path} was {NAME} when this step placed it and its bytes have changed since "
+                    "at the same size (the full check); it is replaced")
+        elif there is None and path.is_file():
+            rep.say(f"font: the file at {path} is not a font the runtime takes (a TrueType or OpenType file of at "
+                    f"most {MAX_FONT >> 20} MiB); it is replaced by {NAME}")
+        if files is not None:
+            source = str(self.kit)
+            rep.say(f"font: {NAME} from {self.kit}")
+        else:
+            if self.kit.is_dir():
+                rep.say(f"font: {self.kit} does not hold {' and '.join(self.pin)} as pinned (each by size and "
+                        "SHA-256); it is not used")
+            source = self.base
+            rep.say(f"font: downloading {NAME} ({COMMIT[:7]}, SIL Open Font License 1.1) from {self.base}")
+            try:
+                files = fetch(self.pin, self.base, self.kit, self.get)
+            except PrepareError:
+                if not alone:
+                    raise
+                rep.say(f"font: the download did not succeed; keeping {NAME} already at {path}, though its licence "
+                        f"text is not beside it as pinned ({LICENCE_FILE})")
+                return {FONT_FILE: there}, str(path), False
+        return {self.pin[name][3]: data for name, data in files.items()}, source, True
 
     def run(self, ctx: Context) -> dict:
         rep, folder = ctx.reporter, ctx.dest / "fonts"
         named = self.named(ctx)
         if named:
-            placed = {FONT_FILE: own_font(Path(named))}
-            source = str(named)
+            placed, source, fresh = {FONT_FILE: own_font(Path(named))}, str(named), True
             rep.say(f"font: your own font {named}, placed as it is; its licence is yours to keep")
         else:
-            files = kit_files(self.kit, self.pin)
-            if files is not None:
-                source = str(self.kit)
-                rep.say(f"font: {NAME} from {self.kit}")
-            else:
-                source = self.base
-                rep.say(f"font: downloading {NAME} ({COMMIT[:7]}, SIL Open Font License 1.1) from {self.base}")
-                files = fetch(self.pin, self.base, self.kit, self.get)
-            placed = {self.pin[name][3]: data for name, data in files.items()}
-        for name in (FONT_FILE, LICENCE_FILE):
+            placed, source, fresh = self.pinned(ctx)
+        for name in (FONT_FILE, LICENCE_FILE) if fresh else ():
             if name in placed:
                 write(folder / name, placed[name])
             else:

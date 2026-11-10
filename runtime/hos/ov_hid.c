@@ -488,6 +488,9 @@ static void six_fill(Cpu *c, uint64_t out, int max, const char *fn) {
             rt_guest_stop(c, "nn::hid::%s: state %d is not writable guest memory", fn, i);
     }
     if (n > 0) ONCE("hid: six-axis read: live motion from the host pad (%d of %d states)", n, max);
+    else if (hid_replay_active())
+        ONCE("hid: six-axis read: at rest, the pad's motion is withheld in a recorded or replayed run (%u states)",
+             (uint32_t)max);
     else ONCE("hid: six-axis read: at rest, no host motion (%u states)", (uint32_t)max);
 }
 

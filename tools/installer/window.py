@@ -584,7 +584,7 @@ def selftest(shot_dir: str | None = None, keep_open_ms: int = 150) -> int:
         lit = {"start": "dump", "check": "prepare", "running": "prepare", "failed": "dest", "settings": "settings"}
         for key, action in app.actions.items():
             action.light(key == lit[name])
-        if name in ("check", "running", "failed") and app.steps.get("1.0", "end").count("\n") < 9:
+        if name in ("check", "running", "failed") and app.steps.get("1.0", "end").count("\n") < len(logic.STEP_ORDER):
             failures += 1
         root.update()
         root.lift()

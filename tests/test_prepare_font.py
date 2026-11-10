@@ -6,9 +6,10 @@ calls, placed in the game folder as fonts/shared-font.ttf.
 No font is in this repository and no test reads the network: the step is given a made-up pin of two small files and a
 function in place of the download, which counts the fetches. What is checked: the pinned files from the kit folder or
 from the network, each by size and SHA-256, with nothing placed when one is not the pin; the player's own font, placed
-without a licence text and refused by name when the runtime would refuse it; the step's record (kept, missing, changed,
-damaged); and that the tool's limits are the runtime's (runtime/hos/ov_system.c) and its step is in prepare's list and
-in the setup window's.
+without a licence text and refused by name when the runtime would refuse it; what is in place already (the pinned files
+taken as they are, any other font the runtime would take kept, a file it would not take replaced); the step's record
+(kept, missing, changed, damaged); and that the tool's limits are the runtime's (runtime/hos/ov_system.c) and its step
+is in prepare's list and in the setup window's.
 
 Run: python -m unittest discover -s tests -v
 """
@@ -124,6 +125,7 @@ class PinnedFontTest(FontTestBase):
                 self.assertIsNone(font.kit_files(self.kit, PIN))
         result, text = self.run_step()
         self.assertEqual(result, "ok", text)
+        self.assertIn(f"font: {self.kit} does not hold Made-Up.ttf and OFL.txt as pinned", text)
         self.assertEqual(len(self.fetched), 2)
         self.assertEqual(self.placed()[font.FONT_FILE], TTF)
         self.assertEqual((self.kit / "Made-Up.ttf").read_bytes(), TTF[:-1] + b"\xff")   # the kit is the player's: left
@@ -134,9 +136,13 @@ class PinnedFontTest(FontTestBase):
                 self.served[BASE + "ttf/Made-Up.ttf"] = wrong
                 result, text = self.run_step()
                 self.assertEqual(result, "failed", text)
-                self.assertIn("oot2 prepare: step font: the file at https://fonts.invalid/pin/ttf/Made-Up.ttf is not "
-                              "the pinned one", text)
+                self.assertIn("oot2 prepare: step font: what https://fonts.invalid/pin/ttf/Made-Up.ttf answered is not "
+                              "the pinned file", text)
+                read = wrong[:len(TTF) + 1]                          # one byte past the pin is all that is read
+                self.assertIn(f"{len(read):,} bytes were read, with SHA-256 {sha(read)}", text)
                 self.assertIn(f"the tools expect {len(TTF):,} bytes with {sha(TTF)}", text)
+                self.assertIn("run prepare again", text)
+                self.assertIn(f"into {self.kit} yourself (as Made-Up.ttf, OFL.txt)", text)
                 self.assertIn("--shared-font FILE", text)
                 self.assertEqual(self.placed(), {})
                 self.assertIsNone(statefile.load(self.dest))        # nothing recorded, and no folder made
@@ -157,7 +163,7 @@ class PinnedFontTest(FontTestBase):
                 self.assertIn("the shared font could not be downloaded from https://fonts.invalid/pin/ttf/Made-Up.ttf",
                               text)
                 self.assertIn(f"yourself into {self.kit} (as Made-Up.ttf, OFL.txt)", text)
-                self.assertIn("--shared-font FILE", text)
+                self.assertIn(f"--shared-font FILE, or put into the game folder as fonts/{font.FONT_FILE}", text)
                 self.assertIn("running oot2 prepare again resumes at this step", text)
                 self.assertEqual(self.placed(), {})
         self.served[BASE + "ttf/Made-Up.ttf"] = TTF                  # the network is back: the next run places the font
@@ -175,8 +181,87 @@ class PinnedFontTest(FontTestBase):
         result, text = self.run_step(verify=True)
         self.assertEqual(result, "ok", text)
         self.assertIn("warning: the output of step font failed its full check; it runs again", text)
+        self.assertIn(f"was {font.NAME} when this step placed it and its bytes have changed since", text)
+        self.assertNotIn("keeping", text)                            # so it is not taken for the player's own
         self.assertEqual(self.placed()[font.FONT_FILE], TTF)
         self.assertEqual(len(self.fetched), 6)
+
+    def test_the_pinned_files_already_in_place_are_taken_as_they_are(self) -> None:
+        folder = self.dest / "fonts"
+        folder.mkdir(parents=True)
+        (folder / font.FONT_FILE).write_bytes(TTF)
+        (folder / font.LICENCE_FILE).write_bytes(TEXT)
+        self.served[BASE + "ttf/Made-Up.ttf"] = urllib.error.URLError("no route to host")
+        result, text = self.run_step()                               # nothing is recorded, and there is no network
+        self.assertEqual(result, "ok", text)
+        self.assertIn(f"font: {font.NAME} and its licence text are in place already, unchanged", text)
+        self.assertEqual(self.fetched, [])
+        self.assertEqual(self.placed(), {font.FONT_FILE: TTF, font.LICENCE_FILE: TEXT})
+        record = statefile.load(self.dest)["steps"]["font"]
+        self.assertEqual(record["source"], str(folder))
+        self.assertEqual(record["files"], {font.FONT_FILE: [len(TTF), sha(TTF)], font.LICENCE_FILE: [len(TEXT), sha(TEXT)]})
+        self.assertIn("font: kept", self.run_step()[1])
+        (folder / font.LICENCE_FILE).unlink()                        # the pinned font alone: both are asked for again,
+        result, text = self.run_step()                               # and with no network the usable font is kept
+        self.assertEqual(result, "ok", text)
+        self.assertIn("font: started (its output is missing)", text)
+        self.assertIn(f"font: the download did not succeed; keeping {font.NAME} already at "
+                      f"{folder / font.FONT_FILE}, though its licence text is not beside it as pinned", text)
+        self.assertEqual(len(self.fetched), 1)
+        self.assertEqual(self.placed(), {font.FONT_FILE: TTF})
+        self.assertEqual(statefile.load(self.dest)["steps"]["font"]["files"], {font.FONT_FILE: [len(TTF), sha(TTF)]})
+        self.assertIn("font: kept", self.run_step()[1])
+
+    def test_the_pinned_font_without_its_licence_text_gets_it_again_from_the_kit(self) -> None:
+        folder = self.dest / "fonts"
+        folder.mkdir(parents=True)
+        (folder / font.FONT_FILE).write_bytes(TTF)
+        self.kit.mkdir()
+        (self.kit / "Made-Up.ttf").write_bytes(TTF)
+        (self.kit / "OFL.txt").write_bytes(TEXT)
+        result, text = self.run_step()
+        self.assertEqual(result, "ok", text)
+        self.assertIn(f"font: {font.NAME} from {self.kit}", text)
+        self.assertNotIn("keeping", text)
+        self.assertEqual(self.fetched, [])
+        self.assertEqual(self.placed(), {font.FONT_FILE: TTF, font.LICENCE_FILE: TEXT})
+
+    def test_a_font_put_over_the_pinned_one_is_kept_though_the_licence_text_is_beside_it(self) -> None:
+        self.assertEqual(self.run_step()[0], "ok")                   # the pinned pair, placed by the step
+        folder = self.dest / "fonts"
+        (folder / font.FONT_FILE).write_bytes(OTF)                   # the player's own font, copied over it by hand
+        self.kit.mkdir()                                             # the kit and the network could both give the pin
+        (self.kit / "Made-Up.ttf").write_bytes(TTF)
+        (self.kit / "OFL.txt").write_bytes(TEXT)
+        result, text = self.run_step()
+        self.assertEqual(result, "ok", text)
+        self.assertIn("font: started (its output is missing)", text)
+        self.assertIn(f"font: keeping the font already at {folder / font.FONT_FILE}, a font of your own", text)
+        self.assertIn(f"The {font.LICENCE_FILE} beside it is {font.NAME}'s licence text and says nothing about this "
+                      "font", text)
+        self.assertEqual(self.placed(), {font.FONT_FILE: OTF, font.LICENCE_FILE: TEXT})
+        self.assertEqual(len(self.fetched), 2)                       # the first run's two, and none since
+        self.assertEqual(statefile.load(self.dest)["steps"]["font"]["files"], {font.FONT_FILE: [len(OTF), sha(OTF)]})
+        self.assertIn("font: kept", self.run_step()[1])
+
+    def test_a_file_in_place_that_is_no_font_is_replaced_by_the_pinned_one(self) -> None:
+        folder = self.dest / "fonts"
+        folder.mkdir(parents=True)
+        for data in (b"<html>not a font</html>", b"OTTO", b""):
+            with self.subTest(data=data):
+                (folder / font.FONT_FILE).write_bytes(data)
+                self.assertIsNone(font.font_in_place(folder / font.FONT_FILE))
+        with mock.patch.object(font, "MAX_FONT", len(OTF) - 1):
+            (folder / font.FONT_FILE).write_bytes(OTF)               # larger than the runtime serves
+            self.assertIsNone(font.font_in_place(folder / font.FONT_FILE))
+            result, text = self.run_step()
+        self.assertEqual(result, "ok", text)
+        self.assertNotIn("keeping", text)
+        self.assertIn(f"font: the file at {folder / font.FONT_FILE} is not a font the runtime takes", text)
+        self.assertIn(f"it is replaced by {font.NAME}", text)
+        self.assertEqual(self.placed(), {font.FONT_FILE: TTF, font.LICENCE_FILE: TEXT})
+        self.assertIsNone(font.font_in_place(folder / "no-such-file.ttf"))
+        self.assertIsNone(font.font_in_place(folder))                # a folder is no font file
 
     def test_download_reads_no_more_than_one_byte_past_the_pinned_size(self) -> None:
         big = self.root / "big.bin"
@@ -204,9 +289,78 @@ class OwnFontTest(FontTestBase):
         result, text = self.run_step(self.own)
         self.assertIn("font: started (its inputs changed)", text)
         self.assertEqual(self.placed(), {font.FONT_FILE: OTF + b"edited"})
-        result, text = self.run_step()                               # without the option: the pinned font again
+        result, text = self.run_step()                               # without the option, as the setup window runs: kept
+        self.assertEqual(result, "ok", text)
+        self.assertIn("font: started (its inputs changed)", text)
+        self.assertIn(f"font: keeping the font already at {self.dest / 'fonts' / font.FONT_FILE}, a font of your own",
+                      text)
+        self.assertIn(f"Delete the file for {font.NAME}", text)
+        self.assertEqual(self.placed(), {font.FONT_FILE: OTF + b"edited"})
+        self.assertEqual(len(self.fetched), 2)
+        record = statefile.load(self.dest)["steps"]["font"]
+        self.assertEqual(record["files"], {font.FONT_FILE: [len(OTF) + 6, sha(OTF + b"edited")]})
+        self.assertIn("font: kept", self.run_step()[1])
+        (self.dest / "fonts" / font.FONT_FILE).unlink()              # deleted: the pinned font again
+        result, text = self.run_step()
         self.assertEqual(result, "ok", text)
         self.assertEqual(self.placed(), {font.FONT_FILE: TTF, font.LICENCE_FILE: TEXT})
+
+    def test_the_pinned_font_given_as_the_players_own_is_kept_by_a_run_without_the_option(self) -> None:
+        self.own.write_bytes(TTF)                                    # the pinned font's bytes, fetched by hand elsewhere
+        self.served[BASE + "ttf/Made-Up.ttf"] = urllib.error.URLError("no route to host")
+        result, text = self.run_step(self.own)
+        self.assertEqual(result, "ok", text)
+        self.assertEqual(self.placed(), {font.FONT_FILE: TTF})
+        for _ in range(2):                                           # one try for the licence text, then it is kept
+            result, text = self.run_step()
+            self.assertEqual(result, "ok", text)
+            self.assertEqual(len(self.fetched), 1)
+            self.assertEqual(self.placed(), {font.FONT_FILE: TTF})
+        self.assertIn("font: kept", text)
+
+    def test_a_file_in_place_that_is_no_font_is_named_above_the_failed_download(self) -> None:
+        folder = self.dest / "fonts"
+        folder.mkdir(parents=True)
+        (folder / font.FONT_FILE).write_bytes(b"wOF2" + bytes(300))  # a web font: the runtime takes none
+        self.served[BASE + "ttf/Made-Up.ttf"] = urllib.error.URLError("no route to host")
+        result, text = self.run_step()
+        self.assertEqual(result, "failed", text)
+        self.assertIn("is not a font the runtime takes", text)
+        self.assertLess(text.index("is not a font the runtime takes"), text.index("could not be downloaded"))
+        self.assertEqual(self.placed(), {font.FONT_FILE: b"wOF2" + bytes(300)})   # left as it was: nothing replaced it
+
+    def test_a_font_of_the_players_own_changed_at_the_same_size_is_kept_by_the_full_check(self) -> None:
+        self.assertEqual(self.run_step(self.own)[0], "ok")
+        (self.dest / "fonts" / font.FONT_FILE).write_bytes(OTF[:-1] + b"!")
+        result, text = self.run_step(self.own, verify=True)          # with the option: the named file is placed again
+        self.assertEqual(self.placed(), {font.FONT_FILE: OTF})
+        self.assertEqual(self.run_step()[0], "ok")                   # now recorded as a kept font of the player's own
+        (self.dest / "fonts" / font.FONT_FILE).write_bytes(OTF[:-1] + b"!")
+        result, text = self.run_step(verify=True)
+        self.assertEqual(result, "ok", text)
+        self.assertIn("warning: the output of step font failed its full check; it runs again", text)
+        self.assertIn("font: keeping the font already at ", text)
+        self.assertEqual(self.placed(), {font.FONT_FILE: OTF[:-1] + b"!"})
+        self.assertEqual(self.fetched, [])
+
+    def test_a_font_placed_by_hand_is_kept_and_needs_no_network(self) -> None:
+        folder = self.dest / "fonts"
+        folder.mkdir(parents=True)
+        (folder / font.FONT_FILE).write_bytes(OTF)
+        self.served[BASE + "ttf/Made-Up.ttf"] = urllib.error.URLError("no route to host")
+        result, text = self.run_step()
+        self.assertEqual(result, "ok", text)
+        self.assertIn("font: started (not done yet)", text)
+        self.assertIn("font: keeping the font already at ", text)
+        self.assertEqual(self.fetched, [])
+        self.assertEqual(self.placed(), {font.FONT_FILE: OTF})       # as it was, and no licence text is written beside it
+        self.assertEqual(statefile.load(self.dest)["steps"]["font"]["source"], str(folder / font.FONT_FILE))
+        (folder / font.FONT_FILE).write_bytes(OTF + b"another")      # swapped by hand for another: kept again
+        result, text = self.run_step()
+        self.assertEqual(result, "ok", text)
+        self.assertIn("font: started (its output is missing)", text)
+        self.assertEqual(self.placed(), {font.FONT_FILE: OTF + b"another"})
+        self.assertEqual(self.fetched, [])
 
     def test_a_file_the_runtime_would_refuse_is_refused_here_by_name(self) -> None:
         cases = (
@@ -231,6 +385,39 @@ class OwnFontTest(FontTestBase):
         self.assertEqual(result, "failed", text)
         self.assertIn("no-such-font.ttf cannot be read", text)
         self.assertEqual(self.fetched, [])                           # a font that was named is never replaced by the pin
+
+    def test_a_folder_or_an_oversized_file_is_refused_by_name_and_never_hashed(self) -> None:
+        many = self.root / "a folder"
+        many.mkdir()
+        (many / "inside.ttf").write_bytes(OTF)
+        hashed: list[str] = []
+
+        def hash_of(path: Path, progress=None) -> str:
+            hashed.append(path.name)
+            return sha(path.read_bytes())
+
+        with mock.patch("prepare.runner.file_sha256", side_effect=hash_of):
+            result, text = self.run_step(many)
+            self.assertEqual(result, "failed", text)
+            self.assertIn(f"oot2 prepare: step font: the font {many} is a folder; name the font file itself", text)
+            with mock.patch.object(font, "MAX_FONT", len(OTF) - 1):
+                result, text = self.run_step(self.own)
+            self.assertEqual(result, "failed", text)
+            self.assertIn("has 324 bytes; the runtime serves at most 0 MiB", text)
+            self.assertEqual(set(hashed), {"font.py"})               # the key is made of the tool alone
+            self.assertEqual(self.run_step(self.own)[0], "ok")       # within the limit: the file is part of the key
+            self.assertEqual(set(hashed), {"font.py", self.own.name})
+        self.assertEqual(self.placed(), {font.FONT_FILE: OTF})
+
+    def test_the_command_line_refuses_a_font_it_cannot_take_before_any_step(self) -> None:
+        self.own.write_bytes(b"<html>not a font</html>")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(oot2, "run_steps", side_effect=AssertionError("a step ran")):
+            code = oot2.main(["prepare", "--dest", str(self.dest), "--shared-font", str(self.own)])
+        self.assertEqual(code, oot2.EXIT["failed"], err.getvalue())
+        self.assertIn(f"the font {self.own} is not a TrueType or OpenType font", err.getvalue())
+        self.assertFalse(self.dest.exists())
 
     def test_every_form_the_runtime_takes_is_taken(self) -> None:
         for magic in font.SFNT:
@@ -265,8 +452,10 @@ class FontStepPlaceTest(unittest.TestCase):
             self.assertRegex(digest, r"^[0-9a-f]{64}$", name)
             self.assertTrue(0 < size <= font.MAX_FONT, name)
             self.assertEqual(Path(path).name, name)
-        if font.kit_files(font.KIT, font.PIN) is None and any((font.KIT / n).exists() for n in font.PIN):
-            self.fail(f"{font.KIT} holds files that are not the pinned ones")
+        for name, (_, size, digest, _) in font.PIN.items():        # a developer's kit folder, whatever part of it is there
+            if (font.KIT / name).is_file():
+                data = (font.KIT / name).read_bytes()
+                self.assertEqual((len(data), sha(data)), (size, digest), f"{font.KIT / name} is not the pinned file")
 
     def test_the_limits_are_the_runtimes(self) -> None:
         source = (ROOT / "runtime" / "hos" / "ov_system.c").read_text("utf-8")

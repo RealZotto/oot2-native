@@ -1221,8 +1221,9 @@ HOS_OVERRIDE("_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTaskD1Ev", ov_netc
 
 // ==== nn::pl shared fonts. The console's system fonts are never shipped and never read from a dump. The runtime serves
 // one open-licence TrueType or OpenType font that the player's game folder holds (fonts/shared-font.ttf, which oot2
-// prepare places there, tools/prepare/font.py) or that OOT2_SHARED_FONT names, for every shared font type, as the console serves its
-// standard font when a language's own font is missing. The game hands the address and size it gets to a font loader
+// prepare places there, tools/prepare/font.py) or that OOT2_SHARED_FONT names, for every shared font type, as the
+// console serves its standard font when a language's own font is missing. The game hands the address and size it gets
+// to a font loader
 // that recognises a plain sfnt (TrueType, OpenType or collection) by its first four bytes, so the file is served as it
 // is. The load state is Loaded though no file may be there: the game spins until it is, so a missing file stops by name at
 // the call that asks for the font, with what to place and where, and not in a wait. The SDK function returns a font's
@@ -1255,11 +1256,18 @@ static void font_load(Cpu *c, const char *fn, int32_t t) {
     char path[1100], at[96];
     font_path(path, sizeof path);
     FILE *f = fopen(path, "rb");
-    if (!f)
+    if (!f) {
+        const char *named = getenv("OOT2_SHARED_FONT");
+        if (named && *named)   // prepare places nothing at a path the variable names: the advice is another one
+            hos_gap(c, "pl", "nn::pl::%s(%d) from %s: no shared font file at %s, the path OOT2_SHARED_FONT names. Name "
+                    "a TrueType or OpenType font that is there, or unset the variable for fonts/shared-font.ttf in the "
+                    "game folder, where oot2 prepare places an open-licence font",
+                    fn, t, hos_caller(c, at, (int)sizeof at), path);
         hos_gap(c, "pl", "nn::pl::%s(%d) from %s: no shared font file at %s. The console's fonts are not part of this "
-                "program: oot2 prepare places an open-licence font there (its font step); run it again, place a TrueType or "
-                "OpenType font there yourself, or name one with OOT2_SHARED_FONT",
+                "program: the font step of oot2 prepare places an open-licence font there, or a font of your own with "
+                "--shared-font FILE. Run it again, or name a TrueType or OpenType font with OOT2_SHARED_FONT",
                 fn, t, hos_caller(c, at, (int)sizeof at), path);
+    }
     uint8_t *data = NULL;
     size_t len = 0;
     if (!fseek(f, 0, SEEK_END)) {

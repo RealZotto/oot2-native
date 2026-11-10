@@ -665,7 +665,8 @@ void hid_replay_start(void) {
         if (!g_rec_file) rt_fatal("input record %s: cannot be created (%s)", rec, strerror(errno));
         fputs("# the input the game was given, by tick (oot2/hid_replay.h): at <tick> for <count> <held>...\n", g_rec_file);
         fflush(g_rec_file);
-        rt_log("hid: recording the input to %s", rec);
+        rt_log("hid: recording the input to %s; the file holds no motion, so the pad's motion is withheld from the game",
+               rec);
         g_rec_on = 1;
     }
 }

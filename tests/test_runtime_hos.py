@@ -77,6 +77,9 @@ FAILING = {
     # the shared font calls with no usable font: a stop that names the call, the file and what to place
     "pl_font_missing": (EXIT_UNIMPLEMENTED, "FATAL: unimplemented pl: nn::pl::GetSharedFontAddress(2) from ",
                         f"import\t{PL_ADDRESS}\timplemented\t1\t{AT_250}\t"),
+    "pl_font_missing_env": (EXIT_UNIMPLEMENTED, "not-there.ttf, the path OOT2_SHARED_FONT names. Name a TrueType or "
+                                                "OpenType font that is there, or unset the variable",
+                            f"import\t{PL_ADDRESS}\timplemented\t1\t{AT_250}\t"),
     "pl_font_not_sfnt": (EXIT_UNIMPLEMENTED, "is not a TrueType or OpenType font",
                          f"import\t{PL_ADDRESS}\timplemented\t1\t{AT_250}\t"),
     "pl_font_type": (EXIT_UNIMPLEMENTED, "FATAL: unimplemented pl: nn::pl::GetSharedFontLoadState: shared font type 9 is "
@@ -332,6 +335,8 @@ class HosTest(unittest.TestCase):
                 self.assertIn("fonts/shared-font.ttf", fatal[0].replace("\\", "/"))
                 self.assertIn("OOT2_SHARED_FONT", fatal[0])
                 self.assertIn("open-licence", fatal[0])
+                self.assertIn("--shared-font FILE", fatal[0])
+                self.assertNotIn("the path OOT2_SHARED_FONT names", fatal[0])
 
     def test_the_shared_font_is_served_as_the_file_it_is_and_the_log_says_where_it_came_from(self) -> None:
         for level in LEVELS:

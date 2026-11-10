@@ -12,8 +12,10 @@
 // feed, the read and the restart. The axis map of hid_motion_from_sdl is DKB Recomp's runtime/input.c
 // (input_motion_axes; no licence header: that repository's GPL-3.0-or-later) at the same commit. Changed here: one
 // layer instead of an instance per controller, under a spin lock instead of the donor's SRW lock; the conversion gives
-// revolutions per second itself; the reader takes the host time and answers nothing after 250 ms without a sample; a
-// clear, the game's wish (hid_motion_wanted) and the config menu's suppress are added; the names follow this runtime.
+// revolutions per second itself; the feed takes the pad's own time step beside the host time, where the donor's takes
+// the step from the host time between two feeds; the reader, which answers nothing once the newest sample is old as
+// the donor's does, waits 250 ms for that and not 200 ms; a clear, the game's wish (hid_motion_wanted) and the config
+// menu's suppress are added; the names follow this runtime.
 #include <math.h>
 #include <stdatomic.h>
 #include <string.h>

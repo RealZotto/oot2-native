@@ -13,6 +13,12 @@ memory, a Vulkan 1.3 GPU and its driver, and no other software. The compiler, Py
 pipeline builder, the runtime library and Microsoft's Visual C++ runtime (vcruntime140.dll, vcruntime140_1.dll,
 msvcp140.dll) are in this folder (llvm, python, bin, runtime) and are the only ones used.
 
+One download: the preparation fetches the font for the game's text, BIZ UDPGothic Regular (4.7 MB, SIL Open Font
+License 1.1), from raw.githubusercontent.com and places it in the folder you chose, beside its licence text. No font is
+in this folder. On a PC without a network connection the font step stops and names the two files to put into
+fetched\font in this folder by hand. A TrueType or OpenType font of your own (at most 16 MiB), put into the folder you
+chose as fonts\shared-font.ttf, is used instead: the preparation keeps a font that is there, so start it again.
+
 Licences: oot2-native is GPL-3.0-or-later (LICENSE). Every piece in this folder, with its source, version and licence,
 has a row in THIRD_PARTY_NOTICES.md (rows whose first cell starts with bundle/), and its licence text is in licenses/.
 CONTENTS.tsv lists every file with its size, SHA-256 and the row it belongs to.

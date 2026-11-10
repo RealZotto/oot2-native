@@ -81,7 +81,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare import all_steps  # noqa: E402
 from prepare import power  # noqa: E402
 from prepare import state as statefile  # noqa: E402
-from prepare.runner import Context, Reporter, run_steps  # noqa: E402
+from prepare.runner import Context, PrepareError, Reporter, run_steps  # noqa: E402
 
 EXIT = {"ok": 0, "failed": 1, "cancelled": 3}
 
@@ -121,6 +121,13 @@ def prepare(args: argparse.Namespace) -> int:
             return EXIT["failed"]
         except store.NamesError as e:
             rep.error(f"the names file {args.names}, {e}")
+            return EXIT["failed"]
+    if getattr(args, "shared_font", None):   # a font that cannot be taken stops the run now, not after the extraction
+        from prepare import font
+        try:
+            font.own_font(args.shared_font)
+        except PrepareError as e:
+            rep.error(str(e))
             return EXIT["failed"]
     try:
         state = statefile.load(dest)
@@ -175,8 +182,9 @@ def main(argv: list[str] | None = None) -> int:
                         "variable, else fetched/imgui, which prepare fetches itself when it is not there)")
     p.add_argument("--shared-font", type=Path,
                    help="a TrueType or OpenType font of your own for the game's text, placed as fonts/shared-font.ttf "
-                        "(default: BIZ UDPGothic, SIL Open Font License 1.1, from fetched/font or downloaded at its "
-                        "pinned commit)")
+                        "and kept by later runs without this option (default: a font of your own that is there "
+                        "already, else BIZ UDPGothic, SIL Open Font License 1.1, from fetched/font or downloaded at "
+                        "its pinned commit)")
     p.add_argument("--runtime-lib", type=Path,
                    help="a runtime library built before (liboot2rt.a) to link instead of building one (default: the "
                         "OOT2_RUNTIME_LIB variable, else the release bundle's, else the runtime is built from runtime/)")

@@ -27,7 +27,8 @@ What goes in, by kind (every piece has a row in THIRD_PARTY_NOTICES.md whose fir
                x64 Microsoft.VC14x.CRT folder of the installed Visual Studio Build Tools (found with vswhere, or --vc-redist),
                never from System32; their versions and SHA-256 go into bundle.json
   vulkan-headers  the Vulkan headers the host probe compiles against
-  zbic-source  the ZBIC decoder's source archive (hexkyz/zstd at its pinned commit), so that prepare needs no download
+  zbic-source  the ZBIC decoder's source archive (hexkyz/zstd at its pinned commit), so that prepare downloads nothing
+               but the shared font, which no bundle carries (tools/prepare/font.py)
   oot2         this repository's tools and runtime headers, the launchers, the licence texts, bundle.json
 
 Nothing from the game goes in: no game file, key, firmware, shader, texture or generated C. The content rules of

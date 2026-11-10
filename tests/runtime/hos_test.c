@@ -450,9 +450,9 @@ static void g_fatal(Cpu *c) {
         rt_dispatch(c);
     } else if (case_is("pl_")) {
         // the shared font calls that stop by name, called from main+0x250 as the game calls its table
-        int which = !strcmp(g_case, "pl_font_missing") || !strcmp(g_case, "pl_font_not_sfnt") ? P_ADDR
+        int which = case_is("pl_font_missing") || !strcmp(g_case, "pl_font_not_sfnt") ? P_ADDR
                     : !strcmp(g_case, "pl_font_type") ? P_STATE : P_REQ;
-        c->x[0] = !strcmp(g_case, "pl_font_missing") ? 2 : !strcmp(g_case, "pl_font_type") ? 9 : 0;
+        c->x[0] = case_is("pl_font_missing") ? 2 : !strcmp(g_case, "pl_font_type") ? 9 : 0;
         c->x[1] = 0x1000;   // pl_nx_buffer: a null buffer
         if (!strcmp(g_case, "pl_nx_size")) c->x[0] = HEAP + 0x4000, c->x[1] = 0;            // no bytes
         if (!strcmp(g_case, "pl_nx_range")) c->x[0] = HEAP + 0x4000, c->x[1] = 1ull << 32;   // runs out of guest memory
@@ -518,6 +518,10 @@ static void boot(const char *folder) {
         if (!strcmp(g_case, "pl_font_env")) {
             snprintf(path, sizeof path, "%s/elsewhere.ttf", folder);
             write_blob(path, 2222, 90, NULL);
+            set_env("OOT2_SHARED_FONT", path);
+        }
+        if (!strcmp(g_case, "pl_font_missing_env")) {   // the folder's font is there; the variable names a file that is not
+            snprintf(path, sizeof path, "%s/not-there.ttf", folder);
             set_env("OOT2_SHARED_FONT", path);
         }
     }
