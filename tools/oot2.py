@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 The oot2-native contributors
-"""The oot2 command line. One command so far:
+"""The oot2 command line. Two commands:
 
     py -3 tools/oot2.py prepare --dump FILE --dest DIR [--check] [--verify] [--cc CC] [--vulkan-sdk DIR] [--jobs N]
                                 [--xlate FILE] [--translate-jobs N] [--plain-modules DIR] [--zbic-archive FILE]
@@ -53,6 +53,19 @@ game's. Without the option no such file is written and nothing else changes (too
 
 Exit codes: 0 done, 1 failed (the message says why), 2 bad command line,
 3 cancelled.
+
+    py -3 tools/oot2.py census --game DIR --rules FILE [--out DIR] [--image FILE]
+
+census lists the game's scenes from the player's own RomFS, in a folder prepare has already filled (DIR): which scenes
+the game has, their places, the ages they exist in, their entrances, the ways from one into another, their events,
+movies and tags, and the menus (tools/census/). It reads DIR/romfs/romfs-index.bin and the image that index points
+into (the .nup prepare recorded, or romfs/romfs.bin), a few hundred files in all, and writes census.json and
+scenes.tsv, the same bytes on every run over the same inputs, into --out (default DIR/census). The census is the game's
+data and stays on the player's disk. It is not a prepare step: it changes nothing prepare keeps, so it can run any time
+after the extract step, as often as wanted, and into any folder. --rules names a JSON file of the player's own that says
+where the scene files are and which keys, words and events mean an age or a tag; the tool has no game name in it, and
+tools/census/rules.py describes the file. A file the index lists that cannot be read stops the run with its name.
+Exit codes: 0 done, 1 failed (the message says why), 2 bad command line.
 """
 
 from __future__ import annotations
@@ -125,6 +138,16 @@ def prepare(args: argparse.Namespace) -> int:
     return EXIT[result]
 
 
+def census_command(args: argparse.Namespace) -> int:
+    import census as censusmod
+    try:
+        censusmod.run(args.game, args.out, args.rules, args.image)
+    except censusmod.CensusError as e:
+        print(f"oot2 census: {e}", file=sys.stderr)
+        return EXIT["failed"]
+    return EXIT["ok"]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="oot2", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="command", required=True)
@@ -173,7 +196,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--names", type=Path,
                    help="your own file of `role = name` lines (outside the repository): adds the store step, which lets "
                         "lines of an input file wait for a state value of the game")
+    c = sub.add_parser("census", help="list the game's scenes from your own RomFS",
+                       description="List the game's scenes, entrances, events and menus from the RomFS of a prepared "
+                                   "folder, into files that stay on your disk.")
+    c.add_argument("--game", type=Path, required=True, help="the prepared folder (after the extract step)")
+    c.add_argument("--rules", type=Path, required=True, help="your rules file (tools/census/rules.py describes it)")
+    c.add_argument("--out", type=Path, help="output folder (default: GAME/census)")
+    c.add_argument("--image", type=Path, help="the image the index points into, when it is not where prepare recorded it")
     args = ap.parse_args(argv)
+    if args.command == "census":
+        return census_command(args)
     if power.wanted():
         power.install()   # children of this run are not throttled either
     # Ctrl+Break and a terminate request end the run the way Ctrl+C does: the finished steps stay recorded.
