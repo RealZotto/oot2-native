@@ -74,6 +74,10 @@ typedef void (*GpuEffect)(void *arg, uint64_t value);
 // submission may be another than the one that began it (the recorder ends the frames the submitting thread begins), as
 // long as the two hand over with a release and an acquire of their own, and every effect is queued before the end. A
 // thread that holds a submission must not wait for its own value, nor begin another submission.
+// A guest thread that finds the gate taken waits for it without its virtual core (the holder may be waiting for one) and
+// takes one again once the gate is its. So a host lock the caller holds across the call is taken by every guest thread with
+// rt_kernel_lock (kernel_lock.h), or a thread on that core that waits for the lock with its core held would keep the core
+// from the caller, which then never gets to open the gate.
 uint64_t gpu_sync_begin(void);
 void gpu_sync_effect(GpuEffect fn, void *arg);
 void gpu_sync_end(void);

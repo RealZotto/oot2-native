@@ -178,6 +178,12 @@ class RingAndPacketTest(RecorderBase):
     def test_a_guest_thread_waiting_for_the_gate_behind_such_a_frame_gives_its_core_up_too(self) -> None:
         self.passes("core_gate")
 
+    def test_a_guest_thread_waiting_for_a_lock_held_across_a_submission_gives_its_core_up(self) -> None:
+        # A thread holds a host mutex and waits for the gate, without its core; a second thread on that core takes the mutex.
+        # Taken with its core held, the second keeps the core from the frame that holds the gate and the case hangs until
+        # its watchdog ends it (exit 3, a line that names the case).
+        self.passes("core_lock")
+
     def test_breadcrumbs_name_their_own_draw(self) -> None:
         print("\n" + [x for x in self.passes("breadcrumbs") if x.startswith("ok breadcrumbs")][0])
 

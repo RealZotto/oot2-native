@@ -9,6 +9,10 @@
 // size is made at the present that needs it, and the old one is destroyed by an effect of that present, once every
 // submission that used it is done. A dump copies the capture into a buffer of its own in the present's submission, and
 // the completion thread writes the file and frees the buffer.
+//
+// That lock is held across gpu_vk_begin, where its holder gives its virtual core up while it waits for the gate, so every
+// take of it is rt_kernel_lock (kernel_lock.h): a guest thread on that core that waited for it with its core held would
+// keep the core from the holder, which needs it back to go on.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +21,7 @@
 #include "oot2/runtime.h"
 #include "oot2/vk_capture.h"
 #include "oot2/vk_image.h"
+#include "kernel_lock.h"
 #include "plat.h"
 
 typedef unsigned long long ull;
@@ -215,7 +220,7 @@ void vkc_present(const tex_t *t, const int crop[4]) {
     }
     uint32_t w = (uint32_t)(x1 - x0), h = (uint32_t)(y1 - y0);
 
-    plat_mutex_lock(&g_mu);
+    rt_kernel_lock(&g_mu);
     settings();
     uint64_t seq = __atomic_add_fetch(&g_presents, 1, __ATOMIC_RELAXED);
     uint64_t value = gpu_vk_begin(GPU_VK_INTERNAL);
@@ -249,7 +254,7 @@ void vkc_present(const tex_t *t, const int crop[4]) {
 
 // ---------- reading
 uint64_t vkc_capture_read(uint8_t *dst, size_t cap, uint32_t *w, uint32_t *h) {
-    plat_mutex_lock(&g_mu);
+    rt_kernel_lock(&g_mu);
     *w = C.w, *h = C.h;
     VkDeviceSize size = (VkDeviceSize)C.w * C.h * 4;
     if (!C.image || cap < size) {
@@ -284,7 +289,7 @@ int vkc_capture_save(const char *path) {
 }
 
 void vkc_close(void) {
-    plat_mutex_lock(&g_mu);
+    rt_kernel_lock(&g_mu);
     if (C.image) vkDestroyImage(gpu_vk.device, C.image, NULL), vkFreeMemory(gpu_vk.device, C.mem, NULL);
     if (C.rbuf) vkDestroyBuffer(gpu_vk.device, C.rbuf, NULL), vkFreeMemory(gpu_vk.device, C.rmem, NULL);
     memset(&C, 0, sizeof C);

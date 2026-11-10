@@ -106,7 +106,9 @@ const char *gpu_vk_result_name(VkResult r);   // "VK_ERROR_DEVICE_LOST", ...; "V
 // never asked for); gpu_vk_effect queues fn(arg, value) for the completion thread, after the device reached the value
 // and before the value is done; gpu_vk_end ends the command buffer, submits it to the one queue after the given waits,
 // signalling the value at all commands, and releases the lock. Only the thread between begin and end may call the
-// others. kind is GPU_VK_INTERNAL or GPU_VK_REPLAY, written in the checkpoints.
+// others. kind is GPU_VK_INTERNAL or GPU_VK_REPLAY, written in the checkpoints. A host lock held across gpu_vk_begin is
+// taken by every guest thread with rt_kernel_lock (kernel_lock.h), as gpu_sync_begin (oot2/gpu.h) says; a lock that is
+// only taken inside a submission is taken after the gate, as vkt_untile_host does.
 enum { GPU_VK_REPLAY = 1, GPU_VK_INTERNAL = 2 };
 uint64_t gpu_vk_begin(int kind);
 VkCommandBuffer gpu_vk_cmd(void);

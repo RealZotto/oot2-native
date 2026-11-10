@@ -20,6 +20,7 @@
 #include "oot2/vk_format.h"
 #include "oot2/vk_image.h"
 #include "oot2/vk_texture.h"
+#include "kernel_lock.h"
 #include "plat.h"
 
 typedef unsigned long long ull;
@@ -59,6 +60,8 @@ static PlatMutex g_mu = PLAT_MUTEX_INIT;
 static VkbImage *g_hash[BUCKETS];
 static VkbImage *g_pending, *g_doomed;
 static VkbImageStats g_st;
+// Spans a texel copy: the fill of the staging buffer, the submission and the read out of it. It is held across gpu_vk_begin,
+// where its holder gives its virtual core up while it waits for the gate, so a guest thread takes it with rt_kernel_lock.
 static PlatMutex g_xfer_mu = PLAT_MUTEX_INIT;
 static VkBuffer g_stage;
 static VkDeviceMemory g_stage_mem;
@@ -867,7 +870,7 @@ static int texels_guest(const tex_t *t, const view_t *v, const NVNcopyRegion *r,
 
 void vkb_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img) {
     if (texels_guest(t, v, r, dst, row, img, 0)) return;
-    plat_mutex_lock(&g_xfer_mu);
+    rt_kernel_lock(&g_xfer_mu);
     Xfer x = xfer_of(t, v, r, row, img);
     stage_grow(x.bytes);
     xfer_run(&x, 0);
@@ -881,7 +884,7 @@ void vkb_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, ui
 void vkb_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row,
                       uint64_t img) {
     if (texels_guest(t, v, r, (uint8_t *)src, row, img, 1)) return;
-    plat_mutex_lock(&g_xfer_mu);
+    rt_kernel_lock(&g_xfer_mu);
     Xfer x = xfer_of(t, v, r, row, img);
     stage_grow(x.bytes);
     memcpy(g_stage_map, src, (size_t)x.bytes);

@@ -23,6 +23,7 @@
 //   frames_setting     the value the store gives (a variable out of the range ends the process by name)
 //   core_wait          a guest thread's wait for an older frame gives its virtual core up (two threads, one core)
 //   core_gate          so does a guest thread that waits for the gate behind it
+//   core_lock          so does one that waits for a host mutex which a thread that waits for the gate holds
 //   breadcrumbs        every draw's marker names its own record; a frame's records are gone once it is reused
 //   breadcrumbs_off    no marker, no record
 //   marker_text        the report's words for a marker
@@ -53,9 +54,10 @@
 #include "oot2/settings.h"
 #include "oot2/vk_pipeline.h"
 #include "oot2/vk_rec.h"
+#include "kernel_lock.h"
 #include "plat.h"
 
-#define CHECK(cond)                                                                                                    \
+#define CHECK(cond)                                                                                                   \
     do {                                                                                                               \
         if (!(cond)) {                                                                                                 \
             fprintf(stderr, "check failed at line %d: %s\n", __LINE__, #cond);                                         \
@@ -1136,15 +1138,19 @@ static void case_frames_setting(void) {
 // Two guest threads on one virtual core, written by hand as host functions in the lifter's shape. The main thread begins
 // a third frame that has to wait for the first to be done; the other thread, of worse priority, can run only when the main
 // thread has given the core up, and it is what lets the wait end (core_wait), or it submits behind the frame that holds the
-// gate and must not keep the core from the thread that holds it (core_gate). A wait that keeps its core hangs the case,
-// which its watchdog ends with exit code 3.
+// gate and must not keep the core from the thread that holds it (core_gate). In core_lock the first of two such threads
+// takes a host mutex and then begins a submission, so it waits for the gate with the mutex held and without the core; the
+// second, on the core the first gave up, takes the same mutex: it must wait for it without the core too, or the main thread
+// cannot get the core back to open the gate. A wait that keeps its core hangs the case, which its watchdog ends with exit
+// code 3.
 #define GMB MOD_MAIN_BASE
 #define GFN(i) (GMB + 0x100ull * (i))   // the guest address of guest function i
 #define GPC (GMB + 0x4000)              // the guest pc the guest threads' SVCs report
-enum { FN_MAIN_WAIT, FN_MAIN_GATE, FN_RAISE, FN_GATE, FN_END };
+enum { FN_MAIN_WAIT, FN_MAIN_GATE, FN_RAISE, FN_GATE, FN_MAIN_LOCK, FN_HOLDER, FN_TAKER, FN_END };
 enum { GSTACK = 0x100000 };
 static uint64_t g_core_heap;
 static uint64_t g_core_steps[8], g_core_nsteps, g_core_at_gate;   // atomic
+static PlatMutex g_core_mu = PLAT_MUTEX_INIT;   // the host mutex of core_lock
 
 static void core_step(uint64_t what) {
     uint64_t i = __atomic_fetch_add(&g_core_nsteps, 1, __ATOMIC_SEQ_CST);
@@ -1156,15 +1162,18 @@ static inline uint64_t gsv(Cpu *t, uint32_t imm, uint64_t a0, uint64_t a1, uint6
     rt_svc(t, imm, GPC);
     return t->x[0];
 }
-// A thread of worse priority than the main thread (44), on the main thread's core, started and joined by it.
-static uint32_t gstart(Cpu *t, int fn) {
-    t->x[1] = GFN(fn), t->x[2] = 0, t->x[3] = g_core_heap + GSTACK + 0x10000, t->x[4] = 50, t->x[5] = 0;
+// A thread of worse priority than the main thread (44), on the main thread's core, started and joined by it; the stack
+// number gives two threads stacks of their own.
+static uint32_t gstart_at(Cpu *t, int fn, int prio, int stack) {
+    t->x[1] = GFN(fn), t->x[2] = 0, t->x[3] = g_core_heap + GSTACK + 0x10000ull * (uint64_t)stack, t->x[4] = (uint64_t)prio,
+    t->x[5] = 0;
     rt_svc(t, 0x08, GPC);   // CreateThread
     CHECK(t->x[0] == 0);
     uint32_t h = (uint32_t)t->x[1];
     CHECK(gsv(t, 0x09, h, 0, 0, 0) == 0);   // StartThread
     return h;
 }
+static uint32_t gstart(Cpu *t, int fn) { return gstart_at(t, fn, 50, 1); }
 static void gjoin(Cpu *t, uint32_t h) {
     *(volatile uint32_t *)(uintptr_t)g_core_heap = h;
     CHECK(gsv(t, 0x18, 0, g_core_heap, 1, ~0ull) == 0);   // WaitSynchronization: the thread ended
@@ -1229,18 +1238,55 @@ static void gate_device(void *arg) {   // the device reaches frame 1 once the ot
     plat_sleep_ns(100000000ull);
     counter_raise(1);
 }
-static const GuestFn g_core_fns[FN_END + 1] = {g_main_wait, g_main_gate, g_raise, g_gate, NULL};
+// core_lock: the main thread holds the gate while it waits for frame 1, without the core. The holder (the better of the two
+// threads, so the first to run) takes a host mutex and begins a submission, which waits for the gate: it has the mutex and
+// no core. The taker runs on the core it left, and takes the mutex. The device reaches frame 1 once the taker is at the
+// mutex, the main thread needs the core back to go on, and it can have it only if the taker gave it up for the mutex.
+static void g_main_lock(Cpu *t) {
+    core_two_frames();
+    uint32_t h = gstart_at(t, FN_HOLDER, 50, 1), k = gstart_at(t, FN_TAKER, 52, 2);
+    core_step(1);
+    uint64_t v = vkrec_begin(GPU_VK_REPLAY);   // holds the gate while it waits for frame 1
+    core_step(4);
+    CHECK(v == 3 && gpu_sync_done() >= 1);
+    vkrec_Draw(3, 1, 0, 0);
+    vkrec_end(NULL, 0);                        // the recorder submits it and opens the gate
+    gjoin(t, h);
+    gjoin(t, k);
+    gexit(t);
+}
+static void g_holder(Cpu *t) {
+    rt_kernel_lock(&g_core_mu);
+    core_step(2);
+    CHECK(gpu_sync_begin() == 4);   // the gate is the main thread's: this waits for it without a core, holding the mutex
+    core_step(5);
+    gpu_sync_end();
+    plat_mutex_unlock(&g_core_mu);
+    gexit(t);
+}
+static void g_taker(Cpu *t) {
+    core_step(3);
+    __atomic_store_n(&g_core_at_gate, 1, __ATOMIC_RELEASE);   // gate_device raises frame 1 a moment after this
+    rt_kernel_lock(&g_core_mu);
+    core_step(6);
+    plat_mutex_unlock(&g_core_mu);
+    gexit(t);
+}
+static const GuestFn g_core_fns[FN_END + 1] = {g_main_wait, g_main_gate, g_raise, g_gate, g_main_lock,
+                                               g_holder,    g_taker,     NULL};
 static uint64_t g_core_addrs[FN_END + 1];
 static void core_guest_end(Cpu *t) { (void)t; }
 
+static const char *const g_core_name[3] = {"core_wait", "core_gate", "core_lock"};
 static void core_watchdog(void *arg) {
-    (void)arg;
     plat_sleep_ns(15000000000ull);
-    fprintf(stderr, "hung: the wait kept the virtual core (steps %llu)\n", (unsigned long long)g_core_nsteps);
+    fprintf(stderr, "hung: %s: a wait kept the virtual core (steps %llu)\n", (const char *)arg,
+            (unsigned long long)g_core_nsteps);
     _Exit(3);
 }
-static void case_core(int gate) {
-    CHECK(plat_thread_start(core_watchdog, NULL, 1 << 20));
+static void case_core(int which) {
+    int gate = which != 0;   // in core_gate and core_lock the device reaches frame 1 once a thread is waiting at something
+    CHECK(plat_thread_start(core_watchdog, (void *)(uintptr_t)g_core_name[which], 1 << 20));
     RtMemConfig m = {.pool_size = 1ull << 30, .heap_region_size = 512ull << 20, .alias_region_size = 1ull << 30,
                      .stack_region_size = 256ull << 20, .system_resource_size = 1ull << 20};
     rt_mem_init(&m);
@@ -1264,13 +1310,14 @@ static void case_core(int gate) {
     begin_fake();
     open_now(1u << 20, 2, 0);
     if (gate) CHECK(plat_thread_start(gate_device, NULL, 1 << 20));
-    rt_kernel_run(GFN(gate ? FN_MAIN_GATE : FN_MAIN_WAIT), 0);
-    uint64_t want[4] = {1, 2, 3, 4};
-    uint64_t n = gate ? 4 : 3;
+    static const int mains[3] = {FN_MAIN_WAIT, FN_MAIN_GATE, FN_MAIN_LOCK};
+    rt_kernel_run(GFN(mains[which]), 0);
+    uint64_t want[6] = {1, 2, 3, 4, 5, 6};
+    uint64_t n = which == 2 ? 6 : gate ? 4 : 3;
     CHECK(__atomic_load_n(&g_core_nsteps, __ATOMIC_ACQUIRE) == n);
     for (uint64_t i = 0; i < n; i++) CHECK(g_core_steps[i] == want[i]);   // the other thread ran while the main one waited
     close_fake();
-    printf("ok %s steps %llu %llu %llu\n", gate ? "core_gate" : "core_wait", (unsigned long long)g_core_steps[0],
+    printf("ok %s steps %llu %llu %llu\n", g_core_name[which], (unsigned long long)g_core_steps[0],
            (unsigned long long)g_core_steps[1], (unsigned long long)g_core_steps[2]);
 }
 
@@ -1961,6 +2008,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "frames_setting")) case_frames_setting();
     else if (!strcmp(cs, "core_wait")) case_core(0);
     else if (!strcmp(cs, "core_gate")) case_core(1);
+    else if (!strcmp(cs, "core_lock")) case_core(2);
     else if (!strcmp(cs, "breadcrumbs")) case_breadcrumbs();
     else if (!strcmp(cs, "breadcrumbs_off")) case_breadcrumbs_off();
     else if (!strcmp(cs, "marker_text")) case_marker_text();

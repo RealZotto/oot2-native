@@ -125,6 +125,10 @@ uint64_t gpu_sync_begin(void) {
         // The submission that holds the gate may be waiting for a virtual core (the recorder's begin gives its own up while
         // it waits for an older frame, and takes one again before it goes on): a guest thread that waited here with its
         // core would keep that core from it for ever. So it waits without one, and takes one again once the gate is its.
+        // The caller may hold a host lock of its own across this call, and until the gate is its the thread is without a
+        // core: another guest thread on that core that blocked on the lock with its core held would keep the core from it
+        // in rt_kernel_block_end, and the gate would stay shut. So a lock held across a submission is taken by guest threads
+        // with rt_kernel_lock (kernel_lock.h): the texel copies' (vk_image.c) and the capture's (vk_capture.c).
         plat_mutex_unlock(&g_lock);
         token = rt_kernel_block_begin();
         plat_mutex_lock(&g_lock);
