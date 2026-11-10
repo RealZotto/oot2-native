@@ -5,12 +5,12 @@ runtime/gpu/backing.c; runtime/include/oot2/pagegen.h, runtime/include/oot2/back
 the write watch whose generations two consumers read alike, a CPU write read by the next submission, the admission rule
 and its fallback to an import, a GPU write written back only once its submission was reached, a mirror replaced only
 after the submission that wrote it, a bind in a raw-access submission that grows past a mirror its page table maps
-(the mirror keeps the part the bind leaves, an import takes the rest, no page has two copies), an import such a
-submission binds a range larger than a uniform's of that becomes a mirror at the next raw-access begin (brought current,
-in the page table, left alone when the submission bound it before its raw stage or the admission refuses, and not past
-the cap on the mirrors that the raw write-back's size sets), and the binds and waits the map refuses by name. The device and the write watch
-stand in (tests/runtime/coherence_test.c says how); the `watch` case uses the real write watch on Windows and prints a
-skip line elsewhere. The device's own tests are tests/test_runtime_vk.py.
+(the mirror keeps the part the bind leaves, or grows in place if already bound, without creating two copies), an import
+such a submission binds a range larger than a uniform's of that becomes a mirror at the next raw-access begin (brought
+current, in the page table, left alone when the submission bound it before its raw stage or the admission refuses, and
+not past the cap on the mirrors that the raw write-back's size sets), and the binds and waits the map refuses by name.
+The device and the write watch stand in (tests/runtime/coherence_test.c says how); the `watch` case uses the real write
+watch on Windows and prints a skip line elsewhere. The device's own tests are tests/test_runtime_vk.py.
 
 Also, without building anything: the runtime has one caller of rt_mem_written (a query resets the marks it reports, so a
 second caller would take pages from the first).
@@ -35,17 +35,22 @@ from test_runtime_gpu import EXIT_FATAL, LEVELS, ROOT, build_program, case_env, 
 
 TEST_SOURCE = ROOT / "tests" / "runtime" / "coherence_test.c"
 
-PASSING = ("generations", "upload", "admission", "writeback", "writeback_no_reupload", "writeback_partial_page",
-           "writeback_replaced", "writeback_long_run", "gpu_mark", "replace", "raw_grow", "raw_grow_head",
-           "raw_grow_whole", "raw_grow_beside", "raw_grow_wait", "raw_sync_wait", "raw_sync_nowait", "raw_promote",
-           "raw_promote_small", "raw_promote_wait", "raw_promote_cap")
+PASSING = ("generations", "upload", "admission", "guarded_admission", "writeback", "writeback_no_reupload",
+           "writeback_partial_page", "writeback_replaced", "writeback_long_run", "gpu_mark", "replace", "raw_grow",
+           "raw_grow_head", "raw_grow_whole", "raw_grow_beside", "raw_grow_taken", "raw_grow_neighbour",
+           "raw_grow_taken_wait", "raw_grow_taken_head", "raw_grow_taken_layout", "raw_grow_trimmed",
+           "raw_grow_guarded_head", "raw_grow_guarded_tail", "raw_grow_wait", "raw_sync_wait", "raw_sync_nowait",
+           "raw_promote", "raw_promote_small", "raw_promote_wait", "raw_promote_cap")
 
 # case: text the one FATAL line must hold
 FAILING = {
     "unwritten": "into a mirror was not written back by the time its value was done (a CPU wait for a fence)",
     "replace_written": "which submission 1 wrote on the GPU while it is being recorded, would be replaced by a backing "
                        "over",
-    "raw_grow_taken": "earlier in raw-access submission 1, and a bind over",
+    "raw_grow_bound_import": "earlier in raw-access submission",
+    "raw_grow_fragmented": "earlier in raw-access submission",
+    "raw_grow_guarded_blocked": "earlier in raw-access submission",
+    "raw_grow_untracked": "earlier in raw-access submission",
 }
 
 # Where rt_mem_written may appear outside comments: its declaration, its definition, and its one caller.

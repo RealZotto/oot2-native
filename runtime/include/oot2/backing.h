@@ -56,10 +56,12 @@
 //
 // Mirrors (D14, D17a, section 8). A bind in a pool the CPU can see asks the mirror hook (the Vulkan back end's says yes
 // on a discrete device, where imported memory is read across the bus) and then the admission rule: the mirror is made
-// when the device-local heap's use plus the mirror's size plus an eighth of its budget fits the budget, the figures of
-// VK_EXT_memory_budget (BackingOps.vram), and the write watch covers its range; otherwise the bind gets an import. A
-// mirror is VRAM from the blocks, over the range the import would cover (the run of committed pages around the bind
-// inside its cell), and needs no import beside it:
+// when the device-local heap's use plus the mirror's allocation plus an eighth of its budget fits the budget, the
+// figures of VK_EXT_memory_budget (BackingOps.vram), and the write watch covers its range; otherwise the bind gets an
+// import. A mirror is VRAM from the blocks, over the range the import would cover (the run of committed pages around
+// the bind inside its cell), and needs no import beside it. Its allocation reserves BACKING_MIRROR_GUARD bytes at
+// each end so it can grow by one aligned block part without moving already-recorded bindings; those reserved bytes
+// count against the admission budget but do not add pages to the mirror's raw write-back:
 //   CPU to mirror   the first resolve of a mirror in a submission brings it current before that submission's own work:
 //                   it queries the mirror's range through the page generations (oot2/pagegen.h, the one owner of the
 //                   write watch), and copies the pages stamped after the mirror's generation (all of them the first
@@ -96,8 +98,9 @@
 // was recorded before and one for what follows): it makes an import, never a mirror, and takes the pages it needs from the
 // mirrors it overlaps, which keep the part outside the bind (or go, when the bind covers all of them), waiting first for
 // the older raw-access submissions that may have stored into them; the import covers the committed run around the bind up
-// to the mirrors that remain. A mirror the submission already resolved where the bind takes pages, or wrote there on the
-// GPU, is a named fatal.
+// to the mirrors that remain. A mirror already resolved where the bind takes pages can instead grow in place when its
+// enlarged range stays write-watched, fits in the block and the mirror budget, and has no conflicting backings or
+// bindings; otherwise it is a named fatal.
 //
 // An import is never what the rule would give a bind on a discrete device, and the invariant above makes one of every
 // committed page: the GPU reads an import across the bus, so a compute program that works on its buffers stalls on every
@@ -128,6 +131,7 @@
 #define BACKING_DEFERRED_MAX 1024             // backings waiting for retirement; a full queue waits for its oldest
 #define BACKING_EXTENT_ALIGN 0x10000ull       // extents are 64 KiB aligned in their block, as window pages are
 #define BACKING_HOST_PAGE 0x1000ull           // the page of commit and of host import
+#define BACKING_MIRROR_GUARD BACKING_EXTENT_ALIGN   // reserved at either end for in-place growth
 #define BACKING_MIRROR_RESERVE 8              // section 8: a mirror leaves an eighth of the VRAM budget free
 #define BACKING_PROMOTE_MIN (64ull << 10)     // a bind larger than a uniform's (maxUniformBufferRange) marks its import hot
 #define BACKING_PROMOTE_MIRROR_MAX (128ull << 20)   // a promotion leaves the mirrors at or under this many bytes (vk_raw.h's write-back)
