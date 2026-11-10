@@ -452,7 +452,7 @@ class HidReplayTest(unittest.TestCase):
 
 
 MALFORMED = {
-    "unknown_line_kind": (b"# one\nat 0 for 1 a\njump 5 for 3 a\n", 3, 'unknown line kind "jump" (a line starts with "at")'),
+    "unknown_line_kind": (b"# one\nat 0 for 1 a\njump 5 for 3 a\n", 3, 'unknown line kind "jump" (a line starts with "at" or "when")'),
     "missing_tick": (b"\n\nat\n", 3, '"at" needs a tick, then "for" and a count'),
     "tick_not_a_number": (b"at x for 3 a\n", 1, 'the tick "x" is not a decimal number'),
     "tick_negative": (b"at -5 for 3 a\n", 1, 'the tick "-5" is not a decimal number'),
@@ -473,8 +473,8 @@ MALFORMED = {
     "stick_too_low": (b"at 1 for 1 ly=-32769\n", 1, "ly=-32769 is outside -32768..32767"),
     "binary_file": (b"at 0 for 1 a\nat 1 for 1 b\x00\n", 2, "a NUL byte; the input file is text"),
     "byte_order_mark_not_at_the_start": (b"at 0 for 1 a\n\xef\xbb\xbfat 1 for 1 b\n", 2,
-                                         'unknown line kind "???at" (a line starts with "at")'),
-    "garbage_word_is_shown_safely": (b"at 0 for 1 a\n\xff\xfe\x01 5\n", 2, 'unknown line kind "???" (a line starts with "at")'),
+                                         'unknown line kind "???at" (a line starts with "at" or "when")'),
+    "garbage_word_is_shown_safely": (b"at 0 for 1 a\n\xff\xfe\x01 5\n", 2, 'unknown line kind "???" (a line starts with "at" or "when")'),
 }
 
 

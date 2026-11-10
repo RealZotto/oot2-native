@@ -46,11 +46,33 @@
 //
 // A line the reader cannot take stops the run with `FATAL: input file <file>, line <n>: <what is wrong>`.
 //
-// Later markers. A stretch starts at a tick today. A marker that starts it when a named state value of the game is met,
-// instead of at a tick, plugs in at three places of runtime/hos/hid_replay.c, each marked "extension point": the line
-// kinds the reader dispatches on (`at` is the one kind), the start of a stretch (a tick), and the check that a stretch is
-// live. Nothing of that is built, and no game value name or address belongs in this layer: a marker's name is bound
-// elsewhere.
+// Markers. A line can wait for a named state value of the game instead of a tick:
+//   when <role> <op> <value> [after <ticks>] for <count> [<held> ...]
+//     <role>   a role of the store description (oot2/store.h; `oot2 prepare --names FILE` writes oot2-store.txt from a
+//              names file of the player's own, outside the repository): scene, next_scene, entrance, room, age, health,
+//              max_health, boss, paused, loading, menu, or `<kind>.<label>` of the player's choosing with a kind of bool,
+//              int, uint, float or string. Either case. No name of the game's is in this program or in this file.
+//     <op>     == != < <= > >=; a string takes only == and !=
+//     <value>  by the role's kind: a bool is 0, 1, true or false; an int is a whole number from -2147483648 to 2147483647,
+//              a uint one from 0 to 4294967295; a float a decimal number (sign, digits, point, exponent); a string one word
+//              of at most 63 characters, compared exactly with the store's string (cut at 63 characters)
+//     after    optional: whole ticks, 0 to 4294967295, from the tick the value was met to the first tick of the stretch
+//     for ...  the count and the held items are those of an `at` line
+// The value is looked at once per tick, at the tick's first read, from the first read of the file: the first tick at which
+// the comparison holds fires the line, once (a value that is true at the first read fires at tick 0, and one that turns
+// true again later does not fire it again). The stretch is then the ticks fired+delay .. fired+delay+count-1, and it
+// combines with the other lines as any stretch does. A store the game has not built yet, or a table that is not built yet,
+// is waited for. Examples:
+//   when scene == <word> after 30 for 6 a     # press A half a second after the scene changes to the named one
+//   when health <= 3 for 90 zl                # hold ZL for 1.5 seconds once health is down to 3
+//
+// A `when` line is read at start-up and checked against the description then: a role the description lacks, an operator or
+// value that does not fit the role's kind, a description that is missing, malformed or made from another build of the main
+// module (its build id is compared with the loaded module's), all stop the run with the same fatal as any bad line, naming
+// the line. While it runs, a value that no table of its kind has, once every such table is built, for 120 ticks in a row, and
+// an address the description leads to that is outside the guest's memory, stop it by name too. The recorder is unchanged: it
+// writes the ticks the lines took effect at, so the recording of a run with markers replays tick for tick without them. A file
+// with no `when` line never reads the description.
 //
 // The run report (census.tsv, oot2/boot.h) carries a row `input` with the file's name, its SHA-256 and what the run took
 // from it, and a row `input-record` for the recorder.

@@ -5,6 +5,7 @@
 
     py -3 tools/oot2.py prepare --dump FILE --dest DIR [--check] [--verify] [--cc CC] [--vulkan-sdk DIR] [--jobs N]
                                 [--xlate FILE] [--translate-jobs N] [--plain-modules DIR] [--zbic-archive FILE]
+                                [--names FILE]
 
 prepare builds the game from the player's own dump into DIR, one step after the
 other (tools/prepare/). DIR must be empty or new on the first run, and the disk
@@ -43,6 +44,13 @@ of the renderer makes it skip with a warning, until the Vulkan back end is the d
 against the dump's and used instead of decoding, so the ZBIC decoder is not fetched for them. --zbic-archive gives
 the decoder's source archive (hexkyz/zstd at the pinned commit, tools/prepare/zbic.py) instead of downloading it.
 
+--names gives a names file of your own, outside the repository, and adds the store step after the modules step: it finds where
+the game keeps its named state values in your copy of the main module and writes oot2-store.txt beside the program, with the
+hash of each name in your file (never the name), so that lines of an input file (oot2/hid_replay.h) can wait for a value of the
+game. A line of the file is `role = name`: the roles are scene, next_scene, entrance, room, age, health, max_health, boss,
+paused, loading and menu, or `<kind>.<label>` of your own with a kind of bool, int, uint, float or string; the name is the
+game's. Without the option no such file is written and nothing else changes (tools/prepare/store.py).
+
 Exit codes: 0 done, 1 failed (the message says why), 2 bad command line,
 3 cancelled.
 """
@@ -79,16 +87,35 @@ def positive(text: str) -> int:
     return n
 
 
+def steps_for(args: argparse.Namespace) -> list:
+    """The steps of this run: all of them, and the store step after the modules step when a names file is given."""
+    steps = all_steps()
+    if getattr(args, "names", None):
+        from prepare.store import Store
+        steps.insert([s.id for s in steps].index("modules") + 1, Store())
+    return steps
+
+
 def prepare(args: argparse.Namespace) -> int:
     rep = Reporter()
     dest = args.dest.resolve()
+    if args.names:   # a names file that cannot be taken stops the run now, not after the lift
+        from prepare import store
+        try:
+            store.parse_names(args.names.read_bytes())
+        except OSError as e:
+            rep.error(f"the names file {args.names} cannot be read ({e.strerror or e})")
+            return EXIT["failed"]
+        except store.NamesError as e:
+            rep.error(f"the names file {args.names}, {e}")
+            return EXIT["failed"]
     try:
         state = statefile.load(dest)
     except statefile.StateError as e:
         rep.error(str(e))
         return EXIT["failed"]
     ctx = Context(dest, args, rep, state=state, verify=args.verify)
-    steps = all_steps()
+    steps = steps_for(args)
     rep.say(f"oot2 prepare: {'first run' if ctx.fresh else 'resuming'} in {dest}; "
             f"steps: {', '.join(s.id for s in steps)}")
     # The PC stays awake for the run (a first one takes an hour or more); the guard ends with it.
@@ -143,6 +170,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="folder of plain modules you already have (main, sdk, ...), used instead of decoding")
     p.add_argument("--zbic-archive", type=Path,
                    help="source archive of the ZBIC decoder, instead of downloading it")
+    p.add_argument("--names", type=Path,
+                   help="your own file of `role = name` lines (outside the repository): adds the store step, which lets "
+                        "lines of an input file wait for a state value of the game")
     args = ap.parse_args(argv)
     if power.wanted():
         power.install()   # children of this run are not throttled either

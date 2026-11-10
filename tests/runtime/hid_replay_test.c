@@ -15,6 +15,11 @@
 //                                 state TICK BUTTONS LX LY RX RY ATTRIBUTES
 //                             with BUTTONS in hex. At the end the report is written (census.tsv) and "ok run" printed.
 //                             A fatal at start-up (a malformed input file) exits with the runtime's code.
+//                             If DIR/main exists it is a plain module the test loads first, as the program does, so that
+//                             a store the input file's markers read can live in its data (oot2/store.h). A script line
+//                                 P OFFSET HEXBYTES
+//                             writes those bytes at OFFSET (hex) in the main module's image before the next line runs: how
+//                             the test changes the store while the game runs.
 //   hid_replay_test run_then_fatal DIR   the same, ending in a fatal of the case's own instead of the report call
 //   hid_replay_test run_then_exit DIR    the same, ending in a stop with exit code 3 and no clean-up (TerminateProcess;
 //                                        _Exit elsewhere): a process killed from outside, which closes and flushes
@@ -36,6 +41,7 @@
 #include "oot2/gfx.h"
 #include "oot2/hid_input.h"
 #include "oot2/kernel.h"
+#include "oot2/loader.h"
 #include "oot2/memory.h"
 #include "oot2/vsync.h"
 #include "plat.h"
@@ -82,6 +88,14 @@ static void boot(const char *folder) {
                         .main_core = 0, .main_stack_size = 0x100000, .handle_table_size = 512, .is_application = 1};
     for (unsigned i = 0; i < sizeof APP_SVCS / sizeof *APP_SVCS; i++) k.svc_mask[APP_SVCS[i] >> 6] |= 1ull << (APP_SVCS[i] & 63);
     rt_kernel_init(&k);
+    char mpath[4200];
+    snprintf(mpath, sizeof mpath, "%s/main", folder);
+    FILE *mf = fopen(mpath, "rb");
+    if (mf) {
+        fclose(mf);
+        RtModuleFile mfile = {"main", mpath, MB, MOD_MAIN_SIZE, NULL};
+        rt_load_modules(&mfile, 1);
+    }
     g_init = rt_hostfn_bind("_ZN2nn3hid14InitializeNpadEv");   // before the layer and the dispatch table, as the loader does
     g_ids = rt_hostfn_bind("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm");
     g_styles = rt_hostfn_bind("_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE");
@@ -133,6 +147,17 @@ static int run(const char *dir, int fatal) {
         unsigned long long tick, reads, buttons;
         int lx, ly, rx, ry;
         if (line[0] == '#' || line[0] == '\n') continue;
+        if (line[0] == 'P') {
+            unsigned long long off;
+            char hexbytes[256];
+            CHECK(sscanf(line, "P %llx %255s", &off, hexbytes) == 2 && strlen(hexbytes) % 2 == 0);
+            for (size_t i = 0; i < strlen(hexbytes) / 2; i++) {
+                unsigned b;
+                CHECK(sscanf(hexbytes + 2 * i, "%2x", &b) == 1);
+                *(volatile uint8_t *)(uintptr_t)(MB + off + i) = (uint8_t)b;
+            }
+            continue;
+        }
         CHECK(sscanf(line, "%llu %llu %llx %d %d %d %d", &tick, &reads, &buttons, &lx, &ly, &rx, &ry) == 7);
         if (!have_first) first = tick, have_first = 1;
         set_tick(FIRST_TICK + (tick - first));

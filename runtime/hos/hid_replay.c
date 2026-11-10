@@ -15,9 +15,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "hos.h"
 #include "oot2/hid_replay.h"
 #include "oot2/loader.h"
 #include "oot2/runtime.h"
+#include "oot2/store.h"
 #include "oot2/vsync.h"
 #include "plat.h"
 
@@ -40,12 +42,29 @@ typedef struct Held {
     int32_t axis[AXES];
 } Held;
 
-// One line of the file. The start is a tick today (extension point: the start of a stretch).
+// One line of the file. A stretch starts at a tick (`at`), or, for a `when` line, at the tick its marker fires plus the
+// delay: `at` is then set when it fires, and `marker` is the number of its marker plus one.
 typedef struct Span {
     uint64_t at, count;
     Held held;
     uint8_t axes_set;   // bit i: the line gives axis i
+    uint32_t marker;    // 0 for a line that starts at a tick
 } Span;
+
+// What a `when` line waits for: a value of the store compared with a constant. It fires the first tick the comparison holds.
+enum { OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OPS };
+static const char *const OP_NAME[OPS] = {"==", "!=", "<", "<=", ">", ">="};
+#define NEVER UINT64_MAX
+#define MISSING_TICKS 120   // ticks a value may stay absent from tables that are all built, before the run stops by name
+typedef struct Marker {
+    int line, role, op;
+    int64_t ival;
+    double fval;
+    char sval[64];
+    uint64_t after;           // ticks from the firing to the start of the stretch
+    int fired;
+    uint64_t missing_since;   // the tick the value was first found absent from a built store, or NEVER
+} Marker;
 
 static PlatMutex g_lock = PLAT_MUTEX_INIT;   // everything below that is written after start-up
 static int g_started;
@@ -54,6 +73,9 @@ static int g_replay_on, g_rec_on;   // written once by hid_replay_start, before 
 static char g_replay_path[1024], g_rec_path[1024];
 static Span *g_spans;
 static size_t g_nspans, g_cap;
+static Marker *g_markers;
+static size_t g_nmarkers, g_markers_cap;
+static int g_store_loaded;
 static char g_sha_hex[65];
 static size_t g_replay_bytes;   // the size of the replayed file
 
@@ -173,9 +195,23 @@ static void parse_held(int line, char **p, Span *s) {
     }
 }
 
-// at <tick> for <count> [<held> ...]. Extension point: the start of a stretch. A marker that starts a stretch at a named
-// state value instead of a tick has its own line kind, reads its own start words here and keeps them in the span's
-// start; the rest of the line (for, the count, the held items) is the same.
+// at <tick> for <count> [<held> ...]. The rest of the line after the start (for, the count, the held items) is the same
+// for every kind of line, in parse_for.
+static void parse_for(int line, char **p, Span *s, char *w) {   // w: the word after the start, if already read
+    char buf[32];
+    uint64_t v = 0;
+    if (!w) w = next_word(p);
+    if (!w || strcmp(w, "for")) bad(line, "expected \"for\" and a count after the %s, not \"%s\"", s->marker ? "value" : "tick", w ? shown(w, buf) : "the end of the line");
+    w = next_word(p);
+    if (!w) bad(line, "\"for\" needs a count");
+    int r = number(w, &v);
+    if (r == -1) bad(line, "the count \"%s\" is not a decimal number", shown(w, buf));
+    if (r == -2) bad(line, "the count \"%s\" is above %llu", shown(w, buf), (unsigned long long)NUM_MAX);
+    if (v == 0) bad(line, "the count is 0; a stretch lasts 1 tick or more");
+    s->count = v;
+    parse_held(line, p, s);
+}
+
 static void parse_at(int line, char **p, Span *s) {
     char buf[32];
     char *w = next_word(p);
@@ -185,16 +221,117 @@ static void parse_at(int line, char **p, Span *s) {
     if (r == -1) bad(line, "the tick \"%s\" is not a decimal number", shown(w, buf));
     if (r == -2) bad(line, "the tick \"%s\" is above %llu", shown(w, buf), (unsigned long long)NUM_MAX);
     s->at = v;
+    parse_for(line, p, s, NULL);
+}
+
+// when <role> <op> <value> [after <ticks>] for <count> [<held> ...]. The role is one the store description holds (the
+// prepare step wrote it from the player's names file), the operator one of == != < <= > >=, the value a constant of the
+// role's kind. The line is read here and checked against the description now, so a role it does not know, a value that does
+// not fit the role's kind and a missing description all stop the run at start-up, naming the line.
+static int add_marker(const Marker *m) {
+    if (g_nmarkers == g_markers_cap) {
+        size_t cap = g_markers_cap ? g_markers_cap * 2 : 8;
+        Marker *n = realloc(g_markers, cap * sizeof *g_markers);
+        if (!n) rt_fatal("input file %s: out of memory", g_replay_path);
+        g_markers = n;
+        g_markers_cap = cap;
+    }
+    g_markers[g_nmarkers] = *m;
+    return (int)++g_nmarkers;
+}
+
+// A decimal number as a person writes one: an optional sign, digits with an optional point (at least one digit), and an
+// optional exponent. Nothing else (no inf, no nan, no hexadecimal).
+static int float_syntax(const char *t) {
+    if (*t == '+' || *t == '-') t++;
+    int digits = 0;
+    while (isdigit((unsigned char)*t)) t++, digits++;
+    if (*t == '.') {
+        t++;
+        while (isdigit((unsigned char)*t)) t++, digits++;
+    }
+    if (!digits) return 0;
+    if (*t == 'e' || *t == 'E') {
+        t++;
+        if (*t == '+' || *t == '-') t++;
+        if (!isdigit((unsigned char)*t)) return 0;
+        while (isdigit((unsigned char)*t)) t++;
+    }
+    return !*t;
+}
+
+static void parse_when(int line, char **p, Span *s) {
+    char buf[32], why[512];
+    if (!g_store_loaded) {
+        char path[1100];
+        snprintf(path, sizeof path, "%s/%s", hos_game_folder(), STORE_FILE);
+        if (!store_load(path, why, sizeof why)) bad(line, "a \"when\" line needs the store description: %s", why);
+        g_store_loaded = 1;
+    }
+    char *w = next_word(p);
+    if (!w) bad(line, "\"when\" needs a role, an operator and a value");
+    int role = store_role(w);
+    if (role < 0) {
+        char list[256] = "";
+        for (int i = 0; i < store_role_count() && strlen(list) + 60 < sizeof list; i++)
+            snprintf(list + strlen(list), sizeof list - strlen(list), "%s%s", i ? ", " : "", store_role_name(i));
+        bad(line, "unknown role \"%s\" (the store description has: %s)", shown(w, buf), *list ? list : "no roles");
+    }
+    StoreKind kind = store_role_kind(role);
+    Marker m = {.line = line, .role = role, .missing_since = NEVER};
     w = next_word(p);
-    if (!w || strcmp(w, "for")) bad(line, "expected \"for\" and a count after the tick, not \"%s\"", w ? shown(w, buf) : "the end of the line");
+    if (!w) bad(line, "\"when %s\" needs an operator and a value", store_role_name(role));
+    m.op = -1;
+    for (int i = 0; i < OPS; i++)
+        if (!strcmp(w, OP_NAME[i])) m.op = i;
+    if (m.op < 0) bad(line, "unknown operator \"%s\" (use == != < <= > >=)", shown(w, buf));
+    if (kind == STORE_STRING && m.op != OP_EQ && m.op != OP_NE)
+        bad(line, "%s is a string; only == and != apply to it", store_role_name(role));
     w = next_word(p);
-    if (!w) bad(line, "\"for\" needs a count");
-    r = number(w, &v);
-    if (r == -1) bad(line, "the count \"%s\" is not a decimal number", shown(w, buf));
-    if (r == -2) bad(line, "the count \"%s\" is above %llu", shown(w, buf), (unsigned long long)NUM_MAX);
-    if (v == 0) bad(line, "the count is 0; a stretch lasts 1 tick or more");
-    s->count = v;
-    parse_held(line, p, s);
+    if (!w) bad(line, "\"when %s %s\" needs a value", store_role_name(role), OP_NAME[m.op]);
+    switch (kind) {
+    case STORE_BOOL:
+        if (!strcmp(w, "1") || ieq(w, "true")) m.ival = 1;
+        else if (!strcmp(w, "0") || ieq(w, "false")) m.ival = 0;
+        else bad(line, "the value \"%s\" of the bool %s is not 0, 1, true or false", shown(w, buf), store_role_name(role));
+        break;
+    case STORE_INT:
+    case STORE_UINT: {
+        int neg = kind == STORE_INT && *w == '-';
+        uint64_t v = 0;
+        int r = number(w + neg, &v);
+        int64_t lo = kind == STORE_INT ? INT32_MIN : 0, hi = kind == STORE_INT ? INT32_MAX : (int64_t)UINT32_MAX;
+        if (r == -1) bad(line, "the value \"%s\" of %s is not a whole number", shown(w, buf), store_role_name(role));
+        if (r == -2 || (neg ? -(int64_t)v < lo : v > (uint64_t)hi))
+            bad(line, "the value \"%s\" of %s is outside %lld..%lld", shown(w, buf), store_role_name(role), (long long)lo, (long long)hi);
+        m.ival = neg ? -(int64_t)v : (int64_t)v;
+        break;
+    }
+    case STORE_FLOAT: {
+        char *end = NULL;
+        m.fval = float_syntax(w) ? strtod(w, &end) : 0;
+        if (!end || *end) bad(line, "the value \"%s\" of %s is not a number", shown(w, buf), store_role_name(role));
+        break;
+    }
+    case STORE_STRING:
+        if (strlen(w) >= sizeof m.sval) bad(line, "the value of %s is longer than %zu characters", store_role_name(role), sizeof m.sval - 1);
+        snprintf(m.sval, sizeof m.sval, "%s", w);
+        break;
+    }
+    // [after <ticks>]: the delay from the firing to the start of the stretch
+    w = next_word(p);
+    if (w && !strcmp(w, "after")) {
+        w = next_word(p);
+        if (!w) bad(line, "\"after\" needs a number of ticks");
+        uint64_t v = 0;
+        int r = number(w, &v);
+        if (r == -1) bad(line, "the delay \"%s\" is not a decimal number", shown(w, buf));
+        if (r == -2) bad(line, "the delay \"%s\" is above %llu", shown(w, buf), (unsigned long long)NUM_MAX);
+        m.after = v;
+        w = NULL;
+    }
+    s->marker = (uint32_t)add_marker(&m);
+    parse_for(line, p, s, w);
 }
 
 // Extension point: the line kinds. Each kind is the first word of a line and the function that reads the rest of it
@@ -203,7 +340,7 @@ typedef struct LineKind {
     const char *word;
     void (*parse)(int line, char **p, Span *s);
 } LineKind;
-static const LineKind LINE_KINDS[] = {{"at", parse_at}};
+static const LineKind LINE_KINDS[] = {{"at", parse_at}, {"when", parse_when}};
 
 static void add_span(int line, const Span *s) {
     if (g_nspans == MAX_LINES) bad(line, "more than %u lines in the file", MAX_LINES);
@@ -242,7 +379,7 @@ static void parse_file(char *buf, size_t n) {
             for (size_t i = 0; i < sizeof LINE_KINDS / sizeof *LINE_KINDS; i++)
                 if (!strcmp(kind, LINE_KINDS[i].word)) k = &LINE_KINDS[i];
             char shown_buf[32];
-            if (!k) bad(line, "unknown line kind \"%s\" (a line starts with \"at\")", shown(kind, shown_buf));
+            if (!k) bad(line, "unknown line kind \"%s\" (a line starts with \"at\" or \"when\")", shown(kind, shown_buf));
             Span s = {0};
             k->parse(line, &p, &s);
             add_span(line, &s);
@@ -306,8 +443,70 @@ static int has_replay_bytes(const char *path) {
 }
 
 // ---- the replay: the state of a tick
-// Extension point: whether a stretch is live at a tick (today: the tick is inside its run).
-static int span_live(const Span *s, uint64_t tick) { return tick >= s->at && tick - s->at < s->count; }
+// Whether a stretch is live at a tick: the tick is inside its run. The run of a `when` line exists once its marker fired.
+static int span_live(const Span *s, uint64_t tick) {
+    if (s->marker && !g_markers[s->marker - 1].fired) return 0;
+    return tick >= s->at && tick - s->at < s->count;
+}
+
+// Whether the value of the store satisfies a marker.
+static int holds(const Marker *m, const StoreValue *v) {
+    int c;
+    if (store_role_kind(m->role) == STORE_STRING) {
+        c = strcmp(v->s, m->sval);
+    } else if (store_role_kind(m->role) == STORE_FLOAT) {
+        if (v->f != v->f) return 0;   // not a number: no comparison holds
+        c = (v->f > m->fval) - (v->f < m->fval);
+    } else {
+        c = (v->i > m->ival) - (v->i < m->ival);
+    }
+    switch (m->op) {
+    case OP_EQ: return c == 0;
+    case OP_NE: return c != 0;
+    case OP_LT: return c < 0;
+    case OP_LE: return c <= 0;
+    case OP_GT: return c > 0;
+    default: return c >= 0;
+    }
+}
+
+// The first read of a tick: look at each marker that has not fired. A marker fires the first tick its value satisfies it,
+// once; its stretch starts `after` ticks later. A store the game has not built yet is a wait; a value absent from a built
+// store for MISSING_TICKS ticks in a row, or an address the description leads to that is not guest memory, is a stop by name
+// (fatal, with the line): the text of that stop goes to *fatal, for the caller to raise once it has let go of the lock.
+static void markers_update(uint64_t tick, char *fatal, size_t fatal_size) {
+    for (size_t i = 0; i < g_nmarkers && !fatal[0]; i++) {
+        Marker *m = &g_markers[i];
+        if (m->fired) continue;
+        StoreValue v;
+        char why[300];
+        StoreRead r = store_read(m->role, &v, why, sizeof why);
+        if (r == STORE_BAD) {
+            snprintf(fatal, fatal_size, "input file %s, line %d: reading %s from the store: %s", g_replay_path, m->line,
+                     store_role_name(m->role), why);
+        } else if (r == STORE_MISSING) {
+            if (m->missing_since == NEVER) m->missing_since = tick;
+            if (tick - m->missing_since >= MISSING_TICKS)
+                snprintf(fatal, fatal_size,
+                         "input file %s, line %d: %s has no entry in the game's store (every table of its kind is built "
+                         "and none has it); the name in the names file is not one of the game's, or %s is from another "
+                         "game folder",
+                         g_replay_path, m->line, store_role_name(m->role), STORE_FILE);
+        } else if (r == STORE_OK) {
+            m->missing_since = NEVER;
+            if (holds(m, &v)) {
+                m->fired = 1;
+                for (size_t k = 0; k < g_nspans; k++)
+                    if (g_spans[k].marker == i + 1) g_spans[k].at = tick + m->after;
+                rt_log("hid: the marker of line %d (%s %s) fired at tick %llu; its stretch starts at tick %llu", m->line,
+                       store_role_name(m->role), OP_NAME[m->op], (unsigned long long)tick,
+                       (unsigned long long)(tick + m->after));
+            }
+        } else {
+            m->missing_since = NEVER;   // a wait: the game has not built the store, or this table, yet
+        }
+    }
+}
 
 static Held replay_state(uint64_t tick) {
     Held h = {0};
@@ -371,6 +570,7 @@ static void give(const Held *h, HidHostInput *in) {
 void hid_replay_filter(HidHostInput *in) {
     if (!g_replay_on && !g_rec_on) return;
     uint64_t now = rt_vsync_tick();
+    char fatal[512] = "";
     plat_mutex_lock(&g_lock);
     if (!g_anchored) {
         g_anchored = 1;
@@ -379,6 +579,7 @@ void hid_replay_filter(HidHostInput *in) {
     }
     uint64_t tick = now >= g_base ? now - g_base : 0;
     if (!g_latched || tick > g_lat_tick) {   // the first read of a tick takes the state
+        if (g_replay_on && g_nmarkers) markers_update(tick, fatal, sizeof fatal);
         Held h = g_replay_on ? replay_state(tick) : held_of(in);
         if (g_rec_on && !g_rec_closed) record(tick, &h);
         g_lat = h;
@@ -388,6 +589,7 @@ void hid_replay_filter(HidHostInput *in) {
     }
     give(&g_lat, in);
     plat_mutex_unlock(&g_lock);
+    if (fatal[0]) rt_fatal("%s", fatal);   // after the lock: the stop hook closes the recorder under it
 }
 
 void hid_replay_finish(void) {
@@ -406,7 +608,7 @@ void hid_replay_finish(void) {
 }
 
 void hid_replay_rows(HidReplayRowFn row, void *ctx) {
-    char why[320];
+    char why[400];
     plat_mutex_lock(&g_lock);
     if (g_replay_on) {
         if (g_anchored)
@@ -416,6 +618,12 @@ void hid_replay_rows(HidReplayRowFn row, void *ctx) {
         else
             snprintf(why, sizeof why, "sha256 %s; %zu lines; replaces the real input; the game has not read the pad",
                      g_sha_hex, g_nspans);
+        if (g_nmarkers) {
+            size_t fired = 0;
+            for (size_t i = 0; i < g_nmarkers; i++) fired += (size_t)g_markers[i].fired;
+            size_t n = strlen(why);
+            snprintf(why + n, sizeof why - n, "; %zu of %zu markers fired", fired, g_nmarkers);
+        }
         row(ctx, "input", g_replay_path, "implemented", g_served, why);
     }
     if (g_rec_on) {
