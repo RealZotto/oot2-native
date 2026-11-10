@@ -175,6 +175,19 @@ class SettingsTest(unittest.TestCase):
         names = by_key["page_release"][6].split("|")
         self.assertEqual([names[int(levels[i])] for i in (1, 2, 3)], ["off", "count", "release"])
 
+    def test_collect_variants_is_a_development_switch_that_is_off_by_default(self) -> None:
+        done = self.passes("table")[0]
+        rows = {line.split("\t")[0]: line.split("\t") for line in done.stdout.splitlines() if "\t" in line}
+        key, group, kind, apply, default, low, high, names, env, what = rows["collect_variants"]
+        self.assertEqual((group, kind, apply, default, low, high, env),
+                         ("debug", "bool", "restart", "0", "0", "1", "OOT2_COLLECT_VARIANTS"))
+        self.assertIn("DEVELOPMENT", what)
+        self.assertIn("never set in a proof run", what)
+        for done in self.passes("show"):
+            self.assertEqual(keys_of(done.stdout)["collect_variants"], ("0", "default", "the default"))
+        for done in self.passes("show", OOT2_COLLECT_VARIANTS="1"):
+            self.assertEqual(keys_of(done.stdout)["collect_variants"], ("1", "environment", "OOT2_COLLECT_VARIANTS"))
+
     # ---- the layers
     def test_command_line_then_environment_then_file_then_default_for_a_key_of_each_type(self) -> None:
         # key, its default, then the file's, the environment's and the command line's value

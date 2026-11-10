@@ -201,7 +201,12 @@ typedef enum RtSettingSource {
     X(census_timer, DEBUG, BOOL, RESTART, 0, 0, 1, NULL,                                                              \
       "census mode only: time every host function call by its own thread CPU time (census-time.tsv); costs about 2 us a call") \
     X(census_probe, DEBUG, BOOL, RESTART, 0, 0, 1, NULL,                                                               \
-      "census mode only: the D11 probe, a hash of each command memory range compared at EndRecording, submit and Finalize")
+      "census mode only: the D11 probe, a hash of each command memory range compared at EndRecording, submit and Finalize") \
+    X(collect_variants, DEBUG, BOOL, RESTART, 0, 0, 1, NULL,                                                           \
+      "DEVELOPMENT switch for collecting variants, never set in a proof run: the Vulkan replay skips a draw that stops "  \
+      "on an answer the ledger can fix (a vertex attribute of another scalar type than the module's input), after "      \
+      "writing its ledger row, and goes on; any other stop still stops. The skipped draws are not drawn, so the run is " \
+      "counted and logged as a collection run; oot2 prepare then writes all the variants at once")
 
 typedef enum RtSettingId {
 #define RT_SETTING_ID(key, group, type, apply, def, min, max, names, what) RT_SET_##key,

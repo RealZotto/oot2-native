@@ -403,6 +403,59 @@ class GraphicsTest(ReplayBase):
             self.assertEqual(len(vertex), 1, rows)
             self.assertIn('"attr":{"0":"uint"}', vertex[0])
 
+    def collecting(self, case: str, folder: str, on: bool) -> subprocess.CompletedProcess:
+        """A case with the development setting collect_variants on (the environment layer) or left alone."""
+        env = case_env()
+        env.pop("OOT2_COLLECT_VARIANTS", None)
+        if on:
+            env["OOT2_COLLECT_VARIANTS"] = "1"
+        return subprocess.run([str(self.exe), case, folder], capture_output=True, text=True, timeout=60, env=env)
+
+    def test_with_collect_variants_on_draws_that_stop_on_their_answers_are_skipped_and_their_rows_written(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="oot2-vkreplay-collect-") as folder:
+            done = self.collecting("attr_collect", folder, True)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("submit returned", done.stdout)
+            self.assertIn("ok attr_collect", done.stdout)
+            # unsigned, signed and unsigned again are skipped and counted (3); the float one is drawn (1); nothing is
+            # lost; the ledger holds a vertex row for each of the three answers, two of them from the skipped draws.
+            self.assertIn("stats draws 1 collected 3 lost 0 ledger_collected 3 kinds 2 vs_rows 3", done.stdout)
+            rows = (Path(folder) / "ledger.jsonl").read_text(encoding="utf-8").splitlines()[1:]
+            vertex = [r for r in rows if '"kind":"vs"' in r]
+            self.assertEqual(len(vertex), 3, rows)
+            self.assertTrue(any('"attr":{"0":"uint"}' in r for r in vertex), vertex)
+            self.assertTrue(any('"attr":{"0":"sint"}' in r for r in vertex), vertex)
+            self.assertEqual(fatal_lines(done.stderr), [])
+            # loud: one line that says the run is not a proof, and one line for each stage and answer (not each draw)
+            self.assertEqual(done.stderr.count("COLLECTING VARIANTS"), 1, done.stderr)
+            self.assertIn("NOT a proof run", done.stderr)
+            skipped = [ln for ln in done.stderr.splitlines() if "draw skipped for collection" in ln]
+            self.assertEqual(len(skipped), 2, done.stderr)
+            self.assertIn(f"stage {VS_KEY}", skipped[0])
+            self.assertIn("is of another scalar type than the module's input", skipped[0])
+
+    def test_with_collect_variants_off_the_first_draw_that_stops_on_its_answers_stops_by_name(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="oot2-vkreplay-collect-off-") as folder:
+            done = self.collecting("attr_collect", folder, False)
+            self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+            self.assertNotIn("returned", done.stdout)
+            fatal = fatal_lines(done.stderr)
+            self.assertEqual(len(fatal), 1, done.stderr)
+            self.assertRegex(fatal[0], r"^FATAL: gfx: vulkan: replay of submission 1, after 0 draws and dispatches: vertex "
+                                       r"attribute 0 \(NVN format 0xb\) is of another scalar type than the module's input$")
+            self.assertNotIn("COLLECTING VARIANTS", done.stderr)
+            self.assertNotIn("draw skipped for collection", done.stderr)
+
+    def test_with_collect_variants_on_a_stop_that_is_not_an_answer_still_stops(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="oot2-vkreplay-collect-other-") as folder:
+            done = self.collecting("collect_other_stop", folder, True)
+            self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+            self.assertNotIn("returned", done.stdout)
+            fatal = fatal_lines(done.stderr)
+            self.assertEqual(len(fatal), 1, done.stderr)
+            self.assertRegex(fatal[0], r"after 0 draws and dispatches: conservative rasterization is not replayed yet$")
+            self.assertNotIn("draw skipped for collection", done.stderr)
+
     def test_a_draw_with_rendering_off_is_counted_as_that_and_not_as_lost(self) -> None:
         out = self.passing("skip_render_off")
         self.assertIn("stats draw_ops 3 draws 1 skipped 1 render_off 1 lost 0", out)

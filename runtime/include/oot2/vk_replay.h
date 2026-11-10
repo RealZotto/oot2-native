@@ -219,10 +219,12 @@ typedef struct VkrStats {
     uint64_t scratch_bytes;
     // Recorded against replayed (the Hookshot survey): the draw and dispatch records that reached the replay, those not made
     // because the game had rendering off, and the graphics draws skipped for a pipeline not ready (oot2/vk_miss.h).
-    // lost is what none of those accounts for: draw_ops less draws, dispatches, render_off and skipped (in either
+    // lost is what none of those accounts for: draw_ops less draws, dispatches, render_off, skipped and collected (in either
     // direction), 0 by contract; read it before judging a picture.
     uint64_t draw_ops, render_off, skipped, lost;
-    uint64_t raw_binds;                             // draws and dispatches with a raw-access stage (D15)
+    uint64_t collected;                             // draws skipped for collection (settings.h collect_variants): in the
+                                                    // accounting above, never drawn, 0 in every run but a development one
+    uint64_t raw_binds;                            // draws and dispatches with a raw-access stage (D15)
     uint64_t full_rate;                             // shading rate images and rate modes the game set, replayed at full
                                                     // rate (vk_replay.c full_rate)
 } VkrStats;

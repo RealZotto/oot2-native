@@ -1481,6 +1481,66 @@ static void case_attr_stop(const char *folder) {
     printf("submit returned\n");
 }
 
+static void bind_attr0(Rec *r, int format) {
+    va_st a = {.fmt = (uint32_t)format, .offset = 0, .stream = 0};
+    p_bind_vattr va = {.first = 0, .n = 1};
+    memcpy(&va.st[0], &a, sizeof a);
+    put(r, OP_BIND_VATTR, &va, sizeof va);
+}
+
+#define TRIANGLE ((p_draw){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 3, .instances = 1})
+
+// Collection (settings.h collect_variants, the driver sets OOT2_COLLECT_VARIANTS or not): draws whose attribute 0 is
+// another scalar type than the module's float input. With the setting on, the unsigned one, the signed one and the
+// unsigned one again are skipped (the ledger holds a vertex row for each answer, the third being the same stop as the
+// first), and the float one after them is drawn; with it off the first stops by name, as it always did.
+static void case_attr_collect(const char *folder) {
+    open_fakes();
+    ledger_set_folder(folder);
+    ledger_flush_on_stop();
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    bind_attr0(r, NVN_FORMAT_R32UI);
+    PUT(r, OP_DRAW, TRIANGLE);
+    bind_attr0(r, NVN_FORMAT_R32I);
+    PUT(r, OP_DRAW, TRIANGLE);
+    bind_attr0(r, NVN_FORMAT_R32UI);
+    PUT(r, OP_DRAW, TRIANGLE);
+    bind_attr0(r, NVN_FORMAT_RGBA32F);
+    PUT(r, OP_DRAW, TRIANGLE);
+    uint64_t h = rec_end(r);
+    ledger_frame_enter();
+    vkr_submit(&h, 1);
+    ledger_frame_leave();
+    printf("submit returned\n");
+    CHECK(ledger_flush() == 1);
+    uint64_t vs_rows = 0;
+    for (uint64_t i = 0; i < ledger_rows(); i++)
+        if (strstr(ledger_row_text(i), "\"kind\":\"vs\"")) vs_rows++;
+    VkrStats st;
+    vkr_stats(&st);
+    printf("stats draws %llu collected %llu lost %llu ledger_collected %llu kinds %llu vs_rows %llu\n", (ull)st.draws,
+           (ull)st.collected, (ull)st.lost, (ull)ledger_collected(), (ull)ledger_collected_kinds(), (ull)vs_rows);
+    close_fakes();
+    printf("ok attr_collect\n");
+}
+
+// A named stop that is not an answer the ledger can fix still stops under the setting: conservative rasterization in
+// a draw, whose attribute is the module's own type.
+static void case_collect_other_stop(const char *folder) {
+    open_fakes();
+    ledger_set_folder(folder);
+    ledger_flush_on_stop();
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    PUT(r, OP_CONSERVATIVE, (p_conservative){.which = 0, .value = 1});
+    PUT(r, OP_DRAW, TRIANGLE);
+    uint64_t h = rec_end(r);
+    ledger_frame_enter();
+    vkr_submit(&h, 1);
+    printf("submit returned\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
@@ -1510,6 +1570,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "geometry") && argc >= 3) case_geometry(argv[2]);
     else if (!strcmp(cs, "geometry_stop") && argc >= 3) case_geometry_stop(argv[2]);
     else if (!strcmp(cs, "attr_stop") && argc >= 3) case_attr_stop(argv[2]);
+    else if (!strcmp(cs, "attr_collect") && argc >= 3) case_attr_collect(argv[2]);
+    else if (!strcmp(cs, "collect_other_stop") && argc >= 3) case_collect_other_stop(argv[2]);
     else if (!strcmp(cs, "skip_render_off")) case_skip(1);
     else if (!strcmp(cs, "depth")) case_depth();
     else if (!strcmp(cs, "compute")) case_compute();

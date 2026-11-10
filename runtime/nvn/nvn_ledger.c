@@ -548,6 +548,55 @@ void ledger_track_op(LedgerTrack *t, const op_hdr *h) {
     }
 }
 
+// ---------- collection (settings.h collect_variants)
+// The draws a development run skipped because they stopped on an answer the ledger can fix, and the distinct (stage,
+// answer) pairs among them (a set of 64-bit hashes: a pair seen twice is the same stop, logged once). Its own lock, so a
+// note never waits for the rows' lock.
+static PlatMutex g_clock = PLAT_MUTEX_INIT;
+static uint64_t *g_cset;
+static size_t g_cset_n, g_cset_cap;
+static uint64_t g_collected;
+
+uint64_t ledger_collect_note(const char *stage, const char *answer, int *first) {
+    uint64_t h = fnv(stage, strlen(stage));
+    h = (h ^ 0xFF) * 1099511628211ull;   // a separator no text holds, so ("ab", "c") and ("a", "bc") differ
+    for (const char *c = answer; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+    int isnew = 1;
+    plat_mutex_lock(&g_clock);
+    for (size_t i = 0; i < g_cset_n; i++)
+        if (g_cset[i] == h) {
+            isnew = 0;
+            break;
+        }
+    if (isnew) {
+        if (g_cset_n == g_cset_cap) {
+            size_t cap = g_cset_cap ? g_cset_cap * 2 : 64;
+            uint64_t *grown = realloc(g_cset, cap * sizeof *grown);
+            if (!grown) rt_fatal("ledger: out of memory for the collected stops");
+            g_cset = grown, g_cset_cap = cap;
+        }
+        g_cset[g_cset_n++] = h;
+    }
+    uint64_t n = ++g_collected;
+    plat_mutex_unlock(&g_clock);
+    if (first) *first = isnew;
+    return n;
+}
+
+uint64_t ledger_collected(void) {
+    plat_mutex_lock(&g_clock);
+    uint64_t n = g_collected;
+    plat_mutex_unlock(&g_clock);
+    return n;
+}
+
+uint64_t ledger_collected_kinds(void) {
+    plat_mutex_lock(&g_clock);
+    uint64_t n = g_cset_n;
+    plat_mutex_unlock(&g_clock);
+    return n;
+}
+
 // ---------- the file
 static int flush_file(int stopping);
 // A stop ends the process, so a flush that waits for a safe point has no later one: from the stop path the file is written
@@ -684,4 +733,8 @@ void ledger_reset(void) {
     g_text_n = g_text_cap = g_text_idx_cap = g_bin_n = g_bin_cap = g_bin_idx_cap = 0;
     g_dirty = 0, g_dir[0] = 0, g_writes = 0;
     plat_mutex_unlock(&g_lock);
+    plat_mutex_lock(&g_clock);
+    free(g_cset);
+    g_cset = NULL, g_cset_n = g_cset_cap = 0, g_collected = 0;
+    plat_mutex_unlock(&g_clock);
 }

@@ -13,6 +13,7 @@
 
 #include "nvn_api.h"
 #include "nvn_cmd.h"
+#include "oot2/ledger.h"
 #include "oot2/memory.h"
 #include "oot2/nvn_order.h"
 #include "oot2/nvn_pace.h"
@@ -383,6 +384,12 @@ void nvn_census_stats(NvnStatRow emit, void *ctx) {
                  (ull)p.buffers, (ull)p.ranges, (ull)p.no_access, (ull)p.unreadable, (ull)p.over_cap, (ull)p.bytes_hashed,
                  (ull)p.bytes_checked, (ull)p.bytes_read, (ull)p.bytes_zero, (ull)p.unchecked_bytes, hits);
         emit(ctx, "probe", p.hits, why);
+    }
+    if (ledger_collected()) {   // a collection run (settings.h collect_variants): only then, so a default census is as it was
+        snprintf(why, sizeof why, "NOT A PROOF RUN: %llu draws were skipped, not drawn, for collection (collect_variants), "
+                 "over %llu distinct stage and answer pairs; their ledger rows are written", (ull)ledger_collected(),
+                 (ull)ledger_collected_kinds());
+        emit(ctx, "collected-draws", ledger_collected(), why);
     }
     emit(ctx, "presents", nvn_present_count(), "nvnQueuePresentTexture calls that reached the back end");
 }

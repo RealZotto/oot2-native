@@ -84,6 +84,12 @@ void ledger_frame_leave(void);
 // replay that stops on a draw is inside a submission and the process ends right after (a thread that holds the rows
 // at that moment is not waited for, and the file is not written).
 void ledger_flush_on_stop(void);
+// Collection (settings.h collect_variants, a development switch): the replay skips a draw that stops on an answer the
+// ledger can fix, after its rows were made, and notes it here. Returns the number of draws noted so far, this one
+// included, and sets *first to 1 when this (stage, answer) pair is new, so the caller logs it once.
+uint64_t ledger_collect_note(const char *stage, const char *answer, int *first);
+uint64_t ledger_collected(void);             // draws skipped for collection
+uint64_t ledger_collected_kinds(void);       // distinct (stage, answer) pairs among them
 uint64_t ledger_rows(void);                  // rows held, loaded ones included
 const char *ledger_row_text(uint64_t i);     // row i in the order it was added, NULL past the end (one JSON object)
 uint64_t ledger_writes(void);                // files written

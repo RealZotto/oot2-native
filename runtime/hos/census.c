@@ -20,6 +20,7 @@
 #include "hos.h"
 #include "oot2/gfx.h"
 #include "oot2/hid_replay.h"
+#include "oot2/ledger.h"
 #include "oot2/nvn_pace.h"
 #include "oot2/runtime.h"
 #include "plat.h"
@@ -117,6 +118,9 @@ static void input_row(void *f, const char *kind, const char *key, const char *st
 
 static void write_rows(FILE *f, int code, const char *line) {
     if (rt_census_on()) fprintf(f, "#census-mode OOT2_CENSUS=1: gaps in NVN2 were answered 0 and passed; not a default run\n");
+    if (ledger_collected())
+        fprintf(f, "#collect-variants: NOT A PROOF RUN: %llu draws were skipped, not drawn, to collect shader variants\n",
+                (unsigned long long)ledger_collected());
     fprintf(f, "kind\tkey\tstatus\tcalls\tfirst_at\twhy\n");
     for (uint32_t imm = 0; imm <= 0xFF; imm++) {
         uint64_t n = rt_svc_calls(imm);
@@ -194,6 +198,10 @@ static int write_files(int code, const char *line) {
     write_rows(f, code, line);
     int bad = ferror(f) | fclose(f);
     if (code >= 0) rt_log("census: %s %s", bad ? "could not finish" : "written to", path);
+    if (code >= 0 && ledger_collected())
+        rt_log("COLLECTION RUN, NOT A PROOF RUN: %llu draws were skipped, not drawn, over %llu distinct stage and answer "
+               "pairs (collect_variants); the ledger holds their rows, so oot2 prepare writes the variants",
+               (unsigned long long)ledger_collected(), (unsigned long long)ledger_collected_kinds());
     if (rt_census_on()) {
         snprintf(path, sizeof path, "%s/census-nvn.tsv", hos_game_folder());
         f = fopen(path, "wb");

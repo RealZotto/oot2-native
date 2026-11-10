@@ -12,6 +12,7 @@
 // uniform ranges copied at submit, a GPU write over a copy drops it). The code is ours: the replay writes packets and binds
 // through the uni layout's push descriptors and push constant texture slots. The transfers are vk_replay_xfer.c's; the
 // reports, events, waits and conditions vk_replay_report.c's.
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,7 @@
 #include "oot2/nvn_program.h"
 #include "oot2/nvn_tex.h"
 #include "oot2/runtime.h"
+#include "oot2/settings.h"
 #include "oot2/shader_desc.h"
 #include "oot2/vk_format.h"
 #include "oot2/vk_gpu_time.h"
@@ -189,7 +191,7 @@ void vkr_stats(VkrStats *out) {
     *out = g_stats;
     // Every draw and dispatch record is replayed, skipped by name or not made because rendering was off: what is left is
     // GPU work lost (the Hookshot survey: Hookshot's dark characters and bare foliage were work lost at start), 0 by contract.
-    uint64_t accounted = g_stats.draws + g_stats.dispatches + g_stats.render_off + g_stats.skipped;
+    uint64_t accounted = g_stats.draws + g_stats.dispatches + g_stats.render_off + g_stats.skipped + g_stats.collected;
     out->lost = g_stats.draw_ops > accounted ? g_stats.draw_ops - accounted : accounted - g_stats.draw_ops;
 }
 
@@ -240,6 +242,40 @@ void vkr_stop(const char *fmt, ...) {
         ledger_track_op(&S.track, r);
     }
     rt_fatal("gfx: vulkan: replay of submission %llu, after %u draws and dispatches: %s", (ull)F.value, F.draws, line);
+}
+
+// ---------- collection (settings.h collect_variants, a development switch that never enters a proof run)
+// A stop on a named answer that the ledger can fix (a vertex attribute of another scalar type than the module's input)
+// would show one stop a run, and a run of the route is long while the ledger step is short. Under the setting such a
+// stop writes the draw's ledger row first, as vkr_stop does, counts the draw, logs the pair of stage and answer once,
+// and abandons that draw only: the replay goes on with the next record. The draw is not drawn, so the picture is wrong
+// and the run says so in its log and in the census. Without the setting, or outside a draw or a dispatch, it is
+// vkr_stop with the same message, so every other stop and the default run are as they were.
+static jmp_buf *g_skip;   // the draw or dispatch being replayed under collection, else NULL (the replay is one thread)
+
+static int collecting(void) { return rt_setting(RT_SET_collect_variants) != 0; }
+
+__attribute__((noreturn, format(printf, 2, 3))) static void stop_answer(const char *stage, const char *fmt, ...) {
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (!g_skip || !F.cur || !makes_rows(F.cur->op)) vkr_stop("%s", line);
+    const op_hdr *r = F.cur;
+    F.cur = NULL;
+    ledger_track_op(&S.track, r);   // the draw's rows, which the record's end would have made had it been replayed
+    int first = 0;
+    uint64_t n = ledger_collect_note(stage, line, &first);
+    g_stats.collected++;
+    if (n == 1)
+        rt_log("gfx: vulkan: COLLECTING VARIANTS (collect_variants is on): a draw that stops on an answer the ledger can "
+               "fix is skipped, not drawn, after its ledger row is written. This run is NOT a proof run and its picture "
+               "is wrong");
+    if (first)
+        rt_log("gfx: vulkan: draw skipped for collection, stage %s: %s (logged once for this stage and answer; the "
+               "census counts the draws)", stage, line);
+    longjmp(*g_skip, 1);
 }
 
 __attribute__((noreturn)) static void stop_op(uint32_t op) {
@@ -954,8 +990,8 @@ static void vertex_input(const ShaderBinds *vb) {
             stop("vertex attribute %u has NVN format %#x, which has no vertex format", loc, (unsigned)a.fmt);
         if ((type == VKN_ATTR_FLOAT) != (vb->vin[i].type == SHD_FLOAT) ||
             (type != VKN_ATTR_FLOAT && (type == VKN_ATTR_SINT) != (vb->vin[i].type == SHD_SINT)))
-            stop("vertex attribute %u (NVN format %#x) is of another scalar type than the module's input", loc,
-                 (unsigned)a.fmt);
+            stop_answer(P.id[ST_VS]->key, "vertex attribute %u (NVN format %#x) is of another scalar type than the module's "
+                        "input", loc, (unsigned)a.fmt);
         in.a[in.na++] = (VkVertexInputAttributeDescription2EXT){
             .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, .location = loc, .binding = a.stream,
             .format = fmt, .offset = a.offset};
@@ -1380,7 +1416,22 @@ static void geometry_mode(int32_t mode) {
                "(logged once per mode)", (int)mode);
 }
 
+static void record_op(const op_hdr *r);
+
+// One record. Under collection a draw or a dispatch is replayed with a way out: a stop on an answer the ledger can fix
+// (stop_answer) lands here after the draw's rows were made, and the next record is replayed as if this one were not.
 static void record(const op_hdr *r) {
+    if (!makes_rows(r->op) || !collecting()) {
+        record_op(r);
+        return;
+    }
+    jmp_buf here;
+    g_skip = &here;
+    if (!setjmp(here)) record_op(r);
+    g_skip = NULL;
+}
+
+static void record_op(const op_hdr *r) {
     const void *a = r + 1;
     g_stats.records++;
     F.cur = r;
