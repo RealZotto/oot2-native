@@ -226,7 +226,7 @@ class SaveDeviceTest(DeviceTestCase):
         done = self.save_run(folder, "fatal", "more", f"readcap={len(before) - 1}")   # one byte too large to read
         self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
         self.assertIn("cache_state 0", done.stdout)                              # it started empty
-        self.assertIn("could not be read (too large for memory, or unreadable): starting empty, and no save will replace it",
+        self.assertIn("could not be read at launch (too large for memory): starting empty, and no save will replace it",
                       done.stderr)
         self.assertIn("the pipeline cache was NOT saved at the stop (exit 70): the cache file ", done.stderr)
         self.assertIn(" could not be read at launch", done.stderr)

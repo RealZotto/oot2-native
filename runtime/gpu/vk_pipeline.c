@@ -77,7 +77,9 @@ static struct {
     VkpCacheState cache_state;
     char cache_path[512];
     int flushed;                   // vkp_cache_flush swapped the cache for an empty one: a save would write a part of it
-    int unreadable;                // the cache file is there and was not read: a save would replace it with this run's part
+    int unreadable;                // the cache file is there and was not read (the VKP_READ_* cause; 0: read, or no file): a save
+                                   // would replace it with this run's part
+    int unreadable_err;            // the errno of the open that failed (VKP_READ_OPEN)
     VkcList caps;
     int zero_workgroup;            // the device was made with zero-initialized workgroup memory (an optional feature)
     PlatMutex lock;
@@ -915,26 +917,72 @@ VkpCacheState vkp_cache_judge(const void *data, size_t size, const VkPhysicalDev
 int vkp_read_cap;         // tests only: a cache file larger than this many bytes counts as too large to read (0: no cap)
 int vkp_save_stall_ms;    // tests only: a save pauses this long after writing half of its file, so that two processes overlap
 int vkp_open_errno;       // tests only: opening the cache file to read it fails with this errno (0: it opens as it does)
+int vkp_open_transient;   // tests only: with vkp_open_errno, only the first open fails (then the errno is cleared)
 
-// The cache file read whole, or NULL. *open_err is the errno when the file could not be opened (the C library maps the
-// system's file-not-found and path-not-found to ENOENT), else 0.
-static void *read_whole(const char *path, size_t *size, int *open_err) {
+#define OPEN_RETRY_NS 200000000ull   // an open that failed for another reason than "not there" is tried once more after this
+
+// The cache file read whole, or NULL with *fail the cause: VKP_READ_ABSENT (not there: the C library maps the system's
+// file-not-found and path-not-found to ENOENT), VKP_READ_OPEN (there, and cannot be opened; *err is the errno), VKP_READ_EMPTY,
+// VKP_READ_TOO_LARGE (over the test cap, or the memory is not there) or VKP_READ_UNREADABLE (a seek or a read failed).
+static void *read_whole(const char *path, size_t *size, int *fail, int *err) {
     FILE *f = NULL;
-    errno = vkp_open_errno;
-    if (!vkp_open_errno) f = fopen(path, "rb");
-    *open_err = f ? 0 : errno;
-    if (!f) return NULL;
+    *fail = VKP_READ_OK, *err = 0;
+    errno = 0;
+    if (vkp_open_errno) {
+        errno = vkp_open_errno;
+        if (vkp_open_transient) vkp_open_errno = 0;
+    } else {
+        f = fopen(path, "rb");
+    }
+    if (!f) {
+        *err = errno;
+        *fail = *err == ENOENT ? VKP_READ_ABSENT : VKP_READ_OPEN;
+        return NULL;
+    }
     void *data = NULL;
+    *fail = VKP_READ_UNREADABLE;
     if (OFF_SEEK(f, 0, SEEK_END) == 0) {
         long long n = (long long)OFF_TELL(f);
-        if (vkp_read_cap && n > vkp_read_cap) n = 0;
-        if (n > 0 && OFF_SEEK(f, 0, SEEK_SET) == 0 && (data = malloc((size_t)n)) != NULL) {
-            if (fread(data, 1, (size_t)n, f) == (size_t)n) *size = (size_t)n;
-            else free(data), data = NULL;
+        if (n == 0) {
+            *fail = VKP_READ_EMPTY;
+        } else if (n > 0 && vkp_read_cap && n > vkp_read_cap) {
+            *fail = VKP_READ_TOO_LARGE;
+        } else if (n > 0 && OFF_SEEK(f, 0, SEEK_SET) == 0) {
+            if ((data = malloc((size_t)n)) == NULL) {
+                *fail = VKP_READ_TOO_LARGE;
+            } else if (fread(data, 1, (size_t)n, f) == (size_t)n) {
+                *size = (size_t)n;
+                *fail = VKP_READ_OK;
+            } else {
+                free(data), data = NULL;
+            }
         }
     }
     fclose(f);
     return data;
+}
+
+void *vkp_cache_read(const char *path, size_t *size, int *fail, int *err) {
+    void *data = read_whole(path, size, fail, err);
+    // A file that is there and could not be opened is often a reader or a scanner holding it for a moment: once more, after
+    // a short wait, before the whole run is marked as unable to save.
+    if (!data && *fail == VKP_READ_OPEN) {
+        plat_sleep_ns(OPEN_RETRY_NS);
+        data = read_whole(path, size, fail, err);
+    }
+    return data;
+}
+
+const char *vkp_read_fail_text(int fail, int err, char *buf, size_t cap) {
+    switch (fail) {
+    case VKP_READ_OPEN: snprintf(buf, cap, "could not be opened at launch (%s)", strerror(err)); break;
+    case VKP_READ_TOO_LARGE: snprintf(buf, cap, "could not be read at launch (too large for memory)"); break;
+    case VKP_READ_UNREADABLE: snprintf(buf, cap, "could not be read at launch (a seek or a read failed)"); break;
+    case VKP_READ_EMPTY: snprintf(buf, cap, "is empty"); break;
+    case VKP_READ_ABSENT: snprintf(buf, cap, "is not there"); break;
+    default: snprintf(buf, cap, "was read"); break;
+    }
+    return buf;
 }
 
 static void cache_open(const char *path) {
@@ -943,30 +991,20 @@ static void cache_open(const char *path) {
     uint64_t t0 = plat_now_ns();
     P.cache_state = VKP_CACHE_NONE;
     P.unreadable = 0;
+    P.unreadable_err = 0;
     if (path) {
         snprintf(P.cache_path, sizeof P.cache_path, "%s", path);
-        int open_err = 0;
-        data = read_whole(path, &size, &open_err);
-        if (!data && open_err && open_err != ENOENT) {
-            // Only a file that is not there is absent. One that is there and cannot be opened (permission, a sharing
-            // violation) is not read, so not held, and a save at the stop would replace what is in it with this run's part.
-            P.unreadable = 1;
-            rt_log("gfx: vulkan: the pipeline cache %s could not be opened (%s): starting empty, and no save will replace it",
-                   path, strerror(open_err));
-        } else if (!data && !open_err) {
-            FILE *there = fopen(path, "rb");
-            if (there) {   // a file that is there and cannot be read is not the same as no file: say so
-                long long n = OFF_SEEK(there, 0, SEEK_END) == 0 ? (long long)OFF_TELL(there) : -1;
-                fclose(there);
-                if (n == 0) {
-                    rt_log("gfx: vulkan: the pipeline cache %s is empty: starting empty", path);
-                } else {
-                    // Not read, so not held: a save at the stop would replace what is in this file with what this run built.
-                    P.unreadable = 1;
-                    rt_log("gfx: vulkan: the pipeline cache %s could not be read (too large for memory, or unreadable): starting "
-                           "empty, and no save will replace it", path);
-                }
-            }
+        int fail = VKP_READ_OK, open_err = 0;
+        char said[160];
+        data = vkp_cache_read(path, &size, &fail, &open_err);
+        if (fail == VKP_READ_EMPTY) {
+            rt_log("gfx: vulkan: the pipeline cache %s is empty: starting empty", path);
+        } else if (fail == VKP_READ_OPEN || fail == VKP_READ_TOO_LARGE || fail == VKP_READ_UNREADABLE) {
+            // Only a file that is not there is absent. One that is there and was not read (the open failed twice, it is too
+            // large, a read failed) is not held, and a save at the stop would replace what is in it with this run's part.
+            P.unreadable = fail, P.unreadable_err = open_err;
+            rt_log("gfx: vulkan: the pipeline cache %s %s: starting empty, and no save will replace it", path,
+                   vkp_read_fail_text(fail, open_err, said, sizeof said));
         }
         if (data) {
             P.cache_state = vkp_cache_judge(data, size, &gpu_vk.facts.props);
@@ -1099,6 +1137,45 @@ static void remove_dead_temps(void) {
 #endif
 }
 
+int vkp_move_tries;   // tests only: the tries the last vkp_move_over made
+static int g_denied_lasting;   // a move was refused with "access denied" through the whole wait: later ones try once
+
+// The temporary file moved over the cache file. On Windows another process that reads the cache (vkp_cache_read opens it
+// without delete sharing) makes the replace fail with a sharing violation until it lets go, which is a read of
+// milliseconds: the move is tried a few times over about a second before it is given up, since a refused move loses all of
+// this run's growth. A refusal of "access denied" that lasts through that whole wait is not a reader (the file is read-only,
+// or ours to no avail): it is named once, and later moves try once without waiting, instead of paying the second at every
+// stop and every round of the timer.
+int vkp_move_over(const char *tmp, const char *path) {
+    int ok;
+    vkp_move_tries = 0;
+#ifdef _WIN32
+    int lasting = __atomic_load_n(&g_denied_lasting, __ATOMIC_ACQUIRE);
+    DWORD e = 0;
+    for (int tries = 1;; tries++) {
+        vkp_move_tries = tries;
+        ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING) != 0;
+        e = ok ? 0 : GetLastError();
+        int held = e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED || e == ERROR_LOCK_VIOLATION;
+        if (ok || !held || tries == MOVE_TRIES || (lasting && e == ERROR_ACCESS_DENIED)) break;
+        plat_sleep_ns(MOVE_WAIT_NS);
+    }
+    if (ok) {
+        __atomic_store_n(&g_denied_lasting, 0, __ATOMIC_RELEASE);
+    } else if (e == ERROR_ACCESS_DENIED && !lasting) {
+        __atomic_store_n(&g_denied_lasting, 1, __ATOMIC_RELEASE);
+        rt_log("gfx: vulkan: the pipeline cache %s refused the replace with \"access denied\" through %d tries over %.1f s: it "
+               "is not held by a reader (read-only, or not ours to replace); later saves try once, without waiting", path,
+               MOVE_TRIES, (double)(MOVE_TRIES - 1) * (double)MOVE_WAIT_NS / 1e9);
+    }
+#else
+    vkp_move_tries = 1;
+    (void)g_denied_lasting;
+    ok = rename(tmp, path) == 0;
+#endif
+    return ok;
+}
+
 // The cache's data written to path through a temporary file and a rename, so that an interrupted write leaves the old
 // file whole; *bytes (when not NULL) is its size. A Vulkan failure is a named fatal when `fatal` (the builder's flush),
 // else it is the reason in why (a save, which also runs at a stop, where a second fatal would end the run before the
@@ -1125,20 +1202,7 @@ static int cache_write(VkPipelineCache cache, const char *path, size_t *bytes, i
         remove(tmp);
         return 0;
     }
-#ifdef _WIN32
-    // Another process that reads the cache (read_whole opens it without delete sharing) makes the replace fail with a
-    // sharing violation until it lets go, which is a read of milliseconds: the move is tried a few times over about a
-    // second before it is given up, since a refused move loses all of this run's growth.
-    for (int tries = 1;; tries++) {
-        ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING) != 0;
-        DWORD e = ok ? 0 : GetLastError();
-        int held = e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED || e == ERROR_LOCK_VIOLATION;
-        if (ok || !held || tries == MOVE_TRIES) break;
-        plat_sleep_ns(MOVE_WAIT_NS);
-    }
-#else
-    ok = rename(tmp, path) == 0;
-#endif
+    ok = vkp_move_over(tmp, path);
     if (!ok) {
         if (why && cap) snprintf(why, cap, "cannot move %s over %s", tmp, path);
         remove(tmp);
@@ -1159,8 +1223,9 @@ static const char *save_refusal(char *why, size_t cap) {
         return why;
     }
     if (P.unreadable) {
-        snprintf(why, cap, "the cache file %s was there and could not be read at launch (too large for memory, or unreadable), "
-                           "so this run started empty and a save would replace it with what this run built", P.cache_path);
+        char said[160];
+        snprintf(why, cap, "the cache file %s %s, so this run started empty and a save would replace it with what this run "
+                           "built", P.cache_path, vkp_read_fail_text(P.unreadable, P.unreadable_err, said, sizeof said));
         return why;
     }
     return NULL;
@@ -1246,7 +1311,17 @@ int vkp_save_settings(const char *save, const char *seconds, VkpSaveSettings *ou
 }
 
 // The reasons a save is refused or fails. The timer names each of them once, not every round; a stop names its own.
-enum { REFUSE_FLUSHED, REFUSE_UNREADABLE, REFUSE_NO_SIZE, REFUSE_FAILED };
+enum { REFUSE_FLUSHED, REFUSE_UNREADABLE, REFUSE_NO_SIZE, REFUSE_FAILED, REFUSE_OPEN, REFUSE_TOO_LARGE };
+
+// The reason a refused save is named under: one for each way the file was not read at launch.
+static int refusal_reason(void) {
+    switch (P.unreadable) {
+    case 0: return REFUSE_FAILED;
+    case VKP_READ_OPEN: return REFUSE_OPEN;
+    case VKP_READ_TOO_LARGE: return REFUSE_TOO_LARGE;
+    default: return REFUSE_UNREADABLE;
+    }
+}
 
 static int name_it(int stopping, int reason) {
     int bit = 1 << reason;
@@ -1285,7 +1360,7 @@ static void autosave(const char *when, int stopping) {
     } else if (vkp_cache_save(why, sizeof why)) {
         rt_log("gfx: vulkan: the pipeline cache was saved to %s at %s: %zu bytes (%zu when loaded or last saved) in %.0f ms",
                P.cache_path, when, g_saved_bytes, before, (double)(plat_now_ns() - t0) / 1e6);
-    } else if (name_it(stopping, P.unreadable ? REFUSE_UNREADABLE : REFUSE_FAILED)) {
+    } else if (name_it(stopping, refusal_reason())) {
         rt_log("gfx: vulkan: the pipeline cache was NOT saved at %s: %s", when, why);
     }
     __atomic_store_n(&S.saving, 0, __ATOMIC_RELEASE);
@@ -1412,7 +1487,7 @@ void vkp_close(void) {
     P.cache_path[0] = 0;
     P.cache_state = VKP_CACHE_NONE;
     P.flushed = 0;
-    P.unreadable = 0;
+    P.unreadable = 0, P.unreadable_err = 0;
     P.open = 0;
 }
 

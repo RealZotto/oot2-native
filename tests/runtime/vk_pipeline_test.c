@@ -31,6 +31,8 @@
 //                                the items the device has, the features enabled and whether capability 5309 is allowed
 //   cachejudge                   cache file headers judged for a device
 //   savesettings                 OOT2_VK_CACHE_SAVE and OOT2_VK_CACHE_SAVE_SECONDS judged: the settings, or the refusal
+//   cacheread PATH [readcap=N] [openerr=E] [transient]   the cache file read as the launch reads it: the cause, and the wait
+//   cachemove TMP PATH [heal]    a temporary file moved over PATH three times: tries and wait of each (Windows)
 //   store BASE VARIANTS KEY KIND SHAPE   a stage looked up in a pack of packs (VARIANTS "-" for none)
 //   storeopen BASE VARIANTS      the packs opened: "ok" or the refusal
 //   devbinds BASE KEY N          N stage records of one key asked for their bindings through the replay's device ops
@@ -75,6 +77,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <io.h>
+#include <sys/stat.h>
+#endif
 
 #include "volk.h"
 
@@ -981,6 +987,51 @@ static void case_synth_cache(const char *pack, const char *file, const char *pha
     printf("ok synth_cache\n");
 }
 
+// The cache file read as the launch reads it (no device): the cause of a failure, its phrase, and how long the read took.
+static void case_cacheread(const char *path, int nopt, char **opt) {
+    for (int i = 0; i < nopt; i++) {
+        if (!strncmp(opt[i], "readcap=", 8)) vkp_read_cap = atoi(opt[i] + 8);
+        else if (!strncmp(opt[i], "openerr=", 8)) vkp_open_errno = atoi(opt[i] + 8);
+        else if (!strcmp(opt[i], "transient")) vkp_open_transient = 1;
+        else {
+            printf("unknown option %s\n", opt[i]);
+            exit(2);
+        }
+    }
+    static const char *const names[] = {"ok", "absent", "empty", "open", "too_large", "unreadable"};
+    size_t size = 0;
+    int fail = -1, err = 0;
+    char said[160];
+    uint64_t t0 = plat_now_ns();
+    void *data = vkp_cache_read(path, &size, &fail, &err);
+    double ms = (double)(plat_now_ns() - t0) / 1e6;
+    printf("read %s size %zu ms %.0f\n", data ? "data" : "none", data ? size : (size_t)0, ms);
+    printf("cause %s\n", names[fail]);
+    printf("text %s\n", vkp_read_fail_text(fail, err, said, sizeof said));
+    free(data);
+    printf("ok cacheread\n");
+}
+
+#ifdef _WIN32
+// A temporary file moved over PATH three times. With PATH read-only the move is refused with "access denied": the first call
+// waits through its tries, the second tries once; with "heal" PATH is made writable before the third, which then moves.
+static void case_cachemove(const char *tmp, const char *path, int heal) {
+    for (int i = 1; i <= 3; i++) {
+        if (i == 3 && heal) _chmod(path, _S_IREAD | _S_IWRITE);
+        uint64_t t0 = plat_now_ns();
+        int ok = vkp_move_over(tmp, path);
+        printf("move %d ok %d tries %d ms %.0f\n", i, ok, vkp_move_tries, (double)(plat_now_ns() - t0) / 1e6);
+    }
+    printf("ok cachemove\n");
+}
+#else
+static void case_cachemove(const char *tmp, const char *path, int heal) {
+    (void)tmp, (void)path, (void)heal;
+    printf("skipped: no sharing violation off Windows\n");
+    printf("ok cachemove\n");
+}
+#endif
+
 static void case_savesettings(void) {
     static const struct { const char *save, *seconds; } t[] = {
         {NULL, NULL}, {"", ""}, {"on", "0"}, {"off", "5"}, {"on", "86400"}, {NULL, "1"}, {"maybe", NULL}, {"On", NULL},
@@ -1501,6 +1552,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "optional")) case_optional();
     else if (!strcmp(cs, "cachejudge")) case_cachejudge();
     else if (!strcmp(cs, "savesettings")) case_savesettings();
+    else if (!strcmp(cs, "cacheread") && argc >= 3) case_cacheread(argv[2], argc - 3, argv + 3);
+    else if (!strcmp(cs, "cachemove") && argc >= 4) case_cachemove(argv[2], argv[3], argc >= 5 && !strcmp(argv[4], "heal"));
     else if (!strcmp(cs, "store") && argc >= 7) case_store(argv[2], argv[3], argv[4], argv[5], argv[6]);
     else if (!strcmp(cs, "storemap") && argc >= 9)
         case_storemap(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8], argc > 9 ? argv[9] : "");

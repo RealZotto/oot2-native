@@ -247,6 +247,21 @@ extern int vkp_read_cap, vkp_save_stall_ms;
 // Tests only: while non-zero, opening the cache file to read it at launch fails with this errno (ENOENT counts as no file, any
 // other value as a file that is there and cannot be opened, which a save then refuses to replace).
 extern int vkp_open_errno;
+// Tests only: with vkp_open_errno set, only the first open fails and the errno is cleared (a transient failure).
+extern int vkp_open_transient;
+// Why the cache file was not read at launch. A file that is there and was not read (VKP_READ_OPEN after one more try, TOO_LARGE,
+// UNREADABLE) is not replaced by a save; absent and empty are not a refusal.
+enum { VKP_READ_OK, VKP_READ_ABSENT, VKP_READ_EMPTY, VKP_READ_OPEN, VKP_READ_TOO_LARGE, VKP_READ_UNREADABLE };
+// The file read whole, or NULL with *fail the cause and *err the errno of a failed open. An open that failed for another reason
+// than "not there" is tried once more after a short wait.
+void *vkp_cache_read(const char *path, size_t *size, int *fail, int *err);
+// The cause as a phrase for the log and for the refusal of a save ("could not be opened at launch (Permission denied)").
+const char *vkp_read_fail_text(int fail, int err, char *buf, size_t cap);
+// The temporary file moved over the cache file (tries about a second when another process holds it; a refusal of "access
+// denied" through the whole wait is named once, and later moves try once). Returns 1 when moved; vkp_move_tries is the tries
+// the last call made (tests only).
+int vkp_move_over(const char *tmp, const char *path);
+extern int vkp_move_tries;
 // Destroy every library and pipeline that was made from the stage with this key (for program_release, when no program
 // holds it). The caller guarantees that no submission in flight uses them.
 void vkp_release(const char *key);

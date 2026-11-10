@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import shutil
 import struct
 import subprocess
@@ -1434,6 +1435,79 @@ class CacheHeaderTest(unittest.TestCase):
             self.assertEqual(out[what], other, what)    # another driver or device: dropped, rebuilt
         for what in ("short", "empty", "version", "headersize"):
             self.assertEqual(out[what], bad, what)
+
+
+class CacheReadTest(unittest.TestCase):
+    """The cache file as the launch reads it, and the move of a save over it (no device): each cause of a file not read has its
+    own name and phrase, a transient failure to open is tried once more, and an access denied that lasts through the wait is
+    paid once."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.dir = scratch()
+        cls.cache = cls.dir / "pipeline.cache"
+        cls.cache.write_bytes(b"x" * 4096)
+        cls.empty = cls.dir / "empty.cache"
+        cls.empty.write_bytes(b"")
+
+    @staticmethod
+    def read(path: Path, *opts: str) -> dict[str, str]:
+        done = run("cacheread", str(path), *opts)
+        assert done.returncode == 0, done.stdout + done.stderr
+        out = {}
+        for line in done.stdout.splitlines():
+            key, _, rest = line.partition(" ")
+            out[key] = rest
+        return out
+
+    def test_each_way_the_file_is_not_read_has_its_own_cause_and_phrase(self) -> None:
+        causes = {
+            "absent": (self.read(self.dir / "none.cache"), "absent", "is not there"),
+            "empty": (self.read(self.empty), "empty", "is empty"),
+            "too_large": (self.read(self.cache, "readcap=4095"), "too_large", "too large for memory"),
+            "open": (self.read(self.cache, "openerr=13"), "open", "could not be opened at launch ("),
+        }
+        for name, (out, cause, text) in causes.items():
+            self.assertEqual(out["cause"], cause, name)
+            self.assertEqual(out["read"], "none size 0 ms " + out["read"].rsplit(" ", 1)[1], name)
+            self.assertIn(text, out["text"], name)
+        green = self.read(self.cache, "readcap=4096")   # the counterpart: read whole
+        self.assertEqual((green["cause"], green["read"].split(" ")[:3]), ("ok", ["data", "size", "4096"]))
+
+    def test_an_open_that_fails_once_is_tried_again_and_one_that_keeps_failing_is_not_read(self) -> None:
+        once = self.read(self.cache, "openerr=13", "transient")
+        self.assertEqual(once["cause"], "ok")
+        self.assertTrue(once["read"].startswith("data size 4096"), once["read"])
+        self.assertGreaterEqual(int(once["read"].rsplit(" ", 1)[1]), 150)   # it waited before it tried again
+        lasting = self.read(self.cache, "openerr=13")
+        self.assertEqual(lasting["cause"], "open")
+        self.assertGreaterEqual(int(lasting["read"].rsplit(" ", 1)[1]), 150)
+
+    def test_a_file_that_is_not_there_is_not_tried_again(self) -> None:
+        out = self.read(self.dir / "none.cache", "openerr=2")
+        self.assertEqual(out["cause"], "absent")
+        self.assertLess(int(out["read"].rsplit(" ", 1)[1]), 150)
+
+    @unittest.skipUnless(os.name == "nt", "the sharing violation and the access denied of a replace are Windows'")
+    def test_an_access_denied_that_lasts_is_waited_for_once_and_named_once(self) -> None:
+        folder = scratch()
+        path, tmp = folder / "pipeline.cache", folder / "pipeline.cache.tmp"
+        path.write_bytes(b"old")
+        tmp.write_bytes(b"new")
+        path.chmod(stat.S_IREAD)   # a replace of a read-only file is refused with access denied
+        try:
+            done = run("cachemove", str(tmp), str(path), "heal")
+        finally:
+            path.chmod(stat.S_IREAD | stat.S_IWRITE)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        moves = {int(m[0]): (int(m[1]), int(m[2]), int(m[3])) for m in re.findall(r"move (\d) ok (\d) tries (\d+) ms (\d+)", done.stdout)}
+        self.assertEqual(moves[1][:2], (0, 5))        # the whole wait: five tries
+        self.assertGreaterEqual(moves[1][2], 900)     # about a second
+        self.assertEqual(moves[2][:2], (0, 1))        # the second move tries once
+        self.assertLess(moves[2][2], 300)
+        self.assertEqual(moves[3][:2], (1, 1))        # healed: it moves, at once
+        self.assertEqual(path.read_bytes(), b"new")
+        self.assertEqual(done.stderr.count("refused the replace with \"access denied\""), 1, done.stderr)
 
 
 class StoreTest(unittest.TestCase):
