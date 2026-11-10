@@ -11,20 +11,23 @@ The console's rules (checked against NVIDIA's PTX documentation for the same ope
 * A conversion to an integer saturates: the 64-bit one gives 0 below zero and all ones from 2^64 up.
 * HFMA2 and HMUL2 with .RELU leave a NaN a NaN.
 
-Vulkan leaves the result of FMin, FMax and FClamp with a NaN operand to the driver, and of OpConvertFToS and
-OpConvertFToU undefined. The programs here are assembled from instruction words (no game files), read their operands
-from constant bank 1 so that nothing is folded, and are translated by the real executable. A small evaluator then
-executes the straight-line module on the CPU with the SPIR-V specification's meaning of each instruction, and treats
-an instruction the specification leaves open for the operands it is given (FMin with a NaN, a conversion of a NaN) as an
-undefined value that must not reach the stored result, so a module that relies on a driver's luck is red here.
+Vulkan leaves the result of FMin, FMax and FClamp with a NaN operand to the driver. The programs here are assembled
+from instruction words (no game files), read their operands from constant bank 1 so that nothing is folded, and are
+translated by the real executable. A small evaluator then executes the module on the CPU with the SPIR-V
+specification's meaning of each instruction, and treats an instruction whose result the specification leaves open for
+the operands it is given (FMin with a NaN) as an undefined value that must not reach the stored result, so a module that
+relies on a driver's luck is red here.
 
-OpConvertFToS and OpConvertFToU are undefined for an infinity and for a value outside the integer's range as well, and a
-select after the conversion does not take that back. The conversions the translator adds around a texture instruction
-(the level of detail query's fixed point, the render scale of a texel coordinate and of a size, the level of a size
-query) and the 64-bit conversion therefore bound the float before they convert it, and the cases below give each of them
-a NaN, both infinities, the floats just past the range, the bounds themselves and an ordinary value. Those programs are
-pixel programs: what they read from the pipeline (the queried level of detail, the size, the render scale) is the
-evaluator's to give.
+OpConvertFToS and OpConvertFToU are another matter: for a NaN, an infinity and a value outside the integer's range it is
+the behaviour that is undefined, not only the result, and a select after the conversion does not take that back. The
+evaluator therefore fails at such a conversion itself, whatever the module does with its result: a module that converts
+first and selects the right value afterwards stores the same words as one that bounds the float first, and only this
+tells them apart. The conversions the translator adds around a texture instruction (the level of detail query's fixed
+point, the render scale of a texel coordinate and of a size, the level of a size query) and the 64-bit conversion bound
+the float before they convert it, and the cases below give each of them a NaN, both infinities, the floats just past the
+range, the bounds themselves and an ordinary value. Those programs are pixel programs: what they read from the pipeline
+(the queried level of detail, the size, the render scale) is the evaluator's to give. F2I's own sequence is the one
+exception: it converts a NaN and selects 0 afterwards, so its NaN case alone is run with that tolerated.
 
 Run: python -m unittest discover -s tests -v   (skipped without a built oot2-xlate, see test_xlate_host)
 """
@@ -48,13 +51,15 @@ OPEN_FOR_NAN = {"FMin", "FMax", "FClamp"}   # a NaN operand: which operand is th
 
 
 class Undefined(AssertionError):
-    """A value the SPIR-V specification leaves open reached a store."""
+    """A value the SPIR-V specification leaves open reached a store, or the module ran a conversion whose behaviour the
+    specification leaves undefined."""
 
 
 class Poison:
-    """The result of an instruction the specification leaves open for its operands (FMin of a NaN: which operand; a
-    conversion of a NaN to an integer: any value). It flows through arithmetic, a select that does not pick it drops it,
-    and a store of it fails the test."""
+    """The result of an instruction the specification leaves open for its operands (FMin of a NaN: which operand). It
+    flows through arithmetic, a select that does not pick it drops it, and a store of it fails the test. A float to
+    integer conversion of a NaN, an infinity or a value out of range is not such a value: the evaluator fails there
+    (Evaluator.tolerate_open_conversion)."""
 
     def __repr__(self):
         return "undefined"
@@ -137,8 +142,14 @@ class Evaluator:
     `size` what an OpImageQuerySizeLod returns, `render_scale` the support buffer's scale of every texture and
     `frag_coord` the fragment's position. The texel coordinates of each OpImageFetch are collected in `fetches` and the
     level asked of each OpImageQuerySizeLod in `levels`; an undefined value there makes the instruction's result
-    undefined."""
+    undefined.
 
+    An OpConvertFToS or OpConvertFToU of a NaN, an infinity, a value outside the integer's range or an undefined value
+    raises Undefined where it runs: no select after it makes the module defined. `tolerate_open_conversion` gives the
+    older reading, an undefined value that a select may drop, for the one sequence that still converts first (F2I of a
+    NaN)."""
+
+    tolerate_open_conversion = False
     lod = (0.0, 0.0)
     size = (0, 0)
     render_scale = 1.0
@@ -247,7 +258,7 @@ class Evaluator:
         v = self.vals
         if op == 248:                                              # OpLabel
             return
-        if op in (124, 109, 110, 111, 112, 127, 129, 131, 133, 136, 141, 128, 130, 194, 196, 197, 199, 202, 156, 171, 180, 184,
+        if op in (124, 111, 112, 127, 129, 131, 133, 136, 141, 128, 130, 194, 196, 197, 199, 202, 156, 171, 180, 184,
                   79, 80, 81, 87, 95, 100, 103, 105) and any(v.get(x) is POISON for x in w[2:]):
             v[w[1]] = POISON
             return
@@ -298,9 +309,12 @@ class Evaluator:
                 v[w[1]] = f32_bits(src) if isinstance(src, float) else src & 0xFFFFFFFF
         elif op in (109, 110):                                     # OpConvertFToU, OpConvertFToS
             x = v[w[2]]
-            r = None if math.isnan(x) or math.isinf(x) else int(x)
+            r = None if x is POISON or math.isnan(x) or math.isinf(x) else int(x)
             if r is None or (op == 109 and not 0 <= r < 1 << 32) or (op == 110 and not -(1 << 31) <= r < 1 << 31):
-                v[w[1]] = POISON          # not representable in the integer
+                if not self.tolerate_open_conversion:             # not representable in the integer: undefined behaviour
+                    raise Undefined(f"{'OpConvertFToU' if op == 109 else 'OpConvertFToS'} of {x!r}: a conversion of a value "
+                                    "the integer cannot hold is undefined, whatever is selected after it")
+                v[w[1]] = POISON
             else:
                 v[w[1]] = r & 0xFFFFFFFF
         elif op == 112:                                            # OpConvertUToF
@@ -392,7 +406,8 @@ class Evaluator:
 
 def evaluate(spirv: bytes, *operands: int, **pipeline) -> Evaluator:
     """Runs the module with the operands (32-bit patterns) in words 4, 5, 6 of bank 1 (c[1][0x10], c[1][0x14], c[1][0x18])
-    and what the pipeline gives a pixel program (the evaluator's lod, size, render_scale, frag_coord)."""
+    and what the pipeline gives a pixel program (the evaluator's lod, size, render_scale, frag_coord). The evaluator's
+    tolerate_open_conversion is set the same way."""
     ev = Evaluator(spirv, {4 + n: o for n, o in enumerate(operands)})
     for name, value in pipeline.items():
         setattr(ev, name, value)
@@ -492,6 +507,28 @@ def fadd_imm_sat(rd: int, ra: int, value: int) -> bytes:
     return scheduled(ampere(0x821, rd=rd, ra=ra, rb=value & 0xFF, low_bits=(value >> 8) << 40, high_bits=bit(77)))
 
 
+def without_the_bound(spirv: bytes) -> tuple[bytes, int]:
+    """The module with each conversion of a clamped float reading the float the clamp read instead, and how many
+    conversions that changed. Nothing else changes: the clamp stays, unused by the conversion, and so does every select
+    after the conversion."""
+    words = list(struct.unpack(f"<{len(spirv) // 4}I", spirv))
+    ext = {}                                                       # the result of a GLSL.std.450 import
+    clamped = {}                                                   # the result of an NClamp to its first operand
+    changed = 0
+    i = 5
+    while i < len(words):
+        n, op = words[i] >> 16, words[i] & 0xFFFF
+        if op == 11:                                               # OpExtInstImport
+            ext[words[i + 1]] = struct.pack(f"<{n - 2}I", *words[i + 2:i + n]).split(b"\0")[0]
+        elif op == 12 and ext.get(words[i + 3]) == b"GLSL.std.450" and GLSL.get(words[i + 4]) == "NClamp":
+            clamped[words[i + 2]] = words[i + 5]
+        elif op in (109, 110) and words[i + 3] in clamped:
+            words[i + 3] = clamped[words[i + 3]]
+            changed += 1
+        i += n
+    return struct.pack(f"<{len(words)}I", *words), changed
+
+
 def same(got: int, want: float) -> bool:
     """A result pattern against the expected float: any NaN for a NaN, the exact pattern (the sign of zero too) otherwise."""
     if math.isnan(want):
@@ -572,7 +609,9 @@ class NanRulesTest(Harness):
     def test_a_float_to_signed_integer_conversion_of_a_nan_is_zero(self):
         spirv = self.module("f2i_s32", f2i(True), store(OUT))
         for x, want in [(NAN, 0), (2.7, 2), (-2.7, -2 & 0xFFFFFFFF), (0.0, 0), (1000.0, 1000)]:
-            self.assertEqual(evaluate(spirv, f32_bits(x)).stores, [want], x)
+            # F2I converts the NaN and selects 0 after it (test_the_conversion_itself_keeps_its_instructions has the
+            # sequence), which is the one conversion of an open value this file lets through
+            self.assertEqual(evaluate(spirv, f32_bits(x), tolerate_open_conversion=math.isnan(x)).stores, [want], x)
 
     def test_a_float_to_unsigned_integer_conversion_of_a_nan_is_zero(self):
         spirv = self.module("f2i_u32", f2i(False), store(OUT))
@@ -601,8 +640,25 @@ class NanRulesTest(Harness):
                 shape = [GLSL[w[3]] if op == 12 else op for op, w in ev.body if op in (12, 109, 110, 156, 169) or 180 <= op <= 191]
                 self.assertEqual(shape, [156, *rounding, convert, 169])
                 self.assertEqual(ev.stores, [2])
+        # which is why the signed NaN case above needs the conversion of a NaN tolerated: the sequence converts it
+        with self.assertRaisesRegex(Undefined, "OpConvertFToS of nan"):
+            evaluate(self.module("f2i_s32_nan", f2i(True), store(OUT)), f32_bits(NAN))
 
     # -- the conversions around F2I: the float is bounded before it is converted --
+
+    def test_a_conversion_of_the_unbounded_float_fails_whatever_is_selected_after_it(self):
+        """What the cases below rest on. The level of detail query's module with its two conversions made to read the
+        product itself, not the clamped product, still selects 0 for a NaN, so the words it stores for a NaN are the
+        right ones; it is the conversion of the NaN that is undefined, and the evaluator fails there. The same goes for
+        an infinity and a value past the range, which the stored words would give away as well."""
+        spirv, changed = without_the_bound(self.pixel("tmml_unbounded", TMML))
+        self.assertEqual(changed, 2)
+        self.assertEqual(evaluate(spirv, lod=(1.5, 2.25)).stores, [0x240, 0x180, 0, 0])
+        self.assertEqual(evaluate(spirv, lod=(NAN, 2.25), tolerate_open_conversion=True).stores, [0x240, 0, 0, 0])
+        for x in (NAN, INF, -INF, 8388608.0, -8388609.0):
+            for lod in ((x, 2.25), (2.25, x)):
+                with self.subTest(lod=lod), self.assertRaisesRegex(Undefined, "OpConvertFToS of"):
+                    evaluate(spirv, lod=lod)
 
     def test_the_64_bit_conversion_saturates_and_converts_nothing_out_of_range(self):
         spirv = self.module("f2i_u64_range", F2I_U64, store(OUT), store(OUT + 1, 1))
