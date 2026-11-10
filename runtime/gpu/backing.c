@@ -183,7 +183,13 @@ static int g_filled;
 static uint64_t g_born_value;
 static int g_grow_cap_logged;   // a growth took the mirrors past BACKING_PROMOTE_MIRROR_MAX and said so (once a run)
 static int g_union_on = 1;      // the union pass of backing_raw_begin runs (backing_set_union)
-static uint64_t g_adj_version;  // the map's version at the last union pass that left no chain alone (g_lock exclusive)
+static uint64_t g_adj_version;  // the map's version at the last union pass that left no chain alone for its value (g_lock exclusive)
+// The chains the pass left alone, by the place and the reason, so that a chain left at every begin is counted and written
+// to the ring once, until it changes (a member comes or goes, its reason changes). g_lock exclusive.
+typedef struct { const Rec *r; uint64_t k1, k2, lo, hi; int why, seen; } LeftChain;
+enum { LEFT_MAX = 64 };
+static LeftChain g_left[LEFT_MAX];
+static int g_nleft;
 static uint64_t g_begin_now;    // the value whose backing_raw_begin is before its stamp (0: none): its events are after the begin
 
 // The block thread.
@@ -2523,10 +2529,13 @@ static int union_kind(const Rec *r, const Cell *c, int i, int j, uint64_t *over)
     return UK_MIRROR;
 }
 
-// Replace c->imp[i..j] by one backing of the given kind over their union (union_check passed), in submission value: wait for
-// the older submissions that reached them, take the new backing, and let cell_put defer every member. When the admission
-// refuses a mirror the union is an import, unless promoting (a promotion leaves the chain as it was: 0). g_lock exclusive.
-static int union_make(Rec *r, Cell *c, int i, int j, uint64_t value, int kind, uint64_t over, int promoting) {
+// Replace c->imp[i..j] by one backing over their union (union_check passed), in submission value: wait for the older
+// submissions that reached them, take the new backing, and let cell_put defer every member. uk is union_kind's answer: a
+// mirror for UK_MIRROR, else an import, and the event says why (UK_IMPORT_RULE, UK_IMPORT_CAP). When the admission refuses
+// a mirror the union is an import (UK_IMPORT_ADMIT), unless promoting (a promotion leaves the chain as it was: 0). g_lock
+// exclusive.
+static int union_make(Rec *r, Cell *c, int i, int j, uint64_t value, int uk, uint64_t over, int promoting) {
+    int kind = uk == UK_MIRROR ? BACKING_MIRROR : BACKING_IMPORT;
     uint64_t lo = c->imp[i]->gpu_lo, hi = c->imp[j]->gpu_hi, mine = 0;
     int n = j - i + 1, nm = chain_mirrors(c, i, j);
     for (int k = i; k <= j; k++)
@@ -2534,7 +2543,7 @@ static int union_make(Rec *r, Cell *c, int i, int j, uint64_t value, int kind, u
     replace_wait(c, lo, hi, value, kind == BACKING_MIRROR);
     Backing *b = kind == BACKING_MIRROR ? mirror_admit(r, lo, hi) : NULL;
     if (!b && promoting) return 0;
-    int how = kind == BACKING_MIRROR ? (b ? UK_MIRROR : UK_IMPORT_ADMIT) : UK_IMPORT_RULE;
+    int how = kind == BACKING_MIRROR ? (b ? UK_MIRROR : UK_IMPORT_ADMIT) : uk;
     if (!b) b = import_new(lo, hi, lo, "the union of abutting backings");
     born(b, BORN_UNION, value, lo, hi);
     EvEnt *ev = ev_new(value, EV_UNION);   // the members as they were, read before cell_put replaces them
@@ -2552,12 +2561,26 @@ static int union_make(Rec *r, Cell *c, int i, int j, uint64_t value, int kind, u
     return 1;
 }
 
+// Whether the chain [lo, hi) of cell c left alone for why is one the pass has not left alone before (and marks it seen). A
+// table that is full counts every chain: the counter may then repeat, never miss.
+static int left_is_new(const Rec *r, const Cell *c, uint64_t lo, uint64_t hi, int why) {
+    for (int n = 0; n < g_nleft; n++) {
+        LeftChain *l = &g_left[n];
+        if (l->r == r && l->k1 == c->k1 && l->k2 == c->k2 && l->lo == lo && l->hi == hi && l->why == why) return l->seen = 1, 0;
+    }
+    if (g_nleft < LEFT_MAX) g_left[g_nleft++] = (LeftChain){r, c->k1, c->k2, lo, hi, why, 1};
+    return 1;
+}
+
 // The pass, at the first begin of value and before its stamp (backing_raw_begin). A scan finds the map as the last clean scan
 // left it when the map's version has not moved since (a backing entering or leaving moves it), so a steady scene pays one
-// compare; a chain left alone is looked at again at the next begin. g_lock exclusive.
+// compare. A chain left for a reason that holds until the map moves (another cell, the cell's edge) does not keep the pass
+// looking; one left because of a write of the value does, since the next value may not have it. A chain left alone is
+// counted and written to the ring once. g_lock exclusive.
 static void union_pass(uint64_t value) {
     if (!g_union_on || backing_version() == g_adj_version) return;
     int left = 0;
+    for (int n = 0; n < g_nleft; n++) g_left[n].seen = 0;
     for (int n = 0; n < g_index.n; n++) {
         Rec *r = (Rec *)g_index.e[n].key;
         if (r->cls != CLS_CPU) continue;
@@ -2571,23 +2594,30 @@ static void union_pass(uint64_t value) {
                 }
                 int why = union_check(r, c, i, j, value);
                 if (why != UK_MIRROR) {
-                    g_st.raw_union_skipped[why - UK_LEFT_WRITTEN]++;
-                    EvEnt *ev = ev_new(value, EV_UNION);
-                    ev->x[0] = c->imp[i]->gpu_lo, ev->x[1] = c->imp[j]->gpu_hi, ev->x[2] = (uint64_t)(j - i + 1);
-                    ev->x[3] = (uint64_t)chain_mirrors(c, i, j), ev->x[4] = (uint64_t)why, ev->x[6] = g_st.mirror_bytes;
-                    left++;
+                    uint64_t clo = c->imp[i]->gpu_lo, chi = c->imp[j]->gpu_hi;
+                    if (left_is_new(r, c, clo, chi, why)) {
+                        g_st.raw_union_skipped[why - UK_LEFT_WRITTEN]++;
+                        EvEnt *ev = ev_new(value, EV_UNION);
+                        ev->x[0] = clo, ev->x[1] = chi, ev->x[2] = (uint64_t)(j - i + 1);
+                        ev->x[3] = (uint64_t)chain_mirrors(c, i, j), ev->x[4] = (uint64_t)why, ev->x[6] = g_st.mirror_bytes;
+                    }
+                    left += why == UK_LEFT_WRITTEN;   // the other reasons hold until the map moves; this one depends on the value
                     i = j + 1;
                     continue;
                 }
                 uint64_t over, lo = c->imp[i]->gpu_lo;
                 int kind = union_kind(r, c, i, j, &over);
-                union_make(r, c, i, j, value, kind == UK_MIRROR ? BACKING_MIRROR : BACKING_IMPORT, over, 0);
+                union_make(r, c, i, j, value, kind, over, 0);
                 int at = 0;   // the list changed: on from the place of the union (what is below it is not in a chain with it)
                 while (at < c->nimp && c->imp[at]->gpu_lo < lo) at++;
                 i = at + 1;
             }
         }
     }
+    int k = 0;
+    for (int n = 0; n < g_nleft; n++)
+        if (g_left[n].seen) g_left[k++] = g_left[n];
+    g_nleft = k;
     if (!left) g_adj_version = backing_version();
 }
 
@@ -2653,7 +2683,7 @@ static void promote_hot(uint64_t value) {
                             promote_capped(r, b, clo, chi, value);
                             continue;
                         }
-                        if (!union_make(r, c, ci, cj, value, BACKING_MIRROR, over, 1)) {
+                        if (!union_make(r, c, ci, cj, value, UK_MIRROR, over, 1)) {
                             __atomic_store_n(&b->hot, 0, __ATOMIC_RELAXED);
                             ev_promote(value, clo, chi, 2);
                             return;
@@ -2870,7 +2900,7 @@ void backing_open(const BackingOps *ops) {
     g_ring_seq = 0, g_ring_skip = 0, g_born_value = 0, g_grow_cap_logged = 0;
     const char *union_env = getenv("OOT2_BACKING_UNION");
     g_union_on = !(union_env && union_env[0] == '0');   // the control run of the fix turns the pass off
-    g_adj_version = 0, g_begin_now = 0;
+    g_adj_version = 0, g_begin_now = 0, g_nleft = 0;
     g_raw_last = g_raw_prev = 0, g_filled = 0, g_pools_version = g_fill_pools = g_fill_epoch = 0;
     g_open = 1;
     g_bt_stop = 0, g_bt_want = 1, g_bt_running = 1;

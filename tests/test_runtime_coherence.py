@@ -54,7 +54,8 @@ PASSING = ("generations", "upload", "admission", "guarded_admission", "writeback
            "raw_grow_used_import", "raw_grow_used_edge", "raw_grow_used_wait", "raw_grow_heir", "raw_grow_heir_old",
            "raw_grow_used_decommit",
            "union_begin_straddle", "union_cap_demote", "union_cap_exempt", "union_exact_bytes", "union_order",
-           "union_promote_chain", "union_quiet")
+           "union_promote_chain", "union_quiet", "union_other_cell", "union_left_hot", "union_hot_cap", "union_hot_rule",
+           "union_hot_admit")
 
 # case: text the one FATAL line must hold
 FAILING = {
@@ -95,6 +96,15 @@ FAILING = {
     "raw_ev_g4_hull": "which this submission bound, lies on the pages it would add",
     # The union at the begin leaves a chain a member of which the submission wrote on the GPU: the stop as it was.
     "union_written_skip": "lies on the pages it would add: it lies above the part of it this submission reached",
+    # The union made an import, and the event of the pass in the dump says for which reason (test_the_union_event_*).
+    "union_cap_stop": "lies on the pages it would add: it lies above the part of it this submission reached",
+    "union_admit_stop": "lies on the pages it would add: it lies above the part of it this submission reached",
+    "union_rule_stop": "lies on the pages it would add: it lies above the part of it this submission reached",
+}
+UNION_WHY = {
+    "union_cap_stop": "made one import over them (the mirrors would pass the cap)",
+    "union_admit_stop": "made one import over them (the admission refused the mirror)",
+    "union_rule_stop": "made one import over them (the rule says import)",
 }
 
 # The rule of import_gives that refuses the import in each of those stops, and the reason the text adds after the head (none
@@ -497,6 +507,26 @@ class CoherenceTest(unittest.TestCase):
                 self.assertNotEqual(evs[0]["what"], "begin")   # the oldest ones are the lost ones
                 self.assertEqual(evs[-1]["what"], "miss")
                 self.assertIn(f"of {total + 2} events", next(line for line in lines if line.startswith("events of ")))
+
+    def test_the_union_event_names_the_reason_the_union_is_an_import(self) -> None:
+        """The dump of a stop says why the pass made an import of a chain with a mirror in it: the cap, the rule or the
+        admission, not one of them for all."""
+        for case, why in UNION_WHY.items():
+            for level in LEVELS:
+                with self.subTest(case=case, level=level):
+                    done, lines = self.stop_with_dump(level, case)
+                    unions = [e for e in events(lines) if e["what"] == "union"]
+                    self.assertEqual(len(unions), 1, lines)
+                    self.assertIn(": " + why + ";", unions[0]["text"])
+
+    def test_a_hot_chain_over_the_cap_says_so_once(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level):
+                done = self.run_case(level, "union_hot_cap")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                said = [line for line in done.stderr.splitlines() if "the mirrors would pass 128 MiB, the most a promotion "
+                        "makes; imported" in line]
+                self.assertEqual(len(said), 1, done.stderr)
 
     def test_the_event_ring_keeps_the_origin_of_a_cut_mirror(self) -> None:
         """A mirror a promotion made, then cut: the dump says both. The events of the raw submission before come first."""

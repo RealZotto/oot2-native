@@ -98,6 +98,13 @@
 //                MiB; the copy waits for the older submission's GPU write and the CPU's later write reaches the next sync;
 //                the pass runs before the stamp and once a value; a hot import promotes with the import it abuts; nothing
 //                moves the version when there is nothing to join; a member written by the submission is left alone
+//   union_cap_stop, union_admit_stop, union_rule_stop   the union is an import, and the event in the stop's dump names the
+//                reason (the cap, the admission, the rule)
+//   union_other_cell, union_left_hot   a chain with a backing of another cell on it is left alone, counted once however many
+//                begins follow, and does not keep the pass scanning; a chain left for a write is counted once too, and a hot
+//                import beside its mirror is not promoted
+//   union_hot_cap, union_hot_rule, union_hot_admit   a hot chain of imports stays imports when the cap, the rule or the
+//                admission says so
 //   unwritten, replace_written, raw_grow_bound_import, raw_grow_fragmented, raw_grow_guarded_blocked,
 //   raw_grow_untracked, raw_grow_cap   stop by name, each with the reason the mirror could not grow
 #include <stdio.h>
@@ -2862,6 +2869,183 @@ static void case_union_written_skip(void) {
     printf("returned\n");
 }
 
+// The straddle that ends the cases below in the stop's dump: the mirror m was resolved by v before its begin, a bind of an
+// import beside it follows (committed below it since), and a bind across both is the named stop. The dump then holds the event
+// of the union pass of the begin, whose text says what the pass did and why.
+static void union_stop(uint64_t m, uint64_t v) {
+    resolve(m + 0x100, 4, v);
+    cpu_fill(m - 0x20000, 0x20000, 0xBBBBBBBBu);
+    resolve(m - 0x10000, 4, v);
+    printf("union_stop: m=%#llx v=%llu\n", (ull)m, (ull)v);
+    resolve(m - 0x1800, 0x5800, v);
+    printf("returned\n");
+}
+
+// The union is an import for each reason the pass can give, and the event says that one: the cap on the mirrors, the rule, the
+// admission.
+static void case_union_cap_stop(void) {
+    uint64_t run[3];
+    cap_world(run);
+    uint64_t v0 = sub_begin();
+    for (int i = 0; i < 3; i++) CHECK(resolve(run[i], 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(run[0] - 2 * MiB, 2 * MiB, 0xBBBBBBBBu);
+    uint64_t v = sub_begin();
+    resolve(run[1] + 0x3000, 4, v);
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    CHECK(s.raw_union_chains == 1 && s.raw_union_import == 1 && s.mirrors == 2);
+    union_stop(run[1], v);
+}
+
+static uint64_t union_import_world(uint64_t *q_out, int admit_refused, int rule_says_import) {
+    uint64_t p, v = union_world(&p, 0x20000);
+    const uint64_t q = p + 4 * MiB;
+    cpu_fill(q, 128 * KiB, 0xDDDDDDDDu);
+    CHECK(resolve(q, 4, v).kind == BACKING_MIRROR);   // a second mirror, alone: no chain
+    CHECK(resolve(p + 0x3000, 4, v).kind == BACKING_MIRROR);
+    if (admit_refused) D.used = D.budget - 1 * MiB;
+    if (rule_says_import) backing_set_mirror_hook(want_none);
+    backing_raw_begin(v);
+    D.used = 0;
+    BackingStats s = stats();
+    CHECK(s.raw_union_chains == 1 && s.raw_union_import == 1 && s.raw_union_mirror == 0 && s.mirrors == 1 && s.imports == 1);
+    CHECK(s.mirrors_refused_budget == (uint64_t)admit_refused);
+    *q_out = q;
+    return v;
+}
+
+static void case_union_admit_stop(void) {
+    uint64_t q, v = union_import_world(&q, 1, 0);
+    union_stop(q, v);
+}
+
+static void case_union_rule_stop(void) {
+    uint64_t q, v = union_import_world(&q, 0, 1);
+    backing_set_mirror_hook(want_all);
+    union_stop(q, v);
+}
+
+// A backing of another cell lies on the union: a bind straddling a window made the cell of two windows over the pages of the
+// mirror, which a join would leave under two copies. The pass leaves the chain, counts it once however many begins follow, and
+// does not look again until the map moves.
+static void case_union_other_cell(void) {
+    setup(256 * MiB, 0);
+    union_on();
+    const uint64_t win = BACKING_IMPORT_WINDOW, b = g_heap + win, m = b - 256 * KiB;
+    CHECK((g_heap & (win - 1)) == 0);
+    pool(g_heap, 4 * win);
+    cpu_fill(m, 256 * KiB, 0xAAAAAAAAu);
+    cpu_fill(b, 128 * KiB, 0xCCCCCCCCu);
+    backing_set_mirror_hook(want_all);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(m, 4, v0).kind == BACKING_MIRROR);   // the cell of window k
+    backing_set_mirror_hook(want_none);
+    CHECK(resolve(b - 0x1000, 0x2000, v0).kind == BACKING_IMPORT);   // the cell of windows k and k + 1, over the same pages
+    backing_set_mirror_hook(want_all);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(m - 0x20000, 0x20000, 0xBBBBBBBBu);
+    uint64_t v1 = sub_begin();
+    backing_raw_begin(v1);
+    uint64_t version = backing_version();
+    BackingStats s = stats();
+    CHECK(s.raw_union_chains == 0 && s.raw_union_skipped[1] == 1 && s.raw_union_skipped[0] == 0 && s.raw_union_skipped[2] == 0);
+    CHECK(s.mirrors == 1 && s.imports == 2);
+    sub_end(v1);
+    gpu_run(v1, NULL);
+    for (int i = 0; i < 3; i++) {
+        uint64_t v = sub_begin();
+        backing_raw_begin(v);
+        sub_end(v);
+        gpu_run(v, NULL);
+    }
+    BackingStats t = stats();
+    CHECK(t.raw_begins == s.raw_begins + 3 && backing_version() == version);
+    CHECK(t.raw_union_skipped[1] == 1 && t.raw_union_chains == 0);   // one chain, one count
+    printf("union_other_cell: m=%#llx\n", (ull)m);
+    done("union_other_cell");
+}
+
+// A chain left because the submission wrote a member is counted once however many begins leave it, and a hot import beside a
+// mirror is not promoted: its chain is a mirror's. The first begin that finds no write joins the chain.
+static void case_union_left_hot(void) {
+    uint64_t p, v1 = union_world(&p, 0x20000);
+    resolve(p + 0x3000, 4, v1);
+    backing_gpu_wrote(p + 0x3000, 4, v1);
+    backing_raw_begin(v1);   // the import below the mirror is made here; the chain is left
+    BackingStats s = stats();
+    CHECK(s.raw_union_chains == 0 && s.raw_union_skipped[0] == 1 && s.imports == 1 && s.mirrors == 1);
+    CHECK(resolve(p - 0x20000, 0x20000, v1).kind == BACKING_IMPORT);   // larger than a uniform's: hot
+    sub_end(v1);
+    gpu_run(v1, NULL);
+    uint64_t v2 = sub_begin();
+    resolve(p + 0x3000, 4, v2);
+    backing_gpu_wrote(p + 0x3000, 4, v2);
+    backing_raw_begin(v2);
+    s = stats();
+    CHECK(s.raw_union_chains == 0 && s.raw_union_skipped[0] == 1 && s.raw_promoted == 0 && s.imports == 1 && s.mirrors == 1);
+    sub_end(v2);
+    gpu_run(v2, NULL);
+    uint64_t v3 = sub_begin();
+    backing_raw_begin(v3);   // nothing written by v3: the pass joins the chain
+    s = stats();
+    CHECK(s.raw_union_chains == 1 && s.raw_union_skipped[0] == 1 && s.imports == 0 && s.mirrors == 1);
+    printf("union_left_hot: p=%#llx\n", (ull)p);
+    union_finish("union_left_hot");
+}
+
+// A hot chain of imports that the promotion may not make a mirror of: over the cap on the mirrors (the log says so, once), the
+// rule says import for the whole, the admission refuses. Each stays imports.
+static int want_small(const BackingAsk *a) { return a->size <= 128 * KiB; }
+
+static void hot_chain(int mode) {
+    const uint64_t len = mode == 0 ? 1 * MiB : 128 * KiB;
+    uint64_t run[3], p;
+    if (mode == 0) {
+        cap_world(run);
+        uint64_t v0 = sub_begin();
+        for (int i = 0; i < 3; i++) CHECK(resolve(run[i], 4, v0).kind == BACKING_MIRROR);
+        sub_end(v0);
+        gpu_run(v0, NULL);
+        p = g_heap + 3 * BACKING_IMPORT_WINDOW + 4 * MiB;
+    } else {
+        setup(64 * MiB, 0);
+        union_on();
+        backing_set_mirror_hook(mode == 1 ? want_small : want_all);
+        p = g_heap + 8 * MiB;
+        pool(p - 1 * MiB, 16 * MiB);
+    }
+    cpu_fill(p, len, 0xAAAAAAAAu);
+    uint64_t v1 = sub_begin();
+    backing_raw_begin(v1);
+    CHECK(resolve(p + 0x1000, len - 0x1000, v1).kind == BACKING_IMPORT);   // larger than a uniform's: hot
+    sub_end(v1);
+    gpu_run(v1, NULL);
+    cpu_fill(p + len, len, 0xCCCCCCCCu);   // an import at the next begin, abutting
+    if (mode == 2) D.used = D.budget - 1 * MiB;
+    uint64_t v2 = sub_begin();
+    backing_raw_begin(v2);
+    D.used = 0;
+    BackingStats s = stats();
+    CHECK(s.raw_promoted == 0 && s.raw_union_chains == 0 && s.imports == 2 && s.mirrors == (mode == 0 ? 3u : 0u));
+    CHECK(s.mirrors_refused_budget == (uint64_t)(mode == 2));
+    sub_end(v2);
+    gpu_run(v2, NULL);
+    uint64_t v3 = sub_begin();   // the flag is spent or the refusal stands: still imports
+    backing_raw_begin(v3);
+    s = stats();
+    CHECK(s.raw_promoted == 0 && s.imports == 2);
+    sub_end(v3);
+    gpu_run(v3, NULL);
+    printf("hot_chain: mode %d stays two imports\n", mode);
+}
+
+static void case_union_hot_cap(void) { hot_chain(0), done("union_hot_cap"); }
+static void case_union_hot_rule(void) { hot_chain(1), done("union_hot_rule"); }
+static void case_union_hot_admit(void) { hot_chain(2), done("union_hot_admit"); }
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc != 2) {
@@ -2905,6 +3089,10 @@ int main(int argc, char **argv) {
         {"union_cap_exempt", case_union_cap_exempt}, {"union_written_skip", case_union_written_skip},
         {"union_exact_bytes", case_union_exact_bytes}, {"union_order", case_union_order},
         {"union_promote_chain", case_union_promote_chain}, {"union_quiet", case_union_quiet},
+        {"union_cap_stop", case_union_cap_stop}, {"union_admit_stop", case_union_admit_stop},
+        {"union_rule_stop", case_union_rule_stop}, {"union_other_cell", case_union_other_cell},
+        {"union_left_hot", case_union_left_hot}, {"union_hot_cap", case_union_hot_cap},
+        {"union_hot_rule", case_union_hot_rule}, {"union_hot_admit", case_union_hot_admit},
         {"raw_grow_used_import", case_raw_grow_used_import}, {"raw_grow_used_edge", case_raw_grow_used_edge},
         {"raw_grow_used_wait", case_raw_grow_used_wait}, {"raw_grow_used_written", case_raw_grow_used_written},
         {"raw_grow_used_hull", case_raw_grow_used_hull}, {"raw_grow_used_hull_edge", case_raw_grow_used_hull_edge},
