@@ -139,8 +139,15 @@ class TraceChangesNothingTest(TraceBase):
                 lines = [x for x in on.stderr.splitlines() if x.startswith("[rt] rc ")]
                 self.assertTrue(any("group=silent" in x for x in lines))
                 self.assertEqual((off.returncode, off.stdout), (on.returncode, on.stdout))
-                self.assertEqual([x for x in off.stderr.splitlines() if not x.startswith("[rt] rc ")],
-                                 [x for x in on.stderr.splitlines() if not x.startswith("[rt] rc ")])
+                # The two runs are two processes: a line that prints a host pointer (the address of a
+                # word of the test's own memory) differs between them wherever the loader randomises
+                # addresses. Only such pointers are masked (as "%p" prints them: 0x and lower case on
+                # Linux, sixteen upper-case digits on Windows); every other number is compared as printed.
+                def kept(text: str) -> list[str]:
+                    return [re.sub(r"\b(?:0x[0-9a-f]{9,}|[0-9A-F]{16})\b", "POINTER", x)
+                            for x in text.splitlines() if not x.startswith("[rt] rc ")]
+
+                self.assertEqual(kept(off.stderr), kept(on.stderr))
 
 
 class SilentCountersTest(TraceBase):
