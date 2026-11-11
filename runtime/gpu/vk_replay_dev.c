@@ -89,11 +89,17 @@ static int dev_target(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarg
     memset(out, 0, sizeof *out);
     int fmt = t->has_view && t->view.set_format ? t->view.format : t->tex.d.format;
     const VkfRow *row = vkf_row(fmt);
-    if (!row || row->vk == VK_FORMAT_UNDEFINED) return 0;
+    if (!row || row->vk == VK_FORMAT_UNDEFINED) {
+        vkr_target_refused("the replay has no Vulkan format for that NVN format");
+        return 0;
+    }
     VkbImage *img = vkb_image_get(&t->tex);
     // a target in storage the CPU can see: its arena image, made current so the pass draws over the CPU's bytes
     if (!img) img = vkb_image_demand_current(&t->tex, value);
-    if (!img) return 0;
+    if (!img) {
+        vkr_target_refused("the texture has no image (its format is not one an image is made in, or its storage is outside every pool)");
+        return 0;
+    }
     vkb_image_use(img, value);
     uint32_t level = t->has_view && t->view.set_levels ? t->view.base_level : 0;
     uint32_t base_layer = t->has_view && t->view.set_layers ? t->view.min_layer : 0;
@@ -135,6 +141,12 @@ static int dev_target(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarg
                    base_layer + layers, format_gap ? "the device renders to no image of that format" : refusal,
                    (unsigned)sh.usage);
         }
+        // the reason goes with the refusal, to the stop the caller makes of it (the log line above comes once per kind)
+        if (format_gap) vkr_target_refused("the device renders to no image of the view's format");
+        else {
+            vkv_plan(&vim, &vw, &plan, &refusal);
+            vkr_target_refused(refusal ? refusal : "the image was made without the usage of this view");
+        }
         return 0;
     }
     if (!vkv_plan(&vim, &vw, &plan, &refusal))
@@ -143,6 +155,19 @@ static int dev_target(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarg
                  storage ? "storage" : "render target", (unsigned long long)(uintptr_t)t->tex.mem, fmt, level, base_layer,
                  base_layer + layers, refusal, sh.levels, sh.layers, sh.depth, (unsigned)sh.usage);
     base_layer = plan.base_layer, layers = plan.layers;
+    // A raw view of a block-compressed image (a format of the block's size, whatever its numeric type): a texel of it is a
+    // block, so its extent counts blocks. The class of the image's own format says it holds the game's blocks (not the
+    // RGBA8 an ASTC texture is decoded into); the view's format decides nothing here but its size, which must be the
+    // block's (the specification's compatibility rule), and a view of another size has no block extent to count.
+    const VkfRow *trow = vkf_row(t->tex.d.format);
+    int raw = trow && (trow->flags & VKF_BLOCK) && !(row->flags & VKF_BLOCK) && vkf_class(sh.format) >= 2001 &&
+              vkf_class(sh.format) < 4000;
+    if (raw && row->bpb != trow->bpb)
+        rt_fatal("gfx: vulkan: the render target view of the texture at %#llx (NVN format %#x, level %u, layers %u..%u) is in "
+                 "NVN format %#x of %u bytes a texel, over block-compressed storage of %u bytes a block: only a view of the "
+                 "block's size has a texel for each block",
+                 (unsigned long long)(uintptr_t)t->tex.mem, t->tex.d.format, level, base_layer, base_layer + layers, fmt,
+                 (unsigned)row->bpb, (unsigned)trow->bpb);
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, .usage = want_usage};
     VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = &use,
                                 .image = vkb_image_handle(img),
@@ -152,12 +177,11 @@ static int dev_target(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarg
     GPU_VK_OK(vkCreateImageView(gpu_vk.device, &vi, NULL, &view), "vkCreateImageView (a render target)");
     vkrec_effect(view_gone, (void *)(uintptr_t)view);
     uint32_t w = t->tex.d.width >> level, h = t->tex.d.height >> level;
-    // a raw view of a block-compressed image (a format of the block's size): a texel of it is a block, so its extent counts
-    // blocks
-    const VkfRow *trow = vkf_row(t->tex.d.format);
-    int raw = trow && (trow->flags & VKF_BLOCK) && !(row->flags & VKF_BLOCK) && vkf_class(sh.format) >= 2001 &&
-              vkf_class(sh.format) < 4000;
-    if (raw) w = (w + trow->bw - 1u) / trow->bw, h = (h + trow->bh - 1u) / trow->bh;
+    if (raw) {
+        w = (w + trow->bw - 1u) / trow->bw, h = (h + trow->bh - 1u) / trow->bh;
+        // the blocks the pass writes exist in the image only: the CPU's bytes of the volume must not come over them
+        if (!storage) vkb_image_gpu_wrote(img);
+    }
     *out = (VkrTarget){view, row->vk, w ? w : 1, h ? h : 1, layers, aspect, (uint64_t)(uintptr_t)vkb_image_handle(img)};
     return 1;
 }

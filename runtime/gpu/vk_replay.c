@@ -580,12 +580,21 @@ void vkr_xfer_begin(void) {
 void vkr_xfer_end(void) { F.after_xfer = 1; }
 void vkr_count_transfer(uint64_t bytes) { g_stats.transfers++, g_stats.transfer_bytes += bytes; }
 
+static const char *g_target_refusal;
+void vkr_target_refused(const char *why) { g_target_refusal = why; }
+
 static int target_of(const nvn_tex_rec *t, VkrTarget *out) {
     if (t->tex.d.samples > 1) stop("a multisampled render target (%d samples) is not replayed yet", t->tex.d.samples);
-    if (!F.ops->target(t, 0, F.value, out))
-        stop("no image stands on the render target's storage (NVN format %#x, %ux%u): see oot2/vk_image.h",
-             (unsigned)(t->has_view && t->view.set_format ? t->view.format : (unsigned)t->tex.d.format),
-             t->tex.d.width, t->tex.d.height);
+    g_target_refusal = NULL;
+    if (!F.ops->target(t, 0, F.value, out)) {
+        unsigned level = t->has_view && t->view.set_levels ? t->view.base_level : 0;
+        unsigned layer = t->has_view && t->view.set_layers ? t->view.min_layer : 0;
+        unsigned layers = t->has_view && t->view.set_layers && t->view.nlayers ? t->view.nlayers : 1;
+        stop("no image stands on the render target's storage (NVN format %#x, %ux%u, level %u, layers %u..%u): %s; see "
+             "oot2/vk_image.h",
+             (unsigned)(t->has_view && t->view.set_format ? t->view.format : (unsigned)t->tex.d.format), t->tex.d.width,
+             t->tex.d.height, level, layer, layer + layers, g_target_refusal ? g_target_refusal : "none stands there");
+    }
     return 1;
 }
 

@@ -56,11 +56,18 @@
 //                                   with --out1
 //   chmask T HEX                    target T's channel mask (r 1, g 2, b 4, a 8), the others 0xf
 //   blend_dual                      blend on target 0 with dual-source factors (SRC1_COLOR, ONE_MINUS_SRC1_COLOR)
-//   bctarget SLICE placed|arena     the colour target is slice SLICE of a 32x32x20 BC4 volume (8x8x20 blocks of 8 bytes),
-//                                   viewed as RGBA16 UINT, so a texel of the target is a block: size must be 8 8, no depth,
+//   bctarget SLICE placed|arena [FORMAT]
+//                                   the colour target is slice SLICE of a 32x32x20 BC4 volume (8x8x20 blocks of 8 bytes),
+//                                   viewed in FORMAT (rgba16ui, the default; rgba16f, rgba16 for unorm, rgba8, bc4), so a texel
+//                                   of the target is a block when the format is the block's size: size must be 8 8, no depth,
 //                                   no clear. The volume stands in the pool of images (placed) or in the CPU-visible pool
 //                                   (an arena image, the game's case); --bc-out FILE gets its blocks as the image holds them
 //                                   (8 blocks a row, 8 rows a slice, 20 slices) and "bc image placed|arena" is printed
+//   bcsecond SLICE [store]          after the first draw, the same pass again into slice SLICE (a second submission); with
+//                                   store, the CPU stores a byte into the volume's last page between the two
+//   bcsample FILE [same]            after the passes, the draw file FILE (size 8 8, one texture of the file name @volume: the
+//                                   volume as BC4, 3d) is played into a float target, written to OUT; with same, in the
+//                                   submission of the last pass (two passes of one frame), else in a submission of its own
 //
 // The program stages may be synthesized for a test; no game data is needed. ProgramSetShaders computes each stage's key
 // from its control section and code area, so both files must match the key in the draw file.
@@ -177,7 +184,12 @@ typedef struct {
     int nvp, ntargets;
     unsigned chmask[2];
     int has_chmask, dual, indirect, base_instance;
-    int bc_slice, bc_arena;    // bctarget: the colour target is slice bc_slice of a BC4 volume, viewed as RGBA16 UINT (-1: none)
+    int bc_slice, bc_arena;    // bctarget: the colour target is slice bc_slice of a BC4 volume, viewed in bc_fmt (-1: none)
+    int bc_fmt;                // the view's NVN format, and the Vulkan format the pipeline draws in
+    VkFormat bc_vk;
+    int bc_second, bc_store;   // bcsecond: another pass into this slice after the first (-1: none), the CPU's store between
+    char bc_sample[NAME];      // bcsample: the draw file of a draw that samples the volume afterwards
+    int bc_same;               // ... in the submission of the last pass (a later pass of the one frame), not in one of its own
 } Draw;
 
 typedef struct {
@@ -275,7 +287,8 @@ static void parse_draw(const char *path, Draw *d) {
     memset(d, 0, sizeof *d);
     d->prim = NVN_DRAW_PRIMITIVE_TRIANGLES;
     d->vp[2] = d->sc[2] = -1;
-    d->polygon = -1, d->nvp = 1, d->ntargets = 1, d->chmask[0] = d->chmask[1] = 0xF, d->bc_slice = -1;
+    d->polygon = -1, d->nvp = 1, d->ntargets = 1, d->chmask[0] = d->chmask[1] = 0xF, d->bc_slice = -1,
+    d->bc_second = -1, d->bc_fmt = NVN_FORMAT_RGBA16UI, d->bc_vk = VK_FORMAT_R16G16B16A16_UINT;
     char line[1200];
     while (fgets(line, sizeof line, f)) {
         char w[32], a[NAME], b[NAME], c2[NAME], e[NAME], g[NAME], h[NAME], file[NAME];
@@ -287,8 +300,22 @@ static void parse_draw(const char *path, Draw *d) {
         if (!strcmp(w, "size")) {
             CHECK(sscanf(rest, "%u %u", &d->w, &d->h) == 2);
         } else if (!strcmp(w, "bctarget")) {
-            CHECK(sscanf(rest, "%u %127s", &u[0], a) == 2 && u[0] < 20 && (!strcmp(a, "arena") || !strcmp(a, "placed")));
+            char fmt[NAME] = "rgba16ui";
+            CHECK(sscanf(rest, "%u %127s %127s", &u[0], a, fmt) >= 2 && u[0] < 20 && (!strcmp(a, "arena") || !strcmp(a, "placed")));
             d->bc_slice = (int)u[0], d->bc_arena = !strcmp(a, "arena");
+            if (!strcmp(fmt, "rgba16f")) d->bc_fmt = NVN_FORMAT_RGBA16F, d->bc_vk = VK_FORMAT_R16G16B16A16_SFLOAT;
+            else if (!strcmp(fmt, "rgba16")) d->bc_fmt = NVN_FORMAT_RGBA16, d->bc_vk = VK_FORMAT_R16G16B16A16_UNORM;
+            else if (!strcmp(fmt, "rgba8")) d->bc_fmt = NVN_FORMAT_RGBA8, d->bc_vk = VK_FORMAT_R8G8B8A8_UNORM;
+            else if (!strcmp(fmt, "bc4")) d->bc_fmt = NVN_FORMAT_RGTC1_UNORM;   // the compressed format itself: no pass can draw in it
+            else CHECK(!strcmp(fmt, "rgba16ui"));
+        } else if (!strcmp(w, "bcsecond")) {
+            char how[NAME] = "";
+            CHECK(sscanf(rest, "%u %127s", &u[0], how) >= 1 && u[0] < 20);
+            d->bc_second = (int)u[0], d->bc_store = !strcmp(how, "store");
+        } else if (!strcmp(w, "bcsample")) {
+            char how[NAME] = "";
+            CHECK(sscanf(rest, "%127s %127s", d->bc_sample, how) >= 1);
+            d->bc_same = !strcmp(how, "same");
         } else if (!strcmp(w, "clear")) {
             CHECK(sscanf(rest, "%f %f %f %f", &d->clear[0], &d->clear[1], &d->clear[2], &d->clear[3]) == 4);
         } else if (!strcmp(w, "viewport")) {
@@ -400,7 +427,8 @@ static void parse_draw(const char *path, Draw *d) {
         CHECK(d->first >= 0);
     } else {
         CHECK(d->nprog == 2 && d->prog[0].stage == ST_VS && d->prog[1].stage == ST_PS && d->nvbuf > 0);
-        CHECK(d->bc_slice < 0 || (d->ntargets == 1 && !d->depth && d->w == 8 && d->h == 8));   // the pass of a 32x32 level's blocks
+        CHECK(d->bc_slice < 0 || (d->ntargets == 1 && !d->depth && d->w == 8 && d->h == 8));
+        CHECK(d->bc_second < 0 || d->bc_slice >= 0);   // the pass of a 32x32 level's blocks
     }
     if (d->vp[2] < 0) d->vp[0] = d->vp[1] = 0, d->vp[2] = (int)d->w, d->vp[3] = (int)d->h;
     if (d->sc[2] < 0) d->sc[0] = d->sc[1] = 0, d->sc[2] = (int)d->w, d->sc[3] = (int)d->h;
@@ -595,7 +623,7 @@ static void init_texture(GTex *t) {
 
 // The BC4 volume of 32x32x20 texels (8x8x20 blocks of 8 bytes) a block compressor writes: in the pool of images, or, for an
 // arena image, in the CPU-visible pool, and the view the pass targets, RGBA16 UINT on one slice (a texel of it a block).
-static GTex plan_bc_volume(int arena, int slice) {
+static GTex plan_bc_volume(int arena, int slice, int view_format) {
     uint64_t keep = g_gpu_used;
     GTex t = plan_texture(NVN_TEXTURE_TARGET_3D, NVN_FORMAT_RGTC1_UNORM, 32, 32, 20);
     if (arena) {
@@ -606,7 +634,7 @@ static GTex plan_bc_volume(int arena, int slice) {
     }
     NVN(nvnTextureViewSetLevels, t.view, 0, 1);
     NVN(nvnTextureViewSetLayers, t.view, (uint64_t)slice, 1);
-    NVN(nvnTextureViewSetFormat, t.view, NVN_FORMAT_RGBA16UI);
+    NVN(nvnTextureViewSetFormat, t.view, (uint64_t)view_format);
     return t;
 }
 
@@ -703,50 +731,37 @@ static void print_stats(void) {
            (ull)m.skipped_draws, (ull)m.late_builds);
 }
 
-static void run_draw(const Opts *o) {
-    static Draw d;
-    parse_draw(o->draw, &d);
-    open_backend(o, o->pack);
-    start_runtime();
+// The recording and the submission of one draw, as a game makes them (the whole of it, programs and buffers included, each
+// time): a volume pass may be played again with another slice (slice >= 0), and a draw's texture of the file name @volume is
+// the volume the earlier pass wrote (`volume`, the texture with a view of the whole volume).
+typedef struct {
+    GTex rt, rt1, depth, tex[MAX_TEX];
+} Scene;
 
-    // the device, its modes, the queue and the pools
-    uint64_t db = galloc(0x40, 16);
-    g_dev = galloc(0x3000, 16);
-    NVN(nvnDeviceBuilderSetDefaults, db);
-    OK(NVN(nvnDeviceInitialize, g_dev, db));
-    NVN(nvnDeviceSetDepthMode, g_dev, (uint64_t)o->depth_mode);
-    NVN(nvnDeviceSetWindowOriginMode, g_dev, (uint64_t)o->origin);
-    make_queue();
-    g_cpu_pool = make_pool(CPU_POOL_BYTES, CPU_UNCACHED | GPU_CACHED | SHADER_CODE, &g_cpu_mem);
-    g_cpu_used = COMMAND_BYTES;
+static int is_volume(const Tex *t) { return !strcmp(t->file, "@volume"); }
 
-    // the images: the colour target, the depth target, the draw's textures, in one pool the CPU cannot see
-    static GTex rt, rt1, depth, tex[MAX_TEX];
-    if (d.bc_slice >= 0) rt = plan_bc_volume(d.bc_arena, d.bc_slice);
-    else rt = plan_texture(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA32F, d.w, d.h, 1);
-    if (d.ntargets > 1) rt1 = plan_texture(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA32F, d.w, d.h, 1);
-    if (d.depth) depth = plan_texture(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_DEPTH32F, d.w, d.h, 1);
-    for (int i = 0; i < d.ntex; i++) {
-        uint32_t layers = d.tex[i].target == NVN_TEXTURE_TARGET_CUBEMAP ? 6 : d.tex[i].d;
-        tex[i] = plan_texture(d.tex[i].target, NVN_FORMAT_RGBA32F, d.tex[i].w, d.tex[i].h, layers);
-    }
-    g_gpu_pool = make_pool(align_up(g_gpu_used ? g_gpu_used : 1, 0x10000), CPU_NO_ACCESS | GPU_CACHED, NULL);   // none: an arena target
-    init_texture(&rt);
-    if (d.ntargets > 1) init_texture(&rt1);
-    if (d.depth) init_texture(&depth);
-    for (int i = 0; i < d.ntex; i++) init_texture(&tex[i]);
+static uint64_t g_held[4];   // command buffers recorded and not yet submitted (hold): the next draw submits them with its own
+static int g_nheld;
 
+static void play_draw(const Opts *o, const Draw *dp, Scene *sc, const GTex *volume, int slice, int hold) {
+    GTex rt = sc->rt, rt1 = sc->rt1, depth = sc->depth, *tex = sc->tex;
     // the descriptor tables: one entry of each pool for each texture, the texture's own sampler beside it
-    uint64_t tp_off = cpu_take(POOL_IDS * 32, 256, 0), sp_off = cpu_take(POOL_IDS * 32, 256, 0);
-    uint64_t tp = galloc(0x40, 16), sp = galloc(0x40, 16);
-    OK(NVN(nvnTexturePoolInitialize, tp, g_cpu_pool, tp_off, POOL_IDS));
-    OK(NVN(nvnSamplerPoolInitialize, sp, g_cpu_pool, sp_off, POOL_IDS));
+    // (one texture pool a submission: the draw that submits a held one registers its textures in the held draw's)
+    static uint64_t g_tp, g_sp;
+    if (!g_nheld) {
+        uint64_t tp_off = cpu_take(POOL_IDS * 32, 256, 0), sp_off = cpu_take(POOL_IDS * 32, 256, 0);
+        g_tp = galloc(0x40, 16), g_sp = galloc(0x40, 16);
+        OK(NVN(nvnTexturePoolInitialize, g_tp, g_cpu_pool, tp_off, POOL_IDS));
+        OK(NVN(nvnSamplerPoolInitialize, g_sp, g_cpu_pool, sp_off, POOL_IDS));
+    }
+    const uint64_t tp = g_tp, sp = g_sp;
     uint64_t handle[MAX_TEX];
-    for (int i = 0; i < d.ntex; i++) {
-        const Tex *t = &d.tex[i];
+    for (int i = 0; i < dp->ntex; i++) {
+        const Tex *t = &dp->tex[i];
         CHECK(t->id > 0 && t->id < POOL_IDS);
-        write_texels(&tex[i], t->file);
-        NVN(nvnTexturePoolRegisterTexture, tp, t->id, tex[i].tex, tex[i].view);
+        const GTex *src = is_volume(t) ? volume : &tex[i];
+        if (!is_volume(t)) write_texels(&tex[i], t->file);
+        NVN(nvnTexturePoolRegisterTexture, tp, t->id, src->tex, src->view);
         uint64_t sb = galloc(0x60, 16), s = galloc(0x40, 16);
         NVN(nvnSamplerBuilderSetDevice, sb, g_dev);
         NVN(nvnSamplerBuilderSetDefaults, sb);
@@ -762,72 +777,72 @@ static void run_draw(const Opts *o) {
 
     // the programs, and their pipeline before the first submission (the pair's attachment formats are the targets')
     const nvn_stage *ids[NVN_STAGE_KINDS] = {0};
-    uint64_t prog = make_program(&d, ids);
-    VkpFormats formats = {(uint32_t)d.ntargets,
-                          {d.bc_slice >= 0 ? VK_FORMAT_R16G16B16A16_UINT : VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT},
-                          d.depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
+    uint64_t prog = make_program(dp, ids);
+    VkpFormats formats = {(uint32_t)dp->ntargets,
+                          {dp->bc_slice >= 0 ? dp->bc_vk : VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT},
+                          dp->depth ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
     VkpStage vs = {.key = ids[ST_VS] ? ids[ST_VS]->key : NULL, .shape = ids[ST_VS]};
     VkpStage task = {.key = ids[ST_TS] ? ids[ST_TS]->key : NULL, .shape = ids[ST_TS]};
     VkpStage mesh = {.key = ids[ST_MS] ? ids[ST_MS]->key : NULL, .shape = ids[ST_MS]};
     VkpStage ps = {.key = ids[ST_PS]->key, .shape = ids[ST_PS]};
-    if (!o->cold) CHECK(vkp_graphics(d.mesh ? &mesh : &vs, d.mesh ? &task : NULL, &ps, &formats) != VK_NULL_HANDLE);
-    else CHECK(vkp_find_graphics(d.mesh ? &mesh : &vs, d.mesh ? &task : NULL, &ps, &formats) == VK_NULL_HANDLE);
+    if (!o->cold) CHECK(vkp_graphics(dp->mesh ? &mesh : &vs, dp->mesh ? &task : NULL, &ps, &formats) != VK_NULL_HANDLE);
+    else CHECK(vkp_find_graphics(dp->mesh ? &mesh : &vs, dp->mesh ? &task : NULL, &ps, &formats) == VK_NULL_HANDLE);
 
     // the buffers
     Buf vbuf[4], ibuf = {0}, ubo[MAX_UBO], sbo[MAX_SBO];
-    for (int i = 0; i < d.nvbuf; i++) {
+    for (int i = 0; i < dp->nvbuf; i++) {
         size_t n;
-        void *data = read_file(d.vbuf[i].file, &n);
+        void *data = read_file(dp->vbuf[i].file, &n);
         vbuf[i] = make_buffer(data, n, 256, 0);
         free(data);
     }
     Buf indirect = {0};
-    if (d.indexed) {
+    if (dp->indexed) {
         size_t n;
-        void *data = read_file(d.ibuf, &n);
+        void *data = read_file(dp->ibuf, &n);
         ibuf = make_buffer(data, n, 256, 0);
         free(data);
     }
-    if (d.mesh_indirect) {
-        const uint32_t record[2] = {(uint32_t)d.count, (uint32_t)d.first};
+    if (dp->mesh_indirect) {
+        const uint32_t record[2] = {(uint32_t)dp->count, (uint32_t)dp->first};
         indirect = make_buffer(record, sizeof record, 256, 0);
-    } else if (d.indirect) {
-        const uint32_t record[5] = {(uint32_t)d.count, 1, 0, 0, (uint32_t)d.base_instance};
+    } else if (dp->indirect) {
+        const uint32_t record[5] = {(uint32_t)dp->count, 1, 0, 0, (uint32_t)dp->base_instance};
         indirect = make_buffer(record, sizeof record, 256, 0);
     }
-    for (int i = 0; i < d.nubo; i++) {
+    for (int i = 0; i < dp->nubo; i++) {
         size_t n;
-        void *data = read_file(d.ubo[i].file, &n);
+        void *data = read_file(dp->ubo[i].file, &n);
         ubo[i] = make_buffer(data, n, 256, 0);
         free(data);
     }
-    for (int i = 0; i < d.nsbo; i++) {
+    for (int i = 0; i < dp->nsbo; i++) {
         size_t n;
-        void *data = read_file(d.sbo[i].file, &n);
-        sbo[i] = make_buffer(data, n, 256, d.sbo[i].low);
+        void *data = read_file(dp->sbo[i].file, &n);
+        sbo[i] = make_buffer(data, n, 256, dp->sbo[i].low);
         free(data);
     }
     NVN(nvnMemoryPoolFlushMappedRange, g_cpu_pool, 0, g_cpu_used);
 
     // vertex state: an attribute at each location (the state is indexed by location) and the streams
     int nloc = 0;
-    for (int i = 0; i < d.nattr; i++)
-        if ((int)d.attr[i].loc + 1 > nloc) nloc = (int)d.attr[i].loc + 1;
-    uint64_t attrs = galloc(4 * (uint64_t)(nloc ? nloc : 1), 16), streams = galloc(8 * (uint64_t)(d.nstream ? d.nstream : 1), 16);
+    for (int i = 0; i < dp->nattr; i++)
+        if ((int)dp->attr[i].loc + 1 > nloc) nloc = (int)dp->attr[i].loc + 1;
+    uint64_t attrs = galloc(4 * (uint64_t)(nloc ? nloc : 1), 16), streams = galloc(8 * (uint64_t)(dp->nstream ? dp->nstream : 1), 16);
     for (int i = 0; i < nloc; i++) NVN(nvnVertexAttribStateSetDefaults, attrs + 4ull * (uint64_t)i);
-    for (int i = 0; i < d.nattr; i++) {
-        uint64_t s = attrs + 4ull * d.attr[i].loc;
-        NVN(nvnVertexAttribStateSetFormat, s, (uint64_t)d.attr[i].format, d.attr[i].offset);
-        NVN(nvnVertexAttribStateSetStreamIndex, s, d.attr[i].stream);
+    for (int i = 0; i < dp->nattr; i++) {
+        uint64_t s = attrs + 4ull * dp->attr[i].loc;
+        NVN(nvnVertexAttribStateSetFormat, s, (uint64_t)dp->attr[i].format, dp->attr[i].offset);
+        NVN(nvnVertexAttribStateSetStreamIndex, s, dp->attr[i].stream);
     }
-    for (int i = 0; i < d.nstream; i++) {
+    for (int i = 0; i < dp->nstream; i++) {
         uint64_t s = streams + 8ull * (uint64_t)i;
         NVN(nvnVertexStreamStateSetDefaults, s);
-        NVN(nvnVertexStreamStateSetStride, s, d.stream[i].stride);
-        NVN(nvnVertexStreamStateSetDivisor, s, d.stream[i].divisor);
+        NVN(nvnVertexStreamStateSetStride, s, dp->stream[i].stride);
+        NVN(nvnVertexStreamStateSetDivisor, s, dp->stream[i].divisor);
     }
     uint64_t ds_state = galloc(0x10, 16);
-    if (d.depth) {
+    if (dp->depth) {
         NVN(nvnDepthStencilStateSetDefaults, ds_state);
         NVN(nvnDepthStencilStateSetDepthTestEnable, ds_state, 1);
         NVN(nvnDepthStencilStateSetDepthWriteEnable, ds_state, 1);
@@ -835,73 +850,77 @@ static void run_draw(const Opts *o) {
     }
 
     // the recording: what a game records for one draw, in the order it would
+    if (slice >= 0) NVN(nvnTextureViewSetLayers, rt.view, (uint64_t)slice, 1);   // the next pass of a volume: another slice
     uint64_t cb = galloc(0xC0, 16);
     OK(NVN(nvnCommandBufferInitialize, cb, g_dev));
-    NVN(nvnCommandBufferAddCommandMemory, cb, g_cpu_pool, 0, COMMAND_BYTES);
+    // one command memory, or a half each for the draws of one submission (a held one takes the first half, the draw that
+    // submits it the second)
+    NVN(nvnCommandBufferAddCommandMemory, cb, g_cpu_pool, hold || g_nheld ? (uint64_t)g_nheld * COMMAND_BYTES / 2 : 0,
+        hold || g_nheld ? COMMAND_BYTES / 2 : COMMAND_BYTES);
     NVN(nvnCommandBufferAddControlMemory, cb, galloc(CONTROL_BYTES, 16), CONTROL_BYTES);
     NVN(nvnCommandBufferBeginRecording, cb);
     uint64_t rts = galloc(16, 8), rgba = galloc(16, 16);
     wr64(rts, rt.tex);
-    if (d.ntargets > 1) wr64(rts + 8, rt1.tex);
-    memcpy((void *)(uintptr_t)rgba, d.clear, sizeof d.clear);
+    if (dp->ntargets > 1) wr64(rts + 8, rt1.tex);
+    memcpy((void *)(uintptr_t)rgba, dp->clear, sizeof dp->clear);
     uint64_t rt_views = 0;
-    if (d.bc_slice >= 0) wr64(rt_views = galloc(8, 8), rt.view);
-    NVN(nvnCommandBufferSetRenderTargets, cb, (uint64_t)d.ntargets, rts, rt_views, d.depth ? depth.tex : 0, 0);
-    NVN(nvnCommandBufferSetViewport, cb, (uint64_t)(int64_t)d.vp[0], (uint64_t)(int64_t)d.vp[1], (uint64_t)(int64_t)d.vp[2],
-        (uint64_t)(int64_t)d.vp[3]);
-    NVN(nvnCommandBufferSetScissor, cb, (uint64_t)(int64_t)d.sc[0], (uint64_t)(int64_t)d.sc[1], (uint64_t)(int64_t)d.sc[2],
-        (uint64_t)(int64_t)d.sc[3]);
-    if (d.nvp > 1) {   // the draw's viewport and scissor first, then quarters of the target, each in its own corner
-        uint64_t vps = galloc(16ull * (uint64_t)d.nvp, 16), scs = galloc(16ull * (uint64_t)d.nvp, 16);
-        for (int i = 0; i < d.nvp; i++) {
+    if (dp->bc_slice >= 0) wr64(rt_views = galloc(8, 8), rt.view);
+    NVN(nvnCommandBufferSetRenderTargets, cb, (uint64_t)dp->ntargets, rts, rt_views, dp->depth ? depth.tex : 0, 0);
+    NVN(nvnCommandBufferSetViewport, cb, (uint64_t)(int64_t)dp->vp[0], (uint64_t)(int64_t)dp->vp[1], (uint64_t)(int64_t)dp->vp[2],
+        (uint64_t)(int64_t)dp->vp[3]);
+    NVN(nvnCommandBufferSetScissor, cb, (uint64_t)(int64_t)dp->sc[0], (uint64_t)(int64_t)dp->sc[1], (uint64_t)(int64_t)dp->sc[2],
+        (uint64_t)(int64_t)dp->sc[3]);
+    if (dp->nvp > 1) {   // the draw's viewport and scissor first, then quarters of the target, each in its own corner
+        uint64_t vps = galloc(16ull * (uint64_t)dp->nvp, 16), scs = galloc(16ull * (uint64_t)dp->nvp, 16);
+        for (int i = 0; i < dp->nvp; i++) {
             float *v = (float *)(uintptr_t)(vps + 16ull * (uint64_t)i);
             int32_t *k = (int32_t *)(uintptr_t)(scs + 16ull * (uint64_t)i);
             if (i == 0) {
-                v[0] = (float)d.vp[0], v[1] = (float)d.vp[1], v[2] = (float)d.vp[2], v[3] = (float)d.vp[3];
-                k[0] = d.sc[0], k[1] = d.sc[1], k[2] = d.sc[2], k[3] = d.sc[3];
+                v[0] = (float)dp->vp[0], v[1] = (float)dp->vp[1], v[2] = (float)dp->vp[2], v[3] = (float)dp->vp[3];
+                k[0] = dp->sc[0], k[1] = dp->sc[1], k[2] = dp->sc[2], k[3] = dp->sc[3];
             } else {
-                v[0] = (float)((i & 1) * (int)d.w / 2), v[1] = (float)((i & 2) * (int)d.h / 4);
-                v[2] = (float)d.w / 2, v[3] = (float)d.h / 2;
-                k[0] = (int32_t)v[0], k[1] = (int32_t)v[1], k[2] = (int32_t)d.w / 2, k[3] = (int32_t)d.h / 2;
+                v[0] = (float)((i & 1) * (int)dp->w / 2), v[1] = (float)((i & 2) * (int)dp->h / 4);
+                v[2] = (float)dp->w / 2, v[3] = (float)dp->h / 2;
+                k[0] = (int32_t)v[0], k[1] = (int32_t)v[1], k[2] = (int32_t)dp->w / 2, k[3] = (int32_t)dp->h / 2;
             }
         }
-        NVN(nvnCommandBufferSetViewports, cb, 0, (uint64_t)d.nvp, vps);
-        NVN(nvnCommandBufferSetScissors, cb, 0, (uint64_t)d.nvp, scs);
+        NVN(nvnCommandBufferSetViewports, cb, 0, (uint64_t)dp->nvp, vps);
+        NVN(nvnCommandBufferSetScissors, cb, 0, (uint64_t)dp->nvp, scs);
     }
-    if (d.depth) {
-        fv(0, d.dnear), fv(1, d.dfar);
+    if (dp->depth) {
+        fv(0, dp->dnear), fv(1, dp->dfar);
         NVN(nvnCommandBufferSetDepthRange, cb);
         NVN(nvnCommandBufferBindDepthStencilState, cb, ds_state);
     }
-    if (d.polygon >= 0) {
+    if (dp->polygon >= 0) {
         uint64_t ps = galloc(0x10, 16);
         NVN(nvnPolygonStateSetDefaults, ps);
-        NVN(nvnPolygonStateSetPolygonMode, ps, (uint64_t)d.polygon);
-        NVN(nvnPolygonStateSetPolygonOffsetEnables, ps, (uint64_t)d.offsets);
+        NVN(nvnPolygonStateSetPolygonMode, ps, (uint64_t)dp->polygon);
+        NVN(nvnPolygonStateSetPolygonOffsetEnables, ps, (uint64_t)dp->offsets);
         NVN(nvnCommandBufferBindPolygonState, cb, ps);
     }
-    if (d.has_offset) {
-        fv(0, d.offset[0]), fv(1, d.offset[1]), fv(2, d.offset[2]);
+    if (dp->has_offset) {
+        fv(0, dp->offset[0]), fv(1, dp->offset[1]), fv(2, dp->offset[2]);
         NVN(nvnCommandBufferSetPolygonOffsetClamp, cb);
     }
-    if (d.clamp) NVN(nvnCommandBufferSetDepthClamp, cb, 1);
-    if (d.bounds) {
-        fv(0, d.bmin), fv(1, d.bmax);
+    if (dp->clamp) NVN(nvnCommandBufferSetDepthClamp, cb, 1);
+    if (dp->bounds) {
+        fv(0, dp->bmin), fv(1, dp->bmax);
         NVN(nvnCommandBufferSetDepthBounds, cb, 1);
     }
-    if (d.line_width > 0.0f) {
-        fv(0, d.line_width);
+    if (dp->line_width > 0.0f) {
+        fv(0, dp->line_width);
         NVN(nvnCommandBufferSetLineWidth, cb);
     }
-    if (d.has_chmask) {
+    if (dp->has_chmask) {
         uint64_t ms = galloc(0x10, 16);
         NVN(nvnChannelMaskStateSetDefaults, ms);
-        for (int i = 0; i < d.ntargets; i++)
-            NVN(nvnChannelMaskStateSetChannelMask, ms, (uint64_t)i, d.chmask[i] & 1, (d.chmask[i] >> 1) & 1,
-                (d.chmask[i] >> 2) & 1, (d.chmask[i] >> 3) & 1);
+        for (int i = 0; i < dp->ntargets; i++)
+            NVN(nvnChannelMaskStateSetChannelMask, ms, (uint64_t)i, dp->chmask[i] & 1, (dp->chmask[i] >> 1) & 1,
+                (dp->chmask[i] >> 2) & 1, (dp->chmask[i] >> 3) & 1);
         NVN(nvnCommandBufferBindChannelMaskState, cb, ms);
     }
-    if (d.dual) {
+    if (dp->dual) {
         uint64_t bs = galloc(0x20, 16), cs = galloc(0x10, 16);
         NVN(nvnBlendStateSetDefaults, bs);
         NVN(nvnBlendStateSetBlendTarget, bs, 0);
@@ -915,55 +934,125 @@ static void run_draw(const Opts *o) {
     }
     NVN(nvnCommandBufferSetTexturePool, cb, tp);
     NVN(nvnCommandBufferSetSamplerPool, cb, sp);
-    if (d.bc_slice < 0) NVN(nvnCommandBufferClearColor, cb, 0, rgba, 0xF);   // a float clear of a UINT target means nothing
-    if (d.ntargets > 1) NVN(nvnCommandBufferClearColor, cb, 1, rgba, 0xF);
-    if (d.depth) {
-        fv(0, d.dclear);
+    if (dp->bc_slice < 0) NVN(nvnCommandBufferClearColor, cb, 0, rgba, 0xF);   // a float clear of a UINT target means nothing
+    if (dp->ntargets > 1) NVN(nvnCommandBufferClearColor, cb, 1, rgba, 0xF);
+    if (dp->depth) {
+        fv(0, dp->dclear);
         NVN(nvnCommandBufferClearDepthStencil, cb, 1, 0, 0);
     }
-    uint64_t stage_mask = d.mesh ? (NVN_SHADER_STAGE_FRAGMENT_BIT | (1u << NVN_STAGE_TASK) | (1u << NVN_STAGE_MESH))
+    uint64_t stage_mask = dp->mesh ? (NVN_SHADER_STAGE_FRAGMENT_BIT | (1u << NVN_STAGE_TASK) | (1u << NVN_STAGE_MESH))
                                  : (NVN_SHADER_STAGE_VERTEX_BIT | NVN_SHADER_STAGE_FRAGMENT_BIT);
     NVN(nvnCommandBufferBindProgram, cb, prog, stage_mask);
-    if (!d.mesh) {
+    if (!dp->mesh) {
         NVN(nvnCommandBufferBindVertexAttribState, cb, (uint64_t)nloc, attrs);
-        NVN(nvnCommandBufferBindVertexStreamState, cb, (uint64_t)d.nstream, streams);
-        for (int i = 0; i < d.nvbuf; i++)
-            NVN(nvnCommandBufferBindVertexBuffer, cb, d.vbuf[i].index, vbuf[i].addr, vbuf[i].size);
+        NVN(nvnCommandBufferBindVertexStreamState, cb, (uint64_t)dp->nstream, streams);
+        for (int i = 0; i < dp->nvbuf; i++)
+            NVN(nvnCommandBufferBindVertexBuffer, cb, dp->vbuf[i].index, vbuf[i].addr, vbuf[i].size);
     }
-    for (int i = 0; i < d.nubo; i++)
-        NVN(nvnCommandBufferBindUniformBuffer, cb, (uint64_t)d.ubo[i].stage, d.ubo[i].r, ubo[i].addr, ubo[i].size);
-    for (int i = 0; i < d.nsbo; i++)
-        NVN(nvnCommandBufferBindStorageBuffer, cb, (uint64_t)d.sbo[i].stage, d.sbo[i].r, sbo[i].addr, sbo[i].size);
-    for (int i = 0; i < d.ntex; i++)
-        NVN(nvnCommandBufferBindTexture, cb, (uint64_t)d.tex[i].stage, d.tex[i].slot, handle[i]);
-    if (d.mesh_indirect) NVN(nvnCommandBufferDrawMeshTasksIndirect, cb, indirect.addr);
-    else if (d.mesh) NVN(nvnCommandBufferDrawMeshTasks, cb, (uint64_t)d.first, (uint64_t)d.count);
-    else if (d.indirect) NVN(nvnCommandBufferDrawElementsIndirect, cb, (uint64_t)d.prim, (uint64_t)d.itype, ibuf.addr, indirect.addr);
-    else if (d.indexed) NVN(nvnCommandBufferDrawElements, cb, (uint64_t)d.prim, (uint64_t)d.itype, (uint64_t)d.count, ibuf.addr);
-    else NVN(nvnCommandBufferDrawArrays, cb, (uint64_t)d.prim, (uint64_t)d.first, (uint64_t)d.count);
-    uint64_t handles = galloc(8, 8);
-    wr64(handles, NVN(nvnCommandBufferEndRecording, cb));
-    CHECK(((const uint64_t *)(uintptr_t)handles)[0] != 0);
+    for (int i = 0; i < dp->nubo; i++)
+        NVN(nvnCommandBufferBindUniformBuffer, cb, (uint64_t)dp->ubo[i].stage, dp->ubo[i].r, ubo[i].addr, ubo[i].size);
+    for (int i = 0; i < dp->nsbo; i++)
+        NVN(nvnCommandBufferBindStorageBuffer, cb, (uint64_t)dp->sbo[i].stage, dp->sbo[i].r, sbo[i].addr, sbo[i].size);
+    for (int i = 0; i < dp->ntex; i++)
+        NVN(nvnCommandBufferBindTexture, cb, (uint64_t)dp->tex[i].stage, dp->tex[i].slot, handle[i]);
+    if (dp->mesh_indirect) NVN(nvnCommandBufferDrawMeshTasksIndirect, cb, indirect.addr);
+    else if (dp->mesh) NVN(nvnCommandBufferDrawMeshTasks, cb, (uint64_t)dp->first, (uint64_t)dp->count);
+    else if (dp->indirect) NVN(nvnCommandBufferDrawElementsIndirect, cb, (uint64_t)dp->prim, (uint64_t)dp->itype, ibuf.addr, indirect.addr);
+    else if (dp->indexed) NVN(nvnCommandBufferDrawElements, cb, (uint64_t)dp->prim, (uint64_t)dp->itype, (uint64_t)dp->count, ibuf.addr);
+    else NVN(nvnCommandBufferDrawArrays, cb, (uint64_t)dp->prim, (uint64_t)dp->first, (uint64_t)dp->count);
+    uint64_t recorded = NVN(nvnCommandBufferEndRecording, cb);
+    CHECK(recorded != 0);
+    if (hold) {
+        CHECK(g_nheld == 0);
+        g_held[g_nheld++] = recorded;
+        return;
+    }
+    uint64_t handles = galloc(8 * (uint64_t)(g_nheld + 1), 8);
+    for (int i = 0; i < g_nheld; i++) wr64(handles + 8ull * (uint64_t)i, g_held[i]);
+    wr64(handles + 8ull * (uint64_t)g_nheld, recorded);
 
     // submit; a game may write to its memory the moment QueueSubmitCommands returns, which is what --rewrite-uniform does
     uint64_t fence = galloc(0x40, 16);
     OK(NVN(nvnSyncInitialize, fence, g_dev));
-    NVN(nvnQueueSubmitCommands, g_queue, 1, handles);
+    NVN(nvnQueueSubmitCommands, g_queue, (uint64_t)g_nheld + 1, handles);
+    g_nheld = 0;
     NVN(nvnQueueFenceSync, g_queue, fence, 0, 0);
     if (o->rewrite) {
-        for (int i = 0; i < d.nubo; i++) {
+        for (int i = 0; i < dp->nubo; i++) {
             memset((void *)(uintptr_t)ubo[i].addr, 0, (size_t)ubo[i].size);
             NVN(nvnBufferFlushMappedRange, ubo[i].obj, 0, ubo[i].size);
         }
-        printf("rewrote %d uniform buffers after the submission\n", d.nubo);
+        printf("rewrote %d uniform buffers after the submission\n", dp->nubo);
     }
     uint32_t waited = (uint32_t)LOW32(NVN(nvnSyncWait, fence, SYNC_TIMEOUT_NS));
     CHECK(waited == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED || waited == NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED);
 
+}
+
+static void run_draw(const Opts *o) {
+    static Draw d, d2;
+    parse_draw(o->draw, &d);
+    open_backend(o, o->pack);
+    start_runtime();
+
+    // the device, its modes, the queue and the pools
+    uint64_t db = galloc(0x40, 16);
+    g_dev = galloc(0x3000, 16);
+    NVN(nvnDeviceBuilderSetDefaults, db);
+    OK(NVN(nvnDeviceInitialize, g_dev, db));
+    NVN(nvnDeviceSetDepthMode, g_dev, (uint64_t)o->depth_mode);
+    NVN(nvnDeviceSetWindowOriginMode, g_dev, (uint64_t)o->origin);
+    make_queue();
+    g_cpu_pool = make_pool(CPU_POOL_BYTES, CPU_UNCACHED | GPU_CACHED | SHADER_CODE, &g_cpu_mem);
+    g_cpu_used = COMMAND_BYTES;
+
+    // the images: the colour target, the depth target, the draw's textures, in one pool the CPU cannot see; a volume case has
+    // a second draw (bcsample) that reads the volume, with a target and textures of its own
+    static Scene sc, sc2;
+    if (d.bc_slice >= 0) sc.rt = plan_bc_volume(d.bc_arena, d.bc_slice, d.bc_fmt);
+    else sc.rt = plan_texture(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA32F, d.w, d.h, 1);
+    if (d.ntargets > 1) sc.rt1 = plan_texture(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA32F, d.w, d.h, 1);
+    if (d.depth) sc.depth = plan_texture(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_DEPTH32F, d.w, d.h, 1);
+    for (int i = 0; i < d.ntex; i++) {
+        uint32_t layers = d.tex[i].target == NVN_TEXTURE_TARGET_CUBEMAP ? 6 : d.tex[i].d;
+        sc.tex[i] = plan_texture(d.tex[i].target, NVN_FORMAT_RGBA32F, d.tex[i].w, d.tex[i].h, layers);
+    }
+    if (d.bc_sample[0]) {
+        char path[1024];
+        CHECK(d.bc_slice >= 0 && snprintf(path, sizeof path, "%s%s", g_dir, d.bc_sample) < (int)sizeof path);
+        parse_draw(path, &d2);
+        CHECK(d2.bc_slice < 0 && d2.ntargets == 1 && !d2.depth && d2.ntex == 1 && is_volume(&d2.tex[0]));
+        sc2.rt = plan_texture(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA32F, d2.w, d2.h, 1);
+    }
+    g_gpu_pool = make_pool(align_up(g_gpu_used ? g_gpu_used : 1, 0x10000), CPU_NO_ACCESS | GPU_CACHED, NULL);   // none: an arena target
+    init_texture(&sc.rt);
+    if (d.ntargets > 1) init_texture(&sc.rt1);
+    if (d.depth) init_texture(&sc.depth);
+    for (int i = 0; i < d.ntex; i++) init_texture(&sc.tex[i]);
+    if (d.bc_sample[0]) init_texture(&sc2.rt);
+
+    play_draw(o, &d, &sc, NULL, -1, d.bc_second < 0 && d.bc_same);
+    if (d.bc_second >= 0) {   // the next pass of the volume, with the CPU's store to its pages between the two if the case says
+        if (d.bc_store) {
+            volatile uint8_t *at = (volatile uint8_t *)(uintptr_t)(g_cpu_mem + sc.rt.off + sc.rt.size - 0x800);
+            *at = 0x5A;
+            NVN(nvnMemoryPoolFlushMappedRange, g_cpu_pool, sc.rt.off + sc.rt.size - 0x1000, 0x1000);
+            printf("cpu store into the volume's last page\n");
+        }
+        play_draw(o, &d, &sc, NULL, d.bc_second, d.bc_same);
+    }
+    if (d.bc_sample[0]) {   // a draw that samples the volume through its own format, into a float target
+        GTex vol = sc.rt;
+        vol.view = galloc(16, 16);
+        NVN(nvnTextureViewSetDefaults, vol.view);
+        play_draw(o, &d2, &sc2, &vol, -1, 0);
+        read_target(&sc2.rt, 16, o->out);
+    }
+    GTex rt = sc.rt, rt1 = sc.rt1, depth = sc.depth;
     if (d.bc_slice >= 0) {
         CHECK(o->bc_out);
         read_bc_volume(&rt, o->bc_out);
-    } else read_target(&rt, 16, o->out);
+    } else if (!d.bc_sample[0]) read_target(&rt, 16, o->out);
     if (d.ntargets > 1) {
         CHECK(o->out1);
         read_target(&rt1, 16, o->out1);

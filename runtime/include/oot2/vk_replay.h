@@ -108,6 +108,10 @@ typedef struct VkrImage {
     uint32_t width, height, depth, layers, levels, samples;   // level 0; layers: a cube's six faces and an array's layers
 } VkrImage;
 
+// A target op that answers 0 says why first (a static string): the stop the replay makes of the refusal names it. An op
+// that says nothing leaves the stop with its generic text.
+void vkr_target_refused(const char *why);
+
 typedef struct VkReplayOps {
     // The pipeline of a graphics draw and of a dispatch (the device's: the miss path, oot2/vk_miss.h) and the layouts
     // the replay binds against. graphics answers NULL for a draw to skip, which it does only when may_skip is set (every

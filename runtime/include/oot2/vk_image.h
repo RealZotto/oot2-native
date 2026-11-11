@@ -79,6 +79,12 @@ void vkb_view_use(void *view, uint64_t value);
 // uploads what the CPU wrote, so the copy lands on the storage's content). NULL when the format has no image. A copy
 // into an arena image is newer than the guest storage, which keeps the CPU's bytes: the CPU does not see it.
 VkbImage *vkb_image_demand_current(const tex_t *t, uint64_t value);
+// A pass writes the blocks of this image through a view in the format of the block's size (its texels are blocks): from
+// now on the image keeps what the GPU wrote. The CPU's bytes of an arena image upload again when the CPU writes their
+// pages (make_current), which would put the guest's older blocks over the pass's; an image so marked takes no more
+// uploads. The image as a whole: a CPU write to another level or layer of it is not uploaded either. No effect on a
+// placed image (it shares the game's storage, which the pass's write reaches by the backing map).
+void vkb_image_gpu_wrote(VkbImage *img);
 void vkb_view_free(void *view);
 VkImageView vkb_view_handle(const void *view);
 void vkb_image_release(const tex_t *t);       // BindlessOps.texture_release: the serial's image may go when nothing holds it

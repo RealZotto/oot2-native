@@ -46,6 +46,7 @@ struct VkbImage {
     int placed, doomed, refs, pending;
     int arena;                    // its memory is an extent of the texture arena: the CPU writes its texels (vk_texture.c)
     int decoded;                  // an ASTC texture the device does not sample: this image holds its decoded RGBA8 texels
+    int gpu_owned;                // a pass wrote the blocks of this arena image (vkb_image_gpu_wrote): the CPU's bytes upload no more (atomic)
     int counted, cls;             // in the table of classes (vkf_img_table_add): its arena or own memory; the class
     uint64_t cmem, cbc;           // what it was added with: the driver's size of its memory and its BC bytes
     TexExtent ext;
@@ -744,10 +745,17 @@ static void make_current(VkbImage *img, uint64_t value) {
     uint64_t seen = __atomic_load_n(&img->up.current_for, __ATOMIC_ACQUIRE);
     if (seen == value) return;
     __atomic_store_n(&img->up.current_for, value, __ATOMIC_RELEASE);
+    // The blocks a pass wrote exist in the image only (the guest's bytes still hold what the CPU put there): an upload for
+    // the pages the CPU wrote since would put them over the pass's blocks.
+    if (__atomic_load_n(&img->gpu_owned, __ATOMIC_ACQUIRE)) return;
     vkt_upload(&img->desc, img->key.storage, img->image, img->aspect, &img->up, value, img->decoded);
 }
 
 void vkb_view_use(void *view, uint64_t value) { make_current(((Vw *)view)->img, value); }
+
+void vkb_image_gpu_wrote(VkbImage *img) {
+    if (img->arena) __atomic_store_n(&img->gpu_owned, 1, __ATOMIC_RELEASE);
+}
 
 VkbImage *vkb_image_demand_current(const tex_t *t, uint64_t value) {
     VkbImage *img = vkb_image_demand(t);
