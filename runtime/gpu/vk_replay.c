@@ -101,6 +101,8 @@ static struct {
     poly_st poly;
     ds_st ds;
     int has_poly, has_ds, has_blend[8];
+    float point_size;                         // the game's last point size (the trace's column only: the programs write the size drawn)
+    int has_point_size;
     float line_width;
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     float bias[3];                            // factor, units, clamp
@@ -356,6 +358,11 @@ static Bound zero_block(void) {
 
 // The counters of a driver bank call (oot2/replay_count.h): which use it is (c[0], c[2] or the roots) by where its cache
 // lies, and whether its bytes were the cache's.
+// A backing resolve through the ops, timed by the stage timer (sampled) when the counters are on.
+static void resolve_t(uint64_t addr, uint64_t size, uint64_t value, BackingRef *out) {
+    ST_TIME(VKST_RESOLVE, F.ops->resolve(addr, size, value, out));
+}
+
 static void bank_count(const BankCache *c, int equal, uint32_t size) {
     int k = (c >= F.c0 && c < F.c0 + ST_N) ? 0 : (c >= F.c2 && c < F.c2 + ST_N) ? 1 : 2;
     rc_add_(RC_BANK_CALLS_C0 + k, 1);
@@ -458,7 +465,13 @@ static void snap_count(uint32_t steps, int hit) {
     if (hit) rc_add_(RC_SNAP_HIT, 1);
 }
 
+static Bound snapshot_body(uint64_t addr, uint64_t size);
 static Bound snapshot(uint64_t addr, uint64_t size) {
+    Bound b;
+    ST_TIME(VKST_SNAPSHOT, b = snapshot_body(addr, size));
+    return b;
+}
+static Bound snapshot_body(uint64_t addr, uint64_t size) {
     Rng r = {addr, addr + size};
 #ifdef OOT2_BENCH_TIMERS
     {
@@ -488,7 +501,13 @@ static Bound snapshot(uint64_t addr, uint64_t size) {
 
 // A uniform range: VRAM and mirrors bind as they are (a mirror is a copy taken at submit); host memory the GPU reads
 // live is copied, unless the frame wrote it already (the drop rule: the live memory holds the GPU's write, in order).
+static Bound uniform_body(VknBuf b);
 static Bound uniform(VknBuf b) {
+    Bound r;
+    ST_TIME(VKST_UNIFORM, r = uniform_body(b));
+    return r;
+}
+static Bound uniform_body(VknBuf b) {
     RC_ADD(RC_UNI_CALLS, 1);
     if (!b.addr || !b.size) {
         RC_ADD(RC_UNI_ZERO, 1);
@@ -497,7 +516,7 @@ static Bound uniform(VknBuf b) {
     }
     uint64_t size = b.size < UNIFORM_MAX ? b.size : UNIFORM_MAX;
     BackingRef ref;
-    BT_TIME(BT_S5_RESOLVE, F.ops->resolve(b.addr, size, F.value, &ref));
+    BT_TIME(BT_S5_RESOLVE, resolve_t(b.addr, size, F.value, &ref));
     RC_ADD(RC_RES_UNI, 1);
 #ifdef OOT2_BENCH_TIMERS
     int written = 0;
@@ -524,6 +543,7 @@ static Bound uniform(VknBuf b) {
 }
 
 // ---------- passes (D18)
+static void trace_readback(void);   // below, with the trace's other views of a pass
 static void full_barrier(void) {
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -552,12 +572,17 @@ static void raw_diag_flush(int kind, const char *const *keys, int nkeys, uint32_
     full_barrier();
 }
 
+static void pass_end_body(void);
 static void pass_end(void) {
     if (!F.in_pass) return;
+    ST_TIME(VKST_PASS_END, pass_end_body());
+}
+static void pass_end_body(void) {
     if (vkrt_on) vkrt_pass_end(F.pass_draws);
     vkr_report_pass_end();   // a samples-passed query begun in the pass ends in it
     vkrec_EndRendering();
     F.in_pass = 0;
+    if (vkrt_on && vkrt_rb_on) trace_readback();
     if (vkgt_enabled) {
         char label[56];
         snprintf(label, sizeof label, "%s+%s", F.pass_vs ? F.pass_vs : "none", F.pass_fs ? F.pass_fs : "none");
@@ -606,8 +631,109 @@ static void area_without_targets(uint32_t *w, uint32_t *h) {
     *h = y1 < 1 ? 1 : y1 > 16384 ? 16384 : (uint32_t)y1;
 }
 
+// ---------- the trace's views of a pass (vk_replay_trace.c): the targets it binds, and the readback of a colour target
+static void trace_target(int slot, const nvn_tex_rec *t, const VkrTarget *tg) {
+    uint32_t level = t->has_view && t->view.set_levels ? t->view.base_level : 0;
+    uint32_t layer = t->has_view && t->view.set_layers ? t->view.min_layer : 0;
+    vkrt_pass_target(slot, (uint64_t)(uintptr_t)t->tex.mem, level, layer, tg->layers, tg->width, tg->height, tg->format);
+}
+
+// A full memory barrier of the readback's own: the replay's statistics and its after-transfer rule are left as they were.
+static void trace_barrier(void) {
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkrec_PipelineBarrier2(&di);
+}
+
+// The state a draw is about to draw with, for the trace's columns (blend and colour mask, depth, point size, line width).
+static void trace_state(void) {
+    VkrtState st = {.ncolor = F.ncolor, .blend_en = S.color.blend_en, .chmask = S.chmask.mask, .has_ds = S.has_ds,
+                    .dt = (int)S.ds.dt, .dw = (int)S.ds.dw, .df = (int)S.ds.df, .st = (int)S.ds.st,
+                    .point_size = S.has_point_size ? S.point_size : -1.0f, .line_width = S.line_width};
+    for (int i = 0; i < 8; i++)
+        if (S.has_blend[i])
+            st.blend[i] = (__typeof__(st.blend[0])){1, (uint8_t)S.blend[i].src_rgb, (uint8_t)S.blend[i].dst_rgb,
+                                                    (uint8_t)S.blend[i].src_a, (uint8_t)S.blend[i].dst_a,
+                                                    (uint8_t)S.blend[i].eq_rgb, (uint8_t)S.blend[i].eq_a};
+    vkrt_state(&st);
+}
+
+#define TRACE_RB_MAX (48u << 20)   // the most one readback copies
+
+// After a pass has ended (outside any rendering): for each colour attachment the trace wants, a copy of the texels the pass
+// drew into into the frame's scratch memory, between two full barriers. The completion thread reads them when the frame is
+// done (vkrt_rb_queued); nothing the game reads and nothing a later draw depends on is touched.
+static void trace_readback(void) {
+    for (uint32_t i = 0; i < F.ncolor; i++) {
+        const nvn_tex_rec *t = &S.rt.color[i];
+        if (!t->present) continue;
+        const VkrTarget *tg = &F.color[i];
+        VkrtRbWant want = {.att = i, .width = tg->width, .height = tg->height, .layers = tg->layers, .format = tg->format};
+        if (!vkrt_rb_wants(&want)) continue;
+        VkrImage img;
+        if (!F.ops->image || !F.ops->scratch || !F.ops->image(t, F.value, &img)) {
+            vkrt_rb_skipped(&want, "no_image");
+            continue;
+        }
+        if (img.samples > 1) {
+            vkrt_rb_skipped(&want, "multisampled");
+            continue;
+        }
+        uint32_t level = t->has_view && t->view.set_levels ? t->view.base_level : 0;
+        uint32_t layer = t->has_view && t->view.set_layers ? t->view.min_layer : 0;
+        int nvn_format = t->has_view && t->view.set_format ? (int)t->view.format : (int)t->tex.d.format;
+        const VkfRow *row = vkf_row(nvn_format), *trow = vkf_row((int)t->tex.d.format);
+        uint32_t bpt = vkrt_texel_bytes(tg->format);
+        if (!row || !bpt) {
+            vkrt_rb_skipped(&want, "no_decoder_for_format");
+            continue;
+        }
+        // a raw view of a block-compressed image: its texels are the image's blocks, so the copy's extent counts texels
+        uint32_t bw = 1, bh = 1;
+        if (trow && (trow->flags & VKF_BLOCK) && !(row->flags & VKF_BLOCK)) bw = trow->bw, bh = trow->bh;
+        uint32_t lw = img.width >> level ? img.width >> level : 1, lh = img.height >> level ? img.height >> level : 1;
+        uint32_t ex = tg->width * bw < lw ? tg->width * bw : lw, ey = tg->height * bh < lh ? tg->height * bh : lh;
+        VkOffset3D at = {0, 0, 0};
+        if (img.type == VK_IMAGE_TYPE_3D) {
+            if (layer + want.z >= (img.depth >> level ? img.depth >> level : 1)) {
+                vkrt_rb_skipped(&want, "slice_past_the_volume");
+                continue;
+            }
+            at.z = (int32_t)(layer + want.z), layer = 0;
+        } else {
+            if (want.z >= tg->layers || layer + want.z >= img.layers) {
+                vkrt_rb_skipped(&want, "slice_past_the_layers");
+                continue;
+            }
+            layer += want.z;
+        }
+        uint64_t bytes = (uint64_t)tg->width * tg->height * bpt;
+        if (bytes > TRACE_RB_MAX) {
+            vkrt_rb_skipped(&want, "target_over_48_MiB");
+            continue;
+        }
+        VkBuffer buf;
+        VkDeviceSize off;
+        void *host = F.ops->scratch(F.value, (uint32_t)bytes, 16, &buf, &off);
+        VkBufferImageCopy cp = {.bufferOffset = off,
+                                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
+                                .imageOffset = at, .imageExtent = {ex, ey, 1}};
+        trace_barrier();
+        vkrec_CopyImageToBuffer(img.image, buf, &cp);
+        trace_barrier();
+        vkrt_rb_queued(&want, level, layer + (uint32_t)at.z, host, bytes);
+    }
+}
+
+static void pass_begin_body(void);
 static void pass_begin(void) {
     if (F.in_pass) return;
+    ST_TIME(VKST_PASS_BEGIN, pass_begin_body());
+}
+static void pass_begin_body(void) {
     uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = UINT32_MAX;
     F.ncolor = 0, F.has_depth = 0;
     memset(&F.formats, 0, sizeof F.formats);
@@ -653,7 +779,12 @@ static void pass_begin(void) {
     F.pass_draws = 0, F.pass_vs = F.pass_fs = NULL;
     F.dyn_valid = 0;   // the viewport's flip and the scissor clip depend on the pass's height
     g_stats.passes++;
-    if (vkrt_on) vkrt_pass_begin(w, h, F.ncolor, F.formats.color, F.formats.depth, F.formats.stencil);
+    if (vkrt_on) {
+        vkrt_pass_begin(w, h, F.ncolor, F.formats.color, F.formats.depth, F.formats.stencil);
+        for (uint32_t i = 0; i < F.ncolor; i++)
+            if (S.rt.color[i].present) trace_target((int)i, &S.rt.color[i], &F.color[i]);
+        if (F.has_depth) trace_target(8, &S.rt.depth, &F.depth);
+    }
 }
 
 // ---------- dynamic state
@@ -795,7 +926,11 @@ static int dyn_all_same(const Dyn *n, const Dyn *o, int mesh) {
     return !n->ntargets || (DSAME(ntargets) && DSAME(blend_en) && DSAME(eq) && DSAME(wm));
 }
 #undef DSAME
+static void dyn_emit_body(VkPrimitiveTopology topo, VkBool32 restart, int mesh);
 static void dyn_emit(VkPrimitiveTopology topo, VkBool32 restart, int mesh) {
+    ST_TIME(VKST_DYN, dyn_emit_body(topo, restart, mesh));
+}
+static void dyn_emit_body(VkPrimitiveTopology topo, VkBool32 restart, int mesh) {
     Dyn n;
     dyn_compute(&n);
     n.topo = topo, n.restart = restart;
@@ -954,8 +1089,14 @@ static uint64_t bank_word(int st, const uint8_t *c0, uint32_t slot, uint32_t off
     return v;
 }
 
+static void stage_resources_body(Set1 *s, int st, const nvn_stage *stage, const prog_stage_t *ps, const ShaderBinds *b,
+                                 const uint8_t *c0, uint32_t descriptor_set);
 static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_stage_t *ps, const ShaderBinds *b,
                             const uint8_t *c0, uint32_t descriptor_set) {
+    ST_TIME(VKST_STAGE_RES, stage_resources_body(s, st, stage, ps, b, c0, descriptor_set));
+}
+static void stage_resources_body(Set1 *s, int st, const nvn_stage *stage, const prog_stage_t *ps, const ShaderBinds *b,
+                                 const uint8_t *c0, uint32_t descriptor_set) {
     for (uint32_t i = 0; i < b->ncb; i++) {
         const ShdCbuf *cb = &b->cb[i];
         if (cb->set != descriptor_set)
@@ -1016,12 +1157,13 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
         uint64_t base = addr & ~(uint64_t)(STORAGE_ALIGN - 1), range = size + (addr - base);
         raw_range(b, 's', base, range);
         BackingRef ref;
-        F.ops->resolve(base, range, F.value, &ref);
+        resolve_t(base, range, F.value, &ref);
         RC_ADD(RC_RES_STORAGE, 1);
         put_buffer(s, sb->binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (Bound){(VkBuffer)(uintptr_t)ref.buffer, ref.offset},
                    range);
         note(backing_letter(ref.kind), base, range, sb->write);
         if (sb->write) BT_TIME(BT_S5_WROTE, vkr_wrote(base, range, 0, F.draws + 1));   // the draw being prepared
+        if (vkrt_on && sb->write) vkrt_write('b', base, 0, range);
     }
     // Storage images: the handle in c[2]'s image rows names a texture pool ID (nvnDeviceGetImageHandle), whose texture
     // the device views for stores, in the general layout every image keeps (D18)
@@ -1039,6 +1181,7 @@ static void stage_resources(Set1 *s, int st, const nvn_stage *stage, const prog_
         note('G', storage, bytes, m->write);
         g_stats.storage_images++;
         if (m->write && bytes) BT_TIME(BT_S5_WROTE, vkr_wrote(storage, bytes, 1, F.draws + 1));   // the draw or dispatch being prepared
+        if (vkrt_on && m->write) vkrt_write('i', id, storage, bytes);
     }
     for (uint32_t i = 0; i < b->ntex; i++) {
         const ShdTex *t = &b->tex[i];
@@ -1177,7 +1320,9 @@ static void vertex_count(const ShaderBinds *vb) {
 // draw is a word the GPU reads from its record, not known here), read and cleared by the first vertex_input after it.
 static int g_reach_below;
 
-static void vertex_input(const ShaderBinds *vb) {
+static void vertex_input_body(const ShaderBinds *vb);
+static void vertex_input(const ShaderBinds *vb) { ST_TIME(VKST_VERTEX, vertex_input_body(vb)); }
+static void vertex_input_body(const ShaderBinds *vb) {
     if (RC_ON()) vertex_count(vb);
     const int below = g_reach_below;
     g_reach_below = 0;
@@ -1227,11 +1372,11 @@ static void vertex_input(const ShaderBinds *vb) {
             .inputRate = div ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX, .divisor = 1};
         BackingRef ref;
         uint64_t size = S.vbuf[s].size ? S.vbuf[s].size : 1;
-        BT_TIME(BT_S4_RESOLVE, F.ops->resolve(S.vbuf[s].address, size, F.value, &ref));
+        BT_TIME(BT_S4_RESOLVE, resolve_t(S.vbuf[s].address, size, F.value, &ref));
         RC_ADD(RC_RES_VERTEX, 1);
         if (below) {
             BackingRef start;
-            F.ops->resolve(S.vbuf[s].address, 1, F.value, &start);
+            resolve_t(S.vbuf[s].address, 1, F.value, &start);
         }
         VkBuffer buf = (VkBuffer)(uintptr_t)ref.buffer;
         VkDeviceSize off = ref.offset;
@@ -1291,6 +1436,7 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
     if (S.conservative) stop("conservative rasterization is not replayed yet");
     if (S.sample_mask != ~0u && (S.sample_mask & 1) != 1) stop("sample mask %#x is not replayed yet", S.sample_mask);
     pass_begin();
+    if (vkrt_on) trace_state();
     VkPrimitiveTopology topo;
     if (!vkn_topology(prim, &topo)) stop("primitive %d has no Vulkan topology", prim);
     VkBool32 restart = (VkBool32)S.restart_en;
@@ -1301,9 +1447,10 @@ static int draw_prepare(int prim, uint32_t base_instance, VkBool32 *restart_out)
     VkPipeline pipe;
     int may_skip;
     BT_TIME(BT_U_STAMPS, may_skip = targets_hold_earlier_picture());
-    BT_TIME(BT_S3_GRAPHICS, pipe = F.ops->graphics(&vst, NULL, &fst, &F.formats, may_skip));
+    ST_TIME(VKST_PIPELINE, BT_TIME(BT_S3_GRAPHICS, pipe = F.ops->graphics(&vst, NULL, &fst, &F.formats, may_skip)));
 #else
-    VkPipeline pipe = F.ops->graphics(&vst, NULL, &fst, &F.formats, targets_hold_earlier_picture());
+    VkPipeline pipe;
+    ST_TIME(VKST_PIPELINE, pipe = F.ops->graphics(&vst, NULL, &fst, &F.formats, targets_hold_earlier_picture()));
 #endif
     if (!pipe) {
         g_stats.skipped++;
@@ -1359,7 +1506,7 @@ static void index_buffer(int itype, uint64_t ibuf, uint64_t count) {
     uint32_t bytes;
     if (!vkn_index_type(itype, &t, &bytes)) stop("index type %d", itype);
     BackingRef ref;
-    F.ops->resolve(ibuf, count ? count * bytes : bytes, F.value, &ref);
+    resolve_t(ibuf, count ? count * bytes : bytes, F.value, &ref);
     RC_ADD(RC_RES_INDEX, 1);
     vkrec_BindIndexBuffer((VkBuffer)(uintptr_t)ref.buffer, ref.offset, t);
     if (S.restart_en) {
@@ -1390,7 +1537,7 @@ static void op_draw_idx_ind(const p_draw_idx_ind *d) {
     // CPU's older word there, while the draw itself takes the GPU's first instance. A GPU copy into the bank, as an
     // indirect dispatch does, would have to run outside the pass: left to the title run if a program reads it.
     BackingRef ref;
-    F.ops->resolve(d->ind, 20, F.value, &ref);
+    resolve_t(d->ind, 20, F.value, &ref);
     RC_ADD(RC_RES_INDIRECT, 1);
     uint32_t base_instance = 0;
     int readable = ref.kind == BACKING_IMPORT || ref.kind == BACKING_MIRROR;
@@ -1428,7 +1575,7 @@ static Bound mesh_indirect_record(uint64_t indirect) {
     if (!indirect || indirect > UINT64_MAX - MESH_INDIRECT_COMMAND_BYTES + 4)
         stop("a mesh indirect draw's record address is invalid");
     BackingRef src;
-    F.ops->resolve(indirect, MESH_INDIRECT_COMMAND_BYTES - 4, F.value, &src);
+    resolve_t(indirect, MESH_INDIRECT_COMMAND_BYTES - 4, F.value, &src);
     RC_ADD(RC_RES_INDIRECT, 1);
     void *mapped;
     Bound dst = scratch(MESH_INDIRECT_RECORD_BYTES, 16, &mapped);
@@ -1478,7 +1625,9 @@ static void op_draw_mesh(const p_draw_mesh *d, uint64_t indirect) {
         stop("sample mask %#x is not replayed yet", S.sample_mask);
 
     pass_begin();
-    VkPipeline pipe = F.ops->graphics(&mesh, ts ? &task : NULL, &pixel, &F.formats, targets_hold_earlier_picture());
+    if (vkrt_on) trace_state();
+    VkPipeline pipe;
+    ST_TIME(VKST_PIPELINE, pipe = F.ops->graphics(&mesh, ts ? &task : NULL, &pixel, &F.formats, targets_hold_earlier_picture()));
     if (!pipe) {
         g_stats.skipped++;
         if (vkrt_on) vkrt_skip();
@@ -1677,7 +1826,9 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     pass_end();
     F.noting = vkgt_enabled;   // the pass's mark is made; the buffers from here on are this dispatch's
     if (F.after_xfer) full_barrier();
-    bind_pipeline(1, F.ops->compute(&cst));
+    VkPipeline cpipe;
+    ST_TIME(VKST_PIPELINE, cpipe = F.ops->compute(&cst));
+    bind_pipeline(1, cpipe);
     bind_set0(1);
     Set1 s;
     memset(&s, 0, sizeof s);
@@ -1688,7 +1839,7 @@ static void dispatch(const uint32_t groups[3], uint64_t ind) {
     BackingRef ref = {0};
     Bound patch = {0};
     if (ind) {
-        F.ops->resolve(ind, 12, F.value, &ref);
+        resolve_t(ind, 12, F.value, &ref);
         RC_ADD(RC_RES_INDIRECT, 1);
         F.c0[ST_CS].valid = 0;   // a bank of its own: stage_resources finds these bytes and binds this copy
         patch = bank(&F.c0[ST_CS], c0, VKN_BANK_BYTES);
@@ -1811,7 +1962,9 @@ static void bind_state(const p_bind_state *s) {
     case 3: break;   // multisample state: the sample count is the targets', checked at the pass
     case 4: memcpy(&S.poly, s->bytes, sizeof S.poly), S.has_poly = 1; break;
     case 5: memcpy(&S.ds, s->bytes, sizeof S.ds), S.has_ds = 1; break;
-    case 6: break;   // point size: written by the programs that draw points
+    case 6:   // point size: written by the programs that draw points; the trace keeps the game's value for its column
+        if (vkrt_on) memcpy(&S.point_size, s->bytes, sizeof S.point_size), S.has_point_size = 1;
+        break;
     case 7: break;   // alpha reference: the alpha test is a draw variant of the translator
     case 8: memcpy(&S.line_width, s->bytes, sizeof S.line_width); break;
     default: stop("state object of kind %d", s->kind);
@@ -1848,7 +2001,7 @@ static void record_op(const op_hdr *r);
 // One record. Under collection a draw is replayed with a way out (a dispatch passes through the same wrapper, but no
 // stop_answer call is made in one): a stop on an answer the ledger can fix (stop_answer) lands here after the draw's
 // rows were made, and the next record is replayed as if this one were not.
-static void record(const op_hdr *r) {
+static void record_body(const op_hdr *r) {
     if (!makes_rows(r->op) || !collecting()) {
         BT_TIME(BT_RECORD, record_op(r));
         return;
@@ -1857,6 +2010,24 @@ static void record(const op_hdr *r) {
     g_skip = &here;
     if (!setjmp(here)) record_op(r);
     g_skip = NULL;
+}
+
+// One record, timed by its class when the counters are on (the state records, thousands a present, are not: the ledger's
+// tracker, which runs after every one, is the sampled class that covers them).
+static void record(const op_hdr *r) {
+    if (__builtin_expect(rc_on, 0)) {
+        int cls = vkst_class_of(r->op);
+        if (cls >= 0) {
+            int32_t inst = r->op == OP_DRAW ? ((const p_draw *)(const void *)(r + 1))->instances
+                         : r->op == OP_DRAW_IDX ? ((const p_draw_idx *)(const void *)(r + 1))->instances : 0;
+            vkst_op(r->op, inst);
+            uint64_t t0 = vkst_in(cls);
+            record_body(r);
+            vkst_out(cls, t0);
+            return;
+        }
+    }
+    record_body(r);
 }
 
 static void record_op(const op_hdr *r) {
@@ -2019,12 +2190,13 @@ static void record_op(const op_hdr *r) {
         }
     }
     F.cur = NULL;
-    BT_TIME(BT_U_LEDGER_OP, ledger_track_op(&S.track, r));
+    ST_TIME(VKST_LEDGER, BT_TIME(BT_U_LEDGER_OP, ledger_track_op(&S.track, r)));
 }
 
 static void walk(int index, uint64_t handle) {
     const uint8_t *p = (const uint8_t *)(uintptr_t)handle;
     if (!p) stop("recording %d is a null handle", index);
+    uint32_t nrec = 0, nops = 0;
     for (size_t at = 0;;) {
         op_hdr h;
         memcpy(&h, p + at, sizeof h);
@@ -2032,8 +2204,12 @@ static void walk(int index, uint64_t handle) {
             (at == 0) != (h.op == OP_BEGIN))
             stop("recording %d is not whole at +%zu (op %u, %u bytes)", index, at, h.op, h.size);
         BT_TIME(BT_WALK, record((const op_hdr *)(const void *)(p + at)));
+        if (RC_ON()) nrec++, nops += vkst_class_of(h.op) == VKST_DRAW || vkst_class_of(h.op) == VKST_DISPATCH;
         at += h.size;
-        if (h.op == OP_END) return;
+        if (h.op == OP_END) {
+            if (RC_ON()) vkst_handle(handle, nrec, nops);
+            return;
+        }
     }
 }
 
@@ -2061,7 +2237,8 @@ uint64_t vkr_submit(const uint64_t *handles, int n) {
     F.wslot = k;
     vkr_report_frame_begin();
     full_barrier();   // the frame's work after every earlier submission's (D18)
-    for (int i = 0; i < n; i++) walk(i, handles[i]);
+    if (RC_ON()) vkst_sub();
+    ST_TIME(VKST_WALK, for (int i = 0; i < n; i++) walk(i, handles[i]));
     pass_end();
     movie_unclosed("no blit program came before the end of this submission");
     if (ops->frame_end) ops->frame_end(value);

@@ -64,6 +64,7 @@ static uint8_t g_vram[HOST_BYTES];
 #define BUF_SCRATCH 0x5Cu
 
 static uint8_t g_arena[8u << 20];
+static int g_rb_fill;   // the trace_readback cases: the stand-in copy to a buffer writes a pattern into it
 static uint32_t g_arena_used;
 static int g_mesh_pushes;
 
@@ -586,6 +587,14 @@ static void VKAPI_CALL fake_CopyImageToBuffer(VkCommandBuffer cb, VkImage s, VkI
     CHECK(cb == FAKE_CB && n == 1 && l == VK_IMAGE_LAYOUT_GENERAL);
     lput(&g_pkt, "pkt CopyImageToBuffer img=0x%llx buf=0x%llx", (ull)(uintptr_t)s, (ull)(uintptr_t)d);
     region_text(r);
+    if (g_rb_fill) {   // texel i: (i mod 256, 255, 16 z + 8 layer, 128), the bytes of an RGBA8 target
+        uint8_t *dst = g_arena + r->bufferOffset;
+        for (uint32_t i = 0; i < r->imageExtent.width * r->imageExtent.height; i++) {
+            dst[4 * i] = (uint8_t)i, dst[4 * i + 1] = 255;
+            dst[4 * i + 2] = (uint8_t)(16 * (uint32_t)r->imageOffset.z + 8 * r->imageSubresource.baseArrayLayer);
+            dst[4 * i + 3] = 128;
+        }
+    }
 }
 static void VKAPI_CALL fake_CopyImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n,
                                       const VkImageCopy *r) {
@@ -1851,6 +1860,155 @@ static void case_movie_open(void) {
     printf("ok movie_open\n");
 }
 
+// ---------- the trace's readback statistics, columns and miss rows (OOT2_REPLAY_TRACE; vk_replay_trace.c)
+// The declarations are the trace file's own: they are private to runtime/gpu.
+typedef struct TChan {
+    double min, max, sum;
+    uint64_t finite, nonfinite, above;
+} TChan;
+typedef struct TScan {
+    int nch;
+    TChan ch[4];
+} TScan;
+int vkrt_scan(const void *data, VkFormat f, uint64_t count, double threshold, TScan *out);
+
+static void scan_print(const char *name, const TScan *s) {
+    printf("scan %s nch=%d", name, s->nch);
+    for (int c = 0; c < s->nch; c++) {
+        const TChan *k = &s->ch[c];
+        printf(" | c%d min=%g max=%g mean=%g finite=%llu nonfinite=%llu above=%llu", c, k->finite ? k->min : 0.0,
+               k->finite ? k->max : 0.0, k->finite ? k->sum / (double)k->finite : 0.0, (ull)k->finite, (ull)k->nonfinite,
+               (ull)k->above);
+    }
+    printf("\n");
+}
+
+// The scan on invented texels: 32-bit floats with a NaN, an infinity and values past the threshold; half floats with the
+// same; the 11 and 10 bit floats of B10G11R11 with an infinity and a NaN; 8-bit unorm; a format with no decoder.
+static void case_trace_scan(void) {
+    TScan s;
+    const float f32[12] = {0.25f, 1.0f, 2.0f, 4.0f, 0.75f, 70000.0f, __builtin_nanf(""), __builtin_inff(), -1.0f, 0.0f,
+                           100000.0f, 0.0f};
+    CHECK(vkrt_scan(f32, VK_FORMAT_R32G32B32A32_SFLOAT, 3, 60000.0, &s));
+    scan_print("f32", &s);
+    const uint16_t f16[8] = {0x3C00, 0x7C00, 0x7E00, 0x7BFF, 0xC000, 0x0000, 0x4000, 0x3800};   // 1 inf NaN 65504 | -2 0 2 0.5
+    CHECK(vkrt_scan(f16, VK_FORMAT_R16G16B16A16_SFLOAT, 2, 60000.0, &s));
+    scan_print("f16", &s);
+    // B10G11R11: texel 0 is (1.0, 2.0, 0.5); texel 1 is (inf, NaN, inf); texel 2 is (0 , 64512 , 0) -> G: e=30,m=63 is 129024
+    const uint32_t b10[3] = {(15u << 6) | ((16u << 6) << 11) | ((14u << 5) << 22),
+                             (31u << 6) | ((31u << 6 | 1u) << 11) | ((31u << 5) << 22),
+                             ((30u << 6 | 63u) << 11)};
+    CHECK(vkrt_scan(b10, VK_FORMAT_B10G11R11_UFLOAT_PACK32, 3, 60000.0, &s));
+    scan_print("b10g11r11", &s);
+    const uint8_t u8[8] = {0, 255, 51, 255, 255, 0, 0, 0};
+    CHECK(vkrt_scan(u8, VK_FORMAT_R8G8B8A8_UNORM, 2, 0.5, &s));
+    scan_print("unorm8", &s);
+    CHECK(!vkrt_scan(u8, VK_FORMAT_BC1_RGB_UNORM_BLOCK, 1, 0.5, &s));
+    printf("scan bc1 refused\n");
+    printf("ok trace_scan\n");
+}
+
+// A pass drawn into a 64 by 32 colour target of the stand-in device, with a readback asked by the spec. The stand-in's copy
+// writes a pattern into the destination (the device would write the texels): texel i is (i mod 256, 255, 16 z + 8 layer,
+// 128) in bytes, z the slice offset the copy named. Run with a spec that selects the pass, and with specs that do not.
+static void case_trace_readback(int volume, int two_passes) {
+    g_rb_fill = 1;
+    open_fakes();
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    p_set_rt rt = one_target(0);
+    if (volume) {
+        rt.color[0].tex.d.target = NVN_TEXTURE_TARGET_3D, rt.color[0].tex.d.depth = 4;
+        put(r, OP_SET_RT, &rt, sizeof rt);
+    }
+    draw3(r, NVN_DRAW_PRIMITIVE_TRIANGLES);
+    if (two_passes) {
+        rt.color[0].tex.d.width = 16, rt.color[0].tex.d.height = 8;
+        put(r, OP_SET_RT, &rt, sizeof rt);
+        draw3(r, NVN_DRAW_PRIMITIVE_TRIANGLES);
+    }
+    uint64_t h = rec_end(r);
+    vkr_submit(&h, 1);
+    rc_present(1);
+    close_fakes();
+    printf("ok trace_readback\n");
+}
+
+// The columns: two targets, blend on target 0 only, a colour mask, a depth state, a point size and a line width, a draw whose
+// pixel stage writes a storage buffer, then a dispatch that stores into a storage image.
+static void case_trace_cols(void) {
+    open_fakes();
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    p_set_rt rt = one_target(1);
+    rt.n = 2;
+    rt.color[1] = rt.color[0];
+    put(r, OP_SET_RT, &rt, sizeof rt);
+    blend_st b = {.target = 0, .src_rgb = NVN_BLEND_FUNC_SRC_ALPHA, .dst_rgb = NVN_BLEND_FUNC_ONE_MINUS_SRC_ALPHA,
+                  .src_a = NVN_BLEND_FUNC_ONE, .dst_a = NVN_BLEND_FUNC_ZERO, .eq_rgb = NVN_BLEND_EQUATION_ADD,
+                  .eq_a = NVN_BLEND_EQUATION_ADD};
+    PUT(r, OP_BIND_STATE, state_of(0, &b, sizeof b));
+    color_st color = {.blend_en = 1};
+    PUT(r, OP_BIND_STATE, state_of(1, &color, sizeof color));
+    chmask_st mask = {.mask = 0x3 | 0x8 << 4};
+    PUT(r, OP_BIND_STATE, state_of(2, &mask, sizeof mask));
+    ds_st ds = {.dt = 1, .dw = 0, .df = 3, .st = 0, .sf_f = NVN_STENCIL_FUNC_ALWAYS, .sf_b = NVN_STENCIL_FUNC_ALWAYS,
+                .fail_f = NVN_STENCIL_OP_KEEP, .zfail_f = NVN_STENCIL_OP_KEEP, .zpass_f = NVN_STENCIL_OP_KEEP,
+                .fail_b = NVN_STENCIL_OP_KEEP, .zfail_b = NVN_STENCIL_OP_KEEP, .zpass_b = NVN_STENCIL_OP_KEEP};
+    PUT(r, OP_BIND_STATE, state_of(5, &ds, sizeof ds));
+    float point = 6.5f, width = 2.0f;
+    PUT(r, OP_BIND_STATE, state_of(6, &point, sizeof point));
+    PUT(r, OP_BIND_STATE, state_of(8, &width, sizeof width));
+    draw3(r, NVN_DRAW_PRIMITIVE_TRIANGLES);
+    PUT(r, OP_BIND_PROGRAM, program_img());
+    PUT(r, OP_BIND_IMG, image_handle(9));
+    PUT(r, OP_DISPATCH, (p_dispatch){1, 1, 1, 0});
+    uint64_t h = rec_end(r);
+    vkr_submit(&h, 1);
+    rc_present(1);
+    close_fakes();
+    printf("ok trace_cols\n");
+}
+
+// The M line's companions: a raw-access dispatch is submitted, then the device reports two misses in its submission; each
+// kept miss gets an m line with the class of its address and the stage keys the submission carried.
+static void case_trace_misses_keys(void) {
+    open_fakes();
+    Rec *r = rec_begin(0);
+    PUT(r, OP_BIND_PROGRAM, program_raw(1));
+    PUT(r, OP_BIND_UBO, (p_bind_buf){.stage = 5, .index = 2, .addr = MIRROR + 0x7000, .size = 0x80});
+    PUT(r, OP_BIND_SSBO, (p_bind_buf){.stage = 5, .index = 1, .addr = VRAM + 0x300, .size = 0x20});
+    PUT(r, OP_DISPATCH, (p_dispatch){4, 2, 1, 0});
+    uint64_t h = rec_end(r);
+    uint64_t v = vkr_submit(&h, 1);
+    GpuVkRawStats st;
+    memset(&st, 0, sizeof st);
+    st.miss_submissions = 1, st.misses = 9, st.last_miss_value = v, st.last_misses = 2;
+    st.last_miss[0] = (RawMiss){0x1234567890ull, RAW_MISS_KIND_LOAD, RAW_MISS_REASON_NO_PAGE};
+    st.last_miss[1] = (RawMiss){0x2000000000ull, RAW_MISS_KIND_STORE, RAW_MISS_REASON_OUTSIDE_SPAN};
+    vkrt_raw_misses(&st, 1);
+    close_fakes();
+    printf("ok trace_misses_keys\n");
+}
+
+// The stage timer's counters (OOT2_REPLAY_COUNTERS, group "stages"): one recording with one draw is submitted three times, as a
+// game that records once and submits every frame does, and a second recording once. The replay makes 4 draws for 2 recorded.
+static void case_stage_repeat(void) {
+    open_fakes();
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    PUT(r, OP_DRAW, (p_draw){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 3, .base_instance = 0, .instances = 1});
+    uint64_t h = rec_end(r);
+    for (int i = 0; i < 3; i++) vkr_submit(&h, 1);
+    r = rec_begin(1);
+    PUT(r, OP_DRAW_IDX, (p_draw_idx){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .itype = NVN_INDEX_TYPE_UNSIGNED_SHORT, .count = 6,
+                                     .base_vertex = 0, .base_instance = 0, .instances = 5, .ibuf = MIRROR + 0x5000});
+    uint64_t h2 = rec_end(r);
+    vkr_submit(&h2, 1);
+    close_fakes();
+    printf("ok stage_repeat\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
@@ -1884,6 +2042,13 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "collect_other_stop") && argc >= 3) case_collect_other_stop(argv[2]);
     else if (!strcmp(cs, "skip_render_off")) case_skip(1);
     else if (!strcmp(cs, "trace_misses")) case_trace_misses();
+    else if (!strcmp(cs, "trace_misses_keys")) case_trace_misses_keys();
+    else if (!strcmp(cs, "trace_scan")) case_trace_scan();
+    else if (!strcmp(cs, "trace_readback")) case_trace_readback(0, 0);
+    else if (!strcmp(cs, "trace_readback_volume")) case_trace_readback(1, 0);
+    else if (!strcmp(cs, "trace_readback_two")) case_trace_readback(0, 1);
+    else if (!strcmp(cs, "trace_cols")) case_trace_cols();
+    else if (!strcmp(cs, "stage_repeat")) case_stage_repeat();
     else if (!strcmp(cs, "depth")) case_depth();
     else if (!strcmp(cs, "compute")) case_compute();
     else if (!strcmp(cs, "raw_first")) case_raw_first();

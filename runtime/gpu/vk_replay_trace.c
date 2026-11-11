@@ -10,12 +10,24 @@
 //   on        a summary line per present
 //   every=N   a summary line every N presents instead of every one (implies on)
 //   A-B       the rows of every draw, dispatch, pass and query of the presents A to B (implies on); a single A is A-A
+//   rb=WxH    readback statistics (R rows) of the colour target of each pass of that extent, in the presents of the windows
+//   rb=WxH/F  and, after the slash, of that VkFormat number only (up to four rb= items; none: every pass)
+//   rbpass=A  only the passes numbered A (or A-B) in their submission (the P rows' numbers)
+//   rbatt=I   the colour attachment read (default 0; "all" for every one)
+//   rbz=N     the slice read: a layer of an array target, a depth slice of a volume target (default 0)
+//   rbn=N     at most N readbacks a present (default 8)
+//   rbthr=V   the threshold of the "above" count (default 60000)
+//   A readback records a copy of the target into the frame's scratch memory after its pass; the completion thread prints the
+//   minimum, maximum and mean of the finite values of each channel, the count of NaN and infinity, and the count above V.
+//   It costs the copy and the scan when on, never changes what is drawn or what the game reads, and is a test of one static
+//   int when off.
 // A submission belongs to the present that follows it (the one the game makes next), so the presents are the numbers the
 // capture's shots carry. The file is OOT2_REPLAY_TRACE_FILE (created anew), else the run log, each line after "[rt] trace".
 // How to read it is in docs/architecture.md (the replay's trace).
 //
 // Cost: a call site tests the static int vkrt_on, which is 0 unless the variable is set. The counters of the summary are
 // atomic increments (the completion thread counts the queries), the rows are formatted only inside a window.
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +40,7 @@
 #include "oot2/texsync.h"
 #include "oot2/vk_format.h"
 #include "oot2/vk_raw.h"
+#include "oot2/vk_rec.h"
 #include "oot2/vk_replay.h"
 #include "oot2/vk_texture.h"
 #include "plat.h"
@@ -59,7 +72,7 @@ static struct {
     uint64_t a, b;
 } g_win[WINDOWS];
 static int g_nwin;
-static char g_spec[128];
+static char g_spec[384];
 static uint64_t g_present;       // atomic: the newest present made
 static int g_writer_added;
 
@@ -70,7 +83,8 @@ static int g_writer_added;
     X(SKIP_PIPE, "skipped_pipeline") X(ZERO_WORK, "zero_work") X(INDIRECT, "indirect") X(RAW, "raw_access")            \
     X(UNB_C1, "unbound_c1") X(UNB_SB, "unbound_storage") X(UNB_UB, "unbound_uniform") X(TEX, "tex_slots")              \
     X(TEX_NOENTRY, "tex_no_entry") X(TEX_UNREG, "tex_unregistered") X(TEX_ASTC, "tex_astc") X(TEX_ZR, "tex_zero_regions") \
-    X(QUERIES, "queries") X(Q_ZERO, "queries_zero_samples") X(Q_ZERO_DRAWS, "queries_zero_samples_with_draws")
+    X(QUERIES, "queries") X(Q_ZERO, "queries_zero_samples") X(Q_ZERO_DRAWS, "queries_zero_samples_with_draws") \
+    X(RB, "readbacks") X(RB_SKIP, "readbacks_skipped")
 enum {
 #define C_ENUM(id, name) C_##id,
     COUNTERS(C_ENUM)
@@ -152,11 +166,22 @@ static struct {
     char tex[8][72];
     uint32_t ntex;
     uint64_t zr_mark;
+    int has_state;
+    VkrtState st;
+    char writes[8][48];
+    uint32_t nwrites;
 } Row;
 
+typedef struct PassTarget {
+    int set;
+    uint64_t storage;
+    uint32_t level, layer, layers, w, h;
+    VkFormat format;
+} PassTarget;
 static struct {
     uint32_t w, h, ncolor;
     VkFormat color[8], depth, stencil;
+    PassTarget tg[9];
 } Pass;
 
 static int in_window(uint64_t present) {
@@ -176,7 +201,29 @@ void vkrt_submit_begin(uint64_t value) {
     cnt(C_SUBS, 1);
 }
 
+// The raw-access stage keys of the last submissions that had any (a miss report names its submission by value, and the keys
+// that submission's draws and dispatches carried are the stages that can have missed).
+#define KEYS_KEPT 16
+static struct {
+    uint64_t value;
+    char keys[RAW_KEYS * 28 + 8];
+} g_rk[KEYS_KEPT];
+static unsigned g_rk_n;   // g_lock
+
+static void keys_note(void) {
+    if (!T.nraw) return;
+    plat_mutex_lock(&g_lock);
+    typeof(g_rk[0]) *k = &g_rk[g_rk_n++ % KEYS_KEPT];
+    k->value = T.value, k->keys[0] = 0;
+    for (uint32_t i = 0; i < T.nraw; i++) {
+        size_t n = strlen(k->keys);
+        snprintf(k->keys + n, sizeof k->keys - n, "%s%s", i ? "," : "", T.raw_key[i]);
+    }
+    plat_mutex_unlock(&g_lock);
+}
+
 void vkrt_submit_end(void) {
+    keys_note();
     if (!T.rows) return;
     VkrStats s;
     vkr_stats(&s);
@@ -200,6 +247,7 @@ void vkrt_pass_begin(uint32_t w, uint32_t h, uint32_t ncolor, const VkFormat *co
     T.passes++;
     cnt(C_PASSES, 1);
     Pass.w = w, Pass.h = h, Pass.ncolor = ncolor > 8 ? 8 : ncolor, Pass.depth = depth, Pass.stencil = stencil;
+    memset(Pass.tg, 0, sizeof Pass.tg);
     for (uint32_t i = 0; i < Pass.ncolor; i++) Pass.color[i] = color[i];
 }
 
@@ -212,14 +260,65 @@ void vkrt_pass_end(uint32_t draws) {
         size_t n = strlen(fm);
         snprintf(fm + n, sizeof fm - n, "%s%d", i ? "," : "", (int)Pass.color[i]);
     }
-    out("P\t%llu\t%llu\t%u\t%ux%u\tcolor=%s\tdepth=%d\tstencil=%d\tdraws=%u", (unsigned long long)T.present,
-        (unsigned long long)T.value, T.passes, Pass.w, Pass.h, fm[0] ? fm : "none", (int)Pass.depth, (int)Pass.stencil, draws);
+    char tg[9 * 100] = "";
+    for (int i = 0; i < 9; i++) {
+        if (!Pass.tg[i].set) continue;
+        const PassTarget *t = &Pass.tg[i];
+        size_t n = strlen(tg);
+        snprintf(tg + n, sizeof tg - n, "\t%s%d=storage:%#llx:fmt:%d:%ux%u:level:%u:layer:%u:layers:%u", i == 8 ? "d" : "t",
+                 i == 8 ? 0 : i, (unsigned long long)t->storage, (int)t->format, t->w, t->h, t->level, t->layer, t->layers);
+    }
+    out("P\t%llu\t%llu\t%u\t%ux%u\tcolor=%s\tdepth=%d\tstencil=%d\tdraws=%u%s", (unsigned long long)T.present,
+        (unsigned long long)T.value, T.passes, Pass.w, Pass.h, fm[0] ? fm : "none", (int)Pass.depth, (int)Pass.stencil, draws,
+        tg);
+}
+
+void vkrt_pass_target(int slot, uint64_t storage, uint32_t level, uint32_t layer, uint32_t layers, uint32_t w, uint32_t h,
+                      VkFormat format) {
+    if (slot < 0 || slot > 8) return;
+    Pass.tg[slot] = (PassTarget){1, storage, level, layer, layers, w, h, format};
 }
 
 // ---------- one row per draw and dispatch
 static void row_open(char kind, const char *status, uint32_t n) {
     memset(&Row, 0, sizeof Row);
     Row.open = 1, Row.kind = kind, Row.status = status, Row.n = n;
+}
+
+// The columns of the state a draw drew with (VkrtState) and of what a draw or dispatch binds for writing, as key=value fields.
+static int state_cols(char *buf, size_t size) {
+    int n = 0;
+    if (Row.has_state) {
+        const VkrtState *s = &Row.st;
+        n += sn(buf + n, size - (size_t)n, "\tncolor=%u\tblend_en=%#x\twmask=%#x", s->ncolor, s->blend_en, s->chmask);
+        for (int i = 0; i < 8; i++)
+            if (s->blend[i].set)
+                n += sn(buf + n, size - (size_t)n, "\tblend%d=%u/%u/%u/%u/%u/%u", i, s->blend[i].src_rgb, s->blend[i].dst_rgb,
+                              s->blend[i].src_a, s->blend[i].dst_a, s->blend[i].eq_rgb, s->blend[i].eq_a);
+        if (s->has_ds) n += sn(buf + n, size - (size_t)n, "\tds=test:%d,write:%d,func:%d,stencil:%d", s->dt, s->dw, s->df, s->st);
+        else n += sn(buf + n, size - (size_t)n, "\tds=unset");
+        if (s->point_size >= 0) n += sn(buf + n, size - (size_t)n, "\tpoint_size=%g", (double)s->point_size);
+        else n += sn(buf + n, size - (size_t)n, "\tpoint_size=unset");
+        n += sn(buf + n, size - (size_t)n, "\tline_width=%g", (double)s->line_width);
+    }
+    if (Row.nwrites) {
+        n += sn(buf + n, size - (size_t)n, "\twrites=");
+        for (uint32_t i = 0; i < Row.nwrites; i++) n += sn(buf + n, size - (size_t)n, "%s%s", i ? "," : "", Row.writes[i]);
+    }
+    return n;
+}
+
+void vkrt_state(const VkrtState *s) {
+    if (!Row.open) return;
+    Row.st = *s, Row.has_state = 1;
+}
+
+void vkrt_write(char what, uint64_t a, uint64_t b, uint64_t size) {
+    if (!Row.open || Row.nwrites >= sizeof Row.writes / sizeof Row.writes[0]) return;
+    if (what == 'b') snprintf(Row.writes[Row.nwrites++], sizeof Row.writes[0], "buf:%#llx+%#llx", (unsigned long long)a,
+                              (unsigned long long)size);
+    else snprintf(Row.writes[Row.nwrites++], sizeof Row.writes[0], "img:id%llu@%#llx+%#llx", (unsigned long long)a,
+                  (unsigned long long)b, (unsigned long long)size);
 }
 
 static void row_emit(const char *extra) {
@@ -232,6 +331,7 @@ static void row_emit(const char *extra) {
         if (Row.k2) n += sn(buf + n, sizeof buf - (size_t)n, "\tkey2=%s", Row.k2);
         if (extra) n += sn(buf + n, sizeof buf - (size_t)n, "\t%s", extra);
         n += sn(buf + n, sizeof buf - (size_t)n, "\traw=%d", Row.raw);
+        n += state_cols(buf + n, sizeof buf - (size_t)n);
         if (Row.unb_c1 || Row.unb_sb || Row.unb_ub)
             n += sn(buf + n, sizeof buf - (size_t)n, "\tunbound_as_zeros=c1:%u,storage:%u,uniform:%u", Row.unb_c1,
                           Row.unb_sb, Row.unb_ub);
@@ -390,6 +490,244 @@ void vkrt_queries_done(void *qs, uint32_t nq, const uint64_t *samples) {
     free(qs);
 }
 
+// ---------- readback statistics (OOT2_REPLAY_TRACE rb=...)
+// Where a white sky or a missing haze is born along the chain of passes: after a chosen pass the replay records a copy of a
+// colour target into the frame's scratch memory (vk_replay.c trace_readback), and the completion thread, once the frame is
+// done and before the scratch memory is taken back, prints what the texels hold. The scan is a pure function of the bytes.
+int vkrt_rb_on;
+
+#define RB_SIZES 4
+static struct {
+    struct {
+        uint32_t w, h;
+        int fmt;           // VkFormat, or -1 for any
+    } size[RB_SIZES];
+    int nsize;
+    uint32_t pass_a, pass_b, z, max;
+    int att;               // the colour attachment, -1: every one
+    double thr;
+    uint64_t present;      // the present the count belongs to
+    uint32_t done;         // readbacks made for it
+} Rb = {.pass_a = 1, .pass_b = UINT32_MAX, .max = 8, .thr = 60000.0};
+
+int vkrt_rb_wants(VkrtRbWant *w) {
+    if (!vkrt_rb_on || !T.rows) return 0;
+    if (T.passes < Rb.pass_a || T.passes > Rb.pass_b) return 0;
+    if (Rb.att >= 0 && w->att != (uint32_t)Rb.att) return 0;
+    if (Rb.nsize) {
+        int hit = 0;
+        for (int i = 0; i < Rb.nsize && !hit; i++)
+            hit = Rb.size[i].w == w->width && Rb.size[i].h == w->height && (Rb.size[i].fmt < 0 || Rb.size[i].fmt == (int)w->format);
+        if (!hit) return 0;
+    }
+    if (Rb.present != T.present) Rb.present = T.present, Rb.done = 0;
+    if (Rb.done >= Rb.max) return 0;
+    Rb.done++;
+    w->z = Rb.z;
+    return 1;
+}
+
+static void rb_head(char *buf, size_t size, const VkrtRbWant *w, uint32_t level, uint32_t layer) {
+    snprintf(buf, size, "R\t%llu\t%llu\tpass=%u\tatt=%u\t%ux%u\tfmt=%d\tz=%u\tlevel=%u\tlayer=%u", (unsigned long long)T.present,
+             (unsigned long long)T.value, T.passes, w->att, w->width, w->height, (int)w->format, w->z, level, layer);
+}
+
+void vkrt_rb_skipped(const VkrtRbWant *w, const char *why) {
+    char buf[ROW_MAX];
+    rb_head(buf, sizeof buf, w, 0, 0);
+    size_t n = strlen(buf);
+    snprintf(buf + n, sizeof buf - n, "\tskipped=%s", why);
+    put_line(buf);
+    cnt(C_RB_SKIP, 1);
+}
+
+typedef struct RbJob {
+    char head[256];
+    VkFormat fmt;
+    uint64_t texels;
+    const void *data;
+    double thr;
+} RbJob;
+
+static void rb_done(void *arg, uint64_t value) {
+    (void)value;
+    RbJob *j = arg;
+    VkrtScan sc;
+    char buf[ROW_MAX];
+    int n = (int)sn(buf, sizeof buf, "%s\ttexels=%llu", j->head, (unsigned long long)j->texels);
+    if (!vkrt_scan(j->data, j->fmt, j->texels, j->thr, &sc)) {
+        snprintf(buf + n, sizeof buf - (size_t)n, "\tskipped=no_decoder_for_format");
+        cnt(C_RB_SKIP, 1);
+    } else {
+        for (int c = 0; c < sc.nch; c++) {
+            const VkrtChan *k = &sc.ch[c];
+            if (k->finite)
+                n += sn(buf + n, sizeof buf - (size_t)n, "\tc%d.min=%.9g\tc%d.max=%.9g\tc%d.mean=%.9g", c, k->min, c, k->max, c,
+                              k->sum / (double)k->finite);
+            else
+                n += sn(buf + n, sizeof buf - (size_t)n, "\tc%d.min=na\tc%d.max=na\tc%d.mean=na", c, c, c);
+            n += sn(buf + n, sizeof buf - (size_t)n, "\tc%d.nonfinite=%llu\tc%d.above=%llu", c,
+                          (unsigned long long)k->nonfinite, c, (unsigned long long)k->above);
+        }
+        cnt(C_RB, 1);
+    }
+    put_line(buf);
+    free(j);
+}
+
+void vkrt_rb_queued(const VkrtRbWant *w, uint32_t level, uint32_t layer, const void *data, uint64_t bytes) {
+    RbJob *j = calloc(1, sizeof *j);
+    if (!j) return;
+    rb_head(j->head, sizeof j->head, w, level, layer);
+    j->fmt = w->format, j->data = data, j->thr = Rb.thr;
+    uint32_t bpt = vkrt_texel_bytes(w->format);
+    j->texels = bpt ? bytes / bpt : 0;
+    vkrec_effect(rb_done, j);
+}
+
+// ---- the decoders
+static double half_to_double(uint16_t h, int *finite) {
+    int e = (h >> 10) & 31, m = h & 1023;
+    double v;
+    *finite = 1;
+    if (e == 31) {
+        *finite = 0;
+        return 0;
+    }
+    v = e ? ldexp(1.0 + m / 1024.0, e - 15) : ldexp(m / 1024.0, -14);
+    return (h & 0x8000) ? -v : v;
+}
+
+// An unsigned small float of `mb` mantissa bits and a 5-bit exponent (B10G11R11's channels).
+static double ufloat(uint32_t bits, int mb, int *finite) {
+    uint32_t m = bits & ((1u << mb) - 1u), e = (bits >> mb) & 31u;
+    *finite = 1;
+    if (e == 31) {
+        *finite = 0;
+        return 0;
+    }
+    return e ? ldexp(1.0 + (double)m / (double)(1u << mb), (int)e - 15) : ldexp((double)m / (double)(1u << mb), -14);
+}
+
+typedef enum { K_NONE, K_F32, K_F16, K_UNORM8, K_UNORM16, K_UINT32, K_UINT16, K_B10G11R11, K_E5B9G9R9, K_A2B10G10R10 } Kind;
+static Kind kind_of(VkFormat f, int *nch, uint32_t *bytes) {
+    switch (f) {
+    case VK_FORMAT_R32G32B32A32_SFLOAT: *nch = 4, *bytes = 16; return K_F32;
+    case VK_FORMAT_R32G32B32_SFLOAT: *nch = 3, *bytes = 12; return K_F32;
+    case VK_FORMAT_R32G32_SFLOAT: *nch = 2, *bytes = 8; return K_F32;
+    case VK_FORMAT_R32_SFLOAT: *nch = 1, *bytes = 4; return K_F32;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: *nch = 4, *bytes = 8; return K_F16;
+    case VK_FORMAT_R16G16_SFLOAT: *nch = 2, *bytes = 4; return K_F16;
+    case VK_FORMAT_R16_SFLOAT: *nch = 1, *bytes = 2; return K_F16;
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_SRGB:
+        *nch = 4, *bytes = 4; return K_UNORM8;
+    case VK_FORMAT_R8G8_UNORM: *nch = 2, *bytes = 2; return K_UNORM8;
+    case VK_FORMAT_R8_UNORM: *nch = 1, *bytes = 1; return K_UNORM8;
+    case VK_FORMAT_R16G16B16A16_UNORM: *nch = 4, *bytes = 8; return K_UNORM16;
+    case VK_FORMAT_R16G16_UNORM: *nch = 2, *bytes = 4; return K_UNORM16;
+    case VK_FORMAT_R16_UNORM: *nch = 1, *bytes = 2; return K_UNORM16;
+    case VK_FORMAT_R32G32B32A32_UINT: *nch = 4, *bytes = 16; return K_UINT32;
+    case VK_FORMAT_R32G32_UINT: *nch = 2, *bytes = 8; return K_UINT32;
+    case VK_FORMAT_R32_UINT: *nch = 1, *bytes = 4; return K_UINT32;
+    case VK_FORMAT_R16G16B16A16_UINT: *nch = 4, *bytes = 8; return K_UINT16;
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: *nch = 3, *bytes = 4; return K_B10G11R11;
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: *nch = 3, *bytes = 4; return K_E5B9G9R9;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: *nch = 4, *bytes = 4; return K_A2B10G10R10;
+    default: return K_NONE;
+    }
+}
+
+uint32_t vkrt_texel_bytes(VkFormat f) {
+    int nch;
+    uint32_t bytes = 0;
+    return kind_of(f, &nch, &bytes) == K_NONE ? 0 : bytes;
+}
+
+static void chan_add(VkrtChan *c, double v, int finite, double thr) {
+    if (!finite || v != v) {
+        c->nonfinite++;
+        return;
+    }
+    if (!c->finite || v < c->min) c->min = v;
+    if (!c->finite || v > c->max) c->max = v;
+    c->finite++;
+    c->sum += v;
+    if (v > thr) c->above++;
+}
+
+int vkrt_scan(const void *data, VkFormat f, uint64_t count, double thr, VkrtScan *out) {
+    int nch = 0;
+    uint32_t bytes = 0;
+    Kind k = kind_of(f, &nch, &bytes);
+    memset(out, 0, sizeof *out);
+    if (k == K_NONE) return 0;
+    out->nch = nch;
+    const uint8_t *p = data;
+    for (uint64_t i = 0; i < count; i++, p += bytes) {
+        for (int c = 0; c < nch; c++) {
+            double v = 0;
+            int fin = 1;
+            switch (k) {
+            case K_F32: {
+                float x;
+                memcpy(&x, p + 4 * c, 4);
+                v = (double)x, fin = x == x && x - x == 0;
+                break;
+            }
+            case K_F16: {
+                uint16_t h;
+                memcpy(&h, p + 2 * c, 2);
+                v = half_to_double(h, &fin);
+                break;
+            }
+            case K_UNORM8: v = p[c] / 255.0; break;
+            case K_UNORM16: {
+                uint16_t h;
+                memcpy(&h, p + 2 * c, 2);
+                v = h / 65535.0;
+                break;
+            }
+            case K_UINT32: {
+                uint32_t h;
+                memcpy(&h, p + 4 * c, 4);
+                v = (double)h;
+                break;
+            }
+            case K_UINT16: {
+                uint16_t h;
+                memcpy(&h, p + 2 * c, 2);
+                v = (double)h;
+                break;
+            }
+            case K_B10G11R11: {
+                uint32_t w;
+                memcpy(&w, p, 4);
+                v = c == 0 ? ufloat(w & 0x7FFu, 6, &fin) : c == 1 ? ufloat((w >> 11) & 0x7FFu, 6, &fin) : ufloat(w >> 22, 5, &fin);
+                break;
+            }
+            case K_E5B9G9R9: {
+                uint32_t w;
+                memcpy(&w, p, 4);
+                int e = (int)(w >> 27) - 15 - 9;
+                uint32_t m = c == 0 ? w & 0x1FFu : c == 1 ? (w >> 9) & 0x1FFu : (w >> 18) & 0x1FFu;
+                v = ldexp((double)m, e);
+                break;
+            }
+            case K_A2B10G10R10: {
+                uint32_t w;
+                memcpy(&w, p, 4);
+                v = c == 0 ? (w & 1023u) / 1023.0 : c == 1 ? ((w >> 10) & 1023u) / 1023.0
+                    : c == 2 ? ((w >> 20) & 1023u) / 1023.0 : (w >> 30) / 3.0;
+                break;
+            }
+            default: break;
+            }
+            chan_add(&out->ch[c], v, fin, thr);
+        }
+    }
+    return 1;
+}
+
 // ---------- the summary, per present, and the raw-access misses the device reported since the last one
 // The raw-access misses the device reported since the last call (r: gpu_vk_raw_stats, or a test's): one M line for the newest
 // submission that had any, with the kind and reason of the entries the log kept.
@@ -411,6 +749,20 @@ void vkrt_raw_misses(const GpuVkRawStats *rs, uint64_t seq) {
         (unsigned long long)kinds[RAW_MISS_KIND_LOAD], (unsigned long long)kinds[RAW_MISS_KIND_STORE],
         (unsigned long long)kinds[RAW_MISS_KIND_ATOMIC], (unsigned long long)reasons[RAW_MISS_REASON_OUTSIDE_SPAN],
         (unsigned long long)reasons[RAW_MISS_REASON_NO_CHUNK], (unsigned long long)reasons[RAW_MISS_REASON_NO_PAGE]);
+    if (!in_window(seq)) return;
+    // inside a window, one m line for each kept miss: its kind and reason, the class of its address (the 16 MiB region and
+    // the 4 KiB page it lies in) and the raw-access stage keys of the submission that missed
+    static const char *const kn[4] = {"?", "load", "store", "atomic"}, *const rn[4] = {"?", "outside_span", "no_chunk", "no_page"};
+    char keys[RAW_KEYS * 28 + 8] = "?";
+    plat_mutex_lock(&g_lock);
+    for (unsigned i = 0; i < KEYS_KEPT; i++)
+        if (g_rk[i].value == r.last_miss_value && g_rk[i].keys[0]) snprintf(keys, sizeof keys, "%s", g_rk[i].keys);
+    plat_mutex_unlock(&g_lock);
+    for (uint64_t i = 0; i < r.last_misses && i < RAW_MISS_ENTRIES; i++)
+        out("m\t%llu\tsubmission=%llu\ti=%llu\taddr=%#llx\tkind=%s\treason=%s\tregion=%#llx\tpage=%#llx\tstage_keys=%s",
+            (unsigned long long)seq, (unsigned long long)r.last_miss_value, (unsigned long long)i,
+            (unsigned long long)r.last_miss[i].address, kn[r.last_miss[i].kind & 3], rn[r.last_miss[i].reason & 3],
+            (unsigned long long)(r.last_miss[i].address >> 24), (unsigned long long)(r.last_miss[i].address >> 12), keys);
 }
 
 // The totals of the whole run, when it ends (a stop as well).
@@ -467,24 +819,83 @@ static void header(void) {
         "dispatch, C dispatch indirect) status key0 key1 key2 count/first/inst(recorded>replayed)/prim raw unbound tex...");
     out("# Q occlusion query: present value pass query samples pass_draws (read on completion, so after the rows that follow)");
     out("# M raw-access misses of the newest submission that had any since the last summary");
+    out("# m (in a window) one kept miss: present submission i address kind reason region(16 MiB) page(4 KiB) stage_keys");
+    out("# R readback statistics: present value pass att extent fmt z level layer texels, per channel min max mean finite "
+        "nonfinite above");
 }
 
 // ---------- the switches
 static void bad(const char *e, const char *why) {
-    fprintf(stderr, "FATAL: OOT2_REPLAY_TRACE is \"%s\": %s; the items are on, every=N, A-B (presents), separated by commas, "
-            "or 0 (off)\n", e, why);
+    fprintf(stderr, "FATAL: OOT2_REPLAY_TRACE is \"%s\": %s; the items are on, every=N, A-B (presents), rb=WxH[/F], rbpass=A[-B], "
+            "rbatt=I|all, rbz=N, rbn=N, rbthr=V, separated by commas, or 0 (off)\n", e, why);
     exit(70);
+}
+
+// An item of the readback (rb=, rbpass=, rbatt=, rbz=, rbn=, rbthr=): 1 when tok is one of them (a malformed one is fatal).
+static int rb_item(const char *tok, const char *spec) {
+    char *end;
+    if (!strncmp(tok, "rb=", 3)) {
+        unsigned long long w = strtoull(tok + 3, &end, 10), h = 0;
+        long long fmt = -1;
+        if (end == tok + 3 || *end != 'x') bad(spec, "rb= needs WxH, then optionally /F (a VkFormat number)");
+        char *hs = end + 1;
+        h = strtoull(hs, &end, 10);
+        if (end == hs || !w || !h) bad(spec, "rb= needs WxH, then optionally /F (a VkFormat number)");
+        if (*end == '/') {
+            char *fs = end + 1;
+            fmt = (long long)strtoull(fs, &end, 10);
+            if (end == fs) bad(spec, "rb=WxH/F needs a VkFormat number after the slash");
+        }
+        if (*end) bad(spec, "rb= needs WxH, then optionally /F (a VkFormat number)");
+        if (Rb.nsize == RB_SIZES) bad(spec, "too many rb= items");
+        Rb.size[Rb.nsize].w = (uint32_t)w, Rb.size[Rb.nsize].h = (uint32_t)h, Rb.size[Rb.nsize].fmt = (int)fmt;
+        Rb.nsize++;
+    } else if (!strncmp(tok, "rbpass=", 7)) {
+        unsigned long long a = strtoull(tok + 7, &end, 10), b = a;
+        if (end == tok + 7 || !a) bad(spec, "rbpass= needs a pass number from 1, or A-B");
+        if (*end == '-') {
+            char *rest = end + 1;
+            b = strtoull(rest, &end, 10);
+            if (end == rest) bad(spec, "rbpass=A-B needs two pass numbers");
+        }
+        if (*end || b < a) bad(spec, "rbpass=A-B needs A not past B");
+        Rb.pass_a = (uint32_t)a, Rb.pass_b = (uint32_t)b;
+    } else if (!strncmp(tok, "rbatt=", 6)) {
+        if (!strcmp(tok + 6, "all")) Rb.att = -1;
+        else {
+            unsigned long long a = strtoull(tok + 6, &end, 10);
+            if (end == tok + 6 || *end || a > 7) bad(spec, "rbatt= needs 0 to 7, or all");
+            Rb.att = (int)a;
+        }
+    } else if (!strncmp(tok, "rbz=", 4)) {
+        unsigned long long a = strtoull(tok + 4, &end, 10);
+        if (end == tok + 4 || *end) bad(spec, "rbz= needs a slice number");
+        Rb.z = (uint32_t)a;
+    } else if (!strncmp(tok, "rbn=", 4)) {
+        unsigned long long a = strtoull(tok + 4, &end, 10);
+        if (end == tok + 4 || *end || !a) bad(spec, "rbn= needs a number from 1");
+        Rb.max = (uint32_t)a;
+    } else if (!strncmp(tok, "rbthr=", 6)) {
+        double v = strtod(tok + 6, &end);
+        if (end == tok + 6 || *end) bad(spec, "rbthr= needs a number");
+        Rb.thr = v;
+    } else {
+        return 0;
+    }
+    vkrt_rb_on = 1;
+    return 1;
 }
 
 __attribute__((constructor)) static void trace_init(void) {
     const char *e = getenv("OOT2_REPLAY_TRACE");
     if (!e || !*e || !strcmp(e, "0") || !strcmp(e, "off")) return;
     snprintf(g_spec, sizeof g_spec, "%s", e);
-    char buf[128];
+    char buf[384];
     snprintf(buf, sizeof buf, "%s", e);
     for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
         char *end;
         if (!strcmp(tok, "on")) continue;
+        if (!strncmp(tok, "rb", 2) && rb_item(tok, e)) continue;
         if (!strncmp(tok, "every=", 6)) {
             unsigned long long v = strtoull(tok + 6, &end, 10);
             if (end == tok + 6 || *end || !v) bad(e, "every= needs a number of presents, 1 or more");

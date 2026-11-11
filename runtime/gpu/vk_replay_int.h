@@ -6,6 +6,7 @@
 #pragma once
 #include <stdint.h>
 
+#include "oot2/replay_count.h"
 #include "oot2/vk_replay.h"
 
 typedef unsigned long long ull;
@@ -110,3 +111,96 @@ void vkrt_queries_done(void *queries, uint32_t nq, const uint64_t *samples);
 void vkrt_present(uint64_t seq);
 struct GpuVkRawStats;
 void vkrt_raw_misses(const struct GpuVkRawStats *r, uint64_t seq);
+
+// ---- the trace's further columns and the readback statistics (vk_replay_trace.c). Every call is made only when vkrt_on is
+// set (the readback ones when vkrt_rb_on is too); read and count only, except that a wanted readback records a copy of the
+// colour target into the frame's scratch memory after the pass, which the game never reads and no draw depends on.
+extern int vkrt_rb_on;
+// One target of a pass (slot 0 to 7 the colour attachments, 8 the depth-stencil one): the storage the texture stands on,
+// its level, first layer and layers, and the extent and Vulkan format the pass uses.
+void vkrt_pass_target(int slot, uint64_t storage, uint32_t level, uint32_t layer, uint32_t layers, uint32_t w, uint32_t h,
+                      VkFormat format);
+// The state the draw being prepared will draw with (the blend, mask and depth state of the replay's bound state).
+typedef struct VkrtState {
+    uint32_t ncolor;
+    uint32_t blend_en;                 // bit i: target i blends
+    uint32_t chmask;                   // 4 bits a target, r=1 g=2 b=4 a=8, bit set = written
+    struct {
+        uint8_t set, src_rgb, dst_rgb, src_a, dst_a, eq_rgb, eq_a;
+    } blend[8];                        // the blend states the game set, by target (set 0: never set)
+    int has_ds, dt, dw, df, st;
+    float point_size, line_width;      // point_size < 0: the game never set one
+} VkrtState;
+void vkrt_state(const VkrtState *s);
+// What the draw or dispatch being prepared binds for writing: 'b' a storage buffer (a its address, size its range), 'i' a
+// storage image (a its texture pool ID, b and size the storage range its stores land in; 0 when the image holds them itself).
+void vkrt_write(char what, uint64_t a, uint64_t b, uint64_t size);
+// The readback of a pass's colour target (OOT2_REPLAY_TRACE rb=...): asked after the pass has ended, per colour attachment.
+typedef struct VkrtRbWant {
+    uint32_t att, width, height, layers;
+    VkFormat format;
+    uint32_t z;                        // out: the slice to read (a layer of an array, a depth slice of a volume)
+} VkrtRbWant;
+int vkrt_rb_wants(VkrtRbWant *w);
+// A wanted readback that cannot be made (the reason), and one that was recorded: `bytes` of texels in host memory at `data`
+// the completion thread reads when the frame is done (before the scratch memory is taken back).
+void vkrt_rb_skipped(const VkrtRbWant *w, const char *why);
+void vkrt_rb_queued(const VkrtRbWant *w, uint32_t level, uint32_t layer, const void *data, uint64_t bytes);
+// The statistics of `count` texels of format f at data: per channel the minimum, maximum and mean of the finite values, the
+// count of non-finite ones and of those above `threshold`. 0 for a format with no decoder here.
+typedef struct VkrtChan {
+    double min, max, sum;
+    uint64_t finite, nonfinite, above;
+} VkrtChan;
+typedef struct VkrtScan {
+    int nch;
+    VkrtChan ch[4];
+} VkrtScan;
+uint32_t vkrt_texel_bytes(VkFormat f);   // bytes of a texel the scan decodes, 0 for none
+int vkrt_scan(const void *data, VkFormat f, uint64_t count, double threshold, VkrtScan *out);
+
+// ---- the replay stage timer (vk_replay_count.c; OOT2_REPLAY_COUNTERS, group "stages"). A class is timed from its in-call to
+// its out-call by the replaying thread only, inclusive of the classes it contains. The call is counted exactly; the clock is
+// read for one call in `every` (the classes that run thousands of times a present), and the line scales the sampled time to
+// the calls. Each site tests rc_on first, so the timer off costs one load.
+enum {
+    VKST_WALK,         // the walk of a submission's recordings
+    VKST_DRAW,         // a graphics or mesh draw, from its record
+    VKST_DISPATCH,
+    VKST_CLEAR,
+    VKST_COPY,         // a copy, fill, update or texture clear (the transfers)
+    VKST_QUERY,        // a report, event, wait or condition record
+    VKST_BARRIER,
+    VKST_PASS_BEGIN,
+    VKST_PASS_END,
+    VKST_PIPELINE,     // the device's pipeline lookup of a draw or dispatch
+    VKST_STAGE_RES,    // the descriptor build of a stage (stage_resources), the resolves and snapshots below included
+    VKST_VERTEX,       // the vertex input of a draw
+    VKST_DYN,          // the dynamic state of a draw
+    VKST_RESOLVE,      // a backing resolve (sampled)
+    VKST_SNAPSHOT,     // a uniform snapshot, its search included (sampled)
+    VKST_UNIFORM,      // a uniform range bound (sampled)
+    VKST_LEDGER,       // the ledger's tracker, once a record (sampled)
+    VKST_N
+};
+uint64_t vkst_in(int cls);
+void vkst_out(int cls, uint64_t t0);
+#define ST_TIME(cls, ...)                                                                                              \
+    do {                                                                                                               \
+        if (__builtin_expect(rc_on, 0)) {                                                                              \
+            uint64_t st_t0_ = vkst_in(cls);                                                                            \
+            __VA_ARGS__;                                                                                               \
+            vkst_out(cls, st_t0_);                                                                                     \
+        } else {                                                                                                       \
+            __VA_ARGS__;                                                                                               \
+        }                                                                                                              \
+    } while (0)
+// The class of a record op (VKST_DRAW ... VKST_QUERY, VKST_BARRIER), or -1 for a state record that is not timed.
+int vkst_class_of(uint32_t op);
+// A submission begun, a recording walked (its address, its records and the draws and dispatches among them) and a draw or
+// dispatch record by kind: the counters that say why more draws are replayed than the game's calls count.
+void vkst_handle(uint64_t handle, uint32_t records, uint32_t ops);
+void vkst_sub(void);
+void vkst_op(uint32_t op, int32_t instances);
+// Zero the timer and its counters (a test).
+void vkst_reset(void);
