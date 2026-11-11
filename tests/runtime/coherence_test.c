@@ -91,6 +91,7 @@
 //                submission, an extent not stated)
 //   raw_ev_g4, raw_ev_g4_hull   the verdict of the dry growth names the rule of import_gives that refused the import (up, hull),
 //                in its refusals and on the import's own line
+//   union_slide_grows (a bind below the mirror a union made grows it in place),
 //   union_begin_straddle, union_cap_demote, union_cap_exempt, union_exact_bytes, union_order, union_promote_chain, union_quiet,
 //   union_written_skip   the union at the begin of a raw-access submission: an import abutting a mirror joins it into one
 //                mirror before the table is built, so the straddling binds are hits; over the cap with a net add past a
@@ -2664,6 +2665,35 @@ static void case_union_begin_straddle(void) {
     done("union_begin_straddle");
 }
 
+// The mirror a union made is a mirror a bind of the same submission slides over: the join covers what the begin could see,
+// and the next bind of the sequence starts below it and runs into it. The mirror holds BACKING_UNION_GUARD at each end, so it
+// grows in place over the 192 KiB below it (more than the plain guard, which left the block without room before it: the
+// mirror it replaced sits there until its submission is done) and the bind is a hit in the one copy, with the bytes of the
+// pages added and of the old boundary right. The submission resolved the mirror's first page before (the hull the take of
+// the pages would have crossed), which is the case that used to stop.
+static void case_union_slide_grows(void) {
+    uint64_t p, v = union_world(&p, 0x20000);
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    CHECK(s.raw_union_chains == 1 && s.raw_union_mirror == 1 && s.mirrors == 1 && s.imports == 0);
+    CHECK(resolve(p - 0x1f800, 4, v).kind == BACKING_MIRROR);   // reached before the slide
+    uint64_t grows = s.raw_grows;
+    cpu_fill(p - 0x50000, 0x30000, 0xCCCCCCCCu);   // committed after the begin, as the pages of the game are
+    BackingRef b = resolve(p - 0x4ff00, 0x30900, v);
+    s = stats();
+    CHECK(b.kind == BACKING_MIRROR);
+    CHECK(s.raw_grows == grows + 1 && s.raw_grow_bytes == 0x30000 && s.mirrors == 1 && s.imports == 0);
+    CHECK(s.raw_straddle_stops == 0);
+    BackingRef c = resolve(p - 0x1f800, 4, v);   // the page reached before is in the same copy
+    CHECK(c.kind == BACKING_MIRROR && bytes(&c) == bytes(&b) + 0x30700);
+    sub_end(v);
+    gpu_run(v, NULL);
+    CHECK(words_are(bytes(&b), 0x2ff00, 0xCCCCCCCCu) && words_are(bytes(&b) + 0x2ff00, 0x900, 0xBBBBBBBBu));
+    printf("union_slide_grows: the mirror of the union grew by %llu KiB in place for the bind below it\n",
+           (ull)(s.raw_grow_bytes >> 10));
+    done("union_slide_grows");
+}
+
 // Three mirrors of 44 MiB, one in each window (132 MiB, over the 128 MiB a promotion leaves), the first with 2 MiB committed
 // below it since: the union would add 2 MiB to the mirrors, more than a growth may (BACKING_MIRROR_GROW_MAX), so it is an
 // import. Exact: the import is the guest's memory; the mirror is given up and the other two stay.
@@ -3189,7 +3219,7 @@ int main(int argc, char **argv) {
         {"raw_dry_kind", case_raw_dry_kind}, {"raw_dry_none", case_raw_dry_none}, {"raw_dry_g4_on", case_raw_dry_g4_on},
         {"raw_dry_g8", case_raw_dry_g8}, {"raw_dry_g5", case_raw_dry_g5}, {"raw_dry_g1", case_raw_dry_g1},
         {"raw_dry_g2", case_raw_dry_g2}, {"raw_ev_g4", case_raw_ev_g4}, {"raw_ev_g4_hull", case_raw_ev_g4_hull},
-        {"union_begin_straddle", case_union_begin_straddle}, {"union_cap_demote", case_union_cap_demote},
+        {"union_begin_straddle", case_union_begin_straddle}, {"union_slide_grows", case_union_slide_grows}, {"union_cap_demote", case_union_cap_demote},
         {"union_cap_exempt", case_union_cap_exempt}, {"union_written_skip", case_union_written_skip},
         {"union_exact_bytes", case_union_exact_bytes}, {"union_order", case_union_order},
         {"union_promote_chain", case_union_promote_chain}, {"union_quiet", case_union_quiet},

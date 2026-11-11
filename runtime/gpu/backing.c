@@ -469,21 +469,22 @@ static Backing *extent_new(Rec *r) {
     return b;
 }
 
-static uint64_t mirror_part_size(uint64_t lo, uint64_t hi) {
-    return up(hi - lo, BACKING_EXTENT_ALIGN) + 2 * BACKING_MIRROR_GUARD;
+// guard bytes are reserved at each end of the part: BACKING_MIRROR_GUARD, or BACKING_UNION_GUARD for the mirror of a union.
+static uint64_t mirror_part_size(uint64_t lo, uint64_t hi, uint64_t guard) {
+    return up(hi - lo, BACKING_EXTENT_ALIGN) + 2 * guard;
 }
 
 // A new mirror over guest pages [lo, hi), fresh: nothing is copied into it until its first use in a submission.
 // The reserved ends let an already-bound mirror grow without moving or displacing another backing. g_lock exclusive.
-static Backing *mirror_new(uint64_t lo, uint64_t hi) {
-    uint64_t size = mirror_part_size(lo, hi), at;
+static Backing *mirror_new(uint64_t lo, uint64_t hi, uint64_t guard) {
+    uint64_t size = mirror_part_size(lo, hi, guard), at;
     char what[96];
     snprintf(what, sizeof what, "the mirror of [%#llx, %#llx)", (ull)lo, (ull)hi);
     Block *blk = vram_take(size, what, &at);
     Backing *b = calloc(1, sizeof *b);
     if (!b) rt_fatal("gfx: vulkan: backing map: out of memory for a mirror");
     *b = (Backing){.kind = BACKING_MIRROR, .gpu_lo = lo, .gpu_hi = hi, .mem = blk->mem,
-                   .offset = at + BACKING_MIRROR_GUARD, .block = blk, .part = size, .part_at = at, .fresh = 1,
+                   .offset = at + guard, .block = blk, .part = size, .part_at = at, .fresh = 1,
                    .res_lo = UINT64_MAX};
     g_mirrors = grow(g_mirrors, &g_mirrors_cap, g_nmirrors + 1, sizeof *g_mirrors, "the mirror list");
     g_mirrors[g_nmirrors++] = b;
@@ -936,8 +937,8 @@ static void mirror_use(Backing *m, uint64_t value) {
 
 // A mirror over [rs, re) in r when the admission and the write watch allow one, else NULL (the bind gets an import), the
 // pool's first refusal logged. g_lock exclusive.
-static Backing *mirror_admit(Rec *r, uint64_t rs, uint64_t re) {
-    uint64_t size = mirror_part_size(rs, re), used = 0, budget = 0;
+static Backing *mirror_admit(Rec *r, uint64_t rs, uint64_t re, uint64_t guard) {
+    uint64_t size = mirror_part_size(rs, re, guard), used = 0, budget = 0;
     char why[160] = "";
     if (!g_ops.vram(&used, &budget) || !backing_mirror_fits(used, budget, size)) {
         g_st.mirrors_refused_budget++;
@@ -947,7 +948,7 @@ static Backing *mirror_admit(Rec *r, uint64_t rs, uint64_t re) {
         g_st.mirrors_refused_untracked++;
         snprintf(why, sizeof why, "the write watch does not cover it");
     } else {
-        return mirror_new(rs, re);
+        return mirror_new(rs, re, guard);
     }
     if (!r->mirror_logged) {
         r->mirror_logged = 1;
@@ -2157,7 +2158,7 @@ static void make(uint64_t addr, uint64_t size, uint64_t value) {
         beside(c, plo, phi, &rs, &re, value, why);
     }
     replace_wait(c, rs, re, value, kind == BACKING_MIRROR);
-    Backing *b = kind == BACKING_MIRROR ? mirror_admit(r, rs, re) : NULL;
+    Backing *b = kind == BACKING_MIRROR ? mirror_admit(r, rs, re, BACKING_MIRROR_GUARD) : NULL;
     if (!b) {
         char why[96];
         snprintf(why, sizeof why, "a bind of [%#llx, %#llx)", (ull)addr, (ull)(addr + size));
@@ -2543,7 +2544,7 @@ static int union_make(Rec *r, Cell *c, int i, int j, uint64_t value, int uk, uin
     for (int k = i; k <= j; k++)
         if (c->imp[k]->kind == BACKING_MIRROR) mine += c->imp[k]->gpu_hi - c->imp[k]->gpu_lo;
     replace_wait(c, lo, hi, value, kind == BACKING_MIRROR);
-    Backing *b = kind == BACKING_MIRROR ? mirror_admit(r, lo, hi) : NULL;
+    Backing *b = kind == BACKING_MIRROR ? mirror_admit(r, lo, hi, BACKING_UNION_GUARD) : NULL;
     if (!b && promoting) return 0;
     int how = kind == BACKING_MIRROR ? (b ? UK_MIRROR : UK_IMPORT_ADMIT) : uk;
     if (!b) b = import_new(lo, hi, lo, "the union of abutting backings");
@@ -2700,7 +2701,7 @@ static void promote_hot(uint64_t value) {
                     promote_capped(r, b, lo, hi, value);
                     continue;
                 }
-                Backing *m = mirror_admit(r, lo, hi);
+                Backing *m = mirror_admit(r, lo, hi, BACKING_MIRROR_GUARD);
                 if (!m) {   // no room (or no write watch): it stays an import, and the rest wait for the next begin
                     __atomic_store_n(&b->hot, 0, __ATOMIC_RELAXED);
                     ev_promote(value, lo, hi, 2);

@@ -146,6 +146,8 @@
 #define BACKING_HOST_PAGE 0x1000ull           // the page of commit and of host import
 #define BACKING_MIRROR_GUARD BACKING_EXTENT_ALIGN   // reserved at either end for in-place growth
 #define BACKING_MIRROR_GROW_MAX (1ull << 20)  // the most one in-place growth of a bound mirror adds (a few pages, not a new mirror)
+#define BACKING_UNION_GUARD BACKING_MIRROR_GROW_MAX   // reserved at either end of the mirror a begin-time union makes: the binds that follow
+                                                      // the join slide over its edges by a growth, which the plain guard (64 KiB) does not hold
 #define BACKING_MIRROR_RESERVE 8              // section 8: a mirror leaves an eighth of the VRAM budget free
 #define BACKING_PROMOTE_MIN (64ull << 10)     // a bind larger than a uniform's (maxUniformBufferRange) marks its import hot
 #define BACKING_PROMOTE_MIRROR_MAX (128ull << 20)   // a promotion leaves the mirrors at or under this many bytes (the raw write-back's traffic and sinks, vk_raw.h)
