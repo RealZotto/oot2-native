@@ -183,6 +183,8 @@ enum {
     VKST_LEDGER,       // the ledger's tracker, once a record (sampled)
     VKST_N
 };
+// A test's clock for the timer (NULL: plat_now_ns); a time it returns must be odd, and stay odd by even steps.
+extern uint64_t (*vkst_clock)(void);
 uint64_t vkst_in(int cls);
 void vkst_out(int cls, uint64_t t0);
 #define ST_TIME(cls, ...)                                                                                              \
@@ -199,7 +201,7 @@ void vkst_out(int cls, uint64_t t0);
 int vkst_class_of(uint32_t op);
 // A submission begun, a recording walked (its address, its records and the draws and dispatches among them) and a draw or
 // dispatch record by kind: the counters that say why more draws are replayed than the game's calls count.
-void vkst_handle(uint64_t handle, uint32_t records, uint32_t ops);
+void vkst_handle(uint64_t handle, const void *bytes, size_t nbytes, uint32_t records, uint32_t ops);
 void vkst_sub(void);
 void vkst_op(uint32_t op, int32_t instances);
 // Zero the timer and its counters (a test).

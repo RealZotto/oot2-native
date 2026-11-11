@@ -106,6 +106,7 @@ typedef struct VkrImage {
     VkImageAspectFlags aspect;       // the one a copy takes (depth for a depth-stencil format, unless the texture reads stencil)
     VkImageAspectFlags all_aspects;  // every aspect of the format (a clear takes them all)
     uint32_t width, height, depth, layers, levels, samples;   // level 0; layers: a cube's six faces and an array's layers
+    VkImageUsageFlags usage;         // what the image was made for (a copy out of it needs TRANSFER_SRC; 0: not stated)
 } VkrImage;
 
 // A target op that answers 0 says why first (a static string): the stop the replay makes of the refusal names it. An op

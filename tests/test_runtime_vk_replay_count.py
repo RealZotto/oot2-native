@@ -146,17 +146,53 @@ class StageTimerTest(ReplayBase):
                 names = [k[3:-8] for k in s if k.startswith("st_") and k.endswith("_samples")]
                 self.assertGreaterEqual(len(names), 17)
                 self.assertEqual(s["st_clock_reads"], 2 * sum(s[f"st_{n}_samples"] for n in names))   # a sample is two reads
-                for n, every in (("walk", 1), ("draw", 1), ("resolve", 16), ("snapshot", 16), ("uniform", 16), ("ledger", 32),
-                                 ("pipeline", 4), ("descriptors", 4)):
+                for n, every in (("walk", 1), ("draw", 1), ("resolve", 17), ("snapshot", 17), ("uniform", 17), ("ledger", 31),
+                                 ("pipeline", 5), ("descriptors", 5)):
                     calls = s[f"st_{n}_n"]
                     self.assertEqual(s[f"st_{n}_samples"], (calls + every - 1) // every, (case, n))
                 self.assertGreater(s["st_clock_ns_x1000"], 0)
-                self.assertLessEqual(s["st_overhead_ns"], s["st_clock_reads"] * s["st_clock_ns_x1000"] // 1000 + 1)
+                self.assertEqual(s["st_clock_overhead_ns"], s["st_clock_reads"] * s["st_clock_ns_x1000"] // 1000)
+                self.assertEqual(s["st_site_calls"], sum(s[f"st_{n}_n"] for n in names))   # every site call, sampled or not
+                self.assertGreater(s["st_site_ns_x1000"], 0)
+                self.assertEqual(s["st_site_overhead_ns"], s["st_site_calls"] * s["st_site_ns_x1000"] // 1000)
+                self.assertNotIn("st_overhead_ns", s)    # no single figure that reads as the whole cost
 
     def test_an_interval_holds_the_intervals_inside_it(self) -> None:
         s = self.stages("graphics")
         inner = sum(s[f"st_{n}_ns"] for n in ("draw", "dispatch", "clear", "copy", "query", "barrier"))
         self.assertGreaterEqual(s["st_walk_ns"], inner)
+
+    def test_a_recording_written_again_at_the_same_address_with_other_content_is_not_a_repeat(self) -> None:
+        s = self.stages("stage_rerecord")
+        # three submissions of recordings at one address, all with the same number of records: the second has other bytes
+        self.assertEqual((s["st_handles"], s["st_handles_repeat"]), (3, 1))   # only the third equals one seen (the first)
+        self.assertEqual(s["st_handle_records_repeat"] * 3, s["st_handle_records"])
+
+    def test_the_time_of_a_class_is_the_scaled_sum_of_its_samples_and_the_intervals_nest(self) -> None:
+        s = self.stages("stage_clock")
+
+        # a clock the case drives: 10 draws, each with 1 pipeline lookup (8), 2 descriptor builds (200, 20), 1 vertex input
+        # (6), 1 dynamic state (4) and 3 ledger records (14 each). A class read every `every` calls reads ceil(n/every)
+        # samples, each added `every` times.
+        def est(n: int, every: int, cost: int) -> int:
+            return -(-n // every) * every * cost
+
+        self.assertEqual((s["st_draw_n"], s["st_pipeline_n"], s["st_descriptors_n"], s["st_ledger_n"]), (10, 10, 20, 30))
+        self.assertEqual(s["st_draw_ns"], 10 * (10 + 8 + 200 + 20 + 6 + 4))                   # every call is timed
+        self.assertEqual(s["st_pipeline_ns"], est(10, 5, 8))
+        self.assertEqual(s["st_vertex_ns"], est(10, 5, 6))
+        self.assertEqual(s["st_dynamic_state_ns"], est(10, 5, 4))
+        # the descriptor builds alternate 200 and 20 and the period 5 is odd, so the samples take both kinds: the estimate is
+        # the true total. A period of 4 would take only the first kind, and read 4,000.
+        self.assertEqual(s["st_descriptors_ns"], 10 * (200 + 20))
+        self.assertEqual((s["st_resolve_ns"], s["st_snapshot_ns"], s["st_uniform_ns"]),
+                         (est(20, 17, 4), est(20, 17, 2), est(20, 17, 6)))
+        self.assertEqual(s["st_ledger_ns"], est(30, 31, 14))
+        self.assertEqual(s["st_walk_ns"], 30 + s["st_draw_ns"] + 30 * 14)
+        self.assertGreaterEqual(s["st_draw_ns"],
+                                sum(s[f"st_{n}_ns"] for n in ("pipeline", "descriptors", "vertex", "dynamic_state")))
+        self.assertGreaterEqual(s["st_descriptors_ns"], sum(s[f"st_{n}_ns"] for n in ("resolve", "uniform", "snapshot")))
+        self.assertGreaterEqual(s["st_walk_ns"], s["st_draw_ns"])
 
     def test_with_the_counters_off_there_is_no_stages_line(self) -> None:
         env = {k: v for k, v in case_env().items() if k != ENV}

@@ -221,46 +221,67 @@ static void report(RcLine *l) {
 // that run thousands of times a present are sampled, and a sample stands for `every` calls (its time is added `every`
 // times), so the printed time of a class is an estimate of the sum of all its calls, exact in the count.
 //
-// The cost, bounded by what the line itself prints: st_clock_reads is the number of clock reads made, st_clock_ns_x1000 the
-// measured cost of one read (taken once, when the first line is printed, as the mean of 2,000 consecutive reads, times
-// 1000), and st_overhead_ns their product; a reader divides it by st_walk_ns, the time of the walk. A present of 1,000
-// draws makes about 10,000 reads; at 25 ns a read on a walk of 50 ms that is 0.5 percent. With the counters off a site
-// tests rc_on and nothing else.
+// The sampling period of a class is a prime (5, 17, 31), never a power of two: the descriptor build runs twice a draw
+// (vertex stage, then pixel stage) and the ledger once a record, so a period that divides such a pattern would sample the
+// same stage or the same opcode every time, and a sample scaled by the period would then be consistently wrong while the
+// counts stayed exact. A call is sampled when the calls since the last sample have reached the period (a down-counter, no
+// divide at the site): the first call of a class is sampled, then one in `every`.
+//
+// The cost, in three parts, none of them a bound on the whole perturbation. st_clock_reads times st_clock_ns_x1000 (the
+// mean of 2,000 consecutive reads, times 1000, taken once when the first line is printed) is st_clock_overhead_ns.
+// st_site_calls is the number of vkst_in calls, sampled or not, and st_site_ns_x1000 the measured cost of one unsampled
+// vkst_in plus vkst_out pair in a hot loop (a floor: the replay's own cache pressure is not in it); their product is
+// st_site_overhead_ns. st_hash_ns is the time spent hashing the recordings for the repeat counters, which runs inside the
+// walk's time. All three are measured in a hot loop and are floors; the perturbation of a real run is the difference of
+// st_walk_ns, or of the frame time, between a run with the counters on and one with them off. With the counters off a
+// site tests rc_on and nothing else.
 #define STAGE_NAMES(X)                                                                                                 \
     X(WALK, "walk", 1) X(DRAW, "draw", 1) X(DISPATCH, "dispatch", 1) X(CLEAR, "clear", 1) X(COPY, "copy", 1)           \
     X(QUERY, "query", 1) X(BARRIER, "barrier", 1) X(PASS_BEGIN, "pass_begin", 1) X(PASS_END, "pass_end", 1)            \
-    X(PIPELINE, "pipeline", 4) X(STAGE_RES, "descriptors", 4) X(VERTEX, "vertex", 4) X(DYN, "dynamic_state", 4)        \
-    X(RESOLVE, "resolve", 16) X(SNAPSHOT, "snapshot", 16) X(UNIFORM, "uniform", 16) X(LEDGER, "ledger", 32)
+    X(PIPELINE, "pipeline", 5) X(STAGE_RES, "descriptors", 5) X(VERTEX, "vertex", 5) X(DYN, "dynamic_state", 5)        \
+    X(RESOLVE, "resolve", 17) X(SNAPSHOT, "snapshot", 17) X(UNIFORM, "uniform", 17) X(LEDGER, "ledger", 31)
 
 static const char *const st_name[VKST_N] = {
 #define ST_NAME(id, name, every) name,
     STAGE_NAMES(ST_NAME)
 #undef ST_NAME
 };
-static const uint32_t st_every[VKST_N] = {
+// One more slot than classes: the calibration of the site's own cost (the printing thread's, never read as a class).
+static const uint32_t st_every[VKST_N + 1] = {
 #define ST_EVERY(id, name, every) every,
     STAGE_NAMES(ST_EVERY)
 #undef ST_EVERY
-};
-static struct {
+    UINT32_MAX};
+typedef struct {
     uint64_t n, est_ns, samples;
-} st[VKST_N];
-static uint64_t st_reads;
+    uint32_t left;   // calls to pass before the next sample: the replaying thread's alone
+} StSlot;
+static StSlot st[VKST_N + 1];
+static uint64_t st_reads, st_hash_ns;
+
+// The timer's clock: plat_now_ns, or a test's (a function that returns a time that is always odd, since a sample's start
+// time carries a low bit that marks it).
+uint64_t (*vkst_clock)(void);
+static uint64_t now(void) { return vkst_clock ? vkst_clock() : plat_now_ns(); }
 
 // A cumulative counter of one writer (the replaying thread), read by the printing one: stored relaxed so the read is whole.
 static void st_add(uint64_t *p, uint64_t v) { __atomic_store_n(p, *p + v, __ATOMIC_RELAXED); }
 
 uint64_t vkst_in(int cls) {
-    uint64_t n = st[cls].n;
-    st_add(&st[cls].n, 1);
-    if (n % st_every[cls]) return 0;
+    StSlot *s = &st[cls];
+    st_add(&s->n, 1);
+    if (s->left) {
+        s->left--;
+        return 0;
+    }
+    s->left = st_every[cls] - 1;
     st_add(&st_reads, 1);
-    return plat_now_ns() | 1u;   // never 0: 0 marks a call that was not sampled
+    return now() | 1u;   // never 0: 0 marks a call that was not sampled
 }
 
 void vkst_out(int cls, uint64_t t0) {
     if (!t0) return;
-    uint64_t t = plat_now_ns();
+    uint64_t t = now();
     st_add(&st_reads, 1);
     st_add(&st[cls].samples, 1);
     st_add(&st[cls].est_ns, (t > t0 ? t - t0 : 0) * st_every[cls]);
@@ -283,8 +304,16 @@ int vkst_class_of(uint32_t op) {
 // ---- why more draws are replayed than the game's calls count
 // The game's census counts the calls the guest makes while it records; the replay walks a recording every time it is
 // submitted. So the replayed draws are the draws of the recordings walked: these counters give the submissions, the
-// recordings walked, those an earlier submission had walked already (same address and same number of records), the draw
-// operations made inside those, and the draw operations by kind.
+// recordings walked, those walked before (same address, same bytes, same number of records), the draw operations made
+// inside those, and the draw operations by kind.
+//
+// The key of a repeat is the recording's address, the hash of its bytes and its record count. The address alone is not
+// enough: the allocator recycles recording memory, so a recording freed and written again at the same address with other
+// content is a new recording, which the bytes tell apart. What the key cannot tell apart is a recording written again at
+// the same address with the same bytes (a game that rebuilds an identical list every frame): that counts as a repeat, and
+// is one in the sense that matters here, the replay walking the same work again. The set is never emptied per submission or
+// per present: it spans presents (a recording submitted every frame is seen again in the next), and is emptied only when
+// half full, so a repeat across that emptying is not seen.
 enum { K_DRAW, K_DRAW_IDX, K_DRAW_IDX_IND, K_DRAW_MESH, K_DRAW_MESH_IND, K_DISPATCH, K_DISPATCH_IND, K_N };
 static const char *const k_name[K_N] = {"draw", "draw_idx", "draw_idx_ind", "draw_mesh", "draw_mesh_ind", "dispatch",
                                         "dispatch_ind"};
@@ -305,8 +334,25 @@ static uint32_t nseen_handle;
 
 void vkst_sub(void) { st_add(&c_subs, 1); }
 
-void vkst_handle(uint64_t handle, uint32_t records, uint32_t ops) {
-    uint64_t key = (handle * 0x9E3779B97F4A7C15ull ^ (uint64_t)records * 0xC2B2AE3D27D4EB4Full) | 1u;
+// The bytes of a recording, eight at a time (every record is a multiple of 8 bytes).
+static uint64_t content_hash(const void *p, size_t n) {
+    const uint8_t *b = p;
+    uint64_t h = 0xCBF29CE484222325ull;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, b + i, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++) h = (h ^ b[i]) * 0x100000001B3ull;
+    return h;
+}
+
+void vkst_handle(uint64_t handle, const void *bytes, size_t nbytes, uint32_t records, uint32_t ops) {
+    uint64_t h0 = plat_now_ns();   // the hash is the counters' own cost, and runs inside the walk's time: it is measured
+    uint64_t key = (handle * 0x9E3779B97F4A7C15ull ^ (uint64_t)records * 0xC2B2AE3D27D4EB4Full ^
+                    content_hash(bytes, nbytes) * 0xD6E8FEB86659FD93ull) | 1u;
     uint32_t at = (uint32_t)(key >> 17) & (SEEN_HANDLES - 1);
     int found = 0;
     while (seen_handle[at]) {
@@ -325,15 +371,31 @@ void vkst_handle(uint64_t handle, uint32_t records, uint32_t ops) {
     }
     st_add(&c_handles, 1), st_add(&c_records, records), st_add(&c_ops, ops);
     if (found) st_add(&c_repeat, 1), st_add(&c_records_repeat, records), st_add(&c_ops_repeat, ops);
+    uint64_t h1 = plat_now_ns();
+    st_add(&st_hash_ns, h1 > h0 ? h1 - h0 : 0);
 }
 
-// The cost of one clock read in nanoseconds times 1000, measured once.
+// The cost of one clock read in nanoseconds times 1000, measured once (on the real clock, whatever the timer reads).
 static uint64_t clock_cost_x1000(void) {
     static uint64_t cost;
     if (cost) return cost;
     uint64_t t0 = plat_now_ns(), last = t0;
     for (int i = 0; i < 2000; i++) last = plat_now_ns();
     cost = (last - t0) * 1000 / 2000;
+    if (!cost) cost = 1;
+    return cost;
+}
+
+// The cost of one site that does not sample, nanoseconds times 1000, measured once: vkst_in then vkst_out on the
+// calibration slot, which never samples, so the call, the counter and the branch are all that is timed.
+static uint64_t site_cost_x1000(void) {
+    static uint64_t cost;
+    if (cost) return cost;
+    st[VKST_N].left = UINT32_MAX;
+    uint64_t t0 = plat_now_ns();
+    for (int i = 0; i < 2000; i++) vkst_out(VKST_N, vkst_in(VKST_N));
+    cost = (plat_now_ns() - t0) * 1000 / 2000;
+    memset(&st[VKST_N], 0, sizeof st[VKST_N]);
     if (!cost) cost = 1;
     return cost;
 }
@@ -350,9 +412,15 @@ static void report_stages(RcLine *l) {
         rc_put(l, k, __atomic_load_n(&st[i].samples, __ATOMIC_RELAXED));
     }
     uint64_t reads = __atomic_load_n(&st_reads, __ATOMIC_RELAXED), cost = clock_cost_x1000();
+    uint64_t sites = 0, site_cost = site_cost_x1000();
+    for (int i = 0; i < VKST_N; i++) sites += __atomic_load_n(&st[i].n, __ATOMIC_RELAXED);
     rc_put(l, "st_clock_reads", reads);
     rc_put_raw(l, "st_clock_ns_x1000", cost);
-    rc_put(l, "st_overhead_ns", reads * cost / 1000);
+    rc_put(l, "st_clock_overhead_ns", reads * cost / 1000);
+    rc_put(l, "st_site_calls", sites);
+    rc_put_raw(l, "st_site_ns_x1000", site_cost);
+    rc_put(l, "st_site_overhead_ns", sites * site_cost / 1000);
+    rc_put(l, "st_hash_ns", __atomic_load_n(&st_hash_ns, __ATOMIC_RELAXED));
     rc_put(l, "st_subs", __atomic_load_n(&c_subs, __ATOMIC_RELAXED));
     rc_put(l, "st_handles", __atomic_load_n(&c_handles, __ATOMIC_RELAXED));
     rc_put(l, "st_handles_repeat", __atomic_load_n(&c_repeat, __ATOMIC_RELAXED));
@@ -374,5 +442,5 @@ void vkst_reset(void) {
     memset(k_ops, 0, sizeof k_ops);
     memset(seen_handle, 0, sizeof seen_handle);
     nseen_handle = 0;
-    st_reads = k_inst = c_subs = c_handles = c_repeat = c_ops = c_ops_repeat = c_records = c_records_repeat = 0;
+    st_reads = st_hash_ns = k_inst = c_subs = c_handles = c_repeat = c_ops = c_ops_repeat = c_records = c_records_repeat = 0;
 }

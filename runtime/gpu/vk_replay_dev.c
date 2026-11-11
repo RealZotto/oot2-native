@@ -196,7 +196,7 @@ static int dev_image(const nvn_tex_rec *t, uint64_t value, VkrImage *out) {
     VkbShape sh;
     vkb_image_shape(img, &sh);
     *out = (VkrImage){vkb_image_handle(img), sh.format, sh.type, sh.aspect, sh.all_aspects, sh.width, sh.height, sh.depth,
-                      sh.layers, sh.levels, sh.samples};
+                      sh.layers, sh.levels, sh.samples, sh.usage};
     return 1;
 }
 

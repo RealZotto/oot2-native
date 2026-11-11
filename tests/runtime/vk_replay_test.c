@@ -64,6 +64,7 @@ static uint8_t g_vram[HOST_BYTES];
 #define BUF_SCRATCH 0x5Cu
 
 static uint8_t g_arena[8u << 20];
+static int g_image_no_src;   // the stand-in images carry no TRANSFER_SRC usage
 static int g_rb_fill;   // the trace_readback cases: the stand-in copy to a buffer writes a pattern into it
 static uint32_t g_arena_used;
 static int g_mesh_pushes;
@@ -271,6 +272,7 @@ static int op_image(const nvn_tex_rec *t, uint64_t value, VkrImage *out) {
     out->format = VK_FORMAT_R8G8B8A8_UNORM;
     out->width = d->width, out->height = d->height, out->depth = 1, out->layers = 1, out->samples = 1;
     out->levels = d->levels ? (uint32_t)d->levels : 1;
+    out->usage = VK_IMAGE_USAGE_SAMPLED_BIT | (g_image_no_src ? 0 : VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (d->target == NVN_TEXTURE_TARGET_2D_ARRAY) out->layers = d->depth;
     if (d->target == NVN_TEXTURE_TARGET_3D) out->type = VK_IMAGE_TYPE_3D, out->depth = d->depth;
     if (d->samples > 1) out->samples = (uint32_t)d->samples;
@@ -1913,6 +1915,7 @@ static void case_trace_scan(void) {
 // 128) in bytes, z the slice offset the copy named. Run with a spec that selects the pass, and with specs that do not.
 static void case_trace_readback(int volume, int two_passes) {
     g_rb_fill = 1;
+    if (volume == 2) volume = 0, g_image_no_src = 1;   // the image has no TRANSFER_SRC: the readback is skipped by name
     open_fakes();
     Rec *r = rec_begin(0);
     graphics_state(r);
@@ -2009,6 +2012,76 @@ static void case_stage_repeat(void) {
     printf("ok stage_repeat\n");
 }
 
+// Two different recordings written at one address with the same number of records, then the second again: the counters take
+// the first two for two recordings (no repeat: the allocator recycles recording memory) and the third for a repeat.
+static void case_stage_rerecord(void) {
+    open_fakes();
+    for (int i = 0; i < 3; i++) {
+        Rec *r = rec_begin(0);   // the same buffer every time: the same address
+        graphics_state(r);
+        PUT(r, OP_DRAW, (p_draw){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = i == 0 ? 3 : 6, .base_instance = 0,
+                                 .instances = 1});
+        uint64_t h = rec_end(r);
+        vkr_submit(&h, 1);
+    }
+    close_fakes();
+    printf("ok stage_rerecord\n");
+}
+
+// The timer's attribution with a clock the test drives (vkst_clock): time moves only when the test says, in even steps (a
+// sample's start time carries a low bit). Ten draws; each makes one pipeline lookup, two descriptor builds (the first of
+// them costs 200 and the second 20, as a vertex stage and a pixel stage can), one vertex input, one dynamic state, and
+// three ledger records. The expected sums are in the test: a class timed every `every` calls reads back
+// ceil(n / every) * every * cost, and the inclusive relations hold.
+// The timer's own entry points (runtime/gpu/vk_replay_int.h, not included: it clashes with this file's names) and the values
+// of its classes, in the header's order; a reordering there turns the expected sums of the test red.
+extern uint64_t (*vkst_clock)(void);
+uint64_t vkst_in(int cls);
+void vkst_out(int cls, uint64_t t0);
+void vkst_reset(void);
+enum { VKST_WALK = 0, VKST_DRAW = 1, VKST_PIPELINE = 9, VKST_STAGE_RES = 10, VKST_VERTEX = 11, VKST_DYN = 12, VKST_RESOLVE = 13,
+       VKST_SNAPSHOT = 14, VKST_UNIFORM = 15, VKST_LEDGER = 16 };
+static uint64_t g_fake_time = 1001;
+static uint64_t fake_clock(void) { return g_fake_time; }
+static void spend(int cls, uint64_t ns) {
+    uint64_t t = vkst_in(cls);
+    g_fake_time += ns;
+    vkst_out(cls, t);
+}
+static void case_stage_clock(void) {
+    open_fakes();
+    Rec *r = rec_begin(0);
+    graphics_state(r);
+    PUT(r, OP_DRAW, (p_draw){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .first = 0, .count = 3, .base_instance = 0, .instances = 1});
+    uint64_t h = rec_end(r);
+    vkr_submit(&h, 1);   // hooks the report
+    vkst_reset();
+    vkst_clock = fake_clock;
+    uint64_t walk = vkst_in(VKST_WALK);
+    g_fake_time += 30;
+    for (int d = 0; d < 10; d++) {
+        uint64_t dr = vkst_in(VKST_DRAW);
+        g_fake_time += 10;
+        spend(VKST_PIPELINE, 8);
+        for (int k = 0; k < 2; k++) {
+            uint64_t ds = vkst_in(VKST_STAGE_RES);
+            g_fake_time += k ? 8 : 188;
+            spend(VKST_RESOLVE, 4);
+            spend(VKST_SNAPSHOT, 2);
+            spend(VKST_UNIFORM, 6);
+            vkst_out(VKST_STAGE_RES, ds);
+        }
+        spend(VKST_VERTEX, 6);
+        spend(VKST_DYN, 4);
+        vkst_out(VKST_DRAW, dr);
+        for (int k = 0; k < 3; k++) spend(VKST_LEDGER, 14);
+    }
+    vkst_out(VKST_WALK, walk);
+    vkst_clock = NULL;
+    close_fakes();
+    printf("ok stage_clock\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
@@ -2046,9 +2119,12 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "trace_scan")) case_trace_scan();
     else if (!strcmp(cs, "trace_readback")) case_trace_readback(0, 0);
     else if (!strcmp(cs, "trace_readback_volume")) case_trace_readback(1, 0);
+    else if (!strcmp(cs, "trace_readback_nosrc")) case_trace_readback(2, 0);
     else if (!strcmp(cs, "trace_readback_two")) case_trace_readback(0, 1);
     else if (!strcmp(cs, "trace_cols")) case_trace_cols();
     else if (!strcmp(cs, "stage_repeat")) case_stage_repeat();
+    else if (!strcmp(cs, "stage_rerecord")) case_stage_rerecord();
+    else if (!strcmp(cs, "stage_clock")) case_stage_clock();
     else if (!strcmp(cs, "depth")) case_depth();
     else if (!strcmp(cs, "compute")) case_compute();
     else if (!strcmp(cs, "raw_first")) case_raw_first();

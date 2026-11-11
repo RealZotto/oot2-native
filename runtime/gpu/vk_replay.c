@@ -682,6 +682,14 @@ static void trace_readback(void) {
             vkrt_rb_skipped(&want, "multisampled");
             continue;
         }
+        // An image made without the usage (vk_image.c gives TRANSFER_SRC only where the format allows it) cannot be copied
+        // out of: the copy would be invalid and the run could die of the instrument.
+        if (!(img.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+            vkrt_rb_skipped(&want, "no_transfer_src");
+            continue;
+        }
+        // The slice below counts from the view's own first layer: vkv_plan returns the base layer it was asked for (it
+        // refuses or accepts, never moves it: vk_view_plan.c 57, 86, 97), so it is the one dev_target's view starts at.
         uint32_t level = t->has_view && t->view.set_levels ? t->view.base_level : 0;
         uint32_t layer = t->has_view && t->view.set_layers ? t->view.min_layer : 0;
         int nvn_format = t->has_view && t->view.set_format ? (int)t->view.format : (int)t->tex.d.format;
@@ -2207,7 +2215,7 @@ static void walk(int index, uint64_t handle) {
         if (RC_ON()) nrec++, nops += vkst_class_of(h.op) == VKST_DRAW || vkst_class_of(h.op) == VKST_DISPATCH;
         at += h.size;
         if (h.op == OP_END) {
-            if (RC_ON()) vkst_handle(handle, nrec, nops);
+            if (RC_ON()) vkst_handle(handle, p, at, nrec, nops);
             return;
         }
     }

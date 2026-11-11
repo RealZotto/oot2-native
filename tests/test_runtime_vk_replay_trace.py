@@ -418,6 +418,13 @@ class ReadbackTest(TraceBase):
         self.assertEqual(f["skipped"], "slice_past_the_layers")
         self.assertEqual(fields(rows(text)["TOTAL"][0])["readbacks_skipped"], "1")
 
+    def test_an_image_without_transfer_src_is_skipped_by_name_and_no_copy_is_recorded(self) -> None:
+        done, text = self.run_rb("trace_readback_nosrc", "1-9,rb=64x32")
+        (_, f), = r_rows(text)
+        self.assertEqual(f["skipped"], "no_transfer_src")
+        self.assertEqual(done.stdout.count("pkt CopyImageToBuffer"), 0)
+        self.assertEqual(fields(rows(text)["TOTAL"][0])["readbacks_skipped"], "1")
+
     def test_the_replay_is_the_same_with_the_readback_on_but_for_its_own_copy(self) -> None:
         off, _ = self.shown(("trace_readback_two",), None)
         on, text = self.shown(("trace_readback_two",), "1-9,rb=64x32")
