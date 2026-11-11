@@ -43,6 +43,10 @@
 //              plan, so no call carries it; the validation layer reports nothing
 //   targets    the replay's render-target op on a slice of a volume and a plain texture (a view the validation layer
 //              accepts) and on a BC1 image made without the attachment usage (skipped, named once, no view call)
+//   bctarget   a colour target in another format of the storage of a block-compressed volume (the view names RGBA16 UINT, the
+//              texture is BC4, whose image has no attachment usage): the op serves it with the 2D image of the view's format
+//              on the same storage, a view the validation layer accepts, and a view that names the texture's own format still
+//              gets none
 //   depth_stop (fatal) a depth texture the CPU wrote stops by name at the first submission that binds it
 // Every device case ends with the validation layer's counts (the driver sets synchronization validation): 0 and 0.
 #include <stdio.h>
@@ -1039,7 +1043,6 @@ static void case_targets(void) {
     VkbImage *b = image_for(&at, &bc1, 3, &bc1_tex);
     VkbShape sh;
     vkb_image_shape(b, &sh);
-    CHECK(!(sh.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));   // the fixture: an image without the usage
     vkb_image_shape(v, &sh);
     CHECK(sh.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     vkb_image_shape(f, &sh);
@@ -1065,6 +1068,104 @@ static void case_targets(void) {
     vkrec_end(NULL, 0);
     vkrec_close();
     finish("targets");
+}
+
+// A BC4 volume (an 8-byte block, so the view format RGBA16 UINT, a texel of it one block). The image itself carries the colour
+// attachment usage where the device renders to that format, so a target viewed as RGBA16 UINT is a view of the texture's own
+// image: its extent counts blocks (8x8 for a 32x32 level), every slice has one, and no second image is made. A pass writing
+// through such a view then lands in the blocks of the image, which the second half checks by a clear and a read-back.
+static void case_bctarget(void) {
+    setup(64 * MiB, 1024 * MiB);
+    uint64_t at = g_heap + 4 * MiB;
+    tex_t *vol_tex;
+    Spec vol = {NVN_TEXTURE_TARGET_3D, NVN_FORMAT_RGTC1_UNORM, 0, 32, 32, 20, 1, 0};
+    VkbImage *v = image_for(&at, &vol, 1, &vol_tex);
+    VkbShape sh;
+    vkb_image_shape(v, &sh);
+    CHECK(sh.type == VK_IMAGE_TYPE_3D && (sh.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));
+    CHECK(sh.flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT);
+    const VkReplayOps *ops = vkr_device_ops();
+    VkRecOpen open = {0};
+    vkrec_open(&open);
+    uint64_t frame = vkrec_begin(GPU_VK_REPLAY);
+    VkrTarget out;
+    static const uint32_t slices[] = {0, 5, 19};
+    for (unsigned k = 0; k < 3; k++) {
+        nvn_tex_rec raw = {.tex = *vol_tex, .present = 1, .has_view = 1};
+        raw.view.set_format = 1, raw.view.format = NVN_FORMAT_RGBA16UI;
+        raw.view.set_layers = 1, raw.view.min_layer = slices[k], raw.view.nlayers = 1;
+        CHECK(ops->target(&raw, 0, frame, &out) == 1 && out.view != VK_NULL_HANDLE);
+        CHECK(out.format == VK_FORMAT_R16G16B16A16_UINT && out.layers == 1);
+        CHECK(out.width == 8 && out.height == 8);   // blocks, not the texture's 32x32 texels
+        CHECK(out.image == (uint64_t)(uintptr_t)vkb_image_handle(v));   // the texture's own image
+        printf("target, RGBA16 UINT on slice %u of a BC4 volume: an 8x8 view of the texture's own image\n", slices[k]);
+    }
+    CHECK(vkb_image_demand(vol_tex) == v);
+    nvn_tex_rec own = {.tex = *vol_tex, .present = 1, .has_view = 1};
+    own.view.set_format = 1, own.view.format = NVN_FORMAT_RGTC1_UNORM;
+    CHECK(ops->target(&own, 0, frame, &out) == 0 && out.view == VK_NULL_HANDLE);
+    printf("target, the texture's own BC4 format: skipped\n");
+    vkrec_end(NULL, 0);
+    vkrec_close();
+    // the view the op makes, made here in a submission of the test's own (the op's views die with the recorder's frame): a
+    // clear of slice 5 through it changes the blocks of slice 5 and no other
+    UntileGeom g;
+    const char *why;
+    CHECK(untile_geom(&vol_tex->d, 0, 0, &g, &why));
+    size_t slice_bytes = (size_t)g.row_bytes * g.rows;
+    uint8_t *before = readback(vol_tex, 0, 0, &g);
+    uint64_t sub = gpu_vk_begin(GPU_VK_INTERNAL);
+    VkbImage *img = vkb_image_demand_current(vol_tex, sub);
+    CHECK(img == v);
+    vkb_image_shape(img, &sh);
+    VkvImage vim = {sh.type, sh.depth, sh.layers, sh.levels, sh.flags, sh.usage, gpu_vk.image_2d_view_of_3d};
+    VkvWant want = {VKV_PICK, 0, 5, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+    VkvPlan plan;
+    CHECK(vkv_plan(&vim, &want, &plan, &why));
+    VkImageViewUsageCreateInfo ui = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+                                     .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = &ui, .image = vkb_image_handle(img),
+                                .viewType = plan.type, .format = VK_FORMAT_R16G16B16A16_UINT,
+                                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, plan.base_layer, plan.layers}};
+    VkImageView view;
+    CHECK(vkCreateImageView(gpu_vk.device, &vi, NULL, &view) == VK_SUCCESS);
+    VkCommandBuffer cb = gpu_vk_cmd();
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    VkRenderingAttachmentInfo att = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view,
+                                     .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                     .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                                     .clearValue = {.color = {.uint32 = {0x0201, 0x0403, 0x0605, 0x0807}}}};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {8, 8}}, .layerCount = 1,
+                          .colorAttachmentCount = 1, .pColorAttachments = &att};
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdEndRendering(cb);
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, mb.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier2(cb, &di);
+    gpu_vk_end(NULL, 0);
+    CHECK(gpu_sync_wait(sub, 30ull * 1000 * 1000 * 1000));
+    vkDestroyImageView(gpu_vk.device, view, NULL);
+    uint8_t *after = readback(vol_tex, 0, 0, &g);
+    static const uint8_t pat[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    for (size_t i = 0; i < slice_bytes * g.slices; i++) {
+        size_t slice = i / slice_bytes;
+        uint8_t want = slice == 5 ? pat[i % 8] : before[i];
+        if (after[i] != want) {
+            fprintf(stderr, "bctarget: slice %zu byte %zu: %02x, want %02x\n", slice, i % slice_bytes, after[i], want);
+            exit(1);
+        }
+    }
+    CHECK(memcmp(before + 5 * slice_bytes, after + 5 * slice_bytes, slice_bytes) != 0);
+    printf("a clear through the RGBA16 UINT view of slice 5 wrote its blocks and no other slice's (%zu bytes a slice)\n",
+           slice_bytes);
+    free(before);
+    free(after);
+    finish("bctarget");
 }
 
 static void case_stop(int depth) {
@@ -1121,6 +1222,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "rawview")) case_rawview();
     else if (!strcmp(argv[1], "views")) case_views();
     else if (!strcmp(argv[1], "targets")) case_targets();
+    else if (!strcmp(argv[1], "bctarget")) case_bctarget();
     else if (!strcmp(argv[1], "depth_stop")) case_stop(1);
     else if (!strcmp(argv[1], "stop_counted")) case_stop_counted();
     else {

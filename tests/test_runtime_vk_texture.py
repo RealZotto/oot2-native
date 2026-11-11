@@ -148,9 +148,19 @@ class DeviceTest(unittest.TestCase):
         self.assertIn("target, slice 5 of a volume: a view made", done.stdout)
         self.assertIn("target, a plain 2D texture: a view made", done.stdout)
         self.assertIn("target, a BC1 image without the attachment usage: skipped (ask 2)", done.stdout)
-        named = re.findall(r"the render target view of the texture at \S+ \(NVN format \S+\) is skipped: "
-                           r"its image was made without colour attachment usage \(usage \S+\)", done.stderr)
+        named = re.findall(r"the render target view of the texture at \S+ \(NVN format \S+, level 0, layers 0..1\) is skipped: "
+                           r"the device renders to no image of that format \(usage \S+\)", done.stderr)
         self.assertEqual(len(named), 1, done.stderr[-2000:])
+
+    def test_a_colour_target_in_another_format_of_a_compressed_volumes_storage_is_a_view_of_its_own_image(self) -> None:
+        """A BC4 volume's image carries the colour attachment usage for its block-sized format: a target viewed as RGBA16
+        UINT on slices 0, 5 and 19 is an 8x8 view (blocks) of the texture's own image (validation clean), a clear through
+        that view of slice 5 writes the blocks of slice 5 and no other, and a view naming the BC4 format itself gets none."""
+        done = self.passing("bctarget")
+        for k in (0, 5, 19):
+            self.assertIn(f"target, RGBA16 UINT on slice {k} of a BC4 volume: an 8x8 view of the texture's own image", done.stdout)
+        self.assertIn("target, the texture's own BC4 format: skipped", done.stdout)
+        self.assertRegex(done.stdout, r"a clear through the RGBA16 UINT view of slice 5 wrote its blocks and no other slice's")
 
     def test_the_arena_gets_its_memory_back_when_textures_are_replaced(self) -> None:
         done = self.passing("churn")

@@ -189,24 +189,35 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
     const int decoded = vkf_decoded(row, fmt);   // an ASTC texture the device does not sample: its image holds RGBA8 texels
     // A volume a pass renders into slice by slice or a program stores into as 2D slices: the flags that make those views
     // exist (oot2/vk_view_plan.h). Depth, block-compressed and decoded images are never such targets.
-    if (!(row->flags & (VKF_DEPTH | VKF_STENCIL)) && !compressed && !decoded)
+    // A block-compressed image is one when a raw view of it is a target (its slices, below).
+    if (!(row->flags & (VKF_DEPTH | VKF_STENCIL)) && !decoded)
         flags |= vkv_image_flags(sh->type, gpu_vk.image_2d_view_of_3d);
-    int raw_storage = 0;
+    int raw_storage = 0, raw_color = 0;
     if (compressed && (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
         flags |= RAW_VIEW_FLAGS;
         usage |= VK_IMAGE_USAGE_STORAGE_BIT, raw_storage = 1;
+        // and colour attachment usage where the device renders to the uncompressed format of the block's size: a pass the
+        // console draws into the image's blocks writes through that view (a texel of it a block of the image)
+        VkFormat block = row->bpb == 8 ? VK_FORMAT_R16G16B16A16_UINT : row->bpb == 16 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_UNDEFINED;
+        if (block != VK_FORMAT_UNDEFINED && (features(block) & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+            usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, raw_color = 1;
     }
     VkImageFormatProperties fp;
     VkResult r;
     for (;;) {
         r = vkGetPhysicalDeviceImageFormatProperties(gpu_vk.phys, fmt, sh->type, VK_IMAGE_TILING_OPTIMAL, usage, flags, &fp);
         if (r == VK_SUCCESS) break;
-        if (raw_storage) {   // raw views without storage usage
-            usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_STORAGE_BIT, raw_storage = 0;
+        // a compressed volume's slice views are the newest ask: the first a device that takes not all of it gives up
+        if (compressed && (flags & (VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT | VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT))) {
+            flags &= ~(VkImageCreateFlags)(VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT | VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT);
             continue;
         }
-        if (flags & RAW_VIEW_FLAGS) {   // a device that takes no raw views of this image still takes the image
-            flags &= ~(VkImageCreateFlags)RAW_VIEW_FLAGS;
+        if (raw_color) {   // raw views without colour attachment usage
+            usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, raw_color = 0;
+            continue;
+        }
+        if (raw_storage) {   // raw views without storage usage
+            usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_STORAGE_BIT, raw_storage = 0;
             continue;
         }
         // a device that takes the volume's view flags in no combination with this usage still takes the volume, then the
@@ -217,6 +228,10 @@ static VkbImage *image_make(const tex_t *t, const VkfRow *row, VkFormat vk, cons
         }
         if (flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT) {
             flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+            continue;
+        }
+        if (flags & RAW_VIEW_FLAGS) {   // a device that takes no raw views of this image still takes the image
+            flags &= ~(VkImageCreateFlags)RAW_VIEW_FLAGS;
             continue;
         }
         if (arena) break;

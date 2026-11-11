@@ -87,14 +87,14 @@ static void view_gone(void *arg, uint64_t value) {
 
 static int dev_target(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarget *out) {
     memset(out, 0, sizeof *out);
+    int fmt = t->has_view && t->view.set_format ? t->view.format : t->tex.d.format;
+    const VkfRow *row = vkf_row(fmt);
+    if (!row || row->vk == VK_FORMAT_UNDEFINED) return 0;
     VkbImage *img = vkb_image_get(&t->tex);
     // a target in storage the CPU can see: its arena image, made current so the pass draws over the CPU's bytes
     if (!img) img = vkb_image_demand_current(&t->tex, value);
     if (!img) return 0;
     vkb_image_use(img, value);
-    int fmt = t->has_view && t->view.set_format ? t->view.format : t->tex.d.format;
-    const VkfRow *row = vkf_row(fmt);
-    if (!row || row->vk == VK_FORMAT_UNDEFINED) return 0;
     uint32_t level = t->has_view && t->view.set_levels ? t->view.base_level : 0;
     uint32_t base_layer = t->has_view && t->view.set_layers ? t->view.min_layer : 0;
     uint32_t layers = t->has_view && t->view.set_layers && t->view.nlayers ? t->view.nlayers : 1;
@@ -113,16 +113,26 @@ static int dev_target(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarg
     VkvWant vw = {VKV_PICK, level, base_layer, layers, want_usage};
     VkvPlan plan;
     const char *refusal;
+    // A colour view's own format must render (an image of a block-compressed texture carries the usage for the views of the
+    // block's size, which is no licence for a view in the compressed format itself).
+    int format_gap = 0;
+    if (!storage && aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(gpu_vk.phys, row->vk, &fp);
+        format_gap = !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
+    }
     // An image made without the usage (its format gives none: the driver took such views before) is no target: skipped, the
-    // way an unusable format is, and named once per kind of usage.
-    if (vkv_usage_gap(&vim, want_usage)) {
+    // way an unusable format is, and named once per kind of usage, with the level and layers asked.
+    if (format_gap || vkv_usage_gap(&vim, want_usage)) {
         static unsigned logged;
         unsigned kind = storage ? 1u : aspect == VK_IMAGE_ASPECT_COLOR_BIT ? 2u : 4u;
         if (!(logged & kind)) {
             logged |= kind;
             vkv_plan(&vim, &vw, &plan, &refusal);
-            rt_log("gfx: vulkan: the %s view of the texture at %#llx (NVN format %#x) is skipped: %s (usage %#x)",
-                   storage ? "storage" : "render target", (unsigned long long)(uintptr_t)t->tex.mem, fmt, refusal,
+            rt_log("gfx: vulkan: the %s view of the texture at %#llx (NVN format %#x, level %u, layers %u..%u) is skipped: %s "
+                   "(usage %#x)",
+                   storage ? "storage" : "render target", (unsigned long long)(uintptr_t)t->tex.mem, fmt, level, base_layer,
+                   base_layer + layers, format_gap ? "the device renders to no image of that format" : refusal,
                    (unsigned)sh.usage);
         }
         return 0;
@@ -142,6 +152,12 @@ static int dev_target(const nvn_tex_rec *t, int storage, uint64_t value, VkrTarg
     GPU_VK_OK(vkCreateImageView(gpu_vk.device, &vi, NULL, &view), "vkCreateImageView (a render target)");
     vkrec_effect(view_gone, (void *)(uintptr_t)view);
     uint32_t w = t->tex.d.width >> level, h = t->tex.d.height >> level;
+    // a raw view of a block-compressed image (a format of the block's size): a texel of it is a block, so its extent counts
+    // blocks
+    const VkfRow *trow = vkf_row(t->tex.d.format);
+    int raw = trow && (trow->flags & VKF_BLOCK) && !(row->flags & VKF_BLOCK) && vkf_class(sh.format) >= 2001 &&
+              vkf_class(sh.format) < 4000;
+    if (raw) w = (w + trow->bw - 1u) / trow->bw, h = (h + trow->bh - 1u) / trow->bh;
     *out = (VkrTarget){view, row->vk, w ? w : 1, h ? h : 1, layers, aspect, (uint64_t)(uintptr_t)vkb_image_handle(img)};
     return 1;
 }
