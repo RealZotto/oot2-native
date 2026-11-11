@@ -1146,7 +1146,8 @@ static void vertex_count(const ShaderBinds *vb) {
 // An indexed draw with a negative base vertex reads below the start of each vertex stream it resolves, inside the stream's
 // buffer. The resolve states the stream's extent upward only, so such a draw resolves the stream's first byte once more:
 // the backing map takes a resolve of one byte for an extent not stated and will not give pages away below it (backing.c,
-// import_gives). Set by op_draw_idx for the one draw, read and cleared by the first vertex_input after it.
+// import_gives). Set by op_draw_idx for the one draw, and by op_draw_idx_ind for every draw (the base vertex of an indirect
+// draw is a word the GPU reads from its record, not known here), read and cleared by the first vertex_input after it.
 static int g_reach_below;
 
 static void vertex_input(const ShaderBinds *vb) {
@@ -1308,6 +1309,7 @@ static uint32_t instances(int32_t n) { return n > 0 ? (uint32_t)n : 1u; }
 
 static void op_draw(const p_draw *d) {
     VkBool32 restart;
+    g_reach_below = 0;   // a walk that left an indexed draw by the collection way-out may have left it set
     if (!draw_prepare(d->prim, (uint32_t)d->base_instance, &restart)) return;
     vkrec_Draw((uint32_t)d->count, instances(d->instances), (uint32_t)d->first, (uint32_t)d->base_instance);
 }
@@ -1353,7 +1355,10 @@ static void op_draw_idx_ind(const p_draw_idx_ind *d) {
         if (overlaps((Rng){d->ind, d->ind + 20}, F.wrote[scanned])) readable = 0;
     RC_ADD(RC_IND_SCAN_STEPS, scanned);
     if (readable) memcpy(&base_instance, (const uint8_t *)(uintptr_t)d->ind + 16, 4);
-    if (!draw_prepare(d->prim, base_instance, &restart)) return;
+    g_reach_below = 1;
+    const int prepared = draw_prepare(d->prim, base_instance, &restart);
+    g_reach_below = 0;
+    if (!prepared) return;
     index_buffer(d->itype, d->ibuf, 0);
     vkrec_DrawIndexedIndirect((VkBuffer)(uintptr_t)ref.buffer, ref.offset, 1, 20);
 }

@@ -51,7 +51,8 @@ PASSING = ("generations", "upload", "admission", "guarded_admission", "writeback
            "raw_promote", "raw_promote_small", "raw_promote_wait", "raw_promote_cap",
            "raw_dry_grow", "raw_dry_g4", "raw_dry_cap", "raw_dry_kind", "raw_dry_none", "raw_dry_g4_on", "raw_dry_g8",
            "raw_dry_g5", "raw_dry_g1", "raw_dry_g2",
-           "raw_grow_used_import", "raw_grow_used_edge", "raw_grow_used_wait", "raw_grow_heir", "raw_grow_heir_old")
+           "raw_grow_used_import", "raw_grow_used_edge", "raw_grow_used_wait", "raw_grow_heir", "raw_grow_heir_old",
+           "raw_grow_used_decommit")
 
 # case: text the one FATAL line must hold
 FAILING = {
@@ -86,6 +87,7 @@ FAILING = {
                         "far a resolve reaches upward is not bounded",
     "raw_grow_heir_hull": "which this submission bound, lies on the pages it would add",
     "raw_grow_heir_written": "lies on the pages it would add: it was written on the GPU by this submission",
+    "raw_grow_heir_loose": "lies on the pages it would add: it was reached by a resolve whose extent is not stated",
 }
 
 # The rule of import_gives that refuses the import in each of those stops, and the reason the text adds after the head (none
@@ -98,7 +100,7 @@ WHY = {
 }
 RULE_OF = {
     "raw_grow_bound_import": "hull", "raw_grow_used_hull": "hull", "raw_grow_used_hull_edge": "hull",
-    "raw_grow_heir_hull": "hull", "raw_grow_used_written": "written", "raw_grow_heir_written": "written",
+    "raw_grow_heir_hull": "hull", "raw_grow_heir_loose": "loose", "raw_grow_used_written": "written", "raw_grow_heir_written": "written",
     "raw_grow_used_loose": "loose", "raw_grow_used_up": "up", "raw_diag_hull": "up", "raw_diag_dry": "up",
     "raw_diag_birth": "up", "raw_ev_miss": "hull", "raw_ev_survives_hits": "hull", "raw_ev_lost": "hull",
     "raw_ev_origin": "hull",

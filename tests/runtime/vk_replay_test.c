@@ -1012,6 +1012,30 @@ static void case_base_vertex(void) {
     printf("ok base_vertex\n");
 }
 
+// The base vertex of an indexed indirect draw is a word of the record the GPU reads, so every such draw reads below its
+// streams as far as the map can tell: it resolves each stream's first byte once more. Frame 1 is the indirect draw, frame
+// 2 a direct one with a base vertex of 2 (resolved once: the mark does not outlast the indirect draw).
+static void case_base_vertex_ind(void) {
+    open_fakes();
+    g_log_resolves = 1;
+    for (int f = 0; f < 2; f++) {
+        Rec *r = rec_begin(f);
+        if (!f) graphics_state(r);
+        if (!f)
+            PUT(r, OP_DRAW_IDX_IND, (p_draw_idx_ind){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES,
+                                                     .itype = NVN_INDEX_TYPE_UNSIGNED_INT, .ibuf = MIRROR + 0x5000,
+                                                     .ind = VRAM + 0x200});
+        else
+            PUT(r, OP_DRAW_IDX, (p_draw_idx){.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .itype = NVN_INDEX_TYPE_UNSIGNED_SHORT,
+                                             .count = 6, .base_vertex = 2, .base_instance = 0, .instances = 1,
+                                             .ibuf = MIRROR + 0x5000});
+        uint64_t h = rec_end(r);
+        vkr_submit(&h, 1);
+    }
+    close_fakes();
+    printf("ok base_vertex_ind\n");
+}
+
 // ---------- storage images
 static p_bind_program program_img(void) {
     p_bind_program p = program(1);
@@ -1840,6 +1864,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cs, "movie_open")) case_movie_open();
     else if (!strcmp(cs, "storage_stop") && argc >= 3) case_storage_stop(argv[2]);
     else if (!strcmp(cs, "base_vertex")) case_base_vertex();
+    else if (!strcmp(cs, "base_vertex_ind")) case_base_vertex_ind();
     else if (!strcmp(cs, "conflict_read_first")) case_conflict(0);
     else if (!strcmp(cs, "conflict_write_first")) case_conflict(1);
     else if (!strcmp(cs, "transfers")) case_transfers();

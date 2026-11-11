@@ -727,6 +727,21 @@ class ComputeTest(ReplayBase):
                                   ["op resolve 0x30003000+0x40", "op resolve 0x30003000+0x1"],
                                   ["op resolve 0x30003000+0x40"]])
 
+    def test_an_indexed_indirect_draw_resolves_the_streams_first_byte_once_more(self) -> None:
+        # Its base vertex is a word of the record the GPU reads, so it may be negative: the same extra resolve as a direct
+        # draw with a negative base vertex, for every such draw, and only for it (frame 2 is a direct draw with base 2).
+        out = self.passing("base_vertex_ind")
+        frames: list[list[str]] = []
+        for line in (line for line in out.splitlines() if line.startswith("op ")):
+            if line == "op frame_begin":
+                frames.append([])
+            else:
+                frames[-1].append(line)
+        self.assertEqual(len(frames), 2)
+        stream = [[line for line in ops if line.startswith("op resolve 0x30003000+")] for ops in frames]
+        self.assertEqual(stream, [["op resolve 0x30003000+0x40", "op resolve 0x30003000+0x1"],
+                                  ["op resolve 0x30003000+0x40"]])
+
     def test_dispatches_become_their_packets(self) -> None:
         out = self.passing("compute")
         f = frame(out, 1)

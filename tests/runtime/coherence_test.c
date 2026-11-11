@@ -78,14 +78,17 @@
 //                everything it resolved in it: the import is trimmed in place (same buffer, memory and offset of what it still
 //                holds, one page less at its start), no page has two backings, the page the mirror took is copied in and
 //                a write through the mirror reaches guest memory; the edge case has the hull start on the page after
+//   raw_grow_used_decommit   the same growth, then the guest gives back the page the mirror took: the trimmed import, whose host
+//                import still stands over that page, is retired at the next sync
 //   raw_grow_used_wait   the growth waits for the plain submission issued before it that wrote through the import, not for
 //                the submission being recorded, whose stamp the import carries
 //   raw_grow_used_written, raw_grow_used_hull, raw_grow_used_hull_edge, raw_grow_used_loose, raw_grow_used_up   stop by the
 //                rule that refuses such an import: written on the GPU by the submission, its hull on the pages (a byte
 //                before the page's end included), an extent not stated, the pages above the hull (a head growth)
 //   raw_grow_heir, raw_grow_heir_old   an import that replaces two used ones takes over their hull, so a growth over it
-//                sees it; a hull of an older submission is not taken over; raw_grow_heir_hull, raw_grow_heir_written stop
-//                by the rule that sees what was taken over (the hull on the pages, a GPU write of the submission)
+//                sees it; a hull of an older submission is not taken over; raw_grow_heir_hull, raw_grow_heir_written,
+//                raw_grow_heir_loose stop by the rule that sees what was taken over (the hull on the pages, a GPU write of the
+//                submission, an extent not stated)
 //   unwritten, replace_written, raw_grow_bound_import, raw_grow_fragmented, raw_grow_guarded_blocked,
 //   raw_grow_untracked, raw_grow_cap   stop by name, each with the reason the mirror could not grow
 #include <stdio.h>
@@ -2276,7 +2279,7 @@ static void case_raw_dry_none(void) {
 // the places the mode says, then a bind across the boundary, [E - 0x600, E + 0x810), takes the mirror's tail growth over E's
 // page: the pages [E, E + 0x1000) are I's lowest. Passing: the mirror grows and I is trimmed in place (its start moves up
 // one page, its buffer, stamps and hull stay). Stopping: the rule that refused I is named in the stop.
-enum { U_OK, U_EDGE, U_HULL, U_EDGE_HULL, U_WRITTEN, U_LOOSE };
+enum { U_OK, U_EDGE, U_HULL, U_EDGE_HULL, U_WRITTEN, U_LOOSE, U_DECOMMIT };
 static BackingRef g_u_big, g_u_import;
 
 static void used_resolves(int mode, uint64_t E, uint64_t v) {
@@ -2379,12 +2382,29 @@ static void used_pass(const char *name, int mode) {
     s = stats();
     printf("%s: the mirror grew one page over an import the submission used, which was trimmed in place (raw_grows %llu, "
            "raw_grow_trims %llu)\n", name, (ull)s.raw_grows, (ull)s.raw_grow_trims);
+    if (mode == U_DECOMMIT) {
+        // The guest gives back the one page the mirror took (MapMemory moves it to the stack region), the rest of the
+        // import stays committed. The trimmed import's host import still stands over that page: it is retired.
+        uint64_t dst = 0;
+        CHECK(rt_mem_info(14, &dst));
+        c.x[0] = dst + 0x100000, c.x[1] = E, c.x[2] = PG;
+        rt_svc(&c, 0x04, 0);
+        CHECK(c.x[0] == 0);
+        int committed = 1;
+        CHECK(rt_mem_commit_run(E, PG, &committed) == PG && !committed);
+        CHECK(rt_mem_commit_run(E + PG, PG, &committed) == PG && committed);
+        CHECK(s.imports == 1);
+        backing_sync();
+        s = stats();
+        CHECK(s.imports == 0 && s.imports_stale == 1);
+    }
     backing_pool_fini(&pp);
     done(name);
 }
 
 static void case_raw_grow_used_import(void) { used_pass("raw_grow_used_import", U_OK); }
 static void case_raw_grow_used_edge(void) { used_pass("raw_grow_used_edge", U_EDGE); }
+static void case_raw_grow_used_decommit(void) { used_pass("raw_grow_used_decommit", U_DECOMMIT); }
 
 static void used_stop(const char *name, int mode) {
     uint64_t p;
@@ -2452,7 +2472,7 @@ static void case_raw_grow_used_wait(void) {
 // Two used imports replaced by one bind (a miss across the uncommitted chunk between them): the import that replaces
 // them takes over what the submission knew of both, so a later growth over it sees the hull of the first one and the GPU
 // write declared in it. A hull of an older submission says nothing about this one.
-enum { H_PASS, H_HULL, H_WRITTEN, H_OLD };
+enum { H_PASS, H_HULL, H_WRITTEN, H_OLD, H_LOOSE };
 static void heir_scene(const char *name, int mode, int stop) {
     setup(64 * MiB, 0);
     backing_set_mirror_hook(want_all);
@@ -2478,7 +2498,7 @@ static void heir_scene(const char *name, int mode, int stop) {
     CHECK(s.mirrors == 1 && s.imports == 2 && s.import_bytes == 128 * KiB);
     CHECK(resolve(A - 0xc00, 0x1d0, v).kind == BACKING_MIRROR);
     const uint64_t h1 = mode == H_HULL ? 0x100 : 0x4000;
-    if (mode != H_OLD) CHECK(resolve(A + h1, 8, v).kind == BACKING_IMPORT);
+    if (mode != H_OLD) CHECK(resolve(A + h1, mode == H_LOOSE ? 0 : 8, v).kind == BACKING_IMPORT);   // size 0: no extent stated
     if (mode == H_WRITTEN) backing_gpu_wrote(A + h1, 4, v);
     CHECK(resolve(B + 0x100, 8, v).kind == BACKING_IMPORT);
     CHECK(resolve(A + 0x10100, 8, v).kind == BACKING_IMPORT);   // commits the chunk: one import over I1, it and I2
@@ -2505,6 +2525,7 @@ static void case_raw_grow_heir(void) { heir_scene("raw_grow_heir", H_PASS, 0); }
 static void case_raw_grow_heir_old(void) { heir_scene("raw_grow_heir_old", H_OLD, 0); }
 static void case_raw_grow_heir_hull(void) { heir_scene("raw_grow_heir_hull", H_HULL, 1); }
 static void case_raw_grow_heir_written(void) { heir_scene("raw_grow_heir_written", H_WRITTEN, 1); }
+static void case_raw_grow_heir_loose(void) { heir_scene("raw_grow_heir_loose", H_LOOSE, 1); }
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -2551,6 +2572,7 @@ int main(int argc, char **argv) {
         {"raw_grow_used_loose", case_raw_grow_used_loose}, {"raw_grow_used_up", case_raw_grow_used_up},
         {"raw_grow_heir", case_raw_grow_heir}, {"raw_grow_heir_old", case_raw_grow_heir_old},
         {"raw_grow_heir_hull", case_raw_grow_heir_hull}, {"raw_grow_heir_written", case_raw_grow_heir_written},
+        {"raw_grow_heir_loose", case_raw_grow_heir_loose}, {"raw_grow_used_decommit", case_raw_grow_used_decommit},
     };
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++)
         if (!strcmp(argv[1], cases[i].name)) {
