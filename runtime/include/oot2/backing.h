@@ -340,7 +340,6 @@ typedef struct BackingStats {
     uint64_t raw_union_overcap_bytes, raw_union_skipped[3];
 } BackingStats;
 void backing_stats(BackingStats *out);
-// The same for a line printed at a stop or by a thread that must not wait (the replay counters): a lock the map holds is not
-// waited for, because a named stop is raised under it and its stop writers run on that thread. Returns a mask of the parts
-// left out (the fields of those parts are zero): 1 the map's counters (g_lock), 2 the coherence counters (g_coh); 0 when all read.
-int backing_stats_try(BackingStats *out);
+// The resolve count and the count of resolves that missed, and nothing else: two atomics, read with no lock, so a line printed
+// at a stop (on the thread that raised the stop under the map's lock) or by a thread that must not wait can read them.
+void backing_resolve_counts(uint64_t *resolves, uint64_t *misses);

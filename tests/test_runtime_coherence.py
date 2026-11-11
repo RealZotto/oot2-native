@@ -609,8 +609,8 @@ class CoherenceTest(unittest.TestCase):
 
     def test_a_named_stop_under_the_maps_lock_ends_the_process_at_once_with_the_counters_on(self) -> None:
         # The replay counters' line at a stop reads the map's statistics from the thread that raised the stop under the
-        # map's lock: waiting for that lock left the process at no CPU after the FATAL line. The statistics are a try now;
-        # the line names the group it left out (silent_unavailable bit 16) and the stop ends the process within seconds.
+        # map's lock: waiting for that lock left the process at no CPU after the FATAL line. The two counters it prints from the map are atomics read with no lock, so the stop ends the
+        # process within seconds (a blocking read of the map's statistics hangs here and hits the bound).
         for level in LEVELS:
             with self.subTest(level=level):
                 started = time.monotonic()
@@ -622,7 +622,10 @@ class CoherenceTest(unittest.TestCase):
                 self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
                 lines = done.stderr.splitlines()
                 self.assertEqual(len([l for l in lines if l.startswith("FATAL: ")]), 1, done.stderr)
-                self.assertTrue(any("silent_unavailable=16" in l for l in lines), done.stderr)
+                counters = [l for l in lines if " backing_resolves=" in l]
+                self.assertEqual(len(counters), 1, done.stderr)
+                self.assertIn(" backing_resolve_misses=", counters[0])
+                self.assertNotIn("silent_unavailable=16", done.stderr)
                 self.assertEqual(len([l for l in lines if l.startswith(TOTALS_LINE)]), 1, done.stderr)
 
     def test_a_run_that_does_not_stop_prints_the_dry_counters_once_at_exit(self) -> None:

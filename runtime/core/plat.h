@@ -70,7 +70,6 @@ typedef pthread_rwlock_t PlatLock;
 void plat_lock(PlatLock *l);
 void plat_unlock(PlatLock *l);
 void plat_lock_shared(PlatLock *l);
-int plat_lock_shared_try(PlatLock *l);   // 1 when it took the lock shared, 0 when a writer holds it or waits
 void plat_unlock_shared(PlatLock *l);
 
 // ---- threads (architecture D7). A host thread per guest thread, with a large reserved stack: every guest call is a
