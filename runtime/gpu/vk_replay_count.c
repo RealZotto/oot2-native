@@ -173,7 +173,7 @@ static void report(RcLine *l) {
     rc_put(l, "vkr_full_rate", s.full_rate);
     rc_put(l, "vkr_movie_skipped", s.movie_skipped), rc_put(l, "vkr_movie_blits", s.movie_blits);
     BackingStats b;
-    backing_stats(&b);
+    int have_b = !backing_stats_try(&b);   // a try: the stopping thread may hold the map's lock (see below)
     rc_group(l, "backing");
     rc_put(l, "backing_resolves", b.resolves), rc_put(l, "backing_resolve_misses", b.resolve_misses);
     // The counters of work the replay drops, approximates or reads as nothing without a stop, which nothing printed before
@@ -183,9 +183,9 @@ static void report(RcLine *l) {
     // zeros, and the textures that got no image.
     // The line prints at a stop, from the thread that stopped, and at every window, from the present thread. A thread
     // that stops inside a locked section (vkt_upload names its fatals under the texture lock) would wait for itself on
-    // a lock here, and the present thread would wait behind a texture readback, so these four are read with a try: a
+    // a lock here, and the present thread would wait behind a texture readback, so these five (the backing map's counters among them: a named stop is raised under its lock) are read with a try: a
     // busy lock leaves its values out of the line and sets its bit in silent_unavailable (1 reports, 2 textures, 4
-    // texture sync, 8 images). A key left out keeps its baseline, so the next window line shows the change over both.
+    // texture sync, 8 images, 16 backing map). A key left out keeps its baseline, so the next window line shows the change over both.
     VkrReportStats r = {0};
     VkbStats bs;
     vkb_stats(&bs);
@@ -195,7 +195,7 @@ static void report(RcLine *l) {
     int have_r = vkr_report_stats_try(&r), have_t = vkt_stats_try(&ts), have_x = texsync_stats_try(&xs);
     int have_i = vkb_image_stats_try(&is);
     rc_group(l, "silent");
-    rc_put_raw(l, "silent_unavailable", (uint64_t)(!have_r | !have_t << 1 | !have_x << 2 | !have_i << 3));
+    rc_put_raw(l, "silent_unavailable", (uint64_t)(!have_r | !have_t << 1 | !have_x << 2 | !have_i << 3 | !have_b << 4));
     rc_put(l, "vkr_render_off_enable", s.render_off_enable), rc_put(l, "vkr_render_off_cond", s.render_off_cond);
     rc_put(l, "vkr_clears_off", s.clears_off);
     if (have_r) {

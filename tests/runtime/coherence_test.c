@@ -115,6 +115,7 @@
 #include "oot2/gpu.h"
 #include "oot2/memory.h"
 #include "oot2/pagegen.h"
+#include "oot2/replay_count.h"
 #include "oot2/runtime.h"
 #include "plat.h"
 
@@ -1945,6 +1946,16 @@ static void case_raw_grow_cap(void) {
     printf("returned\n");
 }
 
+// The replay counters are on, and the run ends on a named stop that the map raises under its own lock: the counters' line
+// at the stop reads the map's statistics on the thread that holds that lock, and must not wait for it (it did: the process
+// sat at no CPU after the FATAL line). The driver bounds the time.
+void vkrc_submit_begin(void);   // runtime/gpu/vk_replay_int.h: registers the counters' report
+static void case_raw_grow_cap_counters(void) {
+    rc_enable(1000);
+    vkrc_submit_begin();
+    case_raw_grow_cap();
+}
+
 static void case_unwritten(void) {
     setup(64 * MiB, 0);
     backing_set_mirror_hook(want_all);
@@ -3169,7 +3180,7 @@ int main(int argc, char **argv) {
         {"raw_grow_guarded_blocked", case_raw_grow_guarded_blocked},
         {"raw_grow_untracked", case_raw_grow_untracked},
         {"raw_grow_over_total", case_raw_grow_over_total}, {"raw_grow_head_import", case_raw_grow_head_import},
-        {"raw_grow_tail_import", case_raw_grow_tail_import}, {"raw_grow_cap", case_raw_grow_cap},
+        {"raw_grow_tail_import", case_raw_grow_tail_import}, {"raw_grow_cap", case_raw_grow_cap}, {"raw_grow_cap_counters", case_raw_grow_cap_counters},
         {"raw_diag_hull", case_raw_diag_hull}, {"raw_diag_dry", case_raw_diag_dry},
         {"raw_diag_birth", case_raw_diag_birth},
         {"raw_ev_miss", case_raw_ev_miss}, {"raw_ev_survives_hits", case_raw_ev_survives_hits},

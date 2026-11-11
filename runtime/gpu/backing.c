@@ -2861,6 +2861,26 @@ int backing_extent_pool(uint64_t addr, uint64_t size) {
     return extent;
 }
 
+int backing_stats_try(BackingStats *out) {
+    memset(out, 0, sizeof *out);
+    int left = 0;
+    if (plat_lock_shared_try(&g_lock)) {
+        *out = g_st;
+        out->spare_blocks = (uint64_t)spare_count();
+        plat_unlock_shared(&g_lock);
+    } else left |= 1;
+    if (plat_mutex_trylock(&g_coh)) {
+        out->mirror_syncs = g_cst.mirror_syncs, out->uploads = g_cst.uploads, out->upload_bytes = g_cst.upload_bytes;
+        out->writebacks = g_cst.writebacks, out->writeback_bytes = g_cst.writeback_bytes;
+        out->writebacks_skipped = g_cst.writebacks_skipped, out->reads_in_flight = g_cst.reads_in_flight;
+        out->pending = (uint64_t)g_npend, out->raw_waits = g_cst.raw_waits;
+        plat_mutex_unlock(&g_coh);
+    } else left |= 2;
+    out->resolves = __atomic_load_n(&g_resolves, __ATOMIC_RELAXED);
+    out->resolve_misses = __atomic_load_n(&g_misses, __ATOMIC_RELAXED);
+    return left;
+}
+
 void backing_stats(BackingStats *out) {
     plat_lock_shared(&g_lock);
     *out = g_st;

@@ -224,6 +224,7 @@ void plat_lock(PlatLock *l) { AcquireSRWLockExclusive((PSRWLOCK)l); }
 void plat_unlock(PlatLock *l) { ReleaseSRWLockExclusive((PSRWLOCK)l); }
 void plat_lock_shared(PlatLock *l) { AcquireSRWLockShared((PSRWLOCK)l); }
 void plat_unlock_shared(PlatLock *l) { ReleaseSRWLockShared((PSRWLOCK)l); }
+int plat_lock_shared_try(PlatLock *l) { return TryAcquireSRWLockShared((PSRWLOCK)l) != 0; }
 
 _Static_assert(sizeof(PlatMutex) == sizeof(SRWLOCK), "PlatMutex holds an SRWLOCK");
 _Static_assert(sizeof(PlatCond) == sizeof(CONDITION_VARIABLE), "PlatCond holds a CONDITION_VARIABLE");
@@ -628,6 +629,7 @@ void plat_lock(PlatLock *l) { pthread_rwlock_wrlock(l); }
 void plat_unlock(PlatLock *l) { pthread_rwlock_unlock(l); }
 void plat_lock_shared(PlatLock *l) { pthread_rwlock_rdlock(l); }
 void plat_unlock_shared(PlatLock *l) { pthread_rwlock_unlock(l); }
+int plat_lock_shared_try(PlatLock *l) { return pthread_rwlock_tryrdlock(l) == 0; }
 
 void plat_mutex_lock(PlatMutex *m) { pthread_mutex_lock(m); }
 void plat_mutex_unlock(PlatMutex *m) { pthread_mutex_unlock(m); }

@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -605,6 +606,24 @@ class CoherenceTest(unittest.TestCase):
                     self.assertEqual(len(found), 1, done.stderr)
                     self.assertGreater(found[0], fatal_at[0], done.stderr)
                     self.assertEqual(done.stderr.count(EXIT_LINE), 0)   # the dump holds the dry evaluation
+
+    def test_a_named_stop_under_the_maps_lock_ends_the_process_at_once_with_the_counters_on(self) -> None:
+        # The replay counters' line at a stop reads the map's statistics from the thread that raised the stop under the
+        # map's lock: waiting for that lock left the process at no CPU after the FATAL line. The statistics are a try now;
+        # the line names the group it left out (silent_unavailable bit 16) and the stop ends the process within seconds.
+        for level in LEVELS:
+            with self.subTest(level=level):
+                started = time.monotonic()
+                try:
+                    done = self.run_case(level, "raw_grow_cap_counters", timeout=30)
+                except subprocess.TimeoutExpired as e:
+                    self.fail(f"the process did not end after its stop: {e.stderr}")
+                self.assertLess(time.monotonic() - started, 20)
+                self.assertEqual(done.returncode, EXIT_FATAL, done.stdout + done.stderr)
+                lines = done.stderr.splitlines()
+                self.assertEqual(len([l for l in lines if l.startswith("FATAL: ")]), 1, done.stderr)
+                self.assertTrue(any("silent_unavailable=16" in l for l in lines), done.stderr)
+                self.assertEqual(len([l for l in lines if l.startswith(TOTALS_LINE)]), 1, done.stderr)
 
     def test_a_run_that_does_not_stop_prints_the_dry_counters_once_at_exit(self) -> None:
         for case, refusals in DRY_CASES.items():
