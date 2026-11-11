@@ -149,6 +149,7 @@
 #define BACKING_MIRROR_RESERVE 8              // section 8: a mirror leaves an eighth of the VRAM budget free
 #define BACKING_PROMOTE_MIN (64ull << 10)     // a bind larger than a uniform's (maxUniformBufferRange) marks its import hot
 #define BACKING_PROMOTE_MIRROR_MAX (128ull << 20)   // a promotion leaves the mirrors at or under this many bytes (the raw write-back's traffic and sinks, vk_raw.h)
+#define BACKING_UNION_OVERSHOOT_MAX (8ull << 20)   // the most the unions of a run may add to the mirrors beyond BACKING_PROMOTE_MIRROR_MAX, all together (backing.c, union_kind)
 #define BACKING_GROW_RULES 7                  // the answers of the rule that says what a growth may take of an import (backing.c)
 enum { BACKING_NONE, BACKING_EXTENT, BACKING_IMPORT, BACKING_MIRROR };
 
@@ -254,6 +255,9 @@ void backing_cpu_synced(uint64_t fence);
 // Submission `value` holds a raw-access program: keep the invariant, bring the mirrors current and record it. On the
 // submission's thread, before the table is read.
 void backing_raw_begin(uint64_t value);
+// The union pass of backing_raw_begin on (1, the default; the environment's OOT2_BACKING_UNION=0 turns it off at
+// backing_open) or off: for tests of the stops that a boundary made inside a submission still gives, and for a control run.
+void backing_set_union(int on);
 // The page generation up to which every live mirror is current (the lowest of their syncs; 0 for one never brought
 // current), UINT64_MAX when there is none: a page stamped at or before it by the CPU is in its mirror, one stamped after it
 // may not be (the raw path's write-back, oot2/pagegen.h, pagegen_mark_gpu_direct). Read after backing_raw_begin.
@@ -319,5 +323,18 @@ typedef struct BackingStats {
     uint64_t raw_grows, raw_grow_bytes, raw_grow_used, raw_grow_trims, raw_grow_trim_bytes, raw_grow_waits;
     uint64_t raw_refused[BACKING_GROW_RULES];
     uint64_t raw_heirs, raw_heir_written;
+    // The growths that left the mirrors' total above BACKING_PROMOTE_MIRROR_MAX (a growth is exempt from the cap: it adds a few
+    // pages, not a new mirror), the highest the total reached, and the most it stood above the cap.
+    uint64_t raw_grow_over_cap, mirror_bytes_peak, mirror_overshoot_peak;
+    // The union at the begin of a raw-access submission (backing.c, union_pass): a chain of abutting backings of one cell with a
+    // mirror among them is replaced by one backing over their union. Chains made one, how many of those are a mirror and how
+    // many an import (the rule, the cap or the admission said so: the mirror is given up), the bytes of the unions and the
+    // bytes they added to the mirrors (signed: negative when a mirror union replaces more mirror than it adds), the net add
+    // of the unions that passed the cap only by the exemption (a union whose net add is at most BACKING_MIRROR_GROW_MAX, all
+    // together at most BACKING_UNION_OVERSHOOT_MAX), and the chains left alone, by reason: a member written on the GPU by the
+    // submission or a GPU write of it pending over the union, a backing of another cell on the union, the union past its cell.
+    uint64_t raw_union_chains, raw_union_mirror, raw_union_import, raw_union_bytes;
+    int64_t raw_union_net_bytes;
+    uint64_t raw_union_overcap_bytes, raw_union_skipped[3];
 } BackingStats;
 void backing_stats(BackingStats *out);

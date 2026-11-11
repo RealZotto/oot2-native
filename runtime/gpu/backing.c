@@ -182,6 +182,9 @@ static int g_filled;
 // record of their imports, and cell_put for what an import takes over from the ones it replaces. g_lock exclusive.
 static uint64_t g_born_value;
 static int g_grow_cap_logged;   // a growth took the mirrors past BACKING_PROMOTE_MIRROR_MAX and said so (once a run)
+static int g_union_on = 1;      // the union pass of backing_raw_begin runs (backing_set_union)
+static uint64_t g_adj_version;  // the map's version at the last union pass that left no chain alone (g_lock exclusive)
+static uint64_t g_begin_now;    // the value whose backing_raw_begin is before its stamp (0: none): its events are after the begin
 
 // The block thread.
 static PlatMutex g_bt_lock = PLAT_MUTEX_INIT;
@@ -223,6 +226,15 @@ static uint64_t reach_before(const Backing *b, uint64_t value) {
 // A backing entered or left the map, or a virtual pool's run moved: the raw path's table is out of date. g_lock
 // exclusive.
 static void changed(void) { __atomic_fetch_add(&g_version, 1, __ATOMIC_RELEASE); }
+
+// The mirrors' total once a backing entered the map or a growth settled, against the cap a promotion keeps: the highest it
+// reached and the most it stood above the cap. Not called by the dry evaluation of the dump. g_lock exclusive.
+static void mirror_note(void) {
+    if (g_st.mirror_bytes > g_st.mirror_bytes_peak) g_st.mirror_bytes_peak = g_st.mirror_bytes;
+    if (g_st.mirror_bytes > BACKING_PROMOTE_MIRROR_MAX &&
+        g_st.mirror_bytes - BACKING_PROMOTE_MIRROR_MAX > g_st.mirror_overshoot_peak)
+        g_st.mirror_overshoot_peak = g_st.mirror_bytes - BACKING_PROMOTE_MIRROR_MAX;
+}
 
 static void *grow(void *p, int *cap, int need, size_t size, const char *what) {
     if (need <= *cap) return p;
@@ -825,6 +837,7 @@ static void cell_put(Cell *c, uint64_t rs, uint64_t re, Backing *b) {
     c->imp[at] = b;
     c->nimp++;
     g_st.imports_grown += (uint64_t)replaced;
+    mirror_note();
     changed();
 }
 
@@ -1031,9 +1044,9 @@ static int import_gives(const Backing *b, uint64_t glo, uint64_t ghi, uint64_t v
 #define DIAG "gfx: vulkan: backing map: straddle dump: "
 
 enum { BORN_NONE, BORN_BIND, BORN_FILL_POOL, BORN_PROMOTE, BORN_BESIDE_FRONT, BORN_BESIDE_END, BORN_GROW, BORN_RESCAN,
-       BORN_TRIM };
+       BORN_TRIM, BORN_UNION };
 static const char *const k_born[] = {"none", "bind", "fill_pool", "promote", "beside_front", "beside_end", "grow", "rescan",
-                                     "trim"};
+                                     "trim", "union"};
 
 // beside_front: a mirror that kept its start (the bind took its end); beside_end: one that kept its end. born_lo/born_hi
 // are the range the backing had before that cut or growth.
@@ -1280,6 +1293,19 @@ static void growth_counts(char *out, size_t n) {
         at += sn(out + at, n - at, " %s %llu", k_gi[i], (ull)g_st.raw_refused[i]);
 }
 
+// The mirrors' total against the cap and what the unions of the begins did, the second list the dump and the exit line print.
+// Read-only: the dry evaluation's digest covers the counters, and none moves here.
+static void cap_counts(char *out, size_t n) {
+    snprintf(out, n, "mirror_bytes %llu (peak %llu, a promotion leaves at most %llu, peak overshoot %llu), growths that left it "
+             "over the cap %llu; unions %llu (%llu mirrors, %llu imports, %llu bytes, mirrors moved by %lld bytes, %llu of the "
+             "%llu bytes of the cap exemption used), chains left alone: written %llu, other cell %llu, past the cell %llu",
+             (ull)g_st.mirror_bytes, (ull)g_st.mirror_bytes_peak, (ull)BACKING_PROMOTE_MIRROR_MAX,
+             (ull)g_st.mirror_overshoot_peak, (ull)g_st.raw_grow_over_cap, (ull)g_st.raw_union_chains,
+             (ull)g_st.raw_union_mirror, (ull)g_st.raw_union_import, (ull)g_st.raw_union_bytes,
+             (long long)g_st.raw_union_net_bytes, (ull)g_st.raw_union_overcap_bytes, (ull)BACKING_UNION_OVERSHOOT_MAX,
+             (ull)g_st.raw_union_skipped[0], (ull)g_st.raw_union_skipped[1], (ull)g_st.raw_union_skipped[2]);
+}
+
 // The refusal of the growth, as it happens: the reason and the mirror. The stop's dump follows from beside().
 static void diag_refusal(const Backing *m, uint64_t plo, uint64_t phi, uint64_t value, const char *why) {
     char hull[80];
@@ -1299,14 +1325,15 @@ static void diag_refusal(const Backing *m, uint64_t plo, uint64_t phi, uint64_t 
 #define EV_N 256
 #define EV_IMP 4    // the backings an event records in full; the rest are counted
 #define EV_VAL 32   // the submissions whose events are counted, to say how many the ring lost
-enum { EV_BEGIN, EV_PROMOTE, EV_FILL, EV_MISS, EV_MADE, EV_GREW, EV_CUT, EV_VERDICT };
-static const char *const k_ev[] = {"begin", "promote", "fill", "miss", "made", "grew", "cut", "verdict"};
+enum { EV_BEGIN, EV_PROMOTE, EV_FILL, EV_MISS, EV_MADE, EV_GREW, EV_CUT, EV_VERDICT, EV_UNION };
+static const char *const k_ev[] = {"begin", "promote", "fill", "miss", "made", "grew", "cut", "verdict", "union"};
 
 // A backing as an event saw it, read before anything freed or replaced it.
 typedef struct EvImp {
     uint64_t lo, hi, used, res_value, res_lo, res_hi, res_n, born_value, born0_value, born0_lo, born0_hi;
     int kind, born_by, born0_by;
     int added;   // a verdict's replaced import: 0 not asked, 1 its hull is off the pages the growth would add, 2 on them, 3 unknown
+    int gi;      // a verdict's replaced import: 0 not asked, else 1 + the answer of import_gives (GI_*; 1 is GI_OK)
 } EvImp;
 typedef struct EvSnap { EvImp imp[EV_IMP]; int n, more; } EvSnap;
 
@@ -1315,6 +1342,7 @@ typedef struct EvEnt {
     uint64_t x[14];              // numbers, as each kind of event says (ev_line)
     int what, kind, phase;
     uint32_t mask;               // a verdict's refusals: bit i is k_dry[i]
+    uint32_t g4rules;            // a verdict's: bit i is the answer GI_* i of import_gives that refused an import (with G4)
     EvImp mir;                   // a cut's mirror, a verdict's mirror
     EvSnap s;                    // the backings a made, a grew or a verdict replaces
 } EvEnt;
@@ -1342,7 +1370,7 @@ static struct { uint64_t evals, would, refused, mutated, g[DRY_N]; } g_dry;
 
 static void ev_imp_of(EvImp *o, const Backing *b) {
     *o = (EvImp){b->gpu_lo, b->gpu_hi, used_by(b), b->res_value, b->res_lo, b->res_hi, b->res_n, b->born_value,
-                 b->born0_value, b->born0_lo, b->born0_hi, b->kind, b->born_by, b->born0_by, 0};
+                 b->born0_value, b->born0_lo, b->born0_hi, b->kind, b->born_by, b->born0_by, 0, 0};
 }
 
 // Whether the hull of what submission value resolved in b lies on the pages a growth of [old_lo, old_hi) to [lo, hi) would
@@ -1364,7 +1392,11 @@ static void ev_snap(EvSnap *s, const Cell *c, uint64_t lo, uint64_t hi, const Ba
         if (b == skip || !overlaps(lo, hi, b->gpu_lo, b->gpu_hi)) continue;
         if (s->n < EV_IMP) {
             ev_imp_of(&s->imp[s->n], b);
-            if (value) s->imp[s->n].added = hull_on_added(b, value, lo, hi, old_lo, old_hi);
+            if (value) {
+                s->imp[s->n].added = hull_on_added(b, value, lo, hi, old_lo, old_hi);
+                if (b->kind == BACKING_IMPORT)
+                    s->imp[s->n].gi = 1 + import_gives(b, b->gpu_lo > lo ? b->gpu_lo : lo, b->gpu_hi < hi ? b->gpu_hi : hi, value);
+            }
             s->n++;
         } else {
             s->more++;
@@ -1391,7 +1423,7 @@ static EvEnt *ev_new(uint64_t value, int what) {
     EvEnt *e = &g_ev[g_ev_seq % EV_N];
     uint64_t last = raw_last();
     *e = (EvEnt){.seq = g_ev_seq++, .value = value, .miss = g_ev_cur, .what = what,
-                 .phase = value < last ? PHASE_NEWER : value == last ? PHASE_AFTER : PHASE_BEFORE};
+                 .phase = value < last ? PHASE_NEWER : value == last || value == g_begin_now ? PHASE_AFTER : PHASE_BEFORE};
     ev_count(value);
     return e;
 }
@@ -1420,6 +1452,7 @@ static void dry_growth(const Rec *rec, const Cell *c, const Backing *m, uint64_t
             mask |= 1u << DRY_G2;
         } else if (import_gives(b, b->gpu_lo > lo ? b->gpu_lo : lo, b->gpu_hi < hi ? b->gpu_hi : hi, value) != GI_OK) {
             mask |= 1u << DRY_G4;
+            e->g4rules |= 1u << import_gives(b, b->gpu_lo > lo ? b->gpu_lo : lo, b->gpu_hi < hi ? b->gpu_hi : hi, value);
             used_on_added |= hull_on_added(b, value, lo, hi, old_lo, old_hi) != 1;
         }
     }
@@ -1468,6 +1501,14 @@ static void dry_growth(const Rec *rec, const Cell *c, const Backing *m, uint64_t
     for (int i = 0; i < DRY_N; i++) g_dry.g[i] += (mask >> i) & 1u;
 }
 
+// What the union pass did with a chain of abutting backings (an event's x[4]).
+enum { UK_MIRROR, UK_IMPORT_CAP, UK_IMPORT_RULE, UK_IMPORT_ADMIT, UK_LEFT_WRITTEN, UK_LEFT_CELL, UK_LEFT_EDGE };
+static const char *const k_union[] = {
+    "made one mirror over them", "made one import over them (the mirrors would pass the cap)",
+    "made one import over them (the rule says import)", "made one import over them (the admission refused the mirror)",
+    "left alone: a member, or a pending GPU write, was written by this submission",
+    "left alone: a backing of another cell lies on the union", "left alone: the union runs past its cell"};
+
 static void ev_miss(uint64_t value, uint64_t addr, uint64_t size, uint64_t plo, uint64_t phi, uint64_t rs, uint64_t re,
                     int kind) {
     EvEnt *e = ev_new(value, EV_MISS);
@@ -1493,11 +1534,13 @@ static const char *const k_added[] = {"", " hull_on_added_pages no", " hull_on_a
 static void ev_imp_line(const EvEnt *e, const char *role, const EvImp *o) {
     char hull[112];
     ev_hull(hull, sizeof hull, o);
+    char rule[40] = "";
+    if (o->gi > 1) snprintf(rule, sizeof rule, " G4 rule %s", k_gi[o->gi - 1]);   // the answer that refused it
     rt_log(DIAG "event %llu: %s %s [%#llx, %#llx) used_by %llu (%s submission %llu) hull %s res_n %llu born %s for %llu "
-           "born0 %s for %llu was [%#llx, %#llx)%s", (ull)e->seq, role, kind_name(o->kind), (ull)o->lo, (ull)o->hi,
+           "born0 %s for %llu was [%#llx, %#llx)%s%s", (ull)e->seq, role, kind_name(o->kind), (ull)o->lo, (ull)o->hi,
            (ull)o->used, o->used >= e->value ? "reached by" : "before", (ull)e->value, hull, (ull)o->res_n,
            k_born[o->born_by], (ull)o->born_value, k_born[o->born0_by], (ull)o->born0_value, (ull)o->born0_lo,
-           (ull)o->born0_hi, k_added[o->added]);
+           (ull)o->born0_hi, k_added[o->added], rule);
 }
 
 static void ev_snap_lines(const EvEnt *e, const char *role) {
@@ -1533,6 +1576,11 @@ static void ev_line(const EvEnt *e) {
                  "the submission reached was trimmed at its start, the others deferred)",
                  (ull)x[0], (ull)x[1], (ull)x[2], (ull)x[3], e->s.n, e->s.more);
         break;
+    case EV_UNION:
+        snprintf(d, sizeof d, "[%#llx, %#llx) of %llu abutting backings (%llu of them mirrors): %s; the mirrors' total moved by "
+                 "%lld bytes to %llu", (ull)x[0], (ull)x[1], (ull)x[2], (ull)x[3], k_union[x[4]], (long long)(int64_t)x[5],
+                 (ull)x[6]);
+        break;
     case EV_CUT:
         snprintf(d, sizeof d, "mirror [%#llx, %#llx) %s: now [%#llx, %#llx)", (ull)x[0], (ull)x[1],
                  x[4] == 0 ? "kept its start (the bind took its end)" : x[4] == 1 ? "kept its end (the bind took its start)"
@@ -1540,10 +1588,18 @@ static void ev_line(const EvEnt *e) {
                  (ull)x[2], (ull)x[3]);
         break;
     default: {
-        char list[96] = "";
+        char list[128] = "";
         size_t at = 0;
-        for (int i = 0; i < DRY_N; i++)
-            if (e->mask >> i & 1u) at += sn(list + at, sizeof list - at, "%s%s", at ? "," : "", k_dry[i]);
+        for (int i = 0; i < DRY_N; i++) {
+            if (!(e->mask >> i & 1u)) continue;
+            at += sn(list + at, sizeof list - at, "%s%s", at ? "," : "", k_dry[i]);
+            if (i != DRY_G4) continue;   // G4 names the answers of import_gives that refused: G4[hull+up]
+            at += sn(list + at, sizeof list - at, "[");
+            int first = 1;
+            for (int g = GI_NEWER; g < GI_N; g++)
+                if (e->g4rules >> g & 1u) at += sn(list + at, sizeof list - at, "%s%s", first ? "" : "+", k_gi[g]), first = 0;
+            at += sn(list + at, sizeof list - at, "]");
+        }
         snprintf(d, sizeof d, "the mirror [%#llx, %#llx) would grow to [%#llx, %#llx), adding %#llx bytes (head %#llx, "
                  "its offset %#llx); rule says %s; mirror_bytes %llu, at most %llu; block room before its part [%#llx, "
                  "%#llx) %#llx after %#llx; %llu other mirrors of the cell on the bind; the evaluation left the map %s (its digest leaves out the list of GPU writes); refuses: %s",
@@ -1556,6 +1612,7 @@ static void ev_line(const EvEnt *e) {
            k_ev[e->what], (ull)e->miss, d);
     if (e->what == EV_CUT) ev_imp_line(e, "the mirror cut", &e->mir);
     if (e->what == EV_MADE || e->what == EV_GREW) ev_snap_lines(e, "replaced");
+    if (e->what == EV_UNION) ev_snap_lines(e, "joined");
     if (e->what == EV_VERDICT) {
         ev_imp_line(e, "the mirror it would grow", &e->mir);
         ev_snap_lines(e, "would be replaced");
@@ -1621,6 +1678,9 @@ static void diag_stop(const Cell *c, const Backing *m, uint64_t plo, uint64_t ph
     char counts[320];
     growth_counts(counts, sizeof counts);
     rt_log(DIAG "growths so far: %s", counts);
+    char caps[480];
+    cap_counts(caps, sizeof caps);
+    rt_log(DIAG "mirror totals so far: %s", caps);
     uint64_t span = 2ull << 20, from = plo > span ? plo - span : 0, to = phi + span;
     for (int i = 0; i < c->nimp; i++)
         if (overlaps(from, to, c->imp[i]->gpu_lo, c->imp[i]->gpu_hi)) diag_backing(c->imp[i], m);
@@ -1811,6 +1871,8 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
     g_st.mirror_bytes += added;
     g_st.raw_grows++, g_st.raw_grow_bytes += added;
     g_st.raw_grow_used += (uint64_t)(trims > 0);
+    g_st.raw_grow_over_cap += (uint64_t)(g_st.mirror_bytes > BACKING_PROMOTE_MIRROR_MAX);
+    mirror_note();
     changed();
     if (g_st.raw_grows <= 64)
         rt_log("gfx: vulkan: backing map: raw growth %llu in submission %llu: the mirror [%#llx, %#llx) grew to [%#llx, "
@@ -1820,8 +1882,10 @@ static int grow_taken(Rec *r, Cell *c, Backing *m, uint64_t plo, uint64_t phi, u
     if (g_st.mirror_bytes > BACKING_PROMOTE_MIRROR_MAX && !g_grow_cap_logged) {
         g_grow_cap_logged = 1;
         rt_log("gfx: vulkan: backing map: a growth of a mirror left the mirrors at %llu bytes, past the %llu a promotion "
-               "leaves; the growth is exempt (it adds at most %llu bytes)", (ull)g_st.mirror_bytes,
-               (ull)BACKING_PROMOTE_MIRROR_MAX, (ull)BACKING_MIRROR_GROW_MAX);
+               "leaves; the growth is exempt (it adds at most %llu bytes); growths over the cap so far %llu, mirror_bytes "
+               "peak %llu, peak overshoot %llu", (ull)g_st.mirror_bytes, (ull)BACKING_PROMOTE_MIRROR_MAX,
+               (ull)BACKING_MIRROR_GROW_MAX, (ull)g_st.raw_grow_over_cap, (ull)g_st.mirror_bytes_peak,
+               (ull)g_st.mirror_overshoot_peak);
     }
 
     plat_mutex_lock(&g_coh);
@@ -2385,6 +2449,161 @@ static void fill_pool(Rec *r) {
     }
 }
 
+// ---------- the union at the begin of a raw-access submission
+// A mirror next to another backing of its cell (an import fill_pool or rescan_cell made when pages were committed beside
+// it, or one a bind made beside it) is a boundary a bind of a raw-access submission can straddle: the bind is a miss, the
+// mirror is cut, and an import is made over the pages it gave, so that a later bind across the new boundary finds a mirror
+// the submission already resolved and an import it used, and stops by name (beside, grow_taken). The pass below removes the
+// boundary before any raw access of the submission exists: at its first backing_raw_begin, every chain of abutting
+// backings of one cell with a mirror among them is replaced by ONE backing over their union, a mirror when the rule, the cap
+// and the admission allow it, else an import (the mirrors in the chain are given up: exact, and read across the bus). It
+// leaves alone a chain that a bind could not be moved off: one a member of which the submission wrote on the GPU (or has a
+// GPU write pending over the union), one with a backing of another cell on the union. Those keep the named stop.
+//
+// It runs before the begin is stamped (raw_last() is still the previous raw-access submission), so replace_wait's check that
+// a mirror the page table maps is never replaced cannot fire, and it waits for the older submissions that reached the
+// members and for their GPU writes into them, so the union's first copy holds them. It cannot run once a raw access of the
+// submission exists: only the first begin of a value runs it. What the submission recorded before the begin read the members'
+// buffers, which live until it is done; what it records after reads the union, equal or newer bytes (the tolerance a
+// promotion already relies on).
+static int chain_end(const Cell *c, int i) {
+    int j = i;
+    while (j + 1 < c->nimp && c->imp[j]->gpu_hi == c->imp[j + 1]->gpu_lo) j++;
+    return j;
+}
+
+static int chain_mirrors(const Cell *c, int i, int j) {
+    int n = 0;
+    for (int k = i; k <= j; k++) n += c->imp[k]->kind == BACKING_MIRROR;
+    return n;
+}
+
+// UK_MIRROR when the chain c->imp[i..j] may be replaced, else the reason it is left alone (UK_LEFT_*). Pure.
+static int union_check(const Rec *r, const Cell *c, int i, int j, uint64_t value) {
+    uint64_t lo = c->imp[i]->gpu_lo, hi = c->imp[j]->gpu_hi;
+    if (lo < c->lo || hi > c->hi) return UK_LEFT_EDGE;
+    for (int k = i; k <= j; k++)
+        if (__atomic_load_n(&c->imp[k]->written, __ATOMIC_ACQUIRE) == value) return UK_LEFT_WRITTEN;
+    int pending = 0;
+    plat_mutex_lock(&g_coh);
+    for (int n = 0; n < g_npend; n++)
+        pending |= g_pend[n].value == value && overlaps(lo, hi, g_pend[n].lo, g_pend[n].hi);
+    plat_mutex_unlock(&g_coh);
+    if (pending) return UK_LEFT_WRITTEN;
+    for (int n = 0; n < g_index.n; n++) {
+        const Rec *other = (const Rec *)g_index.e[n].key;
+        if (other->cls != CLS_CPU) continue;
+        for (int m = 0; m < other->ncells; m++) {
+            const Cell *cell = &other->cells[m];
+            if (other == r && cell == c) continue;
+            for (int k = 0; k < cell->nimp; k++)
+                if (overlaps(lo, hi, cell->imp[k]->gpu_lo, cell->imp[k]->gpu_hi)) return UK_LEFT_CELL;
+        }
+    }
+    return UK_MIRROR;
+}
+
+// What the union of c->imp[i..j] is: UK_MIRROR, or the reason it is an import (UK_IMPORT_RULE, UK_IMPORT_CAP). The questions
+// promote_hot asks, with the bytes of the chain's own mirrors given back. A union that would pass the cap on the mirrors'
+// total is still a mirror when its net add is at most BACKING_MIRROR_GROW_MAX, as a growth is, and the net adds of such unions
+// over a run stay at most BACKING_UNION_OVERSHOOT_MAX; *over is the net add of a mirror that passes the cap only so (else 0).
+// Pure.
+static int union_kind(const Rec *r, const Cell *c, int i, int j, uint64_t *over) {
+    uint64_t lo = c->imp[i]->gpu_lo, hi = c->imp[j]->gpu_hi, mine = 0;
+    for (int k = i; k <= j; k++)
+        if (c->imp[k]->kind == BACKING_MIRROR) mine += c->imp[k]->gpu_hi - c->imp[k]->gpu_lo;
+    *over = 0;
+    BackingAsk ask = {lo, hi - lo, r->flags};
+    if (!has_mirrors() || !g_mirror_hook || backing_rule(&ask) != BACKING_MIRROR) return UK_IMPORT_RULE;
+    if (g_st.mirror_bytes - mine + up(hi - lo, BACKING_EXTENT_ALIGN) <= BACKING_PROMOTE_MIRROR_MAX) return UK_MIRROR;
+    uint64_t net = (hi - lo) - mine;
+    if (net > BACKING_MIRROR_GROW_MAX || g_st.raw_union_overcap_bytes + net > BACKING_UNION_OVERSHOOT_MAX)
+        return UK_IMPORT_CAP;
+    *over = net;
+    return UK_MIRROR;
+}
+
+// Replace c->imp[i..j] by one backing of the given kind over their union (union_check passed), in submission value: wait for
+// the older submissions that reached them, take the new backing, and let cell_put defer every member. When the admission
+// refuses a mirror the union is an import, unless promoting (a promotion leaves the chain as it was: 0). g_lock exclusive.
+static int union_make(Rec *r, Cell *c, int i, int j, uint64_t value, int kind, uint64_t over, int promoting) {
+    uint64_t lo = c->imp[i]->gpu_lo, hi = c->imp[j]->gpu_hi, mine = 0;
+    int n = j - i + 1, nm = chain_mirrors(c, i, j);
+    for (int k = i; k <= j; k++)
+        if (c->imp[k]->kind == BACKING_MIRROR) mine += c->imp[k]->gpu_hi - c->imp[k]->gpu_lo;
+    replace_wait(c, lo, hi, value, kind == BACKING_MIRROR);
+    Backing *b = kind == BACKING_MIRROR ? mirror_admit(r, lo, hi) : NULL;
+    if (!b && promoting) return 0;
+    int how = kind == BACKING_MIRROR ? (b ? UK_MIRROR : UK_IMPORT_ADMIT) : UK_IMPORT_RULE;
+    if (!b) b = import_new(lo, hi, lo, "the union of abutting backings");
+    born(b, BORN_UNION, value, lo, hi);
+    EvEnt *ev = ev_new(value, EV_UNION);   // the members as they were, read before cell_put replaces them
+    ev->kind = b->kind;
+    ev_snap(&ev->s, c, lo, hi, NULL, 0, 0, 0);
+    g_st.raw_union_chains++;
+    if (b->kind == BACKING_MIRROR) g_st.raw_union_mirror++, g_st.raw_union_overcap_bytes += over;
+    else g_st.raw_union_import++;
+    g_st.raw_union_bytes += hi - lo;
+    int64_t net = (int64_t)(b->kind == BACKING_MIRROR ? hi - lo : 0) - (int64_t)mine;
+    g_st.raw_union_net_bytes += net;
+    cell_put(c, lo, hi, b);
+    ev->x[0] = lo, ev->x[1] = hi, ev->x[2] = (uint64_t)n, ev->x[3] = (uint64_t)nm, ev->x[4] = (uint64_t)how;
+    ev->x[5] = (uint64_t)net, ev->x[6] = g_st.mirror_bytes;
+    return 1;
+}
+
+// The pass, at the first begin of value and before its stamp (backing_raw_begin). A scan finds the map as the last clean scan
+// left it when the map's version has not moved since (a backing entering or leaving moves it), so a steady scene pays one
+// compare; a chain left alone is looked at again at the next begin. g_lock exclusive.
+static void union_pass(uint64_t value) {
+    if (!g_union_on || backing_version() == g_adj_version) return;
+    int left = 0;
+    for (int n = 0; n < g_index.n; n++) {
+        Rec *r = (Rec *)g_index.e[n].key;
+        if (r->cls != CLS_CPU) continue;
+        for (int m = 0; m < r->ncells; m++) {
+            Cell *c = &r->cells[m];
+            for (int i = 0; i < c->nimp;) {
+                int j = chain_end(c, i);
+                if (j == i || !chain_mirrors(c, i, j)) {
+                    i = j + 1;
+                    continue;
+                }
+                int why = union_check(r, c, i, j, value);
+                if (why != UK_MIRROR) {
+                    g_st.raw_union_skipped[why - UK_LEFT_WRITTEN]++;
+                    EvEnt *ev = ev_new(value, EV_UNION);
+                    ev->x[0] = c->imp[i]->gpu_lo, ev->x[1] = c->imp[j]->gpu_hi, ev->x[2] = (uint64_t)(j - i + 1);
+                    ev->x[3] = (uint64_t)chain_mirrors(c, i, j), ev->x[4] = (uint64_t)why, ev->x[6] = g_st.mirror_bytes;
+                    left++;
+                    i = j + 1;
+                    continue;
+                }
+                uint64_t over, lo = c->imp[i]->gpu_lo;
+                int kind = union_kind(r, c, i, j, &over);
+                union_make(r, c, i, j, value, kind == UK_MIRROR ? BACKING_MIRROR : BACKING_IMPORT, over, 0);
+                int at = 0;   // the list changed: on from the place of the union (what is below it is not in a chain with it)
+                while (at < c->nimp && c->imp[at]->gpu_lo < lo) at++;
+                i = at + 1;
+            }
+        }
+    }
+    if (!left) g_adj_version = backing_version();
+}
+
+// A hot import that the cap on the mirrors holds back stays an import, the pool's first one said so.
+static void promote_capped(Rec *r, Backing *b, uint64_t lo, uint64_t hi, uint64_t value) {
+    // the raw path writes back across the bus every page its stores reach and keeps a sink over each mirror: bounded
+    __atomic_store_n(&b->hot, 0, __ATOMIC_RELAXED);
+    ev_promote(value, lo, hi, 1);
+    if (!r->mirror_logged) {
+        r->mirror_logged = 1;
+        rt_log("gfx: vulkan: backing map: the mirror of [%#llx, %#llx) (%llu KiB) in pool [%#llx, %#llx) is not made: "
+               "the mirrors would pass %llu MiB, the most a promotion makes; imported", (ull)lo, (ull)hi,
+               (ull)((hi - lo) >> 10), (ull)r->lo, (ull)r->hi, (ull)(BACKING_PROMOTE_MIRROR_MAX >> 20));
+    }
+}
+
 // The imports a bind larger than a uniform's reached (lookup flagged them) become mirrors, as the rule gives a bind in any
 // other submission on a discrete device: the invariant above imported every committed page, and an import is read across the
 // bus (the raw-address study: 22.9 times slower than VRAM), which a compute program that works on its buffers feels in every
@@ -2413,16 +2632,40 @@ static void promote_hot(uint64_t value) {
                     __atomic_store_n(&b->hot, 0, __ATOMIC_RELAXED);   // the rule says import: it stays one
                     continue;
                 }
-                if (g_st.mirror_bytes + up(hi - lo, BACKING_EXTENT_ALIGN) > BACKING_PROMOTE_MIRROR_MAX) {
-                    // the raw path writes back across the bus every page its stores reach and keeps a sink over each mirror: bounded
-                    __atomic_store_n(&b->hot, 0, __ATOMIC_RELAXED);
-                    ev_promote(value, lo, hi, 1);
-                    if (!r->mirror_logged) {
-                        r->mirror_logged = 1;
-                        rt_log("gfx: vulkan: backing map: the mirror of [%#llx, %#llx) (%llu KiB) in pool [%#llx, %#llx) is not made: "
-                               "the mirrors would pass %llu MiB, the most a promotion makes; imported", (ull)lo, (ull)hi,
-                               (ull)((hi - lo) >> 10), (ull)r->lo, (ull)r->hi, (ull)(BACKING_PROMOTE_MIRROR_MAX >> 20));
+                if (g_union_on) {
+                    // Promoting b beside a backing it abuts would make the boundary the union pass removes: the chain it
+                    // is in is promoted whole, or not at all. A chain with a mirror among its members is one the pass left alone.
+                    int ci = k, cj = k;
+                    while (ci > 0 && c->imp[ci - 1]->gpu_hi == c->imp[ci]->gpu_lo) ci--;
+                    while (cj + 1 < c->nimp && c->imp[cj]->gpu_hi == c->imp[cj + 1]->gpu_lo) cj++;
+                    if (cj > ci) {
+                        uint64_t clo = c->imp[ci]->gpu_lo, chi = c->imp[cj]->gpu_hi, over;
+                        if (chain_mirrors(c, ci, cj) || union_check(r, c, ci, cj, value) != UK_MIRROR) {
+                            __atomic_store_n(&b->hot, 0, __ATOMIC_RELAXED);
+                            continue;
+                        }
+                        int uk = union_kind(r, c, ci, cj, &over);
+                        if (uk == UK_IMPORT_RULE) {
+                            __atomic_store_n(&b->hot, 0, __ATOMIC_RELAXED);   // the rule says import: the chain stays imports
+                            continue;
+                        }
+                        if (uk == UK_IMPORT_CAP) {
+                            promote_capped(r, b, clo, chi, value);
+                            continue;
+                        }
+                        if (!union_make(r, c, ci, cj, value, BACKING_MIRROR, over, 1)) {
+                            __atomic_store_n(&b->hot, 0, __ATOMIC_RELAXED);
+                            ev_promote(value, clo, chi, 2);
+                            return;
+                        }
+                        ev_promote(value, clo, chi, 0);
+                        g_st.raw_promoted++, g_st.raw_promote_bytes += chi - clo;
+                        k = -1;   // the list changed: this cell again from its start
+                        continue;
                     }
+                }
+                if (g_st.mirror_bytes + up(hi - lo, BACKING_EXTENT_ALIGN) > BACKING_PROMOTE_MIRROR_MAX) {
+                    promote_capped(r, b, lo, hi, value);
                     continue;
                 }
                 Backing *m = mirror_admit(r, lo, hi);
@@ -2448,9 +2691,10 @@ void backing_raw_begin(uint64_t value) {
     uint64_t e = rt_mem_ready() ? rt_mem_commit_epoch() : 0;
     plat_lock(&g_lock);
     uint64_t before = g_raw_last;
+    int first = before < value;   // the first begin of this value: no raw access of it exists yet
     if (before && before < value) __atomic_store_n(&g_raw_prev, before, __ATOMIC_RELEASE);   // the one before this
-    stamp(&g_raw_last, value);
     g_born_value = value;
+    g_begin_now = value;   // its events are the begin's, whether the stamp is made yet or not
     g_st.raw_begins++;
     EvEnt *be = ev_new(value, EV_BEGIN);
     be->x[0] = g_st.mirror_bytes, be->x[1] = g_st.mirrors;
@@ -2463,10 +2707,22 @@ void backing_raw_begin(uint64_t value) {
             else if (r->cls == CLS_CPU) fill_pool(r);
         }
     }
+    // The imports above abut the mirrors beside them: the pass joins every such chain into one backing, before the stamp
+    // below (raw_last() is the previous raw-access submission's until then, so no mirror the table maps is in the way of
+    // replace_wait) and only the first time (a second call finds raw accesses of the value recorded).
+    if (first) union_pass(value);
+    stamp(&g_raw_last, value);
+    g_begin_now = 0;
     promote_hot(value);
     plat_unlock(&g_lock);
     bound();
     backing_sync_mirrors(value);
+}
+
+void backing_set_union(int on) {
+    plat_lock(&g_lock);
+    g_union_on = !!on;
+    plat_unlock(&g_lock);
 }
 
 uint64_t backing_version(void) { return __atomic_load_n(&g_version, __ATOMIC_ACQUIRE); }
@@ -2612,6 +2868,9 @@ void backing_open(const BackingOps *ops) {
     memset(&g_dry, 0, sizeof g_dry);
     g_ev_seq = g_ev_misses = g_ev_cur = 0;
     g_ring_seq = 0, g_ring_skip = 0, g_born_value = 0, g_grow_cap_logged = 0;
+    const char *union_env = getenv("OOT2_BACKING_UNION");
+    g_union_on = !(union_env && union_env[0] == '0');   // the control run of the fix turns the pass off
+    g_adj_version = 0, g_begin_now = 0;
     g_raw_last = g_raw_prev = 0, g_filled = 0, g_pools_version = g_fill_pools = g_fill_epoch = 0;
     g_open = 1;
     g_bt_stop = 0, g_bt_want = 1, g_bt_running = 1;
@@ -2631,6 +2890,11 @@ void backing_close(void) {
         rt_log("gfx: vulkan: backing map: dry growth at exit: %llu raw-access submissions, %llu binds cut a mirror the "
                "submission had not resolved there, %llu would have grown it, %llu refused (refusals: %s), the evaluation changed the map %llu times",
                (ull)g_st.raw_begins, (ull)g_dry.evals, (ull)g_dry.would, (ull)g_dry.refused, d, (ull)g_dry.mutated);
+    }
+    if (g_st.raw_begins) {
+        char caps[480];
+        cap_counts(caps, sizeof caps);
+        rt_log("gfx: vulkan: backing map: mirror totals at exit: %s", caps);
     }
     if (g_st.raw_grows || g_st.raw_heirs || g_st.raw_refused[GI_NEWER] + g_st.raw_refused[GI_WRITTEN] +
         g_st.raw_refused[GI_NOHULL] + g_st.raw_refused[GI_LOOSE] + g_st.raw_refused[GI_HULL] + g_st.raw_refused[GI_UP]) {

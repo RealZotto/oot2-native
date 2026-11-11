@@ -52,7 +52,9 @@ PASSING = ("generations", "upload", "admission", "guarded_admission", "writeback
            "raw_dry_grow", "raw_dry_g4", "raw_dry_cap", "raw_dry_kind", "raw_dry_none", "raw_dry_g4_on", "raw_dry_g8",
            "raw_dry_g5", "raw_dry_g1", "raw_dry_g2",
            "raw_grow_used_import", "raw_grow_used_edge", "raw_grow_used_wait", "raw_grow_heir", "raw_grow_heir_old",
-           "raw_grow_used_decommit")
+           "raw_grow_used_decommit",
+           "union_begin_straddle", "union_cap_demote", "union_cap_exempt", "union_exact_bytes", "union_order",
+           "union_promote_chain", "union_quiet")
 
 # case: text the one FATAL line must hold
 FAILING = {
@@ -88,6 +90,11 @@ FAILING = {
     "raw_grow_heir_hull": "which this submission bound, lies on the pages it would add",
     "raw_grow_heir_written": "lies on the pages it would add: it was written on the GPU by this submission",
     "raw_grow_heir_loose": "lies on the pages it would add: it was reached by a resolve whose extent is not stated",
+    # The dry verdict names the rule that refused (test_the_verdict_names_the_rule_that_refused).
+    "raw_ev_g4": "which this submission bound, lies on the pages it would add",
+    "raw_ev_g4_hull": "which this submission bound, lies on the pages it would add",
+    # The union at the begin leaves a chain a member of which the submission wrote on the GPU: the stop as it was.
+    "union_written_skip": "lies on the pages it would add: it lies above the part of it this submission reached",
 }
 
 # The rule of import_gives that refuses the import in each of those stops, and the reason the text adds after the head (none
@@ -103,8 +110,9 @@ RULE_OF = {
     "raw_grow_heir_hull": "hull", "raw_grow_heir_loose": "loose", "raw_grow_used_written": "written", "raw_grow_heir_written": "written",
     "raw_grow_used_loose": "loose", "raw_grow_used_up": "up", "raw_diag_hull": "up", "raw_diag_dry": "up",
     "raw_diag_birth": "up", "raw_ev_miss": "hull", "raw_ev_survives_hits": "hull", "raw_ev_lost": "hull",
-    "raw_ev_origin": "hull",
+    "raw_ev_origin": "hull", "raw_ev_g4": "hull", "raw_ev_g4_hull": "hull", "union_written_skip": "up",
 }
+VERDICT_RULES = {"raw_ev_g4": ("G4[up],G4_hull_off", "up"), "raw_ev_g4_hull": ("G4[hull]", "hull")}
 RULE_LINE = re.compile(r"guard G4 rule: (\w+)(?:, loose)?(?:: it (.*))?$")
 
 # The dry growth's refusals, in the order of BackingStats raw_dry_g, as the exit line names them; the case that has each.
@@ -115,6 +123,7 @@ DRY_CASES = {"raw_dry_grow": (), "raw_dry_g4": ("G4", "G4_hull_off"), "raw_dry_g
              "raw_dry_kind": ("rule_kind",), "raw_dry_g8": ("G8",), "raw_dry_g5": ("G5",), "raw_dry_g1": ("G1", "G5"),
              "raw_dry_g2": ("G2", "G7a")}
 EXIT_LINE = "[rt] gfx: vulkan: backing map: dry growth at exit: "
+TOTALS_LINE = "[rt] gfx: vulkan: backing map: mirror totals at exit: "
 
 # The dump's lines, as the log writes them: one prefix, the text after it.
 DUMP = "[rt] gfx: vulkan: backing map: straddle dump: "
@@ -179,6 +188,27 @@ class DryDigestTest(unittest.TestCase):
         self.assertIn("g_ndef", code)   # it still reads the queue the map's lock guards
         self.assertNotIn("g_npend", code)
         self.assertNotIn("g_pend", code)
+
+
+class DryCountersTest(unittest.TestCase):
+    """The dry evaluation of the growth's guards and of the verdict must write none of the counters of the caps and of the
+    unions: the digest it takes of the map before and after covers BackingStats, and the evaluation is not allowed to move it."""
+
+    COUNTERS = ("raw_union_", "raw_grow_over_cap", "mirror_bytes_peak", "mirror_overshoot_peak", "mirror_note(", "union_make(",
+                "union_pass(")
+
+    def body(self, name: str) -> str:
+        text = (ROOT / "runtime" / "gpu" / "backing.c").read_text(encoding="utf-8")
+        start = text.index(f"static void {name}(")
+        body = text[start:text.index("\n}\n", start)]
+        return "\n".join(line.split("//", 1)[0] for line in body.splitlines())
+
+    def test_the_dry_evaluation_does_not_write_the_cap_counters(self) -> None:
+        for name in ("diag_guards", "dry_growth", "diag_stop"):
+            code = self.body(name)
+            for counter in self.COUNTERS:
+                with self.subTest(function=name, counter=counter):
+                    self.assertNotIn(counter, code)
 
 
 class WriteWatchOwnerTest(unittest.TestCase):
@@ -487,6 +517,46 @@ class CoherenceTest(unittest.TestCase):
                 self.assertIn(f"born beside_end for {v} was [{hx(P)}, {hx(P + 0x20000)}) born0 promote for {v} was "
                               f"[{hx(P)}, {hx(P + 0x20000)})", mirror)
                 self.assertIn(f"(submission {v1}: 0 of 2; submission {v}: 0 of 8)", lines[-2])
+
+    def test_the_verdict_names_the_rule_that_refused(self) -> None:
+        """The verdict of the dry growth says which answer of import_gives refused the import (G4[up], G4[hull]), in its
+        refusals and on the line of the import it would replace; the stop that follows names its own rule."""
+        for case, (refuses, rule) in VERDICT_RULES.items():
+            for level in LEVELS:
+                with self.subTest(case=case, level=level):
+                    done, lines = self.stop_with_dump(level, case)
+                    verdicts = [e for e in events(dump_lines(done.stderr)) if e["what"] == "verdict"]
+                    self.assertEqual(len(verdicts), 1, lines)
+                    self.assertTrue(verdicts[0]["text"].endswith(f"refuses: {refuses}"), verdicts[0]["text"])
+                    replaced = [sub for sub in verdicts[0]["sub"] if sub.startswith("would be replaced import ")]
+                    self.assertEqual(len(replaced), 1, verdicts[0]["sub"])
+                    self.assertTrue(replaced[0].endswith(f" G4 rule {rule}"), replaced[0])
+                    # the dry guards of the stop name the rule of the stopping bind on a line of their own, as before
+                    self.assertEqual(len([line for line in lines if line.startswith("guard G4 rule: ")]), 1)
+
+    def test_the_caps_and_the_unions_are_counted_once_at_exit_and_when_a_growth_passes_the_cap(self) -> None:
+        for level in LEVELS:
+            with self.subTest(level=level, case="union_cap_exempt"):
+                done = self.run_case(level, "union_cap_exempt")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                found = [line for line in done.stderr.splitlines() if line.startswith(TOTALS_LINE)]
+                self.assertEqual(len(found), 1, done.stderr)
+                self.assertRegex(found[0][len(TOTALS_LINE):],
+                                 r"mirror_bytes \d+ \(peak \d+, a promotion leaves at most 134217728, peak overshoot \d+\), "
+                                 r"growths that left it over the cap 0; unions 10 \(8 mirrors, 2 imports, 11862016 bytes, "
+                                 r"mirrors moved by 8126464 bytes, 8388608 of the 8388608 bytes of the cap exemption used\), "
+                                 r"chains left alone: written 0, other cell 0, past the cell 0$")
+            with self.subTest(level=level, case="raw_grow_over_total"):
+                done = self.run_case(level, "raw_grow_over_total")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                once = [line for line in done.stderr.splitlines() if "a growth of a mirror left the mirrors at" in line]
+                self.assertEqual(len(once), 1, done.stderr)
+                self.assertTrue(once[0].endswith("growths over the cap so far 1, mirror_bytes peak 138420224, peak overshoot "
+                                                 "4202496"), once[0])
+                found = [line for line in done.stderr.splitlines() if line.startswith(TOTALS_LINE)]
+                self.assertEqual(len(found), 1, done.stderr)
+                self.assertIn("(peak 138420224, a promotion leaves at most 134217728, peak overshoot 4202496), growths that "
+                              "left it over the cap 1; unions 0 ", found[0])
 
     def test_a_run_that_does_not_stop_prints_the_dry_counters_once_at_exit(self) -> None:
         for case, refusals in DRY_CASES.items():

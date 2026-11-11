@@ -89,6 +89,15 @@
 //                sees it; a hull of an older submission is not taken over; raw_grow_heir_hull, raw_grow_heir_written,
 //                raw_grow_heir_loose stop by the rule that sees what was taken over (the hull on the pages, a GPU write of the
 //                submission, an extent not stated)
+//   raw_ev_g4, raw_ev_g4_hull   the verdict of the dry growth names the rule of import_gives that refused the import (up, hull),
+//                in its refusals and on the import's own line
+//   union_begin_straddle, union_cap_demote, union_cap_exempt, union_exact_bytes, union_order, union_promote_chain, union_quiet,
+//   union_written_skip   the union at the begin of a raw-access submission: an import abutting a mirror joins it into one
+//                mirror before the table is built, so the straddling binds are hits; over the cap with a net add past a
+//                growth's it is an import; a net add of a growth's or less keeps it a mirror until the unions' total passes 8
+//                MiB; the copy waits for the older submission's GPU write and the CPU's later write reaches the next sync;
+//                the pass runs before the stamp and once a value; a hot import promotes with the import it abuts; nothing
+//                moves the version when there is nothing to join; a member written by the submission is left alone
 //   unwritten, replace_written, raw_grow_bound_import, raw_grow_fragmented, raw_grow_guarded_blocked,
 //   raw_grow_untracked, raw_grow_cap   stop by name, each with the reason the mirror could not grow
 #include <stdio.h>
@@ -298,6 +307,10 @@ static void setup(uint64_t heap, int real_watch) {
     GpuTimelineSource src = {.wait = counter_wait};
     gpu_sync_start(&src, 0);
     backing_open(&k_ops);
+    // The scenes of the stops below are the shape of a boundary an import and a mirror make at a raw-access begin, which the
+    // union pass of that begin removes: they run with the pass off (the union_* cases turn it on), and keep pinning what the
+    // stops say for a boundary made inside a submission. COHERENCE_UNION=1 in the environment runs them with it on.
+    backing_set_union(getenv("COHERENCE_UNION") != NULL);
 }
 
 static int want_all(const BackingAsk *a) {
@@ -1714,6 +1727,9 @@ static void case_raw_grow_over_total(void) {
     CHECK(g_layout_big.kind == BACKING_MIRROR && g_layout_big.address + g_layout_delta == g_layout_old.address);
     BackingStats s = stats();
     CHECK(s.mirrors == 3 && s.mirrors_made == 3 && s.mirror_bytes == 3 * len + 0x2000);
+    // the growth left the total over the cap: counted, with the highest the total reached and how far above the cap it stood
+    CHECK(s.raw_grows == 1 && s.raw_grow_over_cap == 1 && s.mirror_bytes_peak == 3 * len + 0x2000);
+    CHECK(s.mirror_overshoot_peak == 3 * len + 0x2000 - BACKING_PROMOTE_MIRROR_MAX);
     BackingRun *runs;
     uint64_t version;
     int n = backing_raw_runs(&runs, &version);
@@ -2527,6 +2543,325 @@ static void case_raw_grow_heir_hull(void) { heir_scene("raw_grow_heir_hull", H_H
 static void case_raw_grow_heir_written(void) { heir_scene("raw_grow_heir_written", H_WRITTEN, 1); }
 static void case_raw_grow_heir_loose(void) { heir_scene("raw_grow_heir_loose", H_LOOSE, 1); }
 
+// ---------- the verdict names the rule of import_gives that refused (backing.c, dry_growth)
+// The stop of ev_scene with the import beside the mirror used by the submission first. A word of it 0x10000 bytes below the
+// pages the growth would add: the pages are above everything the submission resolved in it (the rule "up"), its hull off them.
+// Or, in the second case, a word of it on the page [p - 0x1000, p) the growth adds (the rule "hull"). The stop that follows is
+// the same one in both; its rule is "up".
+static void ev_g4_scene(const char *name, int on_pages) {
+    uint64_t p, v0, v = ev_prefix(&p, &v0, !on_pages);
+    if (on_pages) CHECK(resolve(p - 0x400, 4, v).kind == BACKING_IMPORT);
+    CHECK(resolve(p - 0x800, 0x1000, v).kind == BACKING_IMPORT);   // B0
+    BackingStats s = stats();
+    CHECK(s.raw_dry_evals == 1 && s.raw_dry_refused == 1 && s.raw_dry_g[T_G4] == 1);
+    resolve(p + 0x2000, 4, v);
+    resolve(p - 0x10000, 4, v);
+    printf("%s: p=%#llx v0=%llu v=%llu b0_addr=%#llx b0_size=0x1000 bind_addr=%#llx bind_size=0x2800\n", name, (ull)p,
+           (ull)v0, (ull)v, (ull)(p - 0x800), (ull)(p + 0x800));
+    resolve(p + 0x800, 0x2800, v);   // pages [p, p + 0x3000): across I and M's new start
+    printf("returned\n");
+}
+
+static void case_raw_ev_g4(void) { ev_g4_scene("raw_ev_g4", 0); }
+static void case_raw_ev_g4_hull(void) { ev_g4_scene("raw_ev_g4_hull", 1); }
+
+// ---------- the union at the begin of a raw-access submission (backing.c, union_pass)
+// Every scene above is the shape of the F2 stop: an import beside a mirror at the begin, which a bind then straddles. The pass
+// joins such a chain into one backing before the submission's first raw access, so those scenes run with the pass off
+// (setup) and keep pinning what the stops say for a boundary made inside a submission, which the pass cannot see. These cases
+// run with it on.
+static void union_on(void) { backing_set_union(1); }
+
+// M = [p, p + 256 KiB), made by an earlier submission v0 and brought current; `below` bytes under it committed since, which
+// the begin of the next raw-access submission imports: a mirror with an import abutting its start. Returns the submission
+// after v0, not yet begun as a raw-access submission.
+static uint64_t union_world(uint64_t *p_out, uint64_t below) {
+    setup(64 * MiB, 0);
+    union_on();
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 8 * MiB;
+    pool(p - (below > 1 * MiB ? below : 1 * MiB), 16 * MiB);
+    cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    cpu_fill(p - below, below, 0xBBBBBBBBu);
+    *p_out = p;
+    return sub_begin();
+}
+
+static void union_finish(const char *name) {
+    uint64_t v = D.recording;
+    sub_end(v);
+    gpu_run(v, NULL);
+    done(name);
+}
+
+// The begin joins the import and the mirror: one mirror over both, the table maps it as one run, and the binds that stopped
+// the first runs (one across the boundary, one across the page of the mirror it would cut) are hits.
+static void case_union_begin_straddle(void) {
+    uint64_t p, v = union_world(&p, 0x20000);
+    uint64_t version = backing_version();
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    CHECK(backing_version() > version);
+    CHECK(s.raw_union_chains == 1 && s.raw_union_mirror == 1 && s.raw_union_import == 0);
+    CHECK(s.raw_union_bytes == 256 * KiB + 0x20000 && s.raw_union_net_bytes == 0x20000 && s.raw_union_overcap_bytes == 0);
+    CHECK(s.mirrors == 1 && s.imports == 0 && s.mirror_bytes == 256 * KiB + 0x20000);
+    BackingRun *runs;
+    uint64_t rv;
+    int n = backing_raw_runs(&runs, &rv);
+    CHECK(n == 1 && runs[0].kind == BACKING_MIRROR && runs[0].lo == p - 0x20000 && runs[0].hi == p + 256 * KiB);
+    free(runs);
+    uint64_t misses = s.resolve_misses;
+    BackingRef b0 = resolve(p - 0x800, 0x1000, v);   // across the old boundary: a hit
+    CHECK(b0.kind == BACKING_MIRROR);
+    resolve(p + 0x2000, 4, v);
+    resolve(p - 0x10000, 4, v);
+    resolve(p + 0x800, 0x2800, v);   // across what was the import's end and the mirror's start
+    resolve(p - 0x1800, 0x5800, v);
+    s = stats();
+    CHECK(s.resolve_misses == misses && s.raw_straddle_stops == 0 && s.raw_dry_evals == 0 && s.mirrors == 1 && s.imports == 0);
+    sub_end(v);
+    gpu_run(v, NULL);
+    CHECK(words_are(bytes(&b0), 0x800, 0xBBBBBBBBu) && words_are(bytes(&b0) + 0x800, 0x800, 0xAAAAAAAAu));
+    printf("union_begin_straddle: one mirror of %llu KiB over the import and the mirror, no miss\n",
+           (ull)(s.mirror_bytes >> 10));
+    done("union_begin_straddle");
+}
+
+// Three mirrors of 44 MiB, one in each window (132 MiB, over the 128 MiB a promotion leaves), the first with 2 MiB committed
+// below it since: the union would add 2 MiB to the mirrors, more than a growth may (BACKING_MIRROR_GROW_MAX), so it is an
+// import. Exact: the import is the guest's memory; the mirror is given up and the other two stay.
+static const uint64_t k_cap_len = 44 * MiB;
+static void cap_world(uint64_t run[3]) {
+    setup(256 * MiB, 0);
+    union_on();
+    backing_set_mirror_hook(want_all);
+    const uint64_t win = BACKING_IMPORT_WINDOW;
+    CHECK(3 * k_cap_len > BACKING_PROMOTE_MIRROR_MAX && (g_heap & (win - 1)) == 0);
+    for (int i = 0; i < 3; i++) run[i] = g_heap + (uint64_t)i * win + 4 * MiB;
+    pool(g_heap, 4 * win);
+    for (int i = 0; i < 3; i++) cpu_fill(run[i], k_cap_len, 0xA0A0A0A0u + (uint32_t)i);
+}
+
+static void case_union_cap_demote(void) {
+    uint64_t run[3];
+    cap_world(run);
+    uint64_t v0 = sub_begin();
+    for (int i = 0; i < 3; i++) CHECK(resolve(run[i], 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    CHECK(stats().mirror_bytes == 3 * k_cap_len && stats().mirror_bytes > BACKING_PROMOTE_MIRROR_MAX);
+    cpu_fill(run[0] - 2 * MiB, 2 * MiB, 0xBBBBBBBBu);
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    CHECK(s.raw_union_chains == 1 && s.raw_union_import == 1 && s.raw_union_mirror == 0 && s.raw_union_overcap_bytes == 0);
+    CHECK(s.raw_union_net_bytes == -(int64_t)k_cap_len);
+    CHECK(s.mirrors == 2 && s.mirror_bytes == 2 * k_cap_len && s.imports == 1 && s.import_bytes == k_cap_len + 2 * MiB);
+    BackingRef r = resolve(run[0] + 0x100, 0x200, v);
+    CHECK(r.kind == BACKING_IMPORT && words_are(bytes(&r), 0x200, 0xA0A0A0A0u));   // the guest's own bytes
+    BackingRef r2 = resolve(run[0] - 0x100, 0x100, v);
+    CHECK(r2.kind == BACKING_IMPORT && words_are(bytes(&r2), 0x100, 0xBBBBBBBBu));
+    CHECK(stats().resolve_misses == s.resolve_misses);   // both are hits: one import over the whole
+    printf("union_cap_demote: the union is an import (%llu MiB), the mirror of %llu MiB is given up\n",
+           (ull)(s.import_bytes >> 20), (ull)(k_cap_len >> 20));
+    union_finish("union_cap_demote");
+}
+
+// The same over the cap, with ten small mirrors in the fourth window, each with an import of 1 MiB below it (the first with 64
+// KiB more): a union whose net add is at most 1 MiB is a mirror all the same, as a growth is; the first is not (1 MiB and
+// 64 KiB), and the unions together may add 8 MiB beyond the cap, so of the nine that remain the ninth is not.
+static void case_union_cap_exempt(void) {
+    uint64_t run[3];
+    cap_world(run);
+    const uint64_t w3 = g_heap + 3 * BACKING_IMPORT_WINDOW, small = 128 * KiB;
+    uint64_t base[10], below[10];
+    for (int k = 0; k < 10; k++) {
+        base[k] = w3 + 4 * MiB + (uint64_t)k * 3 * MiB;
+        below[k] = k ? 1 * MiB : 1 * MiB + 64 * KiB;
+        cpu_fill(base[k], small, 0xC0C0C0C0u + (uint32_t)k);
+    }
+    uint64_t v0 = sub_begin();
+    for (int i = 0; i < 3; i++) CHECK(resolve(run[i], 4, v0).kind == BACKING_MIRROR);
+    for (int k = 0; k < 10; k++) CHECK(resolve(base[k], 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    uint64_t start = 3 * k_cap_len + 10 * small;
+    CHECK(stats().mirror_bytes == start);
+    for (int k = 0; k < 10; k++) cpu_fill(base[k] - below[k], below[k], 0xBBBBBBBBu);
+    uint64_t v = sub_begin();
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    CHECK(s.raw_union_chains == 10 && s.raw_union_mirror == 8 && s.raw_union_import == 2);
+    CHECK(s.raw_union_overcap_bytes == BACKING_UNION_OVERSHOOT_MAX && s.raw_union_overcap_bytes == 8 * MiB);
+    CHECK(s.raw_union_net_bytes == (int64_t)(8 * MiB) - 2 * (int64_t)small);
+    CHECK(s.mirror_bytes == start + 8 * MiB - 2 * small && s.mirrors == 3 + 8);
+    CHECK(s.mirror_bytes_peak >= s.mirror_bytes && s.mirror_overshoot_peak == s.mirror_bytes_peak - BACKING_PROMOTE_MIRROR_MAX);
+    int kinds[10];
+    for (int k = 0; k < 10; k++) {
+        BackingPage pg;
+        backing_page(base[k] + 0x100, &pg);
+        kinds[k] = pg.kind;
+    }
+    CHECK(kinds[0] == BACKING_IMPORT && kinds[9] == BACKING_IMPORT);   // by the net add, by the total of the exemptions
+    for (int k = 1; k < 9; k++) CHECK(kinds[k] == BACKING_MIRROR);
+    printf("union_cap_exempt: %llu unions passed the cap by the exemption (%llu KiB), two were imports\n",
+           (ull)s.raw_union_mirror, (ull)(s.raw_union_overcap_bytes >> 10));
+    union_finish("union_cap_exempt");
+}
+
+// The older raw-access submission r is still in flight: it declared a GPU write into the mirror, which reaches guest memory
+// only when r is done. The begin of the next waits for r before the union takes its copy, so the copy holds the write; and a
+// CPU write after the begin reaches the mirror at the next submission's sync.
+static void gpu_union_write(void) { memset(g_mirror + 0x100, 0xCC, 0x200); }
+
+static void case_union_exact_bytes(void) {
+    uint64_t p;
+    pool_t pp;
+    BackingRef small;
+    uint64_t r = raw_scene(&p, &pp, &small);   // raw-access submission r, whose table maps the mirror M = [p, p + 256 KiB)
+    union_on();
+    g_mirror = bytes(&small);
+    backing_gpu_wrote(p + 0x100, 0x200, r);
+    sub_end(r);                                // handed over, and the device has not reached it
+    cpu_fill(p + 256 * KiB, 0x20000, 0xBBBBBBBBu);   // committed above M: an import at the next begin
+    uint64_t v = sub_begin();
+    g_older = r;
+    g_older_work = gpu_union_write;
+    CHECK(plat_thread_start(run_older_later, NULL, 256 * KiB));
+    uint64_t t0 = plat_now_ns();
+    backing_raw_begin(v);
+    double waited = (double)(plat_now_ns() - t0) / 1e6;
+    BackingStats s = stats();
+    CHECK(waited >= 150.0 && gpu_sync_done() >= r && s.replace_waits >= 1);
+    CHECK(s.raw_union_chains == 1 && s.raw_union_mirror == 1 && s.mirrors == 1 && s.imports == 0);
+    BackingRef w = resolve(p + 0x100, 0x200, v);
+    BackingRef above = resolve(p + 256 * KiB + 0x100, 4, v);
+    CHECK(w.kind == BACKING_MIRROR && above.kind == BACKING_MIRROR);
+    cpu_fill(p + 256 * KiB + 0x100, 4, 0xEEEEEEEEu);   // a CPU write after the begin
+    sub_end(v);
+    gpu_run(v, NULL);
+    CHECK(words_are(bytes(&w), 0x200, 0xCCCCCCCCu));                      // the write r made, in the copy
+    CHECK(words_are(bytes(&w) + 0x200, 0x100, 0xAAAAAAAAu));              // the rest as the CPU had it
+    CHECK(*(const uint32_t *)bytes(&above) == 0xBBBBBBBBu);               // the pages that were the import's
+    uint64_t v3 = sub_begin();
+    backing_raw_begin(v3);
+    BackingRef next = resolve(p + 256 * KiB + 0x100, 4, v3);
+    sub_end(v3);
+    gpu_run(v3, NULL);
+    CHECK(*(const uint32_t *)bytes(&next) == 0xEEEEEEEEu);   // the CPU's write reached the next sync
+    printf("union_exact_bytes: the union waited %.1f ms for the raw-access submission in flight\n", waited);
+    backing_pool_fini(&pp);
+    done("union_exact_bytes");
+}
+
+// The pass runs before the begin's stamp and only at the first begin of a value. A mirror the submission resolved before the
+// begin is joined without a stop (the check that a mirror the table maps is never replaced would fire after the stamp). A
+// second begin of the same value, after a boundary was made inside the submission (a bind beside a second mirror), joins
+// nothing: raw accesses of the value may exist by then.
+static void case_union_order(void) {
+    uint64_t p, v = union_world(&p, 0x20000);
+    const uint64_t q = p + 4 * MiB;
+    cpu_fill(q, 128 * KiB, 0xDDDDDDDDu);
+    CHECK(resolve(p + 0x3000, 4, v).kind == BACKING_MIRROR);   // M, resolved by the submission before its begin
+    CHECK(resolve(q, 4, v).kind == BACKING_MIRROR);            // a second mirror M2
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    CHECK(s.raw_union_chains == 1 && s.raw_union_mirror == 1 && s.mirrors == 2 && s.imports == 0);
+    cpu_fill(q - 0x20000, 0x20000, 0xBBBBBBBBu);   // committed below M2 inside the submission
+    CHECK(resolve(q - 0x20000, 0x1000, v).kind == BACKING_IMPORT);   // a bind there: an import beside M2, a chain by now
+    uint64_t version = backing_version();
+    s = stats();
+    CHECK(s.mirrors == 2 && s.imports == 1);
+    backing_raw_begin(v);   // the same value again
+    BackingStats t = stats();
+    CHECK(backing_version() == version && t.raw_union_chains == 1 && t.mirrors == 2 && t.imports == 1);
+    CHECK(t.raw_begins == s.raw_begins + 1);
+    union_finish("union_order");
+}
+
+// A hot import that abuts another import is promoted with it, as one mirror over both, or not at all: promoting it alone would
+// make the boundary the pass removes.
+static void case_union_promote_chain(void) {
+    setup(64 * MiB, 0);
+    union_on();
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 8 * MiB;
+    pool(p - 1 * MiB, 16 * MiB);
+    cpu_fill(p, 128 * KiB, 0xAAAAAAAAu);
+    uint64_t v1 = sub_begin();
+    backing_raw_begin(v1);
+    CHECK(resolve(p + 0x1000, 128 * KiB - 0x1000, v1).kind == BACKING_IMPORT);   // larger than a uniform's: hot
+    sub_end(v1);
+    gpu_run(v1, NULL);
+    cpu_fill(p + 128 * KiB, 128 * KiB, 0xCCCCCCCCu);   // committed above it: an import at the next begin, abutting
+    uint64_t v2 = sub_begin();
+    backing_raw_begin(v2);
+    BackingStats s = stats();
+    CHECK(s.raw_fill_imports >= 2 && s.raw_promoted == 1 && s.raw_promote_bytes == 256 * KiB);
+    CHECK(s.mirrors == 1 && s.mirror_bytes == 256 * KiB && s.imports == 0 && s.raw_union_chains == 1);
+    BackingRun *runs;
+    uint64_t rv;
+    int n = backing_raw_runs(&runs, &rv);
+    CHECK(n == 1 && runs[0].kind == BACKING_MIRROR && runs[0].lo == p && runs[0].hi == p + 256 * KiB);   // no boundary left
+    free(runs);
+    BackingRef a = resolve(p + 0x1000, 4, v2), b = resolve(p + 128 * KiB + 0x100, 4, v2);
+    CHECK(a.kind == BACKING_MIRROR && b.kind == BACKING_MIRROR);
+    sub_end(v2);
+    gpu_run(v2, NULL);
+    CHECK(*(const uint32_t *)bytes(&a) == 0xAAAAAAAAu && *(const uint32_t *)bytes(&b) == 0xCCCCCCCCu);
+    printf("union_promote_chain: two abutting imports became one mirror of %llu KiB\n", (ull)(s.mirror_bytes >> 10));
+    done("union_promote_chain");
+}
+
+// Nothing to join and the map unmoved: the pass does nothing, and does not move the version (the raw path's table is rebuilt
+// when it moves).
+static void case_union_quiet(void) {
+    setup(64 * MiB, 0);
+    union_on();
+    backing_set_mirror_hook(want_all);
+    uint64_t p = g_heap + 8 * MiB;
+    pool(p - 1 * MiB, 16 * MiB);
+    cpu_fill(p, 256 * KiB, 0xAAAAAAAAu);
+    uint64_t v0 = sub_begin();
+    CHECK(resolve(p, 4, v0).kind == BACKING_MIRROR);
+    sub_end(v0);
+    gpu_run(v0, NULL);
+    uint64_t v1 = sub_begin();
+    backing_raw_begin(v1);
+    uint64_t version = backing_version();
+    BackingStats s = stats();
+    CHECK(s.raw_union_chains == 0 && s.mirrors == 1 && s.imports == 0);
+    sub_end(v1);
+    gpu_run(v1, NULL);
+    uint64_t v2 = sub_begin();
+    backing_raw_begin(v2);
+    BackingStats t = stats();
+    CHECK(backing_version() == version && t.raw_union_chains == 0 && t.replace_waits == s.replace_waits);
+    CHECK(t.raw_union_skipped[0] + t.raw_union_skipped[1] + t.raw_union_skipped[2] == 0 && t.raw_begins == 2);
+    union_finish("union_quiet");
+}
+
+// A member of the chain the submission wrote on the GPU before the begin: the pass leaves the chain (a join would have to move
+// the write), counts it, and the straddle stops as it did, by the one named stop.
+static void case_union_written_skip(void) {
+    uint64_t p, v = union_world(&p, 0x20000);
+    resolve(p + 0x3000, 4, v);
+    backing_gpu_wrote(p + 0x3000, 4, v);
+    backing_raw_begin(v);
+    BackingStats s = stats();
+    CHECK(s.raw_union_chains == 0 && s.raw_union_skipped[0] == 1 && s.raw_union_skipped[1] == 0);
+    CHECK(s.mirrors == 1 && s.imports == 1 && s.import_bytes == 0x20000);
+    resolve(p + 0x100, 4, v);
+    resolve(p - 0x10000, 4, v);
+    printf("union_written_skip: p=%#llx v=%llu\n", (ull)p, (ull)v);
+    resolve(p - 0x1800, 0x5800, v);   // across the import and the mirror: today's stop
+    printf("returned\n");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc != 2) {
@@ -2565,7 +2900,11 @@ int main(int argc, char **argv) {
         {"raw_dry_grow", case_raw_dry_grow}, {"raw_dry_g4", case_raw_dry_g4}, {"raw_dry_cap", case_raw_dry_cap},
         {"raw_dry_kind", case_raw_dry_kind}, {"raw_dry_none", case_raw_dry_none}, {"raw_dry_g4_on", case_raw_dry_g4_on},
         {"raw_dry_g8", case_raw_dry_g8}, {"raw_dry_g5", case_raw_dry_g5}, {"raw_dry_g1", case_raw_dry_g1},
-        {"raw_dry_g2", case_raw_dry_g2},
+        {"raw_dry_g2", case_raw_dry_g2}, {"raw_ev_g4", case_raw_ev_g4}, {"raw_ev_g4_hull", case_raw_ev_g4_hull},
+        {"union_begin_straddle", case_union_begin_straddle}, {"union_cap_demote", case_union_cap_demote},
+        {"union_cap_exempt", case_union_cap_exempt}, {"union_written_skip", case_union_written_skip},
+        {"union_exact_bytes", case_union_exact_bytes}, {"union_order", case_union_order},
+        {"union_promote_chain", case_union_promote_chain}, {"union_quiet", case_union_quiet},
         {"raw_grow_used_import", case_raw_grow_used_import}, {"raw_grow_used_edge", case_raw_grow_used_edge},
         {"raw_grow_used_wait", case_raw_grow_used_wait}, {"raw_grow_used_written", case_raw_grow_used_written},
         {"raw_grow_used_hull", case_raw_grow_used_hull}, {"raw_grow_used_hull_edge", case_raw_grow_used_hull_edge},
